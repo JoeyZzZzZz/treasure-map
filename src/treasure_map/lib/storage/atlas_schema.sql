@@ -542,11 +542,13 @@ CREATE TABLE IF NOT EXISTS function_presence (
     operand_markup_incomplete INTEGER DEFAULT 0, -- 1 = its export wrote an operand of it in its
                                     --   default form: an additional fact, never a state
     -- What the other side holds where this function maps through the nearest pair at or below it
-    -- (lib/diff/layer0.probe_counterparts): unpaired (a function in no pair: the state is then
-    -- 'counterpart_suspected', existence UNDETERMINED, never an add/delete) / occupied (a paired
-    -- function or an import stub) / uncovered (no function, and the other side's leftover code is
-    -- known not to reach it) / residual_code / coverage_unknown / unmappable (these three make a
-    -- would-be-complete row 'unmatched_analysis_incomplete'). NULL = not probed.
+    -- (lib/diff/layer0.probe_counterparts): unpaired (a function OR a thunk in no pair: the state is
+    -- then 'counterpart_suspected', existence UNDETERMINED, never an add/delete) / occupied (a
+    -- paired function, a paired thunk, or an import-stub slot) / uncovered (no function, and neither
+    -- the other side's leftover code nor its undisassembled bytes reach it) / residual_code /
+    -- undisassembled_bytes (executable bytes the other side's analysis never disassembled — W11) /
+    -- coverage_unknown / unmappable (these four make a would-be-complete row
+    -- 'unmatched_analysis_incomplete'). NULL = not probed.
     counterpart_probe TEXT,
     counterpart_addr TEXT,          -- the other side's function at the mapped address
     presence_reason TEXT,           -- why the probe left existence undetermined; NULL otherwise
@@ -701,8 +703,8 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     toolchain_binexport     TEXT,            --   application.version, the BinExport extension's
     toolchain_bindiff       TEXT,            --   version, `bindiff --version`); NULL = not read
     -- The import stubs, accounted by import name outside the pairs (lib/diff/layer0.StubLedger).
-    stub_table_a            TEXT,            -- per side: resolved | unknown (binaries.stub_names)
-    stub_table_b            TEXT,
+    stub_table_a            TEXT,            -- per side: resolved | none_named | unknown
+    stub_table_b            TEXT,            --   (binaries.stub_names: named / '{}' / NULL)
     stub_pairs              INTEGER,         -- import names stubbed on both sides; NULL unless both
                                              --   tables are resolved (then the stubs are out of
                                              --   function_alignment / function_presence)
@@ -711,6 +713,10 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     stub_pair_mismatch      TEXT,            -- JSON [[addr_a, addr_b], ...]: pairs joining a stub
                                              --   to a function that is not one (its partner is
                                              --   then unmatched)
+    stub_complete_a         INTEGER,         -- per side (binaries.stub_table_complete): 1 = the
+    stub_complete_b         INTEGER,         --   named table covers every stub, 0 = it does not
+                                             --   (a_only/b_only may miss a name called through
+                                             --   another stub), NULL = no resolution
     export_gaps_on_stubs_a  INTEGER,         -- export gaps on an accounted stub (NULL: stubs not
     export_gaps_on_stubs_b  INTEGER,         --   accounted, or no export report)
     export_gaps_on_code_a   INTEGER,         -- the other export gaps (every gap when the stubs are

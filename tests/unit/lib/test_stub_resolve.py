@@ -61,6 +61,10 @@ def test_plt_stubs_resolve_to_their_import_names() -> None:
     assert resolution.names, "a PLT binary that resolves no stub proves nothing"
     assert all(name.isidentifier() for name in resolution.names.values())
     assert resolution.regions
+    # W13: the regions carry their section name, and complete is a determined bool.
+    assert resolution.named_regions
+    assert all(n in (".plt", ".MIPS.stubs") for n, _lo, _hi in resolution.named_regions)
+    assert isinstance(resolution.complete, bool)
 
 
 @_needs_plt
@@ -94,6 +98,8 @@ def test_a_classic_binary_without_a_plt_fabricates_no_stub_names() -> None:
     resolution = resolve_stubs(_CLASSIC)
     assert resolution is not None
     assert resolution.names == {}
+    # W13: a non-empty .MIPS.stubs that this path does not name is NOT a complete account.
+    assert resolution.complete is False
 
 
 # ── the domain guard: the line between a false negative and a false positive ──────────

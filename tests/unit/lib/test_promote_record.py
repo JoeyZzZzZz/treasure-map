@@ -45,6 +45,14 @@ _PROMOTE_COLS = (
     "promote_residual_unowned",
     "promote_residual_ranges",
     "promote_residual_ranges_truncated",
+    "promote_undefined_ranges",
+    "promote_undefined_ranges_truncated",
+    "promote_undefined_bytes",
+    "promote_recovered",
+    "promote_recover_rejected",
+    "promote_recover_seeds",
+    "promote_recover_lost_bytes",
+    "promote_recover_noreturn_flips",
 )
 
 _PROMOTE = {
@@ -56,6 +64,15 @@ _PROMOTE = {
     "residual_unowned": 1,
     "residual_ranges": [["0x400100", "0x40010b"], ["0x400200", "0x400213"]],
     "residual_ranges_truncated": False,
+    # W11: executable bytes never disassembled. W14: pointer-reached recovery + its two 0 guards.
+    "undefined_ranges": [["0x400300", "0x40031f"]],
+    "undefined_ranges_truncated": False,
+    "undefined_bytes": 32,
+    "recovered": 3,
+    "recover_rejected": 1,
+    "recover_seeds": 7,
+    "recover_lost_insn_bytes": 0,
+    "recover_noreturn_flips": 0,
 }
 
 
@@ -92,19 +109,25 @@ def test_origin_and_the_promote_record_are_stored(tmp_path: Path) -> None:
     residual_ranges keeps its [["0x<lo>","0x<hi>"], ...] form.
 
     MUTATION (verified RED): store origin as NULL always -> RED; leave the promote UPDATE out ->
-    every column NULL -> RED; write the residual ranges as '[]' -> RED."""
+    every column NULL -> RED; write the residual ranges as '[]' -> RED; drop "recovered" from
+    _ORIGINS -> the recovered row reads NULL -> RED."""
     conn = _ingest(
         tmp_path,
         [
             _fn("FUN_00400000", "0x400000", origin="promoted"),
             _fn("main", "0x400400", origin="analysis"),
+            _fn("FUN_00400300", "0x400300", origin="recovered"),  # W14
         ],
         {"promote": _PROMOTE},
     )
     origins = dict(conn.execute("SELECT name, origin FROM functions").fetchall())
     got = _promote_row(conn)
     conn.close()
-    assert origins == {"FUN_00400000": "promoted", "main": "analysis"}
+    assert origins == {
+        "FUN_00400000": "promoted",
+        "main": "analysis",
+        "FUN_00400300": "recovered",
+    }
     assert got == {
         "promote_created": 4,
         "promote_residual_insns": 9,
@@ -113,6 +136,14 @@ def test_origin_and_the_promote_record_are_stored(tmp_path: Path) -> None:
         "promote_residual_unowned": 1,
         "promote_residual_ranges": '[["0x400100","0x40010b"],["0x400200","0x400213"]]',
         "promote_residual_ranges_truncated": 0,
+        "promote_undefined_ranges": '[["0x400300","0x40031f"]]',
+        "promote_undefined_ranges_truncated": 0,
+        "promote_undefined_bytes": 32,
+        "promote_recovered": 3,
+        "promote_recover_rejected": 1,
+        "promote_recover_seeds": 7,
+        "promote_recover_lost_bytes": 0,
+        "promote_recover_noreturn_flips": 0,
     }
 
 
@@ -154,6 +185,13 @@ def test_truncated_ranges_are_flagged(tmp_path: Path) -> None:
         {"residual_ranges": [["0x1", "0x2", "0x3"]]},
         {"residual_ranges": [[1, 2]]},
         {"residual_ranges_truncated": "no"},
+        # W11 / W14 fields join the same all-or-nothing rule:
+        {"undefined_bytes": -1},
+        {"undefined_ranges": [[1, 2]]},
+        {"undefined_ranges_truncated": "no"},
+        {"recovered": -1},
+        {"recover_rejected": True},  # a bool is not a count
+        {"recover_noreturn_flips": -1},
     ],
 )
 def test_a_record_that_does_not_hold_together_is_null(
@@ -162,11 +200,55 @@ def test_a_record_that_does_not_hold_together_is_null(
     """A malformed record states nothing: all of its columns NULL, not the parts that parsed.
 
     MUTATION (verified RED): drop the sum check -> the first case stores 8 -> RED; drop the
-    range-shape check -> the two range cases store -> RED."""
+    range-shape check -> the two range cases store -> RED; drop the undefined/recover checks ->
+    those cases store -> RED."""
     conn = _ingest(tmp_path, [_fn("f", "0x1000")], {"promote": {**_PROMOTE, **broken}})
     got = _promote_row(conn)
     conn.close()
     assert got == dict.fromkeys(_PROMOTE_COLS)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "undefined_ranges",
+        "undefined_ranges_truncated",
+        "undefined_bytes",
+        "recovered",
+        "recover_rejected",
+        "recover_seeds",
+        "recover_lost_insn_bytes",
+        "recover_noreturn_flips",
+    ],
+)
+def test_a_record_missing_a_w11_or_w14_field_is_all_null(tmp_path: Path, missing: str) -> None:
+    """★ W11/W14: a pre-W11 export carries the W1 fields but none of the undefined_*/recover_*
+    ones. Missing ANY of them makes the WHOLE promote group NULL — never a partial row that reads
+    the W1 counts while the undefined bytes silently read 0.
+
+    MUTATION (verified RED): drop a new field from the _promote_columns completeness check -> that
+    field's case stores a partial row -> RED."""
+    rec = {k: v for k, v in _PROMOTE.items() if k != missing}
+    conn = _ingest(tmp_path, [_fn("f", "0x1000")], {"promote": rec})
+    got = _promote_row(conn)
+    conn.close()
+    assert got == dict.fromkeys(_PROMOTE_COLS)
+
+
+def test_undefined_ranges_truncated_is_flagged(tmp_path: Path) -> None:
+    """W11: the extractor capped the undefined ranges — truncated stored as 1, bytes still the full
+    count, so a reader never takes the stored ranges for all of them.
+
+    MUTATION (verified RED): store undefined truncation as 0 always -> RED."""
+    conn = _ingest(
+        tmp_path,
+        [_fn("f", "0x1000")],
+        {"promote": {**_PROMOTE, "undefined_ranges_truncated": True}},
+    )
+    got = _promote_row(conn)
+    conn.close()
+    assert got["promote_undefined_ranges_truncated"] == 1
+    assert got["promote_undefined_bytes"] == 32
 
 
 def test_a_reextraction_without_the_record_clears_the_earlier_one(tmp_path: Path) -> None:
@@ -489,7 +571,45 @@ def test_the_two_scripts_spell_the_handoff_the_same_way() -> None:
 
     assert const(promote, "OPTIONS_CATEGORY") == const(export, "PROMOTE_OPTIONS")
     assert const(promote, "BOOKMARK_CATEGORY") == const(export, "PROMOTE_BOOKMARK")
-    # Every option ExportFunctions reads is one PromoteUndefined writes.
+    # W14: the recovered-function bookmark, read back as origin='recovered'.
+    assert const(promote, "RECOVERED_BOOKMARK") == const(export, "PROMOTE_RECOVERED")
+    # Every option ExportFunctions reads is one PromoteUndefined writes (now incl. the W11/W14
+    # fields: undefined_ranges / undefined_bytes / recovered / recover_* ).
     written = set(re.findall(r'opts\.set\w+\("(\w+)"', promote))
     read = set(re.findall(r'opts\.(?:get\w+|contains)\("(\w+)"', export))
     assert read and read <= written, read - written
+    assert {"undefined_ranges", "undefined_bytes", "recovered", "recover_lost_insn_bytes"} <= read
+
+
+def test_w14_freezes_and_restores_no_return_discovery() -> None:
+    """★ W14 re-analyses with no-return discovery FROZEN; without the freeze, re-analysis can newly
+    mark an existing command wrapper non-returning and delete every instruction after each call to
+    it. The original value is restored at the end.
+
+    MUTATION (verified RED): drop the freeze setAnalysisOption(... "false") -> RED; drop the
+    restoreNoReturn call -> RED; drop one initializeOptions -> RED."""
+    code = _code(_GHIDRA_DIR / "PromoteUndefined.java")
+    assert 'NO_RETURN_OPTION = "Non-Returning Functions - Discovered"' in code
+    assert 'setAnalysisOption(currentProgram, NO_RETURN_OPTION, "false")' in code
+    assert "restoreNoReturn(nrWas)" in code
+    # the analyzer options are re-initialised after both the freeze and the restore
+    assert code.count("initializeOptions()") >= 2
+    # the recovery guard counts exist and are recorded (both 0 by design)
+    assert "recover_lost_insn_bytes" in code
+    assert "recover_noreturn_flips" in code
+
+
+def test_w14_bookmarks_recovered_functions_and_export_reads_the_origin() -> None:
+    """★ W14 bookmarks each recovered function under RECOVERED_BOOKMARK; ExportFunctions reads that
+    bookmark to write origin='recovered', checked BEFORE the promoted bookmark.
+
+    MUTATION (verified RED): make originField check the promoted bookmark first -> a recovered
+    function reads 'promoted' -> RED; drop the recovered createFunction bookmark -> RED."""
+    promote = _code(_GHIDRA_DIR / "PromoteUndefined.java")
+    export = _code(_GHIDRA_DIR / "ExportFunctions.java")
+    assert "RECOVERED_BOOKMARK" in promote and "createFunction(a, null)" in promote
+    # originField resolves recovered -> promoted -> analysis, in that order.
+    rec_at = export.index("PROMOTE_RECOVERED")
+    prom_at = export.index("PROMOTE_BOOKMARK", export.index("originField"))
+    assert rec_at < export.index('"recovered"')
+    assert export.index("PROMOTE_RECOVERED", export.index("originField")) < prom_at

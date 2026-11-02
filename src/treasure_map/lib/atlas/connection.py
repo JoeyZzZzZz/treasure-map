@@ -276,6 +276,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("stub_a_only", "TEXT"),
         ("stub_b_only", "TEXT"),
         ("stub_pair_mismatch", "TEXT"),
+        ("stub_complete_a", "INTEGER"),
+        ("stub_complete_b", "INTEGER"),
         ("export_gaps_on_stubs_a", "INTEGER"),
         ("export_gaps_on_stubs_b", "INTEGER"),
         ("export_gaps_on_code_a", "INTEGER"),

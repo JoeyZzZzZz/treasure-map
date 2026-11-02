@@ -316,11 +316,14 @@ def _analysis(w: _World, side: str, sha: str, funcs: dict[int, str]) -> Path:
     so_path.write_bytes(b"\x7fELF")
     w.so_sha[str(so_path)] = sha
     conn.execute(
-        # promote_residual_*: a current extraction recorded that it left no code outside a
-        # function, so an unmatched function with nothing at its mapped address reads determined.
+        # promote_residual_* / promote_undefined_*: a current extraction recorded that it left no
+        # code outside a function and no undisassembled bytes, so an unmatched function with nothing
+        # at its mapped address reads determined (both must be known for the probe to be complete).
         "INSERT INTO binaries (id, name, path, sha256, arch, pass_version, ghidra_version, "
-        "ghidra_ok, last_seen_at, promote_residual_ranges, promote_residual_ranges_truncated) "
-        "VALUES (1, 'liba', ?, ?, 'ARM:LE:32:v7', ?, ?, 1, '2026-01-01T00:00:00', '[]', 0)",
+        "ghidra_ok, last_seen_at, promote_residual_ranges, promote_residual_ranges_truncated, "
+        "promote_undefined_ranges, promote_undefined_ranges_truncated) "
+        "VALUES (1, 'liba', ?, ?, 'ARM:LE:32:v7', ?, ?, 1, '2026-01-01T00:00:00', '[]', 0, "
+        "'[]', 0)",
         (str(so_path), sha, _PV, _GV),
     )
     for addr, name in funcs.items():

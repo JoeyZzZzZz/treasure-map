@@ -502,11 +502,13 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             export_degenerate_functions_b, bindiff_vertex0_fallbacks, export_code_hash_a,
             export_code_hash_b, toolchain_ghidra, toolchain_binexport, toolchain_bindiff,
             stub_table_a, stub_table_b, stub_pairs, stub_a_only, stub_b_only, stub_pair_mismatch,
+            stub_complete_a, stub_complete_b,
             export_gaps_on_stubs_a, export_gaps_on_stubs_b, export_gaps_on_code_a,
             export_gaps_on_code_b)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?)""",
         (
             row.diff_id,
             row.run_a_id,
@@ -581,6 +583,8 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             row.stub_a_only,
             row.stub_b_only,
             row.stub_pair_mismatch,
+            row.stub_complete_a,
+            row.stub_complete_b,
             row.export_gaps_on_stubs_a,
             row.export_gaps_on_stubs_b,
             row.export_gaps_on_code_a,

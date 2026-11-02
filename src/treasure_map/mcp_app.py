@@ -576,9 +576,14 @@ _AGENT_GUIDE = (
     "get_diff_string_delta(diff_id) lists the string literals one side holds and the other does "
     "not, with their reference anchors (get_diff_meta carries the counts). "
     "A P entry is a function in no matched pair: its counterpart_probe says what the other side "
-    "holds where it maps, and only presence_state unmatched_analysis_complete is a determined "
-    "existence (counterpart_suspected and unmatched_analysis_incomplete are not). Import stubs "
-    "are paired by import name outside the function pairs (get_diff_meta import_stubs). A "
+    "holds where it maps — a thunk or import-stub slot there is occupied, and bytes the other "
+    "side's analysis never disassembled are undisassembled_bytes (reason "
+    "other_side_bytes_not_disassembled, incomplete) — and only presence_state "
+    "unmatched_analysis_complete is a determined existence (counterpart_suspected and "
+    "unmatched_analysis_incomplete are not). Import stubs are paired by import name outside the "
+    "function pairs (get_diff_meta import_stubs); the accounting covers only both sides' named "
+    ".plt stubs, so when a side's complete is not 1 its a_only/b_only names are "
+    "one_sided_unconfirmed (another stub may call them). A "
     "proposed pairing with a pairing_name_conflict is not lifted; an R entry read "
     "identical_unique whose B side lost every direct caller keeps that basis. "
     "The non-binary files (scripts, configs, credentials, web assets) are compared by "
@@ -2343,9 +2348,11 @@ def make_tools(
         either side (``no_sink_candidate_unchecked`` when the callee lists could not be read);
         ``P`` = a function in no matched pair (subclass = its ``presence_state``: only
         ``unmatched_analysis_complete`` is a determined existence; ``counterpart_suspected`` — a
-        function itself in no pair sits where it maps on the other side — and
+        function or thunk itself in no pair sits where it maps on the other side — and
         ``unmatched_analysis_incomplete`` are not; ``counterpart_probe`` says what the other side
-        holds at the mapped address, with ``counterpart_addr`` / ``presence_reason`` /
+        holds at the mapped address — a thunk / import-stub slot is ``occupied``, and executable
+        bytes the other side never disassembled are ``undisassembled_bytes`` (reason
+        ``other_side_bytes_not_disassembled``) — with ``counterpart_addr`` / ``presence_reason`` /
         ``counterpart_overlap``); ``E`` = a similarity-1 pair whose function has a
         direct caller on the A side and none found (or none provable) on the B side — a caller-set
         edge (``callers_a`` / ``callers_b``) similarity is blind to. ``S`` = an aligned similarity-1
@@ -3078,10 +3085,15 @@ def make_tools(
         ``unconfirmed_by``) when a truncated or unknown side makes the counts unconfirmable.
         ``import_stubs``: the lazy-binding import stubs, paired by the import each calls and kept
         out of the function pairs and presence rows when both sides' stub tables are resolved
-        (``table_a`` / ``table_b``: resolved / unknown; ``pairs``, the one-sided names ``a_only``
-        / ``b_only``, ``pair_mismatch`` = pairs the diff tool made between a stub and a function
-        that is not one, each side's ``export_gaps_on_stubs`` / ``export_gaps_on_code``; null
-        counts = not accounted); null on a diff written before.
+        (``table_a`` / ``table_b``: resolved / none_named / unknown; ``pairs``, the one-sided names
+        ``a_only`` / ``b_only``, ``pair_mismatch`` = pairs the diff tool made between a stub and a
+        function that is not one, each side's ``export_gaps_on_stubs`` / ``export_gaps_on_code``;
+        null counts = not accounted). ``complete`` ``{a, b}`` (1 / 0 / null) says whether each
+        named table covers every stub of its binary; the accounting only covers both sides' named
+        ``.plt`` stubs, so when a side is not complete the run carries ``one_sided_unconfirmed`` and
+        an ``a_only`` / ``b_only`` name may still be called through another stub (``.MIPS.stubs`` or
+        an unnamed ``.plt`` entry) on the other side — not a determined one-sided add. Null on a
+        diff written before.
         ``server`` reports the running server's own build (D33; see list_runs)."""
         server, moved = _server_block()
         conn = open_atlas(atlas_path)

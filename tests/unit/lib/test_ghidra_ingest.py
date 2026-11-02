@@ -846,6 +846,94 @@ def test_read_but_empty_is_not_the_same_as_not_determined(tmp_path: Path, monkey
     assert absent is None  # never determined
 
 
+def _ingest_stub_cols(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resolution: StubResolution | None
+) -> tuple[object, object]:
+    """Ingest with ``resolve_stubs`` forced; return (stub_table_complete, stub_regions)."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    _write_ghidra_json(
+        output_dir,
+        "test_bin",
+        "a" * 64,
+        {"functions": [], "imports": [], "exports": [], "strings": []},
+    )
+    monkeypatch.setattr(ingest_mod, "resolve_stubs", lambda _path: resolution)
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    row = conn.execute(
+        "SELECT stub_table_complete, stub_regions FROM binaries WHERE sha256 = ?", ("a" * 64,)
+    ).fetchone()
+    conn.close()
+    return row[0], row[1]
+
+
+def test_w13_stub_completeness_and_regions_are_stored(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """★ W13: a complete named table stores stub_table_complete=1 and the section-tagged regions;
+    a table that does not cover every stub stores 0; no resolution stores NULL for both (the same
+    three-state honesty as stub_names).
+
+    MUTATION (verified RED): stop writing the two columns in _ingest_one_binary -> NULL everywhere
+    -> RED; write complete as 1 for a resolution whose complete is False -> RED."""
+    complete, regions = _ingest_stub_cols(
+        tmp_path / "c",
+        monkeypatch,
+        StubResolution(
+            names={0x41EB38: "system"},
+            regions=((0x401000, 0x401200),),
+            complete=True,
+            named_regions=((".plt", 0x401000, 0x401200),),
+        ),
+    )
+    assert complete == 1
+    assert json.loads(str(regions)) == [[".plt", "0x401000", "0x401200"]]
+
+    incomplete, _ = _ingest_stub_cols(
+        tmp_path / "i",
+        monkeypatch,
+        StubResolution(
+            names={0x41EB38: "system"},
+            regions=((0x401000, 0x401200),),
+            complete=False,
+            named_regions=((".MIPS.stubs", 0x401000, 0x401200),),
+        ),
+    )
+    assert incomplete == 0
+
+    absent_complete, absent_regions = _ingest_stub_cols(tmp_path / "n", monkeypatch, None)
+    assert absent_complete is None and absent_regions is None  # not determined, never 0 / '[]'
+
+
+def _ingest_thunks(tmp_path: Path, thunks: object) -> object:
+    """Ingest one binary whose export carries ``thunks`` (omitted when it is the sentinel _OMIT);
+    return the stored thunk_spans."""
+    conn, sha_to_id = _setup_db(tmp_path)
+    output_dir = tmp_path / "ghidra_output"
+    data: dict = {"functions": [], "imports": [], "exports": [], "strings": []}
+    if thunks is not _OMIT:
+        data["thunks"] = thunks
+    _write_ghidra_json(output_dir, "test_bin", "a" * 64, data)
+    ingest_ghidra_output(conn, output_dir, [_make_record("test_bin", "a" * 64)], sha_to_id)
+    row = conn.execute("SELECT thunk_spans FROM binaries WHERE sha256 = ?", ("a" * 64,)).fetchone()
+    conn.close()
+    return row[0]
+
+
+_OMIT = object()
+
+
+def test_w12_thunk_spans_are_stored_and_absence_is_null(tmp_path: Path) -> None:
+    """★ W12: the export's thunks ride with the binary as thunk_spans so the diff can see a thunk
+    where a function maps. A list (even empty) is stored as given; an export predating W12 (no
+    thunks key) stores NULL — "not recorded", never "no thunks".
+
+    MUTATION (verified RED): stop writing thunk_spans -> NULL always -> RED; store '[]' when the
+    key is absent -> the NULL-vs-empty distinction is lost -> RED."""
+    spans = [["0x2100", [["0x2100", "0x210f"]]]]
+    assert json.loads(str(_ingest_thunks(tmp_path / "t", spans))) == spans
+    assert _ingest_thunks(tmp_path / "e", []) == "[]"  # read, no thunks (determined empty)
+    assert _ingest_thunks(tmp_path / "n", _OMIT) is None  # not recorded
+
+
 # ── EC3: a JSON written by another extraction pass / for another binary is not ingested ─────────
 
 

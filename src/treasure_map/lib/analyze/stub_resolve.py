@@ -67,10 +67,19 @@ class StubResolution:
     ``names`` maps a stub's entry address to the import it calls — only the stubs that resolved
     unambiguously. ``regions`` are the ``.plt`` / ``.MIPS.stubs`` address ranges, so a caller's
     ``FUN_<addr>`` callee can be recognised as a stub call even when its name did not resolve (then
-    it is an unclassified external call, surfaced rather than dropped)."""
+    it is an unclassified external call, surfaced rather than dropped).
+
+    ``complete`` says the ``names`` table covers EVERY stub this binary has: no non-empty
+    ``.MIPS.stubs`` section, and every ``.plt`` table entry resolved a name. It is False when a
+    ``.MIPS.stubs`` table carries stubs this path does not name (``_plt_stub_names`` only reads
+    ``.plt``), so a reader never takes an empty-or-partial table for "these are all the stubs".
+    ``named_regions`` is ``regions`` tagged with each range's section name, carried so a later
+    reader can tell a ``.plt`` region from a ``.MIPS.stubs`` one."""
 
     names: dict[int, str]
     regions: tuple[tuple[int, int], ...]
+    complete: bool = False
+    named_regions: tuple[tuple[str, int, int], ...] = ()
 
     def in_stub_region(self, addr: int) -> bool:
         return any(lo <= addr < hi for lo, hi in self.regions)
@@ -170,13 +179,30 @@ def _plt_stub_names(elf: ELFFile, slot_names: dict[int, str]) -> dict[int, str]:
     return out
 
 
-def _stub_regions(elf: ELFFile) -> tuple[tuple[int, int], ...]:
-    regions: list[tuple[int, int]] = []
+def _named_stub_regions(elf: ELFFile) -> tuple[tuple[str, int, int], ...]:
+    """The ``.plt`` / ``.MIPS.stubs`` regions, each tagged with its section name (non-empty)."""
+    regions: list[tuple[str, int, int]] = []
     for sec_name in (".plt", ".MIPS.stubs"):
         sec = elf.get_section_by_name(sec_name)
         if sec is not None and sec["sh_size"]:
-            regions.append((sec["sh_addr"], sec["sh_addr"] + sec["sh_size"]))
+            regions.append((sec_name, sec["sh_addr"], sec["sh_addr"] + sec["sh_size"]))
     return tuple(regions)
+
+
+def _plt_entry_count(elf: ELFFile) -> int:
+    """How many per-import stubs the ``.plt`` holds, by the same arithmetic ``_plt_stub_names``
+    uses (0 when there is no ``.plt``). A table is ``complete`` only when every one resolved."""
+    plt = elf.get_section_by_name(".plt")
+    if plt is None:
+        return 0
+    return max(0, (plt["sh_size"] - _MIPS_PLT_HEADER) // _MIPS_PLT_ENTRY)
+
+
+def _has_nonempty_mips_stubs(elf: ELFFile) -> bool:
+    """True when a non-empty ``.MIPS.stubs`` is present — stubs ``_plt_stub_names`` never reads, so
+    a named table that leaves them out is NOT a full account of this binary's stubs."""
+    sec = elf.get_section_by_name(".MIPS.stubs")
+    return sec is not None and bool(sec["sh_size"])
 
 
 def resolve_stubs(elf_path: Path | str) -> StubResolution | None:
@@ -198,9 +224,14 @@ def resolve_stubs(elf_path: Path | str) -> StubResolution | None:
                 _rel_plt_slot_names(elf, dynsym),
                 _global_got_slot_names(elf, dynsym, tags),
             )
+            names = _plt_stub_names(elf, slot_names)
+            named_regions = _named_stub_regions(elf)
+            complete = not _has_nonempty_mips_stubs(elf) and len(names) == _plt_entry_count(elf)
             return StubResolution(
-                names=_plt_stub_names(elf, slot_names),
-                regions=_stub_regions(elf),
+                names=names,
+                regions=tuple((lo, hi) for _n, lo, hi in named_regions),
+                complete=complete,
+                named_regions=named_regions,
             )
     except (OSError, ELFError, ValueError, KeyError, AttributeError) as exc:
         logger.debug("stub resolution skipped for %s: %s", elf_path, exc)

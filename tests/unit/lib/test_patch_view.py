@@ -1259,6 +1259,34 @@ def test_a_function_with_no_counterpart_is_p_with_its_presence_state(world: Worl
     assert v["by_id"]["b:00023000"]["tier"] == "no_sink"
 
 
+def test_a_p_entry_surfaces_the_counterpart_probe_facts() -> None:
+    """★ W3 / W11 (MINOR-3): a P entry's rendered view carries the counterpart-probe facts — the
+    probe value, the function/thunk found (``counterpart_addr``), why existence is undetermined
+    (``presence_reason``), and the leftover/undisassembled ranges met (``counterpart_overlap``) —
+    so a reader sees what the other side holds, not only that the function is unmatched.
+
+    MUTATION (verified RED): drop counterpart_probe / counterpart_addr / presence_reason /
+    counterpart_overlap from the unpaired branch of ``_entry_json`` -> RED."""
+    e = pv._Entry(pair=None, unpaired=None, bucket="P")
+    e.unpaired = pv._Unpaired(
+        "a",
+        "00002000",
+        "f",
+        "unmatched_analysis_incomplete",
+        None,
+        counterpart_probe="undisassembled_bytes",
+        counterpart_addr="00003100",
+        presence_reason="other_side_bytes_not_disassembled",
+        counterpart_overlap='[["0x3100","0x311f"]]',
+    )
+    e.tier, e.subclass = 3, "unmatched_analysis_incomplete"
+    out = pv._entry_json(e)
+    assert out["counterpart_probe"] == "undisassembled_bytes"
+    assert out["counterpart_addr"] == "00003100"
+    assert out["presence_reason"] == "other_side_bytes_not_disassembled"
+    assert out["counterpart_overlap"] == [["0x3100", "0x311f"]]
+
+
 def test_an_undetermined_pair_is_r_with_or_without_a_candidate(world: World) -> None:
     v = _view(world)
     bare = v["by_id"][_pair_id("0001e000", "0001f000")]
@@ -7797,16 +7825,21 @@ def _name_conflict_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
         return _pair_id(a, b)
 
     ids = {
-        "r_conflict": swap_pair("00020000", "00021000", 0.5, "onDisconnect", "onDealData"),
+        "r_conflict": swap_pair("00020000", "00021000", 0.5, "onEventA", "onEventB"),
         "r_control": swap_pair("00040000", "00041000", 0.5, "cbOne", "cbTwo"),
         "r_fun": swap_pair("00050000", "00051000", 0.5, "FUN_00050000", "FUN_00051000"),
         "aligned": swap_pair("00030000", "00031000", 0.97, "alpha", "beta"),
+        "r_same_name": swap_pair("00060000", "00061000", 0.5, "handle", "handle"),
     }
-    w.fn("b", "00022000", ["foo"], name="onDisconnect", pseudocode="foo();", size_bytes=16)
+    w.fn("b", "00022000", ["foo"], name="onEventA", pseudocode="foo();", size_bytes=16)
     w.fn("a", "00032000", ["foo"], name="beta", pseudocode="foo();", size_bytes=16)
     # The B side holds the A FUN_ name elsewhere as well: only the FUN_ exclusion keeps r_fun
     # free of a conflict.
     w.fn("b", "00052000", ["foo"], name="FUN_00050000", pseudocode="foo();", size_bytes=16)
+    # r_same_name is a same-name pairing (name_a == name_b == "handle"); the B side holds ANOTHER
+    # "handle" (a C++ method name repeats by class). Only the name_a == name_b exclusion keeps a
+    # correct same-name pairing free of a conflict here.
+    w.fn("b", "00062000", ["foo"], name="handle", pseudocode="foo();", size_bytes=16)
     w.commit()
     return w, ids
 
@@ -7814,21 +7847,23 @@ def _name_conflict_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
 def test_a_proposed_pairing_with_a_name_conflict_is_listed_but_not_lifted(
     tmp_path: Path, current: None
 ) -> None:
-    """★ W5. r_conflict carries ``pairing_name_conflict`` (the B side's other onDisconnect) and is
+    """★ W5. r_conflict carries ``pairing_name_conflict`` (the B side's other onEventA) and is
     not lifted (no lift_basis, swap_lift 0), still listed at attention 1; r_control and r_fun,
     the same shape without a conflict, are lifted.
 
     MUTATION (verified RED, 1 failed each): drop the conflict check from ``_lift_basis`` ->
     r_conflict is lifted again -> RED; read FUN_ names as symbols (``_real_symbol`` returns
-    ``bool(name)``) -> r_fun carries a conflict and is not lifted -> RED."""
+    ``bool(name)``) -> r_fun carries a conflict and is not lifted -> RED; drop the
+    ``name_a == name_b`` exclusion in ``_pairing_name_conflict`` -> r_same_name carries a conflict
+    (its B-side namesake) and is not lifted -> RED."""
     w, ids = _name_conflict_world(tmp_path)
     v = _view(w, sort_by="significance")
     for k in ids.values():
         assert k in v["by_id"], k
     conflict = v["by_id"][ids["r_conflict"]]
     assert conflict.get("pairing_name_conflict") == {
-        "name_a": "onDisconnect",
-        "name_b": "onDealData",
+        "name_a": "onEventA",
+        "name_b": "onEventB",
         "a_name_on_b": ["00022000"],
         "a_name_on_b_count": 1,
         "b_name_on_a": [],
@@ -7837,7 +7872,9 @@ def test_a_proposed_pairing_with_a_name_conflict_is_listed_but_not_lifted(
     assert conflict["sink_callee_swap"]["pairing"] == "proposed"
     assert conflict["significance"]["attention"] == 1
     assert (conflict["lift_basis"], conflict["rank_key"]["sink_callee_swap"]) == (None, 0)
-    for key in ("r_control", "r_fun"):
+    # r_control (different names, no duplicate), r_fun (FUN_ names excluded) and r_same_name
+    # (name_a == name_b, so a duplicate on B is not a conflict) all lift.
+    for key in ("r_control", "r_fun", "r_same_name"):
         e = v["by_id"][ids[key]]
         assert e.get("pairing_name_conflict") is None, key
         assert (e["lift_basis"], e["rank_key"]["sink_callee_swap"]) == ("sink_callee_swap", 1), key

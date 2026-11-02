@@ -96,14 +96,20 @@ def _report_promote(promote: dict[str, Any]) -> None:
     them, so their function set may be short) and how many binaries recorded nothing."""
     if not promote or not promote.get("binaries"):
         return
+    total = int(promote.get("binaries") or 0)
     unrecorded = int(promote.get("unrecorded") or 0)
-    line = (
-        f"      → promoted functions: {promote.get('created', 0)} created; "
-        f"{promote.get('residual_insns', 0)} instructions left outside any function"
-    )
-    if unrecorded:
-        line += f" (not recorded for {unrecorded} binaries)"
-    click.echo(line)
+    if total - unrecorded <= 0:
+        # Every extracted binary recorded nothing: say exactly that, never "0 created; 0
+        # instructions left", which reads as a determined zero rather than an absent record.
+        click.echo(f"      → promoted functions: not recorded for {unrecorded} binaries")
+    else:
+        line = (
+            f"      → promoted functions: {promote.get('created', 0)} created; "
+            f"{promote.get('residual_insns', 0)} instructions left outside any function"
+        )
+        if unrecorded:
+            line += f" (not recorded for {unrecorded} binaries)"
+        click.echo(line)
     unowned = list(promote.get("unowned_binaries") or [])
     if unowned:
         click.echo(

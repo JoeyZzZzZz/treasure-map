@@ -639,6 +639,9 @@ _META_NOTE = (
     "baseline_dropped=1 = the diff had a stored candidate baseline that a re-diff dropped (it "
     "failed, or the baseline could not be stored again). "
     "ghidra_version is the diffed binary's own (the run's on a diff written before the stamps). "
+    "When import_stubs accounts the stubs (both tables resolved), functions_total_a/b still COUNT "
+    "the stub functions while matched_in_domain + unmatched do NOT, so those three no longer add "
+    "up — the difference is the accounted stubs (import_stubs.pairs / a_only / b_only). "
     + DIFF_WORKFLOW
 )
 
@@ -854,15 +857,22 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
 
 def _import_stubs(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] | None:
     """The diff's import stubs, accounted by import name outside the pairs (lib/diff/layer0
-    ``StubLedger``): each side's stub table (resolved / unknown); with both resolved, the names
-    stubbed on both sides (``pairs``), on one side only, the pairs the diff tool had made between a
-    stub and a function that is not one (``pair_mismatch``), and each side's export gaps on stubs /
-    on the rest. ``pairs`` etc. null: not accounted (a table unknown — the stubs then went through
-    the pairing). None: a diff written before the accounting."""
+    ``StubLedger``): each side's stub table (resolved / none_named / unknown); with both resolved,
+    the names stubbed on both sides (``pairs``), on one side only, the pairs the diff tool had made
+    between a stub and a function that is not one (``pair_mismatch``), and each side's export gaps
+    on stubs / on the rest. ``pairs`` etc. null: not accounted (a table unknown or none_named — the
+    stubs then went through the pairing). None: a diff written before the accounting.
+
+    ``complete`` (W13) is each side's binaries.stub_table_complete (1 / 0 / null): the accounting
+    only covers the two sides' NAMED .plt stubs, so when either side is not complete, a name in
+    ``a_only`` / ``b_only`` may still be called through another stub (``.MIPS.stubs`` or an unnamed
+    .plt entry) on the other side — flagged ``one_sided_unconfirmed`` rather than a determined
+    one-sided add."""
     row = atlas.execute(
         "SELECT stub_table_a, stub_table_b, stub_pairs, stub_a_only, stub_b_only, "
         "stub_pair_mismatch, export_gaps_on_stubs_a, export_gaps_on_stubs_b, "
-        "export_gaps_on_code_a, export_gaps_on_code_b FROM diff_meta WHERE diff_id = ?",
+        "export_gaps_on_code_a, export_gaps_on_code_b, stub_complete_a, stub_complete_b "
+        "FROM diff_meta WHERE diff_id = ?",
         (diff_id,),
     ).fetchone()
     if row is None or (row[0] is None and row[1] is None):
@@ -871,16 +881,23 @@ def _import_stubs(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] | N
     def names(raw: str | None) -> list[Any] | None:
         return json.loads(raw) if raw is not None else None
 
-    return {
+    complete_a, complete_b = row[10], row[11]
+    out: dict[str, Any] = {
         "table_a": row[0],
         "table_b": row[1],
         "pairs": row[2],
         "a_only": names(row[3]),
         "b_only": names(row[4]),
         "pair_mismatch": names(row[5]),
+        "complete": {"a": complete_a, "b": complete_b},
         "export_gaps_on_stubs": {"a": row[6], "b": row[7]},
         "export_gaps_on_code": {"a": row[8], "b": row[9]},
     }
+    # Either side not confirmed-complete -> a_only / b_only may miss a name called through another
+    # stub. Only meaningful once there IS a one-sided list to qualify (both tables resolved).
+    if out["a_only"] is not None and (complete_a != 1 or complete_b != 1):
+        out["one_sided_unconfirmed"] = True
+    return out
 
 
 def get_diff_string_delta(

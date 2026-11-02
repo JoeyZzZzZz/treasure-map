@@ -127,6 +127,23 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("binaries", "promote_residual_ranges_truncated", "INTEGER"),
     ("functions", "decompile_error", "TEXT"),
     ("functions", "origin", "TEXT"),
+    # W11: executable bytes Ghidra never disassembled (undefined ranges >= 16 B + their total), and
+    # W14: pointer-reached recovery counts and its two guards. Back-fill NULL on older DBs: not
+    # recorded until a re-scan — never 0. Must match schema.sql.
+    ("binaries", "promote_undefined_ranges", "TEXT"),
+    ("binaries", "promote_undefined_ranges_truncated", "INTEGER"),
+    ("binaries", "promote_undefined_bytes", "INTEGER"),
+    ("binaries", "promote_recovered", "INTEGER"),
+    ("binaries", "promote_recover_rejected", "INTEGER"),
+    ("binaries", "promote_recover_seeds", "INTEGER"),
+    ("binaries", "promote_recover_lost_bytes", "INTEGER"),
+    ("binaries", "promote_recover_noreturn_flips", "INTEGER"),
+    # W13: does stub_names cover every stub (1/0; NULL = no resolution), and the stub regions. W12:
+    # the thunks the export skipped. Back-fill NULL on older DBs (not determined until a re-scan —
+    # NOT "no stubs"/"no thunks"). Must match schema.sql.
+    ("binaries", "stub_table_complete", "INTEGER"),
+    ("binaries", "stub_regions", "TEXT"),
+    ("binaries", "thunk_spans", "TEXT"),
 )
 
 

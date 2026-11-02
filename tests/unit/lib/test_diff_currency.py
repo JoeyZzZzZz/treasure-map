@@ -2108,12 +2108,14 @@ def _golden_analysis(path: Path, sha: str, side: str) -> None:
     walk_call = "0x101318" if side == "a" else "0x101329"
     conn = open_db(path)
     conn.execute(
-        # promote_residual_*: what the extraction's function promotion left outside a function
-        # (nothing), as a current extraction records it; the counterpart probe reads it.
+        # promote_residual_* / promote_undefined_*: what the extraction's function promotion left
+        # outside a function (nothing) and the bytes it never disassembled (none), as a current
+        # extraction records them; the counterpart probe needs both known to read determined.
         "INSERT INTO binaries (id, name, path, sha256, arch, pass_version, ghidra_version, "
-        "ghidra_ok, last_seen_at, promote_residual_ranges, promote_residual_ranges_truncated) "
+        "ghidra_ok, last_seen_at, promote_residual_ranges, promote_residual_ranges_truncated, "
+        "promote_undefined_ranges, promote_undefined_ranges_truncated) "
         "VALUES (1, 'libshapes.so', 'lib/libshapes.so', ?, 'x86:LE:64:default', 'pvgolden', "
-        "'11.4.3', 1, '2026-01-01T00:00:00', '[]', 0)",
+        "'11.4.3', 1, '2026-01-01T00:00:00', '[]', 0, '[]', 0)",
         (sha,),
     )
 

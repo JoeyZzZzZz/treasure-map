@@ -27,8 +27,10 @@ BUCKETS (``bucket``):
   C  a changed pair (similarity below 1) with no sink candidate on either side.
   P  a function in no matched pair (``presence_state`` from function_presence, ``absent`` when the
      function has no presence record at all). ``counterpart_probe`` says what the other side holds
-     where it maps (lib/diff/layer0.probe_counterparts); ``counterpart_suspected`` (a function in
-     no pair there) and ``unmatched_analysis_incomplete`` never read as an existence.
+     where it maps (lib/diff/layer0.probe_counterparts): a thunk or import-stub slot there is
+     ``occupied``, bytes the other side never disassembled are ``undisassembled_bytes``;
+     ``counterpart_suspected`` (a function or thunk in no pair there) and
+     ``unmatched_analysis_incomplete`` never read as an existence.
   E  an aligned, similarity-1 pair that would otherwise place no entry, whose called function has a
      direct caller on the A side and none found (or none provable) on the B side — a caller-set edge
      fact (``callers_a`` / ``callers_b``) similarity is blind to. The ONE bucket this build adds.

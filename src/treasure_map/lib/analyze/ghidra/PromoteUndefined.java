@@ -17,44 +17,89 @@
 // ★ A created function takes Ghidra's default name (createFunction(entry, null) -> FUN_<addr>),
 //   never a name derived from its address under another prefix: readers treat FUN_ names as
 //   address-derived, any other name as a stable symbol.
-// ★ The analysis is then re-run on what changed (analyzeChanges), so the new functions get their
-//   references, signatures and the decompiler's view of the code that calls them.
-// ★ Self-check, after that: every instruction still in no function is counted, by kind —
-//     start     the start of a code block that findFunction did not turn into a function;
-//     interior  inside such a block;
-//     unowned   in no code block the block model gives for it (getCodeBlockAt null, and outside
-//               the [min, max] of the block getFirstCodeBlockContaining returns) —
-//   and merged into runs of contiguous addresses (at most RANGE_CAP, then truncated).
-// ★ What it did stays in this session's program for ExportFunctions to write out: a bookmark
-//   (BOOKMARK_CATEGORY) on each entry it created, and the counts and ranges as program options
-//   (OPTIONS_CATEGORY). Written only when the pass ran to the end: a cancelled pass leaves no
-//   options, which the export then reports as not recorded rather than as zero.
 //
-// Prints one summary line: tried, created, function counts, residual kinds and range count.
+// Order in this one session, after Ghidra's own analysis (each step runs on what the one before it
+// left — recording the counts at any earlier step would record a stale state):
+//   1. Promote the leftover blocks (above), then analyzeChanges so the new functions get their
+//      references, signatures and the decompiler's view of the code that calls them.
+//   2. W14 — recover functions reached ONLY through pointers in the binary's own data (callback /
+//      command / applet tables), which no code calls directly, so Ghidra never disassembled them.
+//      Each pass seeds from every non-flow reference target and every aligned data word pointing
+//      into executable memory where nothing sits yet, disassembles following flow, and makes a
+//      function there unless the disassembly raised an error (then it is cleared again — rejected).
+//      ★ No-return discovery is FROZEN for the whole of W14 and the second promotion: without it,
+//      re-analysis can newly, wrongly mark an existing command-wrapper non-returning and then
+//      delete every instruction after each call to it. The original value is restored at the end.
+//   3. A second block promotion (step 1's logic again, still frozen): W14's analysis can leave the
+//      callees of a recovered function as bare blocks outside any function.
+//   4. Self-check on the FINAL state (what the export will see):
+//        - every instruction still in no function, by kind (start / interior / unowned), merged
+//          into runs of contiguous addresses (at most RANGE_CAP, then truncated);
+//        - W11 — the executable bytes Ghidra never disassembled at all: the undefined ranges of
+//          executable memory >= UNDEFINED_MIN bytes (below that is inter-function alignment
+//          padding). A function whose counterpart maps into one of these is code the other side's
+//          analysis never built — a gap, not a determined "no such function";
+//        - W14's guard counts: the existing code lost and the existing functions newly marked
+//          non-returning. Both must be 0 by design; a positive count names the binary.
+// ★ What it did stays in this session's program for ExportFunctions to write out: a bookmark on
+//   each entry it created (BOOKMARK_CATEGORY for a promoted block, RECOVERED_BOOKMARK for a W14
+//   recovery, so a reader can tell origin='promoted' from origin='recovered'), and the counts and
+//   ranges as program options (OPTIONS_CATEGORY). Written only when the pass ran to the end: a
+//   cancelled pass leaves no options, which the export then reports as not recorded rather than as
+//   zero.
+//
+// Prints one summary line: tried, created, function counts, residual kinds, range counts and the
+// recovery counts.
 //@category Analysis
 
+import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.script.GhidraScript;
 import ghidra.framework.options.Options;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressIterator;
+import ghidra.program.model.address.AddressRange;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.block.BasicBlockModel;
 import ghidra.program.model.block.CodeBlock;
+import ghidra.program.model.listing.Bookmark;
 import ghidra.program.model.listing.BookmarkManager;
 import ghidra.program.model.listing.BookmarkType;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
+import ghidra.program.model.listing.Listing;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.ReferenceManager;
 import ghidra.util.UndefinedFunction;
 
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public class PromoteUndefined extends GhidraScript {
 
   // ExportFunctions reads these under the same spelling (its PROMOTE_* constants).
   static final String OPTIONS_CATEGORY = "TreasureMap PromoteUndefined";
   static final String BOOKMARK_CATEGORY = "TreasureMap promoted";
+  static final String RECOVERED_BOOKMARK = "TreasureMap recovered";
   static final int RANGE_CAP = 4096;
+  // Shorter undefined runs are inter-function alignment padding, not missed code.
+  static final int UNDEFINED_MIN = 16;
+  static final int RECOVER_MAX_PASSES = 30;
+  static final String NO_RETURN_OPTION = "Non-Returning Functions - Discovered";
+
+  private FunctionManager fm;
+  private BookmarkManager bm;
 
   @Override
   protected void run() throws Exception {
@@ -62,51 +107,47 @@ public class PromoteUndefined extends GhidraScript {
       printerr("[PromoteUndefined] no current program");
       return;
     }
-    FunctionManager fm = currentProgram.getFunctionManager();
-    BookmarkManager bm = currentProgram.getBookmarkManager();
+    fm = currentProgram.getFunctionManager();
+    bm = currentProgram.getBookmarkManager();
     int before = fm.getFunctionCount();
-    BasicBlockModel model = new BasicBlockModel(currentProgram, true);
 
-    // 1. Collect the block starts no function contains (no listing change while iterating).
-    List<Address> starts = new ArrayList<>();
-    InstructionIterator ii = currentProgram.getListing().getInstructions(true);
-    while (ii.hasNext()) {
-      if (monitor.isCancelled()) {
-        return; // nothing recorded: the export reports the pass as not recorded
-      }
-      Address a = ii.next().getMinAddress();
-      if (fm.getFunctionContaining(a) == null && model.getCodeBlockAt(a, monitor) != null) {
-        starts.add(a);
-      }
+    // 1. Promote the code blocks no function contains, then re-analyse (nothing recorded on cancel).
+    int[] p1 = promoteBlocks();
+    if (p1 == null) {
+      return;
     }
-
-    // 2. Promote them in address order.
-    int tried = 0;
-    int created = 0;
-    for (Address a : starts) {
-      if (monitor.isCancelled()) {
-        return;
-      }
-      if (fm.getFunctionContaining(a) != null) {
-        continue; // swallowed by a function created earlier in this loop
-      }
-      UndefinedFunction candidate = UndefinedFunction.findFunction(currentProgram, a, monitor);
-      if (candidate == null) {
-        continue;
-      }
-      tried++;
-      Function fn = createFunction(candidate.getEntryPoint(), null);
-      if (fn != null) {
-        created++;
-        bm.setBookmark(fn.getEntryPoint(), BookmarkType.INFO, BOOKMARK_CATEGORY, "created");
-      }
-    }
-    int afterCreate = fm.getFunctionCount();
-    if (created > 0) {
+    if (p1[1] > 0) {
       analyzeChanges(currentProgram);
     }
 
-    // 3. Self-check on the final state (what the export will see), with a fresh block model.
+    // 2. W14 — recover functions reached only through pointers in the binary's data. The state the
+    //    guard compares against is taken HERE (after step 1), before no-return discovery is frozen.
+    AddressSet exec = executableSet();
+    AddressSet data = dataSet();
+    AddressSet insnBefore = instructionsIn(exec);
+    Set<Address> funcsBefore = functionEntries();
+    Set<Address> nrBefore = noReturnEntries();
+    String nrWas = freezeNoReturn();
+    long[] rec = {0, 0, 0}; // {recovered, rejected, seeds}
+    if (recoverFromPointers(exec, data, rec)) {
+      restoreNoReturn(nrWas);
+      return; // cancelled: nothing recorded
+    }
+
+    // 3. A second block promotion (still frozen): W14's analysis can leave recovered callees bare.
+    int[] p2 = promoteBlocks();
+    if (p2 == null) {
+      restoreNoReturn(nrWas);
+      return;
+    }
+    if (p2[1] > 0) {
+      analyzeChanges(currentProgram);
+    }
+    int tried = p1[0] + p2[0];
+    int created = p1[1] + p2[1];
+    int afterCreate = fm.getFunctionCount();
+
+    // 4a. Residual self-check on the final state (what the export will see), with a fresh model.
     BasicBlockModel check = new BasicBlockModel(currentProgram, true);
     long resStart = 0;
     long resInterior = 0;
@@ -116,9 +157,10 @@ public class PromoteUndefined extends GhidraScript {
     boolean truncated = false;
     Address runLo = null;
     Address runHi = null;
-    ii = currentProgram.getListing().getInstructions(true);
+    InstructionIterator ii = currentProgram.getListing().getInstructions(true);
     while (ii.hasNext()) {
       if (monitor.isCancelled()) {
+        restoreNoReturn(nrWas);
         return;
       }
       Instruction insn = ii.next();
@@ -163,6 +205,39 @@ public class PromoteUndefined extends GhidraScript {
     }
     ranges.append("]");
 
+    // 4b. W11 — the executable bytes Ghidra never disassembled (undefined ranges >= UNDEFINED_MIN).
+    AddressSetView undef = currentProgram.getListing().getUndefinedRanges(exec, true, monitor);
+    StringBuilder uRanges = new StringBuilder("[");
+    int uCount = 0;
+    boolean uTruncated = false;
+    long uBytes = 0;
+    for (AddressRange r : undef) {
+      if (r.getLength() < UNDEFINED_MIN) {
+        continue;
+      }
+      uBytes += r.getLength();
+      if (uCount < RANGE_CAP) {
+        appendRange(uRanges, uCount, r.getMinAddress(), r.getMaxAddress());
+        uCount++;
+      } else {
+        uTruncated = true;
+      }
+    }
+    uRanges.append("]");
+
+    // 4c. W14 guard — existing code lost and existing functions newly non-returning (both 0 by
+    //     design; a positive count means the freeze did not hold and names the binary in the log).
+    AddressSet lost = insnBefore.subtract(instructionsIn(exec));
+    long recoverLostBytes = lost.getNumAddresses();
+    int recoverNoReturnFlips = 0;
+    for (Function f : fm.getFunctions(true)) {
+      Address e = f.getEntryPoint();
+      if (f.hasNoReturn() && funcsBefore.contains(e) && !nrBefore.contains(e)) {
+        recoverNoReturnFlips++;
+      }
+    }
+
+    // 5. Record everything in one options write (only now, on the final state).
     Options opts = currentProgram.getOptions(OPTIONS_CATEGORY);
     opts.setInt("tried", tried);
     opts.setInt("created", created);
@@ -171,14 +246,282 @@ public class PromoteUndefined extends GhidraScript {
     opts.setLong("residual_unowned", resUnowned);
     opts.setString("residual_ranges", ranges.toString());
     opts.setBoolean("residual_ranges_truncated", truncated);
+    opts.setString("undefined_ranges", uRanges.toString());
+    opts.setBoolean("undefined_ranges_truncated", uTruncated);
+    opts.setLong("undefined_bytes", uBytes);
+    opts.setInt("recovered", (int) rec[0]);
+    opts.setInt("recover_rejected", (int) rec[1]);
+    opts.setInt("recover_seeds", (int) rec[2]);
+    opts.setLong("recover_lost_insn_bytes", recoverLostBytes);
+    opts.setInt("recover_noreturn_flips", recoverNoReturnFlips);
     opts.setBoolean("recorded", true);
+
+    // 6. Restore no-return discovery to what it was before W14.
+    restoreNoReturn(nrWas);
 
     println("[PromoteUndefined] tried=" + tried + " created=" + created + " functions_before="
         + before + " functions_after_create=" + afterCreate + " functions_after_analysis="
         + fm.getFunctionCount() + " residual_insns=" + (resStart + resInterior + resUnowned)
         + " residual_start=" + resStart + " residual_interior=" + resInterior
         + " residual_unowned=" + resUnowned + " residual_ranges=" + rangeCount
-        + (truncated ? " residual_ranges_truncated" : ""));
+        + (truncated ? " residual_ranges_truncated" : "") + " undefined_ranges=" + uCount
+        + " undefined_bytes=" + uBytes + (uTruncated ? " undefined_ranges_truncated" : "")
+        + " recovered=" + rec[0] + " recover_rejected=" + rec[1] + " recover_seeds=" + rec[2]
+        + " recover_lost_insn_bytes=" + recoverLostBytes + " recover_noreturn_flips="
+        + recoverNoReturnFlips);
+  }
+
+  /**
+   * W1 block promotion: make a function of every code block no function contains, in address order.
+   * Returns {tried, created}, or null when the pass was cancelled (so the caller records nothing).
+   */
+  private int[] promoteBlocks() throws Exception {
+    BasicBlockModel model = new BasicBlockModel(currentProgram, true);
+    List<Address> starts = new ArrayList<>();
+    InstructionIterator ii = currentProgram.getListing().getInstructions(true);
+    while (ii.hasNext()) {
+      if (monitor.isCancelled()) {
+        return null;
+      }
+      Address a = ii.next().getMinAddress();
+      if (fm.getFunctionContaining(a) == null && model.getCodeBlockAt(a, monitor) != null) {
+        starts.add(a);
+      }
+    }
+    int tried = 0;
+    int created = 0;
+    for (Address a : starts) {
+      if (monitor.isCancelled()) {
+        return null;
+      }
+      if (fm.getFunctionContaining(a) != null) {
+        continue; // swallowed by a function created earlier in this loop
+      }
+      UndefinedFunction candidate = UndefinedFunction.findFunction(currentProgram, a, monitor);
+      if (candidate == null) {
+        continue;
+      }
+      tried++;
+      Function fn = createFunction(candidate.getEntryPoint(), null);
+      if (fn != null) {
+        created++;
+        bm.setBookmark(fn.getEntryPoint(), BookmarkType.INFO, BOOKMARK_CATEGORY, "created");
+      }
+    }
+    return new int[] {tried, created};
+  }
+
+  /**
+   * W14: recover functions reached only through pointers in the binary's data. Returns true when
+   * the pass was cancelled (caller records nothing); otherwise fills rec = {recovered, rejected,
+   * seeds} and leaves no-return discovery frozen for the caller to restore.
+   */
+  private boolean recoverFromPointers(AddressSet exec, AddressSet data, long[] rec)
+      throws Exception {
+    Listing listing = currentProgram.getListing();
+    Memory mem = currentProgram.getMemory();
+    boolean arm = currentProgram.getLanguage().getProcessor().toString().equalsIgnoreCase("ARM");
+    int align = Math.max(1, currentProgram.getLanguage().getInstructionAlignment());
+    int ptr = currentProgram.getDefaultPointerSize();
+    Set<Address> tried = new HashSet<>();
+    int recovered = 0;
+    int rejected = 0;
+    int seedsTotal = 0;
+    for (int pass = 0; pass < RECOVER_MAX_PASSES; pass++) {
+      if (monitor.isCancelled()) {
+        return true;
+      }
+      // Collect this pass's seeds first (addr -> {mode, note}); the listing is changed only after.
+      LinkedHashMap<Address, String[]> seeds = new LinkedHashMap<>();
+      ReferenceManager rm = currentProgram.getReferenceManager();
+      AddressSet all = new AddressSet(exec);
+      all.add(data);
+      AddressIterator src = rm.getReferenceSourceIterator(all, true);
+      while (src.hasNext()) {
+        if (monitor.isCancelled()) {
+          return true;
+        }
+        Address from = src.next();
+        for (Reference r : rm.getReferencesFrom(from)) {
+          if (r.getReferenceType().isFlow()) {
+            continue;
+          }
+          Address to = r.getToAddress();
+          if (exec.contains(to) && to.getOffset() % align == 0) {
+            seeds.putIfAbsent(to, new String[] {"arm", "ref@" + from});
+          }
+        }
+      }
+      for (AddressRange dr : data) {
+        Address p = dr.getMinAddress();
+        long mis = p.getOffset() % ptr;
+        if (mis != 0) {
+          p = p.add(ptr - mis);
+        }
+        while (p.add(ptr - 1).compareTo(dr.getMaxAddress()) <= 0) {
+          if (monitor.isCancelled()) {
+            return true;
+          }
+          long v;
+          try {
+            v = ptr == 8 ? mem.getLong(p) : (mem.getInt(p) & 0xffffffffL);
+          } catch (Exception ex) {
+            break;
+          }
+          boolean thumb = arm && (v & 1) == 1;
+          long tv = thumb ? v & ~1L : v;
+          if (thumb ? (tv % 2 == 0) : (tv % align == 0)) {
+            Address to = null;
+            try {
+              to = toAddr(tv);
+            } catch (Exception ex) {
+              to = null;
+            }
+            if (to != null && exec.contains(to)) {
+              seeds.putIfAbsent(to, new String[] {thumb ? "thumb" : "arm", "data@" + p});
+            }
+          }
+          if (p.add(ptr).compareTo(dr.getMaxAddress()) > 0) {
+            break;
+          }
+          p = p.add(ptr);
+        }
+      }
+      int madeNow = 0;
+      for (Map.Entry<Address, String[]> s : seeds.entrySet()) {
+        if (monitor.isCancelled()) {
+          return true;
+        }
+        Address a = s.getKey();
+        if (tried.contains(a)) {
+          continue;
+        }
+        if (listing.getInstructionContaining(a) != null
+            || listing.getDefinedDataContaining(a) != null) {
+          continue; // something already sits there
+        }
+        tried.add(a);
+        seedsTotal++;
+        int e0 = errorsIn(exec);
+        boolean thumb = "thumb".equals(s.getValue()[0]);
+        AddressSetView got;
+        if (arm) {
+          ArmDisassembleCommand cmd = new ArmDisassembleCommand(a, null, thumb);
+          cmd.applyTo(currentProgram, monitor);
+          got = cmd.getDisassembledAddressSet();
+        } else {
+          DisassembleCommand cmd = new DisassembleCommand(a, null, true);
+          cmd.applyTo(currentProgram, monitor);
+          got = cmd.getDisassembledAddressSet();
+        }
+        if (got == null || got.isEmpty() || errorsIn(exec) > e0) {
+          if (got != null) {
+            for (AddressRange g : got) {
+              listing.clearCodeUnits(g.getMinAddress(), g.getMaxAddress(), false);
+            }
+          }
+          rejected++;
+          continue; // disassembly raised an error there: not code, undone
+        }
+        if (fm.getFunctionContaining(a) == null) {
+          Function f = createFunction(a, null);
+          if (f != null) {
+            recovered++;
+            bm.setBookmark(a, BookmarkType.INFO, RECOVERED_BOOKMARK, "recovered " + s.getValue()[1]);
+            madeNow++;
+          }
+        }
+      }
+      if (madeNow > 0) {
+        analyzeChanges(currentProgram);
+      }
+      if (madeNow == 0) {
+        break; // fixpoint: a pass made nothing
+      }
+    }
+    rec[0] = recovered;
+    rec[1] = rejected;
+    rec[2] = seedsTotal;
+    return false;
+  }
+
+  /** How many ERROR bookmarks fall inside {@code set}. */
+  private int errorsIn(AddressSetView set) {
+    int n = 0;
+    Iterator<Bookmark> it =
+        currentProgram.getBookmarkManager().getBookmarksIterator(BookmarkType.ERROR);
+    while (it.hasNext()) {
+      if (set.contains(it.next().getAddress())) {
+        n++;
+      }
+    }
+    return n;
+  }
+
+  private AddressSet executableSet() {
+    AddressSet s = new AddressSet();
+    for (MemoryBlock b : currentProgram.getMemory().getBlocks()) {
+      if (b.isExecute() && b.isInitialized()) {
+        s.add(b.getStart(), b.getEnd());
+      }
+    }
+    return s;
+  }
+
+  private AddressSet dataSet() {
+    AddressSet s = new AddressSet();
+    for (MemoryBlock b : currentProgram.getMemory().getBlocks()) {
+      if (!b.isExecute() && b.isInitialized()) {
+        s.add(b.getStart(), b.getEnd());
+      }
+    }
+    return s;
+  }
+
+  private AddressSet instructionsIn(AddressSetView set) {
+    AddressSet s = new AddressSet();
+    InstructionIterator it = currentProgram.getListing().getInstructions(set, true);
+    while (it.hasNext()) {
+      Instruction x = it.next();
+      s.add(x.getMinAddress(), x.getMaxAddress());
+    }
+    return s;
+  }
+
+  private Set<Address> functionEntries() {
+    Set<Address> out = new HashSet<>();
+    for (Function f : fm.getFunctions(true)) {
+      out.add(f.getEntryPoint());
+    }
+    return out;
+  }
+
+  private Set<Address> noReturnEntries() {
+    Set<Address> out = new HashSet<>();
+    for (Function f : fm.getFunctions(true)) {
+      if (f.hasNoReturn()) {
+        out.add(f.getEntryPoint());
+      }
+    }
+    return out;
+  }
+
+  /** Freeze "Non-Returning Functions - Discovered" for the recovery passes; returns its old value. */
+  private String freezeNoReturn() {
+    String was = "true";
+    try {
+      was = String.valueOf(currentProgram.getOptions("Analyzers").getBoolean(NO_RETURN_OPTION, true));
+    } catch (Exception ex) {
+      // keep the "true" default
+    }
+    setAnalysisOption(currentProgram, NO_RETURN_OPTION, "false");
+    AutoAnalysisManager.getAnalysisManager(currentProgram).initializeOptions();
+    return was;
+  }
+
+  private void restoreNoReturn(String was) {
+    setAnalysisOption(currentProgram, NO_RETURN_OPTION, was);
+    AutoAnalysisManager.getAnalysisManager(currentProgram).initializeOptions();
   }
 
   /** True when {@code next} is the address right after {@code hi} in the same address space. */

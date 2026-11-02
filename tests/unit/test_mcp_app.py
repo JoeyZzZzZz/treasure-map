@@ -368,6 +368,26 @@ def test_the_tools_and_the_instructions_say_pseudocode_is_paged_and_detail_summa
     assert "anchor_ref_template" in mcp_app._AGENT_GUIDE
 
 
+def test_the_guide_explains_string_delta_and_callsite_counts() -> None:
+    """W8 (MINOR-3): the two sentences the guide carries for the read-face increments — the
+    one-sided string literals and the per-sink callsite counts — are pinned, so dropping either is
+    caught.
+
+    MUTATION (verified RED): delete the get_diff_string_delta sentence -> RED; delete the
+    sink_callsite_counts sentence -> RED."""
+    guide = " ".join(mcp_app._AGENT_GUIDE.split())
+    assert (
+        "sink_candidate_counts counts hunt candidates and sink_callsite_counts counts calls"
+        in guide
+    )
+    assert "a side with no decompiled text is unknown" in guide
+    assert "sink_callsite_counts never moves the order" in guide
+    assert (
+        "get_diff_string_delta(diff_id) lists the string literals one side holds and the other "
+        "does not" in guide
+    )
+
+
 def test_the_descriptions_name_skipped_micro_and_pseudocode_status() -> None:
     """get_diff_patch_view lists skipped_micro as a pseudocode_sameness value of its own, apart
     from unavailable; get_pseudocode says what an empty text carries.

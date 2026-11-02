@@ -105,7 +105,9 @@ def _mk_analysis(path: Path, binary: str, sha: str, funcs: list[tuple]) -> Path:
         # ('[]': nothing, and not truncated), which a counterpart probe reads; without it an
         # unmatched function with nothing at its mapped address reads undetermined.
         "INSERT INTO binaries (id, name, path, sha256, last_seen_at, promote_residual_ranges, "
-        "promote_residual_ranges_truncated) VALUES (1, ?, ?, ?, '2026-01-01T00:00:00', '[]', 0)",
+        "promote_residual_ranges_truncated, promote_undefined_ranges, "
+        "promote_undefined_ranges_truncated) "
+        "VALUES (1, ?, ?, ?, '2026-01-01T00:00:00', '[]', 0, '[]', 0)",
         (binary, binary, sha),
     )
     for addr, name, pc, size in funcs:
@@ -783,8 +785,9 @@ def _mk_analysis_multi(path: Path, bins: list) -> Path:  # type: ignore[type-arg
     for bid, (binary, sha, funcs) in enumerate(bins, start=1):
         con.execute(
             "INSERT INTO binaries (id, name, path, sha256, last_seen_at, promote_residual_ranges, "
-            "promote_residual_ranges_truncated) "
-            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00', '[]', 0)",  # both: see _mk_analysis
+            "promote_residual_ranges_truncated, promote_undefined_ranges, "
+            "promote_undefined_ranges_truncated) "
+            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00', '[]', 0, '[]', 0)",  # see _mk_analysis
             (bid, binary, binary, sha),
         )
         for addr, name, pc, size in funcs:

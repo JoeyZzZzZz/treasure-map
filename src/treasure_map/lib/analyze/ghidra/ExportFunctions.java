@@ -2454,6 +2454,7 @@ public class ExportFunctions extends GhidraScript {
     // recorded), never zeros or "analysis".
     private static final String PROMOTE_OPTIONS = "TreasureMap PromoteUndefined";
     private static final String PROMOTE_BOOKMARK = "TreasureMap promoted";
+    private static final String PROMOTE_RECOVERED = "TreasureMap recovered";
     private BookmarkManager promoteMarks = null;   // non-null only when the pass was recorded
 
     /** The retry budget the driver set (TMAP_DECOMPILE_RETRY_BUDGET_S), 0 when unset or bad. */
@@ -2468,36 +2469,71 @@ public class ExportFunctions extends GhidraScript {
     }
 
     /**
-     * The "promote" object for the export (tried, created, the residual kinds and their sum, the
-     * residual ranges and whether they were truncated), or null when PromoteUndefined left no
-     * record in this session. Sets promoteMarks so each function's origin can be read.
+     * The "promote" object for the export, or null when PromoteUndefined left no record in this
+     * session. It carries, all together, the block-promotion counts (tried, created), the residual
+     * instructions left outside every function (kinds, sum, ranges, truncation), the executable
+     * bytes never disassembled (W11: undefined_ranges, undefined_ranges_truncated, undefined_bytes)
+     * and the pointer-reached recovery counts (W14: recovered, recover_rejected, recover_seeds,
+     * recover_lost_insn_bytes, recover_noreturn_flips). Missing or malformed ANY of them yields null
+     * (the whole record, never a partial one — the same all-or-nothing rule the W1 fields had). Sets
+     * promoteMarks so each function's origin can be read.
      */
     private String promoteRecord() {
         ghidra.framework.options.Options opts = currentProgram.getOptions(PROMOTE_OPTIONS);
         if (!opts.contains("recorded") || !opts.getBoolean("recorded", false)) return null;
         String ranges = opts.getString("residual_ranges", null);
         if (ranges == null || !ranges.startsWith("[")) return null;
+        String undef = opts.getString("undefined_ranges", null);
+        if (undef == null || !undef.startsWith("[")) return null;
         long start = opts.getLong("residual_start", -1);
         long interior = opts.getLong("residual_interior", -1);
         long unowned = opts.getLong("residual_unowned", -1);
         int tried = opts.getInt("tried", -1);
         int created = opts.getInt("created", -1);
-        if (start < 0 || interior < 0 || unowned < 0 || tried < 0 || created < 0) return null;
+        long undefBytes = opts.getLong("undefined_bytes", -1);
+        int recovered = opts.getInt("recovered", -1);
+        int recoverRejected = opts.getInt("recover_rejected", -1);
+        int recoverSeeds = opts.getInt("recover_seeds", -1);
+        long recoverLostBytes = opts.getLong("recover_lost_insn_bytes", -1);
+        int recoverFlips = opts.getInt("recover_noreturn_flips", -1);
+        if (start < 0 || interior < 0 || unowned < 0 || tried < 0 || created < 0 || undefBytes < 0
+                || recovered < 0 || recoverRejected < 0 || recoverSeeds < 0 || recoverLostBytes < 0
+                || recoverFlips < 0) {
+            return null;
+        }
         promoteMarks = currentProgram.getBookmarkManager();
         return "{\"tried\":" + tried + ",\"created\":" + created
                 + ",\"residual_insns\":" + (start + interior + unowned)
                 + ",\"residual_start\":" + start + ",\"residual_interior\":" + interior
                 + ",\"residual_unowned\":" + unowned + ",\"residual_ranges\":" + ranges
                 + ",\"residual_ranges_truncated\":"
-                + opts.getBoolean("residual_ranges_truncated", false) + "}";
+                + opts.getBoolean("residual_ranges_truncated", false)
+                + ",\"undefined_ranges\":" + undef
+                + ",\"undefined_ranges_truncated\":"
+                + opts.getBoolean("undefined_ranges_truncated", false)
+                + ",\"undefined_bytes\":" + undefBytes
+                + ",\"recovered\":" + recovered
+                + ",\"recover_rejected\":" + recoverRejected
+                + ",\"recover_seeds\":" + recoverSeeds
+                + ",\"recover_lost_insn_bytes\":" + recoverLostBytes
+                + ",\"recover_noreturn_flips\":" + recoverFlips + "}";
     }
 
-    /** {@code "origin":"promoted"|"analysis",} for a function record, "" when not recorded. */
+    /** {@code "origin":"recovered"|"promoted"|"analysis",} for a function record, "" when not
+     *  recorded. A recovered bookmark wins over a promoted one — W14 never re-promotes a function it
+     *  recovered, but a reader must read the origin the same way regardless. */
     private String originField(Function func) {
         if (promoteMarks == null) return "";
-        boolean promoted = promoteMarks.getBookmark(func.getEntryPoint(), BookmarkType.INFO,
-                PROMOTE_BOOKMARK) != null;
-        return "\"origin\":\"" + (promoted ? "promoted" : "analysis") + "\",";
+        Address entry = func.getEntryPoint();
+        String origin;
+        if (promoteMarks.getBookmark(entry, BookmarkType.INFO, PROMOTE_RECOVERED) != null) {
+            origin = "recovered";
+        } else if (promoteMarks.getBookmark(entry, BookmarkType.INFO, PROMOTE_BOOKMARK) != null) {
+            origin = "promoted";
+        } else {
+            origin = "analysis";
+        }
+        return "\"origin\":\"" + origin + "\",";
     }
 
     /** The first line of a message, at most 200 characters ("unknown" when there is none). */
@@ -2851,11 +2887,27 @@ public class ExportFunctions extends GhidraScript {
         List<String> entries = new ArrayList<>();       // one record per exported function
         List<Function> entryFunctions = new ArrayList<>();
         List<Integer> timedOut = new ArrayList<>();     // indices whose decompile timed out
+        // W12: the thunks this export skips (PLT / lazy-binding stubs), recorded as entry + body
+        // ranges only — not added to the exported function set. The diff's counterpart probe reads
+        // them so a function mapping onto an other-side thunk is not read as "there is no function
+        // there" (the analysis.db holds no thunk row). External symbols carry no body and are left
+        // out. Top-level: [["0x<entry>", [["0x<lo>","0x<hi>"], ...]], ...].
+        StringBuilder thunksJson = new StringBuilder("[");
+        boolean firstThunk = true;
         for (Function func : fm.getFunctions(true)) {
             if (monitor.isCancelled()) break;
 
             // Skip PLT thunks and external symbols (no real code body)
-            if (func.isThunk() || func.isExternal()) continue;
+            if (func.isThunk() || func.isExternal()) {
+                if (func.isThunk() && !func.isExternal()) {
+                    if (!firstThunk) thunksJson.append(",");
+                    firstThunk = false;
+                    thunksJson.append("[\"0x")
+                        .append(Long.toHexString(func.getEntryPoint().getOffset()))
+                        .append("\",").append(buildBodyRanges(func)).append("]");
+                }
+                continue;
+            }
 
             String[] status = new String[1];
             entries.add(exportFunction(func, decomp, fm, knownNames, DECOMPILE_TIMEOUT_S, false,
@@ -2864,6 +2916,7 @@ public class ExportFunctions extends GhidraScript {
             entryFunctions.add(func);
             funcCount++;
         }
+        thunksJson.append("]");
         // A decompile that timed out in the loop is retried once here, at a larger limit and one
         // at a time: under load a function can need more than the loop's limit, and its empty
         // pseudocode would otherwise silently take its sink calls and provenance with it. Still
@@ -3107,6 +3160,9 @@ public class ExportFunctions extends GhidraScript {
             pw.print("\"stub_marker\":\"" + esc(stubMarker) + "\",");
             // What PromoteUndefined did in this session; absent when it recorded nothing.
             if (promoteJson != null) pw.print("\"promote\":" + promoteJson + ",");
+            // W12: the thunks skipped above (entry + body ranges), so the diff's counterpart probe
+            // can see an other-side thunk where a function maps instead of reading "no function".
+            pw.print("\"thunks\":" + thunksJson + ",");
             // Written record by record: no second copy of the array is built.
             pw.print("\"functions\":[");
             for (int k = 0; k < entries.size(); k++) {

@@ -70,6 +70,21 @@ CREATE TABLE IF NOT EXISTS binaries (
     -- (not MIPS, unreadable, or ingested before this column existed); '{}' = the ELF was read
     -- and no stub resolved; a JSON object = the stubs that did. NULL never reads as 'no stubs'.
     stub_names   TEXT,
+    -- Does stub_names cover EVERY stub this binary has? 1 = yes (no non-empty .MIPS.stubs, and
+    -- every .plt entry resolved a name); 0 = no (a .MIPS.stubs table this path does not read, or a
+    -- .plt entry left unnamed) — then a name in stub_a_only/b_only of a diff may still be called
+    -- through another stub on the other side; NULL = no resolution result (not MIPS, unreadable, or
+    -- ingested before this column). Keeps '{}' ("read, none named") apart from "these are all".
+    stub_table_complete INTEGER,
+    -- The .plt / .MIPS.stubs regions, JSON [[".plt"|".MIPS.stubs","0x<lo>","0x<hi>"], ...], so a
+    -- diff can tell a point that maps into the other side's stub region (a taken spot) from one in
+    -- real code. NULL = not recorded (see stub_names).
+    stub_regions TEXT,
+    -- The thunks the export skipped (PLT / lazy-binding stubs; they carry no real body), JSON
+    -- [["0x<entry>", [["0x<lo>","0x<hi>"], ...]], ...]. The functions table holds no thunk row, so
+    -- a diff reads these to tell an other-side thunk where a function maps from "no function there".
+    -- NULL = not recorded (extracted before this existed).
+    thunk_spans TEXT,
     reanalyze_pending INTEGER DEFAULT 0,   -- 1 = an unfinished bare --reanalyze still has to
                                            --   re-extract this binary; 0 = not part of any
                                            --   unfinished re-extraction request. Cleared by the
@@ -99,6 +114,23 @@ CREATE TABLE IF NOT EXISTS binaries (
     promote_residual_unowned INTEGER,
     promote_residual_ranges TEXT,
     promote_residual_ranges_truncated INTEGER,
+    -- W11: the executable bytes Ghidra never disassembled at all (not instructions, so not in the
+    -- residual above) — the undefined ranges of executable memory >= 16 bytes, JSON
+    -- [["0x<lo>","0x<hi>"], ...] (inclusive, at most 4096; truncated=1 when more), and their total
+    -- byte count. A function whose counterpart maps into one is code the other side never built — a
+    -- gap, not a determined "no function". NULL = not recorded — never read as 0.
+    promote_undefined_ranges TEXT,
+    promote_undefined_ranges_truncated INTEGER,
+    promote_undefined_bytes INTEGER,
+    -- W14: functions recovered from pointers in the binary's data (origin='recovered'), the seeds
+    -- rejected (disassembly raised an error) and seeds tried, and the guard counts that must both
+    -- be 0 — existing code lost (promote_recover_lost_bytes) and existing functions newly marked
+    -- non-returning (promote_recover_noreturn_flips). NULL = not recorded — never read as 0.
+    promote_recovered INTEGER,
+    promote_recover_rejected INTEGER,
+    promote_recover_seeds INTEGER,
+    promote_recover_lost_bytes INTEGER,
+    promote_recover_noreturn_flips INTEGER,
     last_seen_at DATETIME,                 -- timestamp of most recent ingest scan
     analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -181,8 +213,9 @@ CREATE TABLE IF NOT EXISTS functions (
     decompile_status TEXT,
     decompile_retried INTEGER DEFAULT 0,   -- 1 = it timed out once and was retried
     decompile_error TEXT,                  -- the message of an error status; NULL otherwise
-    -- Which pass made this function: promoted (created by PromoteUndefined) / analysis (by
-    -- Ghidra's own analysis). A fact only — nothing ranks or judges by it. NULL = not recorded.
+    -- Which pass made this function: promoted (a code block PromoteUndefined turned into a
+    -- function) / recovered (W14: reached only through a pointer in the binary's data) / analysis
+    -- (by Ghidra's own analysis). A fact only — nothing ranks or judges by it. NULL = not recorded.
     origin TEXT,
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );

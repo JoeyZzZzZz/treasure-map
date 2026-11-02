@@ -256,14 +256,16 @@ def _decompile_outcome(value: Any, message: Any) -> tuple[str | None, str | None
 
 # functions.origin: which pass made the function. Anything else (an export from a session whose
 # PromoteUndefined left no record, or an older export) is NULL — not recorded, never "analysis".
-_ORIGINS = ("promoted", "analysis")
+_ORIGINS = ("promoted", "recovered", "analysis")
 
 
 def _origin(value: Any) -> str | None:
     return value if isinstance(value, str) and value in _ORIGINS else None
 
 
-# The binaries.promote_* columns, in the order _promote_columns returns them.
+# The binaries.promote_* columns, in the order _promote_columns returns them. All written together
+# from one ``promote`` object (W1 block promotion + W11 undefined bytes + W14 pointer recovery) and
+# all NULL together when it is missing or malformed.
 PROMOTE_COLUMNS: tuple[str, ...] = (
     "promote_created",
     "promote_residual_insns",
@@ -272,6 +274,14 @@ PROMOTE_COLUMNS: tuple[str, ...] = (
     "promote_residual_unowned",
     "promote_residual_ranges",
     "promote_residual_ranges_truncated",
+    "promote_undefined_ranges",
+    "promote_undefined_ranges_truncated",
+    "promote_undefined_bytes",
+    "promote_recovered",
+    "promote_recover_rejected",
+    "promote_recover_seeds",
+    "promote_recover_lost_bytes",
+    "promote_recover_noreturn_flips",
 )
 
 
@@ -282,13 +292,29 @@ def _count(value: Any) -> int | None:
     return int(value)
 
 
+def _is_hex_range_list(value: Any) -> bool:
+    """True when ``value`` is ``[["0x<lo>","0x<hi>"], ...]`` — a partly-read list fails it, so a
+    truncated range set is never mistaken for a complete one."""
+    if not isinstance(value, list):
+        return False
+    return all(
+        isinstance(r, list)
+        and len(r) == 2
+        and all(isinstance(x, str) and x.startswith("0x") for x in r)
+        for r in value
+    )
+
+
 def _promote_columns(promote: Any) -> tuple[Any, ...]:
     """The binaries.promote_* values (PROMOTE_COLUMNS order) from the export's ``promote`` object.
 
-    ★ All NULL when the export carries no such object, or one that does not hold together (a count
-    missing or negative, the residual kinds not summing to residual_insns, a range that is not a
-    pair of hex strings): NULL is "not recorded", which a reader must keep apart from 0 — "no
-    instruction was left outside a function" is a claim only a complete record makes."""
+    ★ All NULL when the export carries no such object, or one that does not hold together (any count
+    missing or negative, the residual kinds not summing to residual_insns, a range field that is not
+    a list of hex-string pairs, a truncation flag that is not a bool): NULL is "not recorded", which
+    a reader must keep apart from 0 — "no instruction was left outside a function", "no byte left
+    undisassembled" and "nothing recovered" are claims only a complete record makes. The W11
+    (undefined_*) and W14 (recover*) fields join the same all-or-nothing rule as the W1 fields: a
+    pre-W11 export, missing them, writes the whole group NULL rather than a partial row."""
     none: tuple[Any, ...] = (None,) * len(PROMOTE_COLUMNS)
     if not isinstance(promote, dict):
         return none
@@ -299,6 +325,14 @@ def _promote_columns(promote: Any) -> tuple[Any, ...]:
     unowned = _count(promote.get("residual_unowned"))
     ranges = promote.get("residual_ranges")
     truncated = promote.get("residual_ranges_truncated")
+    undef_ranges = promote.get("undefined_ranges")
+    undef_truncated = promote.get("undefined_ranges_truncated")
+    undef_bytes = _count(promote.get("undefined_bytes"))
+    recovered = _count(promote.get("recovered"))
+    recover_rejected = _count(promote.get("recover_rejected"))
+    recover_seeds = _count(promote.get("recover_seeds"))
+    recover_lost = _count(promote.get("recover_lost_insn_bytes"))
+    recover_flips = _count(promote.get("recover_noreturn_flips"))
     if (
         created is None
         or insns is None
@@ -307,16 +341,17 @@ def _promote_columns(promote: Any) -> tuple[Any, ...]:
         or unowned is None
         or insns != start + interior + unowned
         or not isinstance(truncated, bool)
-        or not isinstance(ranges, list)
+        or not _is_hex_range_list(ranges)
+        or undef_bytes is None
+        or not isinstance(undef_truncated, bool)
+        or not _is_hex_range_list(undef_ranges)
+        or recovered is None
+        or recover_rejected is None
+        or recover_seeds is None
+        or recover_lost is None
+        or recover_flips is None
     ):
         return none
-    for r in ranges:
-        if not (
-            isinstance(r, list)
-            and len(r) == 2
-            and all(isinstance(x, str) and x.startswith("0x") for x in r)
-        ):
-            return none
     return (
         created,
         insns,
@@ -325,6 +360,14 @@ def _promote_columns(promote: Any) -> tuple[Any, ...]:
         unowned,
         json.dumps(ranges, separators=(",", ":")),
         1 if truncated else 0,
+        json.dumps(undef_ranges, separators=(",", ":")),
+        1 if undef_truncated else 0,
+        undef_bytes,
+        recovered,
+        recover_rejected,
+        recover_seeds,
+        recover_lost,
+        recover_flips,
     )
 
 
@@ -544,6 +587,30 @@ def _ingest_one_binary(
         else None
     )
     conn.execute("UPDATE binaries SET stub_names = ? WHERE id = ?", (stub_names_json, binary_id))
+
+    # W13: whether stub_names covers EVERY stub (1/0; NULL = no resolution — the same three states
+    # as stub_names), and the stub regions tagged with their section name. A diff reads complete=0
+    # to say stub_a_only/b_only may miss a name called through another stub, and the regions to tell
+    # a point mapping into the other side's stub table from one in real code.
+    stub_complete = None if resolution is None else (1 if resolution.complete else 0)
+    stub_regions_json = (
+        None
+        if resolution is None
+        else json.dumps([[n, f"0x{lo:x}", f"0x{hi:x}"] for n, lo, hi in resolution.named_regions])
+    )
+    conn.execute(
+        "UPDATE binaries SET stub_table_complete = ?, stub_regions = ? WHERE id = ?",
+        (stub_complete, stub_regions_json, binary_id),
+    )
+
+    # W12: the thunks the export skipped (entry + body ranges). A list (possibly empty) is stored
+    # as given; absent (an export predating W12) writes NULL — "not recorded", never "this binary
+    # has no thunks". The diff reads these so a function onto an other-side thunk is not "no fn".
+    thunks = data.get("thunks")
+    thunk_spans_json = (
+        json.dumps(thunks, separators=(",", ":")) if isinstance(thunks, list) else None
+    )
+    conn.execute("UPDATE binaries SET thunk_spans = ? WHERE id = ?", (thunk_spans_json, binary_id))
 
     # What PromoteUndefined did in this extraction's session: the functions it created and the
     # instructions still in no function afterwards, by kind and as address ranges (see

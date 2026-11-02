@@ -46,19 +46,34 @@ def _analysis(
     *,
     residual: str | None = _NO_RESIDUAL,
     truncated: int | None = 0,
+    undefined: str | None = _NO_RESIDUAL,
+    undefined_truncated: int | None = 0,
     stubs: dict[int, str] | None = None,
+    stub_complete: int | None = None,
+    stub_regions: str | None = None,
+    thunks: str | None = None,
 ) -> Path:
-    """One binary 'lib.so'; funcs = (entry, name, size, body ranges or None)."""
+    """One binary 'lib.so'; funcs = (entry, name, size, body ranges or None).
+
+    ``undefined`` defaults to ``'[]'`` (W11: a determined-empty set of undisassembled bytes), as a
+    real extraction writes the undefined ranges in the same record as the residual ones."""
     con = open_db(path)
     con.execute(
         "INSERT INTO binaries (id, name, path, sha256, last_seen_at, stub_names, "
-        "promote_residual_ranges, promote_residual_ranges_truncated) "
-        "VALUES (1, 'lib.so', 'lib.so', ?, '2026-01-01T00:00:00', ?, ?, ?)",
+        "promote_residual_ranges, promote_residual_ranges_truncated, "
+        "promote_undefined_ranges, promote_undefined_ranges_truncated, "
+        "stub_table_complete, stub_regions, thunk_spans) "
+        "VALUES (1, 'lib.so', 'lib.so', ?, '2026-01-01T00:00:00', ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             sha,
             json.dumps({f"{k:x}": v for k, v in stubs.items()}) if stubs is not None else None,
             residual,
             truncated,
+            undefined,
+            undefined_truncated,
+            stub_complete,
+            stub_regions,
+            thunks,
         ),
     )
     for entry, name, size, ranges in funcs:
@@ -308,7 +323,7 @@ def test_probe_counterparts_directly() -> None:
     Mutation: the span taken as the mapped address alone (``hi = y``) -> the overlap at y+0x20 is
     missed, red."""
     own = BaselineDomain(functions={"00002000": ("f", "ok")}, sizes={"00002000": 0x30})
-    other = BaselineDomain(functions={}, residual_ranges=((0x2120, 0x2123),))
+    other = BaselineDomain(functions={}, residual_ranges=((0x2120, 0x2123),), undefined_ranges=())
     got = probe_counterparts(
         frozenset({"00002000"}), own, other, [("00001000", "00001100")], frozenset()
     )
@@ -442,3 +457,207 @@ def test_an_unresolved_stub_table_leaves_the_stubs_to_the_pairing(tmp_path: Path
     assert meta["export_gaps_on_stubs"]["a"] is None
     assert meta["export_gaps_on_code"]["a"] == 1
     con.close()
+
+
+# ── W11: the other side's undisassembled bytes ────────────────────────────────────────────────
+
+# keep@0x1000 <-> 0x1100 (+0x100); g@0x2000 is unmatched and maps to 0x2100 with no function there.
+_W11_A = [(0x1000, "keep", 0x40, None), (0x2000, "g", 0x20, None)]
+_W11_B = [(0x1100, "keep", 0x40, None)]
+_W11_PAIRS = [(0x1000, "keep", 0x1100, "keep")]
+_FAR_RESIDUAL = json.dumps([["0x9000", "0x9003"]])  # known, does not reach 0x2100
+
+
+def test_probe_reads_the_other_sides_undisassembled_bytes(tmp_path: Path) -> None:
+    """★ W11 (A20): g maps to 0x2100 — no function, no leftover-instruction overlap, but bytes B's
+    analysis never disassembled sit there. The row is undisassembled_bytes /
+    other_side_bytes_not_disassembled (incomplete), with the overlapping segment recorded — code B
+    never built, a gap, never a determined "no such function".
+
+    Mutation (verified red): drop the undefined-range check (fall straight to uncovered) ->
+    the row reads uncovered / complete -> RED."""
+    con, did = _diff(
+        tmp_path,
+        _W11_A,
+        _W11_B,
+        _W11_PAIRS,
+        b_residual=_FAR_RESIDUAL,
+        b_undefined=json.dumps([["0x2100", "0x211f"]]),
+    )
+    r = {k[1]: v for k, v in _presence(con, did).items() if k[0] == "a"}["00002000"]
+    con.close()
+    assert (r["presence_state"], r["presence_reason"], r["counterpart_probe"]) == (
+        "unmatched_analysis_incomplete",
+        "other_side_bytes_not_disassembled",
+        "undisassembled_bytes",
+    )
+    assert json.loads(r["counterpart_overlap"]) == [["0x2100", "0x211f"]]
+
+
+def test_probe_is_coverage_unknown_when_the_other_sides_undefined_is_truncated(
+    tmp_path: Path,
+) -> None:
+    """★ W11: B's undefined ranges are a truncated prefix — a prefix cannot show a byte is NOT
+    undefined, so the spot is coverage_unknown even though the leftover code is known-empty.
+
+    Mutation (verified red): read the undefined ranges despite truncation -> the row reads
+    undisassembled_bytes -> RED."""
+    con, did = _diff(
+        tmp_path,
+        _W11_A,
+        _W11_B,
+        _W11_PAIRS,
+        b_residual="[]",
+        b_undefined=json.dumps([["0x2100", "0x211f"]]),
+        b_undefined_truncated=1,
+    )
+    r = {k[1]: v for k, v in _presence(con, did).items() if k[0] == "a"}["00002000"]
+    con.close()
+    assert (r["presence_state"], r["presence_reason"], r["counterpart_probe"]) == (
+        "unmatched_analysis_incomplete",
+        "other_side_coverage_unknown",
+        "coverage_unknown",
+    )
+
+
+def test_probe_is_uncovered_when_neither_residual_nor_undefined_reaches(tmp_path: Path) -> None:
+    """W11: with both the leftover code and the undisassembled bytes known and neither reaching the
+    mapped spot, the row stays the determined uncovered (complete) — the <16-byte-gap case.
+
+    Mutation (verified red): default a missing undefined set to a reaching range -> RED."""
+    con, did = _diff(
+        tmp_path,
+        _W11_A,
+        _W11_B,
+        _W11_PAIRS,
+        b_residual=_FAR_RESIDUAL,
+        b_undefined=_FAR_RESIDUAL,
+    )
+    r = {k[1]: v for k, v in _presence(con, did).items() if k[0] == "a"}["00002000"]
+    con.close()
+    assert (r["presence_state"], r["counterpart_probe"]) == (
+        "unmatched_analysis_complete",
+        "uncovered",
+    )
+
+
+# ── W12: the other side's thunks and stub-table slots ─────────────────────────────────────────
+
+# g@0x2000 -> 0x2100 (a PAIRED thunk there); h@0x3000 -> 0x3100 (an UNPAIRED thunk there). The
+# paired-thunk pair sits at a HIGH A address so it is never g/h's nearest anchor.
+_W12_A = [(0x1000, "keep", 0x40, None), (0x2000, "g", 0x20, None), (0x3000, "h", 0x20, None)]
+_W12_B = [(0x1100, "keep", 0x40, None)]
+_W12_PAIRS = [(0x1000, "keep", 0x1100, "keep"), (0x9200, "ta", 0x2100, "tb")]
+_W12_THUNKS = json.dumps([["0x2100", [["0x2100", "0x210f"]]], ["0x3100", [["0x3100", "0x310f"]]]])
+
+
+def test_probe_reads_a_paired_thunk_as_occupied_and_an_unpaired_one_as_suspected(
+    tmp_path: Path,
+) -> None:
+    """★ W12 (A22): a function mapping onto an other-side thunk is not "no function there" (the
+    functions table holds no thunk). A PAIRED thunk is occupied; an UNPAIRED thunk is
+    counterpart_suspected — never uncovered.
+
+    Mutation (verified red): drop the thunks from _Coverage (index functions only) -> both read
+    uncovered / coverage_unknown -> RED."""
+    con, did = _diff(tmp_path, _W12_A, _W12_B, _W12_PAIRS, b_thunks=_W12_THUNKS)
+    a = {k[1]: v for k, v in _presence(con, did).items() if k[0] == "a"}
+    con.close()
+    assert (a["00002000"]["presence_state"], a["00002000"]["counterpart_probe"]) == (
+        "unmatched_analysis_complete",
+        "occupied",
+    )
+    assert a["00002000"]["counterpart_addr"] == "00002100"
+    assert (a["00003000"]["presence_state"], a["00003000"]["counterpart_probe"]) == (
+        COUNTERPART_SUSPECTED,
+        "unpaired",
+    )
+
+
+def test_a_mapped_point_in_the_other_sides_stub_region_is_occupied(tmp_path: Path) -> None:
+    """★ W12 (A22): the mapped point lands in B's .plt / .MIPS.stubs table — a stub slot (the
+    import it jumps through has no tmap function) is a taken spot, read occupied, not uncovered.
+
+    Mutation (verified red): drop the stub-region check -> the row reads uncovered -> RED."""
+    con, did = _diff(
+        tmp_path,
+        _W11_A,
+        _W11_B,
+        _W11_PAIRS,
+        b_stub_regions=json.dumps([[".plt", "0x2100", "0x2200"]]),
+    )
+    r = {k[1]: v for k, v in _presence(con, did).items() if k[0] == "a"}["00002000"]
+    con.close()
+    assert (r["presence_state"], r["counterpart_probe"]) == (
+        "unmatched_analysis_complete",
+        "occupied",
+    )
+
+
+# ── W13: the stub-table "resolved" scope ──────────────────────────────────────────────────────
+
+_W13_A = [(0x1000, "keep", 0x40, None)]
+_W13_B = [(0x1100, "keep", 0x40, None)]
+_W13_PAIRS = [(0x1000, "keep", 0x1100, "keep")]
+
+
+def test_an_empty_named_stub_table_is_none_named_not_resolved(tmp_path: Path) -> None:
+    """★ W13: a '{}' table was READ and named nothing (e.g. a MIPS binary whose stubs are all in
+    .MIPS.stubs). It reads none_named, NOT resolved, and the ledger is not enabled — the stubs go
+    through the pairing, never reported as "0 pairs, no one-sided imports".
+
+    Mutation (verified red): treat '{}' as resolved and enable the ledger -> table reads resolved,
+    pairs 0 -> RED."""
+    con, did = _diff(tmp_path, _W13_A, _W13_B, _W13_PAIRS, a_stubs={}, b_stubs={})
+    st = get_diff_meta(con, did)["import_stubs"]
+    con.close()
+    assert (st["table_a"], st["table_b"]) == ("none_named", "none_named")
+    assert st["pairs"] is None and st["a_only"] is None  # not accounted
+    assert "one_sided_unconfirmed" not in st
+
+
+def test_a_one_sided_name_is_unconfirmed_when_a_table_is_incomplete(tmp_path: Path) -> None:
+    """★ W13 (A23): both sides have named .plt stubs (resolved), but B's table does not cover every
+    stub (complete=0). A name present only on A may still be called through another stub on B, so
+    the diff carries complete {a,b} and flags one_sided_unconfirmed — not a determined one-sided
+    add.
+
+    Mutation (verified red): drop the one_sided_unconfirmed flag -> RED."""
+    con, did = _diff(
+        tmp_path,
+        _W13_A,
+        _W13_B,
+        _W13_PAIRS,
+        a_stubs={0x3000: "system", 0x3010: "printf"},
+        a_stub_complete=1,
+        b_stubs={0x3100: "printf"},
+        b_stub_complete=0,
+    )
+    st = get_diff_meta(con, did)["import_stubs"]
+    con.close()
+    assert (st["table_a"], st["table_b"]) == ("resolved", "resolved")
+    assert st["complete"] == {"a": 1, "b": 0}
+    assert st["a_only"] == ["system"] and st["b_only"] == []
+    assert st.get("one_sided_unconfirmed") is True
+
+
+def test_two_complete_tables_are_not_flagged_unconfirmed(tmp_path: Path) -> None:
+    """W13: both tables complete (complete=1) -> a one-sided name IS a determined one-sided stub;
+    no one_sided_unconfirmed flag.
+
+    Mutation (verified red): raise the flag whenever a one-sided name exists -> RED."""
+    con, did = _diff(
+        tmp_path,
+        _W13_A,
+        _W13_B,
+        _W13_PAIRS,
+        a_stubs={0x3000: "system"},
+        a_stub_complete=1,
+        b_stubs={0x3100: "printf"},
+        b_stub_complete=1,
+    )
+    st = get_diff_meta(con, did)["import_stubs"]
+    con.close()
+    assert st["complete"] == {"a": 1, "b": 1}
+    assert st["a_only"] == ["system"] and st["b_only"] == ["printf"]
+    assert "one_sided_unconfirmed" not in st

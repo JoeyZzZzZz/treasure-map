@@ -318,6 +318,24 @@ class BaselineDomain:
     # recorded by this analysis.db, unparseable, or truncated (a prefix cannot show a range is
     # absent).
     residual_ranges: tuple[tuple[int, int], ...] | None = None
+    # W11: the executable bytes Ghidra never disassembled at all, as inclusive (lo, hi) ranges
+    # (binaries.promote_undefined_ranges). Same None rule as residual_ranges (NULL / not recorded /
+    # unparseable / truncated). A function whose counterpart maps into one is code the other side
+    # never built — a gap, not a determined "no such function".
+    undefined_ranges: tuple[tuple[int, int], ...] | None = None
+    # W12: the thunks the export skipped, entry addr -> the thunk's body as inclusive (lo, hi)
+    # ranges (binaries.thunk_spans). The functions table holds no thunk, so the counterpart probe
+    # reads these to see an other-side thunk where a function maps. Empty = none recorded.
+    thunks: dict[str, tuple[tuple[int, int], ...]] = field(default_factory=dict)
+    # W13: this binary's .plt / .MIPS.stubs regions as half-open [lo, hi) ranges
+    # (binaries.stub_regions). A point that maps into one is a stub-table slot — a taken spot, not
+    # "no function". Empty = none recorded.
+    stub_regions: tuple[tuple[int, int], ...] = ()
+    # W13: does stub_names cover EVERY stub this binary has (binaries.stub_table_complete)? 1 = yes,
+    # 0 = no (a .MIPS.stubs table or an unnamed .plt entry this path does not read), None = no
+    # resolution / not recorded. Carried onto the diff so a one-sided stub name is flagged as
+    # unconfirmed when a table is incomplete.
+    stub_complete: int | None = None
 
     @property
     def addrs(self) -> frozenset[str]:
@@ -359,7 +377,16 @@ def load_baseline(analysis_db_path: str, bin_row: BinaryRow) -> BaselineDomain:
         bcols = {r[1] for r in con.execute("PRAGMA table_info(binaries)")}
         sel = [
             c if c in bcols else f"NULL AS {c}"
-            for c in ("stub_names", "promote_residual_ranges", "promote_residual_ranges_truncated")
+            for c in (
+                "stub_names",
+                "stub_table_complete",
+                "promote_residual_ranges",
+                "promote_residual_ranges_truncated",
+                "promote_undefined_ranges",
+                "promote_undefined_ranges_truncated",
+                "stub_regions",
+                "thunk_spans",
+            )
         ]
         brow = con.execute(
             f"SELECT {', '.join(sel)} FROM binaries WHERE id = ?",  # noqa: S608 -- literal
@@ -380,12 +407,32 @@ def load_baseline(analysis_db_path: str, bin_row: BinaryRow) -> BaselineDomain:
         spans[addr] = _body_spans(addr, size, r["body_ranges"])
     stubs: dict[str, str] | None = None
     residual: tuple[tuple[int, int], ...] | None = None
+    undefined: tuple[tuple[int, int], ...] | None = None
+    thunks: dict[str, tuple[tuple[int, int], ...]] = {}
+    stub_regions: tuple[tuple[int, int], ...] = ()
+    stub_complete: int | None = None
     if brow is not None:
         stubs = _stub_table(brow["stub_names"])
         if brow["promote_residual_ranges_truncated"] == 0:
             residual = _hex_ranges(brow["promote_residual_ranges"])
+        # A truncated prefix cannot show a byte is NOT undefined, so it reads as "not known" (None),
+        # exactly like residual_ranges.
+        if brow["promote_undefined_ranges_truncated"] == 0:
+            undefined = _hex_ranges(brow["promote_undefined_ranges"])
+        thunks = _thunk_spans(brow["thunk_spans"])
+        stub_regions = _stub_region_ranges(brow["stub_regions"])
+        raw_complete = brow["stub_table_complete"]
+        stub_complete = int(raw_complete) if isinstance(raw_complete, int) else None
     return BaselineDomain(
-        functions=funcs, spans=spans, sizes=sizes, stubs=stubs, residual_ranges=residual
+        functions=funcs,
+        spans=spans,
+        sizes=sizes,
+        stubs=stubs,
+        residual_ranges=residual,
+        undefined_ranges=undefined,
+        thunks=thunks,
+        stub_regions=stub_regions,
+        stub_complete=stub_complete,
     )
 
 
@@ -425,6 +472,56 @@ def _body_spans(addr: str, size: int | None, raw: Any) -> tuple[tuple[int, int],
         lo = int(addr, 16)
         return ((lo, lo + size - 1),)
     return ()
+
+
+def _thunk_spans(raw: Any) -> dict[str, tuple[tuple[int, int], ...]]:
+    """binaries.thunk_spans (``[["0x<entry>", [["0x<lo>","0x<hi>"], ...]], ...]``) as {normalized
+    entry addr: inclusive body ranges}. Empty on NULL / not-recorded / any malformed element — a
+    thunk the diff cannot read is simply not in the index, never a fabricated one."""
+    if not isinstance(raw, str):
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, list):
+        return {}
+    out: dict[str, tuple[tuple[int, int], ...]] = {}
+    for item in data:
+        if not (isinstance(item, list) and len(item) == 2):
+            return {}
+        entry = norm_hex(str(item[0]))
+        body = _hex_ranges(json.dumps(item[1])) if isinstance(item[1], list) else None
+        if entry is None or body is None:
+            return {}
+        out[entry] = body
+    return out
+
+
+def _stub_region_ranges(raw: Any) -> tuple[tuple[int, int], ...]:
+    """binaries.stub_regions (``[[name, "0x<lo>", "0x<hi>"], ...]``) as half-open [lo, hi) int
+    ranges (the section name is dropped — the probe only asks "is this a stub slot"). Empty on NULL
+    / not-recorded / any malformed element."""
+    if not isinstance(raw, str):
+        return ()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return ()
+    if not isinstance(data, list):
+        return ()
+    out: list[tuple[int, int]] = []
+    for item in data:
+        if not (isinstance(item, list) and len(item) == 3):
+            return ()
+        try:
+            lo, hi = int(str(item[1]), 16), int(str(item[2]), 16)
+        except ValueError:
+            return ()
+        if hi < lo:
+            return ()
+        out.append((lo, hi))
+    return tuple(sorted(out))
 
 
 def _stub_table(raw: Any) -> dict[str, str] | None:
@@ -489,15 +586,21 @@ class SidePresence:
 #   unpaired       — a function that is itself in no pair there (a pairing the diff tool missed)
 #   occupied       — a paired function (or an import stub) there: the spot is taken, which is what
 #                    a deletion looks like once the following code moves up
-#   uncovered      — no function there, and the other side's leftover code (the instructions its
-#                    extraction left outside every function) is known and does not reach it
+#   uncovered      — no function there, and neither the other side's leftover code (the instructions
+#                    its extraction left outside a function) nor its undisassembled bytes reach it
 #   residual_code  — no function there, but leftover code does
-#   coverage_unknown — no function there, and the other side's leftover code is not known
+#   undisassembled_bytes — no function there, but bytes the other side's analysis never disassembled
+#                    at all do (W11): code it never built, a gap, not a determined "no function"
+#   coverage_unknown — no function there, and the other side's leftover code / undisassembled bytes
+#                    are not known
 #   unmappable     — no pair at or below the function to map it by
+# A thunk or an import-stub slot at the mapped address counts as OCCUPIED (a paired thunk / a stub
+# table slot is a taken spot); a thunk there in no pair is UNPAIRED.
 PROBE_UNPAIRED = "unpaired"
 PROBE_OCCUPIED = "occupied"
 PROBE_UNCOVERED = "uncovered"
 PROBE_RESIDUAL = "residual_code"
+PROBE_UNDISASSEMBLED = "undisassembled_bytes"
 PROBE_COVERAGE_UNKNOWN = "coverage_unknown"
 PROBE_UNMAPPABLE = "unmappable"
 
@@ -510,6 +613,7 @@ COUNTERPART_SUSPECTED = "counterpart_suspected"
 _PROBE_STATE: dict[str, tuple[str, str]] = {
     PROBE_UNPAIRED: (COUNTERPART_SUSPECTED, "counterpart_unpaired_at_mapped_address"),
     PROBE_RESIDUAL: ("unmatched_analysis_incomplete", "other_side_code_outside_functions"),
+    PROBE_UNDISASSEMBLED: ("unmatched_analysis_incomplete", "other_side_bytes_not_disassembled"),
     PROBE_COVERAGE_UNKNOWN: ("unmatched_analysis_incomplete", "other_side_coverage_unknown"),
     PROBE_UNMAPPABLE: ("unmatched_analysis_incomplete", "counterpart_unmappable"),
 }
@@ -534,11 +638,21 @@ def _probed_state(state: str, probe: CounterpartProbe | None) -> tuple[str, str 
 
 
 class _Coverage:
-    """The other side's functions as an address index: which function covers an address."""
+    """The other side's functions AND thunks as an address index: which one covers an address.
+
+    Thunks (binaries.thunk_spans) are indexed beside the functions so a point mapping onto an
+    other-side thunk is found as that thunk's entry — not read as "no function there" (the functions
+    table holds no thunk). A function entry wins over a thunk at the same address."""
 
     def __init__(self, baseline: BaselineDomain) -> None:
         self.entries = {int(a, 16): a for a in baseline.functions}
-        spans = sorted((lo, hi, addr) for addr, rs in baseline.spans.items() for lo, hi in rs)
+        for a in baseline.thunks:
+            self.entries.setdefault(int(a, 16), a)
+        pieces = {addr: rs for addr, rs in baseline.spans.items()}
+        for addr, rs in baseline.thunks.items():
+            if addr not in pieces:
+                pieces[addr] = rs
+        spans = sorted((lo, hi, addr) for addr, rs in pieces.items() for lo, hi in rs)
         self.los = [lo for lo, _hi, _a in spans]
         self.spans = spans
         # running maximum of hi, so the backwards walk below stops once nothing earlier can reach y
@@ -562,6 +676,11 @@ class _Coverage:
 
 def _overlap(ranges: tuple[tuple[int, int], ...], lo: int, hi: int) -> tuple[tuple[int, int], ...]:
     return tuple((a, b) for a, b in ranges if a <= hi and b >= lo)
+
+
+def _in_stub_region(regions: tuple[tuple[int, int], ...], y: int) -> bool:
+    """True when address ``y`` falls in a stub region (half-open [lo, hi), as ELF sections are)."""
+    return any(lo <= y < hi for lo, hi in regions)
 
 
 def probe_counterparts(
@@ -591,17 +710,32 @@ def probe_counterparts(
         y = anchors[i][1] + (x - anchors[i][0])
         found = cov.owner(y)
         if found is not None:
+            # A function OR a thunk covers the spot. Taken (paired fn / stub / paired thunk) ->
+            # occupied; a thunk or function there in no pair -> unpaired (counterpart suspected).
             kind = PROBE_OCCUPIED if found in occupied else PROBE_UNPAIRED
             out[addr] = CounterpartProbe(kind, addr=found)
             continue
-        if other.residual_ranges is None:
+        if _in_stub_region(other.stub_regions, y):
+            # W12: the mapped point lands in the other side's .plt / .MIPS.stubs table — a stub slot
+            # is a taken spot, not "no function" (the import it jumps through has no tmap function).
+            out[addr] = CounterpartProbe(PROBE_OCCUPIED)
+            continue
+        # W11: with no function/thunk/stub there, the spot is still not empty if the other side's
+        # analysis left code it never turned into a function — leftover instructions (residual) or
+        # bytes it never disassembled at all (undefined). Either is a gap, never "no such function".
+        if other.residual_ranges is None or other.undefined_ranges is None:
             out[addr] = CounterpartProbe(PROBE_COVERAGE_UNKNOWN)
             continue
         size = own.sizes.get(addr) or 1
-        hit = _overlap(other.residual_ranges, y, y + size - 1)
+        lo, hi = y, y + size - 1
+        res_hit = _overlap(other.residual_ranges, lo, hi)
+        if res_hit:
+            out[addr] = CounterpartProbe(PROBE_RESIDUAL, overlap=res_hit)
+            continue
+        undef_hit = _overlap(other.undefined_ranges, lo, hi)
         out[addr] = (
-            CounterpartProbe(PROBE_RESIDUAL, overlap=hit)
-            if hit
+            CounterpartProbe(PROBE_UNDISASSEMBLED, overlap=undef_hit)
+            if undef_hit
             else CounterpartProbe(PROBE_UNCOVERED)
         )
     return out
@@ -618,11 +752,15 @@ class StubLedger:
     them by shape, and an export can rarely hold them as they are (on MIPS the next entry is the
     previous one's delay slot). Their identity is the import name read from the ELF structure, so
     they are paired by that name instead and kept out of the function pairs and the presence rows.
-    Only when both sides' stub tables are determined: otherwise nothing is taken out (``enabled``
-    False) and the stubs go through the pairing as before."""
+    The ledger is enabled only when BOTH sides carry a NAMED table: a side that is ``unknown`` (NULL
+    — not determined) or ``none_named`` (``'{}'`` — read, nothing resolved; e.g. a MIPS binary whose
+    stubs are all in ``.MIPS.stubs``, which this path does not name) takes nothing out and the stubs
+    go through the pairing as before. ``complete_a`` / ``complete_b`` (1 / 0 / None) say whether
+    each named table covers every stub of its binary; when either is 0, a name in ``a_only`` /
+    ``b_only`` may still be called through another stub on that side — not a one-sided add."""
 
     enabled: bool
-    table_a: str  # resolved | unknown
+    table_a: str  # resolved | none_named | unknown
     table_b: str
     pairs: int | None = None
     a_only: tuple[str, ...] | None = None
@@ -631,14 +769,37 @@ class StubLedger:
     mismatch: tuple[tuple[str, str], ...] = ()
     stubs_a: frozenset[str] = frozenset()
     stubs_b: frozenset[str] = frozenset()
+    complete_a: int | None = None
+    complete_b: int | None = None
 
 
-def stub_ledger(stubs_a: dict[str, str] | None, stubs_b: dict[str, str] | None) -> StubLedger:
+def _stub_table_state(stubs: dict[str, str] | None) -> str:
+    """The three states a side's stub table takes, which must never be collapsed: ``unknown`` (NULL
+    — not determined), ``none_named`` (``'{}'`` — read, none named), ``resolved`` (named stubs)."""
+    if stubs is None:
+        return "unknown"
+    return "resolved" if stubs else "none_named"
+
+
+def stub_ledger(
+    stubs_a: dict[str, str] | None,
+    stubs_b: dict[str, str] | None,
+    complete_a: int | None = None,
+    complete_b: int | None = None,
+) -> StubLedger:
     """The stub accounting of a diff from the two sides' stub tables (pairs not split yet)."""
-    table_a = "resolved" if stubs_a is not None else "unknown"
-    table_b = "resolved" if stubs_b is not None else "unknown"
-    if stubs_a is None or stubs_b is None:
-        return StubLedger(enabled=False, table_a=table_a, table_b=table_b)
+    table_a = _stub_table_state(stubs_a)
+    table_b = _stub_table_state(stubs_b)
+    # Enabled only when both sides have a NON-EMPTY named table. A None or an empty '{}' on either
+    # side (unknown / none_named) is not a usable account, so nothing is taken out of the pairing.
+    if not stubs_a or not stubs_b:
+        return StubLedger(
+            enabled=False,
+            table_a=table_a,
+            table_b=table_b,
+            complete_a=complete_a,
+            complete_b=complete_b,
+        )
     names_a, names_b = set(stubs_a.values()), set(stubs_b.values())
     return StubLedger(
         enabled=True,
@@ -649,6 +810,8 @@ def stub_ledger(stubs_a: dict[str, str] | None, stubs_b: dict[str, str] | None) 
         b_only=tuple(sorted(names_b - names_a)),
         stubs_a=frozenset(stubs_a),
         stubs_b=frozenset(stubs_b),
+        complete_a=complete_a,
+        complete_b=complete_b,
     )
 
 
@@ -982,7 +1145,12 @@ def run_layer0_parse(
     # Import stubs are accounted by import name and taken out of the pairs and the presence rows
     # (W4); then every function left unmatched is probed for what the other side holds where it
     # maps (W3), with the pairs that remain as the anchors.
-    parsed, ledger = split_stub_pairs(parsed, stub_ledger(baseline_a.stubs, baseline_b.stubs))
+    parsed, ledger = split_stub_pairs(
+        parsed,
+        stub_ledger(
+            baseline_a.stubs, baseline_b.stubs, baseline_a.stub_complete, baseline_b.stub_complete
+        ),
+    )
     pairs_ab = [(r.addr_a, r.addr_b) for r in parsed.rows]
     excl_a = ledger.stubs_a if ledger.enabled else frozenset()
     excl_b = ledger.stubs_b if ledger.enabled else frozenset()
@@ -1100,6 +1268,8 @@ def run_layer0_parse(
         stub_pair_mismatch=(
             json.dumps([list(m) for m in ledger.mismatch]) if ledger.enabled else None
         ),
+        stub_complete_a=ledger.complete_a,
+        stub_complete_b=ledger.complete_b,
         export_gaps_on_stubs_a=stub_gaps_a,
         export_gaps_on_stubs_b=stub_gaps_b,
         export_gaps_on_code_a=code_gaps_a,
