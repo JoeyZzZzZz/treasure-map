@@ -90,10 +90,12 @@ def report_extraction_state(result: Any, reanalyze: str | None) -> None:
 
 
 def _report_promote(promote: dict[str, Any]) -> None:
-    """What the function-promotion pass came to: the functions it created and the instructions
-    still in no function after it, summed over the binaries that recorded them — and, on stderr,
-    the binaries holding instructions in no code block at all (the block model skipped part of
-    them, so their function set may be short) and how many binaries recorded nothing."""
+    """What the function-promotion pass came to: the functions it created, the functions W14
+    recovered through data pointers, and the instructions still in no function after it, summed
+    over the binaries that recorded them — and, on stderr, the binaries holding instructions in no
+    code block at all (the block model skipped part of them, so their function set may be short),
+    the binaries whose W14 guard tripped (the no-return freeze did not hold), and how many binaries
+    recorded nothing."""
     if not promote or not promote.get("binaries"):
         return
     total = int(promote.get("binaries") or 0)
@@ -104,7 +106,8 @@ def _report_promote(promote: dict[str, Any]) -> None:
         click.echo(f"      → promoted functions: not recorded for {unrecorded} binaries")
     else:
         line = (
-            f"      → promoted functions: {promote.get('created', 0)} created; "
+            f"      → promoted functions: {promote.get('created', 0)} created, "
+            f"{promote.get('recovered', 0)} recovered via pointers; "
             f"{promote.get('residual_insns', 0)} instructions left outside any function"
         )
         if unrecorded:
@@ -115,6 +118,13 @@ def _report_promote(promote: dict[str, Any]) -> None:
         click.echo(
             f"  ⚠ {len(unowned)} binaries have instructions in no code block after function "
             f"promotion — their function set may be incomplete: {_shown(unowned)}",
+            err=True,
+        )
+    guard = list(promote.get("guard_binaries") or [])
+    if guard:
+        click.echo(
+            f"  ⚠ {len(guard)} binaries tripped a promotion guard — the no-return freeze did not "
+            f"hold and existing code may have been lost; re-check them: {_shown(guard)}",
             err=True,
         )
 

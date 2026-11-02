@@ -340,7 +340,7 @@ class FunctionPresenceRow:
     operand_markup_incomplete: int = 0
     # What the other side holds where this function maps through the nearest pair at or below it
     # (lib/diff/layer0.probe_counterparts): unpaired / occupied / uncovered / residual_code /
-    # residual_code / undisassembled_bytes (W11) / coverage_unknown / unmappable; the other side's
+    # undisassembled_bytes (W11) / coverage_unknown / unmappable; the other side's
     # function or thunk there (counterpart_addr); the leftover-code or undisassembled ranges the
     # mapped span meets (JSON, counterpart_overlap); and why the probe made the state undetermined
     # (presence_reason). None = not probed (a diff written before).

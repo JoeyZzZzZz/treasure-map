@@ -129,14 +129,19 @@ class AnalyzeResult:
 def promote_summary(conn: sqlite3.Connection) -> dict[str, Any]:
     """The function-promotion record over the current scan's extracted binaries (ghidra_ok = 1).
 
-    ``created`` / ``residual_insns`` sum binaries.promote_created / promote_residual_insns over
-    the binaries that recorded them; ``unowned_binaries`` names those with an instruction in no
-    code block (promote_residual_unowned > 0); ``unrecorded`` counts the extracted binaries with
-    no record (NULL), whose numbers the sums therefore do not include. {} on an analysis.db without
-    the columns."""
+    ``created`` / ``residual_insns`` / ``recovered`` sum binaries.promote_created /
+    promote_residual_insns / promote_recovered over the binaries that recorded them (``created`` is
+    the genuinely-new count — see PromoteUndefined; ``recovered`` is W14's pointer-reached
+    recovery); ``unowned_binaries`` names those with an instruction in no code block
+    (promote_residual_unowned > 0); ``guard_binaries`` names those whose W14 guard tripped
+    (promote_recover_lost_bytes or promote_recover_noreturn_flips > 0 — both 0 by design, so a name
+    here means the no-return freeze did not hold and existing code may have been lost);
+    ``unrecorded`` counts the extracted binaries with no record (NULL), whose numbers the sums
+    therefore do not include. {} on an analysis.db without the columns."""
     try:
         rows = conn.execute(
-            "SELECT name, promote_created, promote_residual_insns, promote_residual_unowned "
+            "SELECT name, promote_created, promote_residual_insns, promote_residual_unowned, "
+            "promote_recovered, promote_recover_lost_bytes, promote_recover_noreturn_flips "
             "FROM current_binaries WHERE ghidra_ok = 1 ORDER BY name"
         ).fetchall()
     except sqlite3.OperationalError:
@@ -147,7 +152,13 @@ def promote_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         "unrecorded": len(rows) - len(recorded),
         "created": sum(int(r[1]) for r in recorded),
         "residual_insns": sum(int(r[2]) for r in recorded),
+        "recovered": sum(int(r[4]) for r in recorded if r[4] is not None),
         "unowned_binaries": [str(r[0]) for r in recorded if int(r[3]) > 0],
+        "guard_binaries": [
+            str(r[0])
+            for r in rows
+            if (r[5] is not None and int(r[5]) > 0) or (r[6] is not None and int(r[6]) > 0)
+        ],
     }
 
 

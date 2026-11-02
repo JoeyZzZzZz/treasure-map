@@ -48,8 +48,10 @@
 //   cancelled pass leaves no options, which the export then reports as not recorded rather than as
 //   zero.
 //
-// Prints one summary line: tried, created, function counts, residual kinds, range counts and the
-// recovery counts.
+// Prints one summary line: tried, created (the genuinely-new functions — see promoteBlocks), the
+// per-pass breakdown (pass1_created is the old raw count of every non-null createFunction return,
+// kept only so A4 can compare it to the r6 single-pass log), function counts, residual kinds, range
+// counts and the recovery counts.
 //@category Analysis
 
 import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
@@ -116,7 +118,7 @@ public class PromoteUndefined extends GhidraScript {
     if (p1 == null) {
       return;
     }
-    if (p1[1] > 0) {
+    if (p1[2] > 0) { // re-analyse whenever createFunction was applied (raw count), as before
       analyzeChanges(currentProgram);
     }
 
@@ -140,11 +142,11 @@ public class PromoteUndefined extends GhidraScript {
       restoreNoReturn(nrWas);
       return;
     }
-    if (p2[1] > 0) {
+    if (p2[2] > 0) { // raw count, as above
       analyzeChanges(currentProgram);
     }
     int tried = p1[0] + p2[0];
-    int created = p1[1] + p2[1];
+    int created = p1[1] + p2[1]; // genuinely-new functions across both passes (stored; MAJOR-2)
     int afterCreate = fm.getFunctionCount();
 
     // 4a. Residual self-check on the final state (what the export will see), with a fresh model.
@@ -259,7 +261,8 @@ public class PromoteUndefined extends GhidraScript {
     // 6. Restore no-return discovery to what it was before W14.
     restoreNoReturn(nrWas);
 
-    println("[PromoteUndefined] tried=" + tried + " created=" + created + " functions_before="
+    println("[PromoteUndefined] tried=" + tried + " created=" + created + " pass1_tried=" + p1[0]
+        + " pass1_created=" + p1[2] + " pass2_created=" + p2[1] + " functions_before="
         + before + " functions_after_create=" + afterCreate + " functions_after_analysis="
         + fm.getFunctionCount() + " residual_insns=" + (resStart + resInterior + resUnowned)
         + " residual_start=" + resStart + " residual_interior=" + resInterior
@@ -273,7 +276,11 @@ public class PromoteUndefined extends GhidraScript {
 
   /**
    * W1 block promotion: make a function of every code block no function contains, in address order.
-   * Returns {tried, created}, or null when the pass was cancelled (so the caller records nothing).
+   * Returns {tried, createdReal, createdRaw}, or null when the pass was cancelled (so the caller
+   * records nothing). createdReal counts only entries that had no function before the call and one
+   * after — what the stored ``created`` and the origin='promoted' bookmark reflect; createdRaw is
+   * the old count of every non-null createFunction return, kept only for the per-pass log line A4
+   * compares against the r6 single-pass log.
    */
   private int[] promoteBlocks() throws Exception {
     BasicBlockModel model = new BasicBlockModel(currentProgram, true);
@@ -289,7 +296,8 @@ public class PromoteUndefined extends GhidraScript {
       }
     }
     int tried = 0;
-    int created = 0;
+    int createdReal = 0;
+    int createdRaw = 0;
     for (Address a : starts) {
       if (monitor.isCancelled()) {
         return null;
@@ -302,13 +310,25 @@ public class PromoteUndefined extends GhidraScript {
         continue;
       }
       tried++;
-      Function fn = createFunction(candidate.getEntryPoint(), null);
+      // ★ createFunction returns the EXISTING function when one already sits at this entry (Ghidra's
+      //   handleExistingFunction returns it for a body of more than one byte), so a non-null return
+      //   is NOT proof a function was made here. Read whether one was there first: only an entry
+      //   with none before and one after is a genuine creation to count and bookmark 'promoted'.
+      //   Counting every non-null return over-counts `created` and stamps a Ghidra-analysed function
+      //   origin='promoted' (both wrong). We still CALL createFunction either way — on a one-byte
+      //   placeholder it makes Ghidra rebuild the real body, which we keep.
+      Address entry = candidate.getEntryPoint();
+      boolean existed = fm.getFunctionAt(entry) != null;
+      Function fn = createFunction(entry, null);
       if (fn != null) {
-        created++;
-        bm.setBookmark(fn.getEntryPoint(), BookmarkType.INFO, BOOKMARK_CATEGORY, "created");
+        createdRaw++; // old method: every non-null return (for the r6-log A4 comparison only)
+        if (!existed) {
+          createdReal++;
+          bm.setBookmark(fn.getEntryPoint(), BookmarkType.INFO, BOOKMARK_CATEGORY, "created");
+        }
       }
     }
-    return new int[] {tried, created};
+    return new int[] {tried, createdReal, createdRaw};
   }
 
   /**

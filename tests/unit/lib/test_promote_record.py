@@ -269,6 +269,30 @@ def test_a_reextraction_without_the_record_clears_the_earlier_one(tmp_path: Path
     conn.close()
 
 
+def test_drop_extraction_clears_thunk_spans_but_keeps_the_elf_stub_columns(tmp_path: Path) -> None:
+    """★ thunk_spans is a Ghidra export product, so drop_extraction clears it with the rest of the
+    pass; the stub columns come from the ELF (unchanged for the same sha) and are left for the next
+    ingest to overwrite — clearing them would read as "no stubs" on a binary that was never
+    re-ingested.
+
+    MUTATION (verified RED): leave thunk_spans out of the drop_extraction UPDATE (it keeps its old
+    value) -> RED; also NULL stub_regions there -> the stub-kept assertion -> RED."""
+    conn = _ingest(tmp_path, [_fn("f", "0x1000")], {"promote": _PROMOTE})
+    conn.execute(
+        "UPDATE binaries SET thunk_spans = ?, stub_regions = ?, stub_table_complete = 1 "
+        "WHERE id = 1",
+        ('[["0x1000",[["0x1000","0x100c"]]]]', '[[".plt","0x900","0x920"]]'),
+    )
+    drop_extraction(conn, "a" * 64)
+    row = conn.execute(
+        "SELECT thunk_spans, stub_regions, stub_table_complete FROM binaries WHERE id = 1"
+    ).fetchone()
+    conn.close()
+    assert row[0] is None  # thunk_spans cleared (Ghidra product)
+    assert row[1] == '[[".plt","0x900","0x920"]]'  # stub_regions kept (from the ELF)
+    assert row[2] == 1  # stub_table_complete kept
+
+
 # ── the schema in both places ───────────────────────────────────────────────────────────────
 
 
@@ -466,27 +490,35 @@ def test_atlas_schema_alone_declares_the_run_columns(tmp_path: Path) -> None:
 
 def _summary_db(tmp_path: Path) -> sqlite3.Connection:
     conn = open_db(tmp_path / "analysis.db")
-    for i, (name, ok, created, insns, unowned) in enumerate(
+    # name, ghidra_ok, created, residual_insns, residual_unowned, recovered, lost_bytes, nr_flips
+    for i, (name, ok, created, insns, unowned, rec, lost, flips) in enumerate(
         [
-            ("a", 1, 10, 4, 0),
-            ("b", 1, 2, 30, 5),
-            ("c", 1, None, None, None),
-            ("dead", 0, None, None, None),
+            ("a", 1, 10, 4, 0, 5, 0, 0),
+            ("b", 1, 2, 30, 5, 1, 0, 2),  # instructions in no block AND its no-return guard tripped
+            ("c", 1, None, None, None, None, None, None),  # extracted, recorded nothing
+            ("dead", 0, None, None, None, None, None, None),  # extraction failed
         ],
         start=1,
     ):
         conn.execute(
             "INSERT INTO binaries (id, name, sha256, ghidra_ok, promote_created, "
-            "promote_residual_insns, promote_residual_unowned) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (i, name, f"{i:064x}", ok, created, insns, unowned),
+            "promote_residual_insns, promote_residual_unowned, promote_recovered, "
+            "promote_recover_lost_bytes, promote_recover_noreturn_flips) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (i, name, f"{i:064x}", ok, created, insns, unowned, rec, lost, flips),
         )
     conn.commit()
     return conn
 
 
 def test_promote_summary_sums_the_recorded_and_counts_the_rest(tmp_path: Path) -> None:
-    """MUTATION (verified RED): count an unrecorded binary's NULL as 0 and drop `unrecorded` ->
-    RED; name every binary with residue as unowned -> RED."""
+    """★ created / residual / recovered sum only the binaries that recorded them; unowned_binaries
+    names those with an instruction in no code block; guard_binaries names those whose W14 guard
+    tripped (both 0 by design). An unrecorded binary is counted, not read as 0.
+
+    MUTATION (verified RED): count an unrecorded binary's NULL as 0 and drop `unrecorded` -> RED;
+    name every binary with residue as unowned -> RED; drop the recovered sum -> RED; never name a
+    guard-tripped binary (drop guard_binaries) -> RED."""
     conn = _summary_db(tmp_path)
     try:
         assert promote_summary(conn) == {
@@ -494,18 +526,21 @@ def test_promote_summary_sums_the_recorded_and_counts_the_rest(tmp_path: Path) -
             "unrecorded": 1,
             "created": 12,
             "residual_insns": 34,
+            "recovered": 6,
             "unowned_binaries": ["b"],
+            "guard_binaries": ["b"],
         }
     finally:
         conn.close()
 
 
 def test_the_scan_prints_the_promotion_line_and_names_unowned_binaries(tmp_path: Path) -> None:
-    """The scan's summary carries one promotion line (created, left outside any function, how
-    many binaries recorded nothing) and, on stderr, the binaries with instructions in no code
-    block.
+    """The scan's summary carries one promotion line (created, recovered, left outside any function,
+    how many binaries recorded nothing) and, on stderr, the binaries with instructions in no code
+    block and the binaries whose W14 guard tripped.
 
-    MUTATION (verified RED): leave _report_promote out of report_extraction_state -> RED."""
+    MUTATION (verified RED): leave _report_promote out of report_extraction_state -> RED; drop the
+    recovered count from the line -> RED; drop the guard-naming stderr block -> RED."""
     import click
 
     from treasure_map.cli.analyze_cli import report_extraction_state
@@ -531,9 +566,13 @@ def test_the_scan_prints_the_promotion_line_and_names_unowned_binaries(tmp_path:
 
     out = CliRunner().invoke(cmd, [])
     assert out.exit_code == 0, out.output
-    assert "promoted functions: 12 created; 34 instructions left outside any function" in out.stdout
+    assert (
+        "promoted functions: 12 created, 6 recovered via pointers; "
+        "34 instructions left outside any function" in out.stdout
+    )
     assert "(not recorded for 1 binaries)" in out.stdout
     assert re.search(r"1 binaries have instructions in no code block.*: b$", out.stderr, re.M)
+    assert re.search(r"tripped a promotion guard.*: b$", out.stderr, re.M)
 
 
 # ── the two Ghidra scripts, read as text ────────────────────────────────────────────────────
@@ -554,6 +593,22 @@ def test_promotion_never_walks_the_program_wide_block_iterator() -> None:
     assert "getInstructions(true)" in code
     assert "getCodeBlocks(" not in code
     assert "getCodeBlocksContaining(" not in code
+
+
+def test_block_promotion_counts_only_new_functions_and_logs_the_pass_breakdown() -> None:
+    """★ createFunction returns the EXISTING function when one already sits at the entry (Ghidra's
+    handleExistingFunction returns it for a body of more than one byte), so counting every non-null
+    return over-counts `created` and stamps a Ghidra-analysed function origin='promoted'.
+    promoteBlocks reads getFunctionAt(entry) BEFORE createFunction and counts/bookmarks only a
+    genuinely-new function; the stored `created` is that count, while the log keeps the raw
+    first-pass count (pass1_created, the old method) so A4 can compare it to the r6 single-pass log.
+
+    MUTATION (verified RED): drop the getFunctionAt(entry) guard (count/bookmark every non-null
+    return) -> RED; stop logging the per-pass breakdown -> RED."""
+    code = _code(_GHIDRA_DIR / "PromoteUndefined.java")
+    assert "getFunctionAt(entry)" in code
+    assert "pass1_created=" in code
+    assert "pass2_created=" in code
 
 
 def test_the_two_scripts_spell_the_handoff_the_same_way() -> None:
@@ -584,16 +639,22 @@ def test_the_two_scripts_spell_the_handoff_the_same_way() -> None:
 def test_w14_freezes_and_restores_no_return_discovery() -> None:
     """★ W14 re-analyses with no-return discovery FROZEN; without the freeze, re-analysis can newly
     mark an existing command wrapper non-returning and delete every instruction after each call to
-    it. The original value is restored at the end.
+    it. The freeze is applied BEFORE the recovery passes, and the original value is restored at the
+    END (after the record is written), not only on the cancel paths.
 
-    MUTATION (verified RED): drop the freeze setAnalysisOption(... "false") -> RED; drop the
-    restoreNoReturn call -> RED; drop one initializeOptions -> RED."""
+    MUTATION (verified RED): drop the freeze setAnalysisOption(... "false") -> RED; move the freeze
+    after recoverFromPointers -> RED; drop one initializeOptions -> RED; drop the FINAL restore (the
+    one after the record) while the cancel-path restores stay -> RED."""
     code = _code(_GHIDRA_DIR / "PromoteUndefined.java")
     assert 'NO_RETURN_OPTION = "Non-Returning Functions - Discovered"' in code
     assert 'setAnalysisOption(currentProgram, NO_RETURN_OPTION, "false")' in code
-    assert "restoreNoReturn(nrWas)" in code
+    # the freeze is applied BEFORE the recovery passes run — order is load-bearing
+    assert code.index("freezeNoReturn()") < code.index("recoverFromPointers(")
     # the analyzer options are re-initialised after both the freeze and the restore
     assert code.count("initializeOptions()") >= 2
+    # the record is written (step 5) and THEN no-return discovery is restored (step 6); dropping
+    # that final restore must be caught even though the cancel paths also call restoreNoReturn.
+    assert "restoreNoReturn(nrWas)" in code[code.index('setBoolean("recorded"') :]
     # the recovery guard counts exist and are recorded (both 0 by design)
     assert "recover_lost_insn_bytes" in code
     assert "recover_noreturn_flips" in code
@@ -604,10 +665,13 @@ def test_w14_bookmarks_recovered_functions_and_export_reads_the_origin() -> None
     bookmark to write origin='recovered', checked BEFORE the promoted bookmark.
 
     MUTATION (verified RED): make originField check the promoted bookmark first -> a recovered
-    function reads 'promoted' -> RED; drop the recovered createFunction bookmark -> RED."""
+    function reads 'promoted' -> RED; drop the setBookmark(... RECOVERED_BOOKMARK ...) call (leaving
+    the constant still declared) -> RED."""
     promote = _code(_GHIDRA_DIR / "PromoteUndefined.java")
     export = _code(_GHIDRA_DIR / "ExportFunctions.java")
-    assert "RECOVERED_BOOKMARK" in promote and "createFunction(a, null)" in promote
+    assert "createFunction(a, null)" in promote
+    # the recovered function is actually bookmarked, not merely the constant declared somewhere
+    assert re.search(r"setBookmark\([^;]*RECOVERED_BOOKMARK", promote)
     # originField resolves recovered -> promoted -> analysis, in that order.
     rec_at = export.index("PROMOTE_RECOVERED")
     prom_at = export.index("PROMOTE_BOOKMARK", export.index("originField"))

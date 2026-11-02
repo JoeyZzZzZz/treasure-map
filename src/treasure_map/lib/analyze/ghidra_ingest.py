@@ -217,13 +217,15 @@ def _delete_extraction_rows(conn: sqlite3.Connection, binary_id: int) -> None:
 def drop_extraction(conn: sqlite3.Connection, sha256: str) -> None:
     """Remove what an earlier extraction stored for this binary — its rows, and the pass that
     wrote them (``pass_version`` NULL), so it reads as having no extraction rather than as one kept
-    from an earlier pass. Not committed here."""
+    from an earlier pass. ``thunk_spans`` is a Ghidra export product, so it is cleared here too; the
+    stub columns (stub_table_complete / stub_regions) come from the ELF and do not change for the
+    same sha, so they are left to be overwritten by the next ingest. Not committed here."""
     row = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", (sha256,)).fetchone()
     if row is None:
         return
     _delete_extraction_rows(conn, int(row[0]))
     conn.execute(
-        "UPDATE binaries SET pass_version = NULL, ghidra_version = NULL, "  # noqa: S608
+        "UPDATE binaries SET pass_version = NULL, ghidra_version = NULL, thunk_spans = NULL, "  # noqa: S608
         + ", ".join(f"{c} = NULL" for c in PROMOTE_COLUMNS)
         + " WHERE id = ?",
         (row[0],),
