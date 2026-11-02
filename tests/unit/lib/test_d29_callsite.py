@@ -12,6 +12,7 @@ size), never an N->0 delta. Zero real data: the test world of test_patch_view.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -189,3 +190,60 @@ def test_a_non_sink_call_is_not_counted(tmp_path: Path, current: None) -> None:
     )
     # _eval steady (1 == 1), strlen not a sink -> nothing to report -> no field on the entry
     assert "sink_callsite_counts" not in _entry(w, PID)
+
+
+def _set_tokens(w: World, side: str, addr: str, tokens: list[dict[str, object]]) -> None:
+    """Overwrite one function's call_tokens with hand-made tokens (any opcode)."""
+    w.adb[side].execute(
+        "UPDATE functions SET call_tokens = ? WHERE address = ?", (json.dumps(tokens), addr)
+    )
+    w.adb[side].commit()
+
+
+def _tok(name: str, opcode: int, i: int) -> dict[str, object]:
+    return {
+        "call_token": name,
+        "opcode": opcode,
+        "op_addr": f"0x{0x1000 + i:x}",
+        "text_off": i * 10,
+        "token_addr": "",
+        "line": i,
+    }
+
+
+def test_a_sink_named_token_that_is_not_a_call_is_not_counted(
+    tmp_path: Path, current: None
+) -> None:
+    """Only opcode-7 (CALL) tokens count. A sink's NAME printed as something other than a call —
+    the function-name token of ``system`` handed on as a pointer, opcode -1 on the live scans — is
+    not a call site. A carries 2 calls + 2 pointer uses of system, B 2 calls: the counts are 2 and
+    2, no delta, so no field.
+
+    MUTATION (verified RED): drop the ``opcode == 7`` test -> A counts 4 -> delta system 4 -> 2."""
+    w = _pair(tmp_path, [], [], a_callees=["system"], b_callees=["system"])
+    _set_tokens(
+        w,
+        "a",
+        A,
+        [_tok("system", 7, 0), _tok("system", -1, 1), _tok("system", 7, 2), _tok("system", -1, 3)],
+    )
+    _set_tokens(w, "b", B, [_tok("system", 7, 0), _tok("system", 7, 1)])
+    assert _entry(w, PID).get("sink_callsite_counts") is None
+    # the same pair with B down to ONE call does report — so the fixture reaches the counter
+    _set_tokens(w, "b", B, [_tok("system", 7, 0)])
+    assert _scc(w)["delta"] == [{"sink": "system", "a": 2, "b": 1}]
+
+
+def test_a_truncated_callee_list_reports_the_side_unknown(tmp_path: Path, current: None) -> None:
+    """A function whose callee list hit the extractor cap (callees_truncated 1) may have its
+    call_tokens cut too, so its count is not trusted: that side is unknown with reason
+    ``call_counts_incomplete``, and no delta is reported against it (A 4 calls, B 2 calls on a
+    truncated B).
+
+    MUTATION (verified RED): ignore callees_truncated in _callsite_side -> delta _eval 4 -> 2."""
+    w = _pair(tmp_path, ["_eval"] * 4, ["_eval"] * 2, a_callees=["_eval"], b_callees=["_eval"])
+    w.adb["b"].execute("UPDATE functions SET callees_truncated = 1 WHERE address = ?", (B,))
+    w.adb["b"].commit()
+    scc = _scc(w)
+    assert {"sink": "_eval", "side": "b", "reason": "call_counts_incomplete"} in scc["unknown"]
+    assert scc["delta"] == []

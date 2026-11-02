@@ -864,6 +864,24 @@ REPLACED = {
         ),
     },
     "get_diff_patch_view": {
+        "``bucket``: ``A`` = at the call instruction BinDiff matched, the other side calls a "
+        "different callee and the paired function holds no candidate with the original "
+        "callee; ``B`` = a sink candidate whose cross-side reading stayed undetermined "
+        "(``subclass`` says why), a persisted candidate whose length constant changed "
+        "(``sink_arg_constant_delta`` — visible even at similarity 1), a changed pair whose "
+        "candidates all line up (``sink_present_no_visible_delta``), or a changed pair with "
+        "no candidate that calls a sink the hunt does not recall "
+        "(``recall_gap_sink:<family>``); inside B, ``sink_presence_signal:*`` sorts first, "
+        "then ``sink_arg_constant_delta``, then the rest; ``R`` = the pair itself is "
+        "undetermined; ``C`` = a changed pair with no sink candidate on either side "
+        "(``no_sink_candidate_unchecked`` when the callee lists could not be read); ``P`` = a "
+        "function with no counterpart; ``E`` = a similarity-1 pair whose function has a "
+        "direct caller on the A side and none found (or none provable) on the B side — a "
+        "caller-set edge (``callers_a`` / ``callers_b``) similarity is blind to.": (
+            "P was named 'a function with no counterpart', which the presence layer never "
+            "established: P is a function in no matched pair, and counterpart_probe says what the "
+            "other side holds where it maps"
+        ),
         "A similarity-1 pair whose candidates line up, or that has none, is not listed UNLESS a "
         "length constant changed or its caller-set edge reads lost-or-undetermined (then E); the "
         "rest are counted under ``not_listed`` by ``pseudocode_sameness`` (below).": (
@@ -1312,6 +1330,10 @@ def test_a_name_with_no_match_says_so_apart_from_an_address_with_none(
             "name": "only_a",
             "presence_state": "unmatched_analysis_complete",
             "export_gap": None,
+            # a presence row written directly, not probed by a diff (lib/diff/layer0)
+            "counterpart_probe": None,
+            "counterpart_addr": None,
+            "presence_reason": None,
         }
     ]
     assert align(_DIFF, "0x7000")["presence"] == one_sided["presence"]

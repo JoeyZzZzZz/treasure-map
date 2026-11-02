@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, replace
+from bisect import bisect_right
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from treasure_map.lib.atlas.models import (
     DiffMetaRow,
@@ -301,6 +303,21 @@ class BaselineDomain:
 
     # addr -> (name, decompile_status) ; status in ok / skipped_micro / failed / unknown
     functions: dict[str, tuple[str | None, str]]
+    # What the counterpart probe (``probe_counterparts``) reads of this side. ``spans``: addr ->
+    # the function's body as inclusive (lo, hi) address ranges (its body_ranges, else entry ..
+    # entry + size - 1; empty when neither was recorded). ``sizes``: addr -> size_bytes (None
+    # when unrecorded).
+    spans: dict[str, tuple[tuple[int, int], ...]] = field(default_factory=dict)
+    sizes: dict[str, int | None] = field(default_factory=dict)
+    # The binary's lazy-binding stub table, entry addr -> the import it calls
+    # (binaries.stub_names). None = not determined (NULL, unparseable, not an object, or a column
+    # this analysis.db does not have) — never read as "no stubs".
+    stubs: dict[str, str] | None = None
+    # The instructions the extraction's function promotion left outside every function, as
+    # inclusive (lo, hi) ranges (binaries.promote_residual_ranges). None = not known: NULL, not
+    # recorded by this analysis.db, unparseable, or truncated (a prefix cannot show a range is
+    # absent).
+    residual_ranges: tuple[tuple[int, int], ...] | None = None
 
     @property
     def addrs(self) -> frozenset[str]:
@@ -332,19 +349,102 @@ def load_baseline(analysis_db_path: str, bin_row: BinaryRow) -> BaselineDomain:
     con = ro_connect(analysis_db_path)
     try:
         con.row_factory = sqlite3.Row
+        fcols = {r[1] for r in con.execute("PRAGMA table_info(functions)")}
+        ranges_sel = "body_ranges" if "body_ranges" in fcols else "NULL AS body_ranges"
         rows = con.execute(
-            "SELECT address, name, pseudocode, size_bytes FROM functions WHERE binary_id = ?",
+            f"SELECT address, name, pseudocode, size_bytes, {ranges_sel} "  # noqa: S608
+            "FROM functions WHERE binary_id = ?",
             (bin_row.id,),
         ).fetchall()
+        bcols = {r[1] for r in con.execute("PRAGMA table_info(binaries)")}
+        sel = [
+            c if c in bcols else f"NULL AS {c}"
+            for c in ("stub_names", "promote_residual_ranges", "promote_residual_ranges_truncated")
+        ]
+        brow = con.execute(
+            f"SELECT {', '.join(sel)} FROM binaries WHERE id = ?",  # noqa: S608 -- literal
+            (bin_row.id,),
+        ).fetchone()
     finally:
         con.close()
     funcs: dict[str, tuple[str | None, str]] = {}
+    spans: dict[str, tuple[tuple[int, int], ...]] = {}
+    sizes: dict[str, int | None] = {}
     for r in rows:
         addr = norm_hex(r["address"])
         if addr is None:
             continue
         funcs[addr] = (r["name"], _decompile_status(r["pseudocode"], r["size_bytes"]))
-    return BaselineDomain(functions=funcs)
+        size = r["size_bytes"] if isinstance(r["size_bytes"], int) else None
+        sizes[addr] = size
+        spans[addr] = _body_spans(addr, size, r["body_ranges"])
+    stubs: dict[str, str] | None = None
+    residual: tuple[tuple[int, int], ...] | None = None
+    if brow is not None:
+        stubs = _stub_table(brow["stub_names"])
+        if brow["promote_residual_ranges_truncated"] == 0:
+            residual = _hex_ranges(brow["promote_residual_ranges"])
+    return BaselineDomain(
+        functions=funcs, spans=spans, sizes=sizes, stubs=stubs, residual_ranges=residual
+    )
+
+
+def _hex_ranges(raw: Any) -> tuple[tuple[int, int], ...] | None:
+    """``[["0x<lo>","0x<hi>"], ...]`` (inclusive) as sorted int ranges; None when the value is not
+    that shape (NULL, unparseable, or any element malformed — a partly read list cannot show that
+    a range is absent)."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, list):
+        return None
+    out: list[tuple[int, int]] = []
+    for item in data:
+        if not (isinstance(item, list) and len(item) == 2):
+            return None
+        try:
+            lo, hi = (int(str(v), 16) for v in item)
+        except ValueError:
+            return None
+        if hi < lo:
+            return None
+        out.append((lo, hi))
+    return tuple(sorted(out))
+
+
+def _body_spans(addr: str, size: int | None, raw: Any) -> tuple[tuple[int, int], ...]:
+    """One function's body as inclusive ranges: its recorded body_ranges, else entry .. entry +
+    size - 1, else nothing."""
+    ranges = _hex_ranges(raw)
+    if ranges:
+        return ranges
+    if size:
+        lo = int(addr, 16)
+        return ((lo, lo + size - 1),)
+    return ()
+
+
+def _stub_table(raw: Any) -> dict[str, str] | None:
+    """binaries.stub_names as {normalized entry addr: import name}, or None when it is not a JSON
+    object (NULL = not determined; never read as "no stubs"). ``'{}'`` is a determined empty
+    table."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    out: dict[str, str] = {}
+    for k, v in data.items():
+        addr = norm_hex(str(k))
+        if addr is not None and isinstance(v, str) and v:
+            out[addr] = v
+    return out
 
 
 def _presence_state(status: str, export_gap: str | None = None) -> str:
@@ -379,6 +479,220 @@ class SidePresence:
     out_of_inventory_addrs: frozenset[str] = frozenset()
 
 
+# ── the counterpart probe (what the other side holds where an unmatched function maps) ─────────
+#
+# A presence row says only "not in a matched pair". Whether the other side has no such function is
+# a separate question the pairing cannot answer: the function may have been missed by the pairing,
+# or the other side's code there may never have been made a function. The probe maps the
+# function's entry to the other side through the nearest pair at or below it (the shift of that
+# pair) and reads what is at the mapped address:
+#   unpaired       — a function that is itself in no pair there (a pairing the diff tool missed)
+#   occupied       — a paired function (or an import stub) there: the spot is taken, which is what
+#                    a deletion looks like once the following code moves up
+#   uncovered      — no function there, and the other side's leftover code (the instructions its
+#                    extraction left outside every function) is known and does not reach it
+#   residual_code  — no function there, but leftover code does
+#   coverage_unknown — no function there, and the other side's leftover code is not known
+#   unmappable     — no pair at or below the function to map it by
+PROBE_UNPAIRED = "unpaired"
+PROBE_OCCUPIED = "occupied"
+PROBE_UNCOVERED = "uncovered"
+PROBE_RESIDUAL = "residual_code"
+PROBE_COVERAGE_UNKNOWN = "coverage_unknown"
+PROBE_UNMAPPABLE = "unmappable"
+
+# A function whose counterpart may exist but is in no pair: existence is NOT determined, never
+# read as an add/delete (every reader treats it like ``unmatched_analysis_incomplete``).
+COUNTERPART_SUSPECTED = "counterpart_suspected"
+
+# probe -> (presence_state, presence_reason) for a row that would otherwise be
+# ``unmatched_analysis_complete``; a probe absent here leaves the row complete.
+_PROBE_STATE: dict[str, tuple[str, str]] = {
+    PROBE_UNPAIRED: (COUNTERPART_SUSPECTED, "counterpart_unpaired_at_mapped_address"),
+    PROBE_RESIDUAL: ("unmatched_analysis_incomplete", "other_side_code_outside_functions"),
+    PROBE_COVERAGE_UNKNOWN: ("unmatched_analysis_incomplete", "other_side_coverage_unknown"),
+    PROBE_UNMAPPABLE: ("unmatched_analysis_incomplete", "counterpart_unmappable"),
+}
+
+
+@dataclass(frozen=True)
+class CounterpartProbe:
+    """What the other side holds where one unmatched function maps (see the section note)."""
+
+    probe: str
+    addr: str | None = None  # the other side's function covering the mapped address
+    overlap: tuple[tuple[int, int], ...] = ()  # the leftover-code ranges the mapped span meets
+
+
+def _probed_state(state: str, probe: CounterpartProbe | None) -> tuple[str, str | None]:
+    """(presence_state, presence_reason): the probe moves only a row the decompile/export rules
+    made ``unmatched_analysis_complete``."""
+    if state != "unmatched_analysis_complete" or probe is None:
+        return state, None
+    moved = _PROBE_STATE.get(probe.probe)
+    return moved if moved is not None else (state, None)
+
+
+class _Coverage:
+    """The other side's functions as an address index: which function covers an address."""
+
+    def __init__(self, baseline: BaselineDomain) -> None:
+        self.entries = {int(a, 16): a for a in baseline.functions}
+        spans = sorted((lo, hi, addr) for addr, rs in baseline.spans.items() for lo, hi in rs)
+        self.los = [lo for lo, _hi, _a in spans]
+        self.spans = spans
+        # running maximum of hi, so the backwards walk below stops once nothing earlier can reach y
+        self.max_hi: list[int] = []
+        top = -1
+        for _lo, hi, _a in spans:
+            top = max(top, hi)
+            self.max_hi.append(top)
+
+    def owner(self, y: int) -> str | None:
+        if y in self.entries:
+            return self.entries[y]
+        i = bisect_right(self.los, y) - 1
+        while i >= 0 and self.max_hi[i] >= y:
+            lo, hi, addr = self.spans[i]
+            if lo <= y <= hi:
+                return addr
+            i -= 1
+        return None
+
+
+def _overlap(ranges: tuple[tuple[int, int], ...], lo: int, hi: int) -> tuple[tuple[int, int], ...]:
+    return tuple((a, b) for a, b in ranges if a <= hi and b >= lo)
+
+
+def probe_counterparts(
+    unmatched: frozenset[str],
+    own: BaselineDomain,
+    other: BaselineDomain,
+    pairs: list[tuple[str, str]],
+    occupied: frozenset[str],
+) -> dict[str, CounterpartProbe]:
+    """The counterpart probe of each ``unmatched`` function on one side.
+
+    ``pairs``: every pair the diff keeps, as (this side's addr, the other side's addr), in either
+    alignment state — the anchors. ``occupied``: the other side's addresses a found function is
+    "taken" by (its paired functions, and its import stubs when the diff accounts them by name);
+    any other function found there is itself in no pair. The mapped span is the function's entry
+    shifted by its anchor pair, ``size_bytes`` long (one byte when its size is unrecorded)."""
+    anchors = sorted((int(x, 16), int(y, 16)) for x, y in pairs)
+    keys = [x for x, _y in anchors]
+    cov = _Coverage(other)
+    out: dict[str, CounterpartProbe] = {}
+    for addr in unmatched:
+        x = int(addr, 16)
+        i = bisect_right(keys, x) - 1
+        if i < 0:
+            out[addr] = CounterpartProbe(PROBE_UNMAPPABLE)
+            continue
+        y = anchors[i][1] + (x - anchors[i][0])
+        found = cov.owner(y)
+        if found is not None:
+            kind = PROBE_OCCUPIED if found in occupied else PROBE_UNPAIRED
+            out[addr] = CounterpartProbe(kind, addr=found)
+            continue
+        if other.residual_ranges is None:
+            out[addr] = CounterpartProbe(PROBE_COVERAGE_UNKNOWN)
+            continue
+        size = own.sizes.get(addr) or 1
+        hit = _overlap(other.residual_ranges, y, y + size - 1)
+        out[addr] = (
+            CounterpartProbe(PROBE_RESIDUAL, overlap=hit)
+            if hit
+            else CounterpartProbe(PROBE_UNCOVERED)
+        )
+    return out
+
+
+# ── import stubs (accounted by import name, outside the pairing) ─────────────────────────────
+
+
+@dataclass(frozen=True)
+class StubLedger:
+    """The import stubs of the two sides, accounted by the import each one calls.
+
+    A lazy-binding stub is a few instructions per import, laid out as a table; the diff tool pairs
+    them by shape, and an export can rarely hold them as they are (on MIPS the next entry is the
+    previous one's delay slot). Their identity is the import name read from the ELF structure, so
+    they are paired by that name instead and kept out of the function pairs and the presence rows.
+    Only when both sides' stub tables are determined: otherwise nothing is taken out (``enabled``
+    False) and the stubs go through the pairing as before."""
+
+    enabled: bool
+    table_a: str  # resolved | unknown
+    table_b: str
+    pairs: int | None = None
+    a_only: tuple[str, ...] | None = None
+    b_only: tuple[str, ...] | None = None
+    # pairs the diff tool made between a stub and a function that is not one: (addr_a, addr_b)
+    mismatch: tuple[tuple[str, str], ...] = ()
+    stubs_a: frozenset[str] = frozenset()
+    stubs_b: frozenset[str] = frozenset()
+
+
+def stub_ledger(stubs_a: dict[str, str] | None, stubs_b: dict[str, str] | None) -> StubLedger:
+    """The stub accounting of a diff from the two sides' stub tables (pairs not split yet)."""
+    table_a = "resolved" if stubs_a is not None else "unknown"
+    table_b = "resolved" if stubs_b is not None else "unknown"
+    if stubs_a is None or stubs_b is None:
+        return StubLedger(enabled=False, table_a=table_a, table_b=table_b)
+    names_a, names_b = set(stubs_a.values()), set(stubs_b.values())
+    return StubLedger(
+        enabled=True,
+        table_a=table_a,
+        table_b=table_b,
+        pairs=len(names_a & names_b),
+        a_only=tuple(sorted(names_a - names_b)),
+        b_only=tuple(sorted(names_b - names_a)),
+        stubs_a=frozenset(stubs_a),
+        stubs_b=frozenset(stubs_b),
+    )
+
+
+def split_stub_pairs(
+    parsed: AlignmentParse, ledger: StubLedger
+) -> tuple[AlignmentParse, StubLedger]:
+    """The parse without the pairs touching an import stub, and the ledger with the pairs that
+    joined a stub to a function that is not one (kept as facts; that function is then unmatched).
+    Unchanged when the ledger is not enabled."""
+    if not ledger.enabled:
+        return parsed, ledger
+    kept: list[FunctionAlignmentRow] = []
+    mismatch: list[tuple[str, str]] = []
+    for r in parsed.rows:
+        on_a, on_b = r.addr_a in ledger.stubs_a, r.addr_b in ledger.stubs_b
+        if not on_a and not on_b:
+            kept.append(r)
+        elif on_a != on_b:
+            mismatch.append((r.addr_a, r.addr_b))
+    return (
+        AlignmentParse(
+            rows=kept,
+            matched_addrs_a=frozenset(r.addr_a for r in kept),
+            matched_addrs_b=frozenset(r.addr_b for r in kept),
+        ),
+        replace(ledger, mismatch=tuple(sorted(mismatch))),
+    )
+
+
+def _gap_split(
+    report: ExportReport | None, ledger: StubLedger, side: str
+) -> tuple[int | None, int | None]:
+    """(gaps on import stubs, gaps on the rest) of one side's export report. Without a report both
+    are None; without an enabled ledger the stubs are not told apart: (None, every gap)."""
+    if report is None:
+        return None, None
+    gaps = report.gaps()
+    if not ledger.enabled:
+        return None, len(gaps)
+    stubs = ledger.stubs_a if side == "a" else ledger.stubs_b
+    on_stubs = sum(1 for a in gaps if a in stubs)
+    return on_stubs, len(gaps) - on_stubs
+
+
 # decompile status -> the presence row's honest ``decompiled`` flag (1 / 0 / NULL-unknown).
 _DECOMPILED_FLAG: dict[str, int | None] = {
     "ok": 1,
@@ -395,34 +709,54 @@ def compute_side_presence(
     baseline: BaselineDomain,
     gaps: dict[str, str] | None = None,
     markup: frozenset[str] = frozenset(),
+    probes: dict[str, CounterpartProbe] | None = None,
+    stubs: frozenset[str] = frozenset(),
 ) -> SidePresence:
     """Per-side presence: baseline functions with no matched pair become explicit, countable rows;
     matched addrs NOT in the baseline are out_of_inventory (counted, never a presence row, never an
     add/delete). A presence row states ONLY 'not in a matched pair', never 'added'/'removed'.
+
+    ``stubs``: this side's import-stub entries when the diff accounts them by import name
+    (``stub_ledger``) — outside the domain here, so a stub is never a presence row. ``probes``:
+    what the other side holds where each unmatched function maps (``probe_counterparts``). Every
+    row carries its probe as facts; it changes the state only of a row that would otherwise be
+    ``unmatched_analysis_complete`` (``_probed_state``) — a gap row stays what its gap makes it.
 
     ★ HONEST COVERAGE NOTE: the presence / baseline layer has NO real-firmware CI coverage. Every
     presence test uses a synthetic analysis.db; the A-side reference numbers (1111 / 737 / 34) rest
     on two one-off manual verifications with no live assertion, and the B-side (where the 'new
     function' signal would live) has never been run on real data because no patched run is ingested.
     The double-machine reproducibility that IS proven covers the .BinDiff EXPORT, not this layer."""
-    unmatched_addrs = baseline.addrs - matched_addrs
+    domain = baseline.addrs - stubs
+    unmatched_addrs = domain - matched_addrs
     out_of_inventory_addrs = matched_addrs - baseline.addrs
-    matched_in_domain = len(matched_addrs & baseline.addrs)
+    matched_in_domain = len(matched_addrs & domain)
     rows: list[FunctionPresenceRow] = []
     gaps = gaps or {}
+    probes = probes or {}
     for addr in sorted(unmatched_addrs):
         name, status = baseline.functions[addr]
         gap = gaps.get(addr)
+        probe = probes.get(addr)
+        state, reason = _probed_state(_presence_state(status, gap), probe)
         rows.append(
             FunctionPresenceRow(
                 diff_id=diff_id,
                 side=side,
                 addr=addr,
                 name=name,
-                presence_state=_presence_state(status, gap),
+                presence_state=state,
                 decompiled=_DECOMPILED_FLAG[status],
                 export_gap=gap,
                 operand_markup_incomplete=1 if addr in markup else 0,
+                counterpart_probe=probe.probe if probe is not None else None,
+                counterpart_addr=probe.addr if probe is not None else None,
+                presence_reason=reason,
+                counterpart_overlap=(
+                    json.dumps([[f"0x{lo:x}", f"0x{hi:x}"] for lo, hi in probe.overlap])
+                    if probe is not None and probe.overlap
+                    else None
+                ),
             )
         )
     # inventory_mismatch is a cross-side-domain state, not derived per-side here (different builds
@@ -645,8 +979,35 @@ def run_layer0_parse(
     parsed = parse_bindiff(bindiff_path, did, threshold, gaps_a, gaps_b, markup_a, markup_b)
     baseline_a = load_baseline(run_a.analysis_db_path, bin_a)
     baseline_b = load_baseline(run_b.analysis_db_path, bin_b)
-    pres_a = compute_side_presence(did, "a", parsed.matched_addrs_a, baseline_a, gaps_a, markup_a)
-    pres_b = compute_side_presence(did, "b", parsed.matched_addrs_b, baseline_b, gaps_b, markup_b)
+    # Import stubs are accounted by import name and taken out of the pairs and the presence rows
+    # (W4); then every function left unmatched is probed for what the other side holds where it
+    # maps (W3), with the pairs that remain as the anchors.
+    parsed, ledger = split_stub_pairs(parsed, stub_ledger(baseline_a.stubs, baseline_b.stubs))
+    pairs_ab = [(r.addr_a, r.addr_b) for r in parsed.rows]
+    excl_a = ledger.stubs_a if ledger.enabled else frozenset()
+    excl_b = ledger.stubs_b if ledger.enabled else frozenset()
+    probes_a = probe_counterparts(
+        baseline_a.addrs - excl_a - parsed.matched_addrs_a,
+        baseline_a,
+        baseline_b,
+        pairs_ab,
+        parsed.matched_addrs_b | excl_b,
+    )
+    probes_b = probe_counterparts(
+        baseline_b.addrs - excl_b - parsed.matched_addrs_b,
+        baseline_b,
+        baseline_a,
+        [(y, x) for x, y in pairs_ab],
+        parsed.matched_addrs_a | excl_a,
+    )
+    pres_a = compute_side_presence(
+        did, "a", parsed.matched_addrs_a, baseline_a, gaps_a, markup_a, probes_a, excl_a
+    )
+    pres_b = compute_side_presence(
+        did, "b", parsed.matched_addrs_b, baseline_b, gaps_b, markup_b, probes_b, excl_b
+    )
+    stub_gaps_a, code_gaps_a = _gap_split(report_a, ledger, "a")
+    stub_gaps_b, code_gaps_b = _gap_split(report_b, ledger, "b")
 
     # sha256 of the diffed content on each side, recorded so the next full diff can skip an
     # unchanged binary (incremental) and reset the attempts counter when the content changed. Read
@@ -731,6 +1092,18 @@ def run_layer0_parse(
         toolchain_ghidra=tools["toolchain_ghidra"],
         toolchain_binexport=tools["toolchain_binexport"],
         toolchain_bindiff=tools["toolchain_bindiff"],
+        stub_table_a=ledger.table_a,
+        stub_table_b=ledger.table_b,
+        stub_pairs=ledger.pairs,
+        stub_a_only=json.dumps(list(ledger.a_only)) if ledger.a_only is not None else None,
+        stub_b_only=json.dumps(list(ledger.b_only)) if ledger.b_only is not None else None,
+        stub_pair_mismatch=(
+            json.dumps([list(m) for m in ledger.mismatch]) if ledger.enabled else None
+        ),
+        export_gaps_on_stubs_a=stub_gaps_a,
+        export_gaps_on_stubs_b=stub_gaps_b,
+        export_gaps_on_code_a=code_gaps_a,
+        export_gaps_on_code_b=code_gaps_b,
     )
 
     delete_diff(atlas, did, commit=False)

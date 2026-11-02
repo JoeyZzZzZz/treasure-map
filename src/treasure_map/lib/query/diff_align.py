@@ -570,7 +570,8 @@ def align_by_function(
             ),
         }
     presence = atlas.execute(
-        f"SELECT addr, name, presence_state, export_gap FROM function_presence "  # noqa: S608
+        "SELECT addr, name, presence_state, export_gap, counterpart_probe, counterpart_addr, "
+        f"presence_reason FROM function_presence "  # noqa: S608
         f"WHERE diff_id = ? AND side = ? AND (name = ?{presence_by_addr}) "
         "ORDER BY addr",
         (diff_id, side, function, *cands),
@@ -584,7 +585,8 @@ def align_by_function(
         "found": False,
         **head,
         # each unmatched function of this name or address; export_gap is non-null when it is
-        # unmatched because its export did not hold it as it is
+        # unmatched because its export did not hold it as it is; counterpart_probe says what the
+        # other side holds where it maps (lib/diff/layer0.probe_counterparts)
         "presence": [dict(p) for p in presence],
         **diff_source_staleness(atlas, diff_id),
         "note": miss + _NOT_PROOF + _ALIGN_NOTE,
@@ -833,16 +835,51 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
         "functions": functions,
         "banners": banners,
         "binary_presence": binary_presence_counts(atlas, *runs) if runs is not None else None,
+        "import_stubs": _import_stubs(atlas, diff_id),
         # D25: how many string literals sit on one side only (list: get_diff_string_delta), with
-        # each side's truncation state so a capped / unknown side is not read as complete.
+        # each side's truncation state so a capped / unknown side is not read as complete, and
+        # ``unconfirmed`` when either side's state makes the two counts unconfirmable.
         "string_delta": {
             "a_only_count": sd["a_only_count"],
             "b_only_count": sd["b_only_count"],
             "strings_truncated": sd["strings_truncated"],
             "read_error": sd["read_error"],
+            "unconfirmed": sd["unconfirmed"],
+            "unconfirmed_by": sd["unconfirmed_by"],
         },
         **diff_source_staleness(atlas, diff_id),
         "note": _META_NOTE,
+    }
+
+
+def _import_stubs(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] | None:
+    """The diff's import stubs, accounted by import name outside the pairs (lib/diff/layer0
+    ``StubLedger``): each side's stub table (resolved / unknown); with both resolved, the names
+    stubbed on both sides (``pairs``), on one side only, the pairs the diff tool had made between a
+    stub and a function that is not one (``pair_mismatch``), and each side's export gaps on stubs /
+    on the rest. ``pairs`` etc. null: not accounted (a table unknown — the stubs then went through
+    the pairing). None: a diff written before the accounting."""
+    row = atlas.execute(
+        "SELECT stub_table_a, stub_table_b, stub_pairs, stub_a_only, stub_b_only, "
+        "stub_pair_mismatch, export_gaps_on_stubs_a, export_gaps_on_stubs_b, "
+        "export_gaps_on_code_a, export_gaps_on_code_b FROM diff_meta WHERE diff_id = ?",
+        (diff_id,),
+    ).fetchone()
+    if row is None or (row[0] is None and row[1] is None):
+        return None
+
+    def names(raw: str | None) -> list[Any] | None:
+        return json.loads(raw) if raw is not None else None
+
+    return {
+        "table_a": row[0],
+        "table_b": row[1],
+        "pairs": row[2],
+        "a_only": names(row[3]),
+        "b_only": names(row[4]),
+        "pair_mismatch": names(row[5]),
+        "export_gaps_on_stubs": {"a": row[6], "b": row[7]},
+        "export_gaps_on_code": {"a": row[8], "b": row[9]},
     }
 
 
@@ -1348,6 +1385,17 @@ _PARTIAL_COLS = (
     "export_entry_addresses_added_a",
     "export_entry_addresses_added_b",
     "bindiff_vertex0_fallbacks",
+    "export_gaps_on_code_a",
+    "export_gaps_on_code_b",
+    "export_gaps_on_stubs_a",
+    "export_gaps_on_stubs_b",
+)
+
+# A side's export gaps outside the import stubs; a diff written before the split (on_code NULL)
+# counts every gap, as it did then.
+_CODE_GAPS = (
+    "COALESCE(export_gaps_on_code_{s}, COALESCE(export_flow_graphs_dropped_{s}, 0) "
+    "+ COALESCE(export_degenerate_functions_{s}, 0))"
 )
 
 
@@ -1360,12 +1408,12 @@ def _partial_blindspots(
     """The diffs that succeeded (diff_ok=1) but whose export could not hold some functions as they
     are (lib/diff/export_report): those functions, and every subject resting on them, read
     undetermined (degenerate_block_source). Each row carries the export counts and how many
-    presence / alignment rows of the diff are marked."""
+    presence / alignment rows of the diff are marked. Only gaps outside the import stubs list a
+    diff (``export_gaps_on_code_*``): the stubs are accounted by import name (get_diff_meta
+    ``import_stubs``), not by the pairing the gap would leave undetermined."""
     where = [
         "diff_ok = 1",
-        "(COALESCE(export_flow_graphs_dropped_a, 0) + COALESCE(export_flow_graphs_dropped_b, 0) "
-        "+ COALESCE(export_degenerate_functions_a, 0) "
-        "+ COALESCE(export_degenerate_functions_b, 0)) > 0",
+        f"({_CODE_GAPS.format(s='a')} + {_CODE_GAPS.format(s='b')}) > 0",
     ]
     params: list[Any] = []
     if run_a_id is not None:

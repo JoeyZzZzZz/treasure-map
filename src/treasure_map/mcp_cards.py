@@ -409,10 +409,11 @@ TOOL_CARDS: dict[str, ToolCard] = {
         ),
         summary=(
             "One diff's function-level view: an entry per function pair that changed, sorted into "
-            "buckets (A, B, R = undetermined pair, C, P = no counterpart, E = caller-set edge, S = "
-            "similarity-1 pair whose pseudocode differs), plus a blind_spots ledger — evidence, "
-            "never a verdict or a score. An entry nobody judged is UNREAD, which is not "
-            '"nothing found". sink_candidate_counts counts hunt candidates, not calls. '
+            "buckets (A, B, R = undetermined pair, C, P = in no matched pair, E = caller-set edge, "
+            "S = similarity-1 pair whose pseudocode differs), plus a blind_spots ledger — "
+            "evidence, never a verdict or a score. An entry nobody judged is UNREAD, which is not "
+            '"nothing found". sink_candidate_counts counts hunt candidates, not calls; '
+            "sink_callsite_counts counts calls (not deduplicated) and is never part of the order. "
             "Default order: "
             "significance; also sort_by, the bucket / subclass / tier / blind_spot filters and "
             "limit / offset (follow next_offset). rows_limit=0 scans every entry with its summary "
@@ -493,7 +494,9 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "delta is version_skew undetermined — do not read it as 'no change'. "
             "changed.no_scoped_signal is NOT 'noise'. diff_ok=0: the binary did not diff, and an "
             "empty get_diff_deltas for it is a BLIND SPOT, never 'no change'. Also banners, "
-            "source_stale and the run pair's non_binary counts."
+            "source_stale, the run pair's non_binary counts, string_delta (how many string "
+            "literals sit on one side only; the list is get_diff_string_delta) and import_stubs "
+            "(the import stubs, paired by import name outside the function pairs)."
         ),
     ),
     "get_diff_string_delta": ToolCard(
@@ -511,8 +514,10 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "are symmetric. A ref with ref_in_func null is a reference in no function, shown not "
             "dropped. refs_exported False means that side exported no string_refs at all — "
             "UNKNOWN, never 'no references'. strings_truncated is each side's state (clean / "
-            "truncated / unknown): a truncated or unknown side is NOT 'complete'. sides.a_only / "
-            "sides.b_only page by limit / offset; get_diff_meta carries the counts."
+            "truncated / unknown): a truncated or unknown side is NOT 'complete' (then "
+            "unconfirmed is true, unconfirmed_by names it). sides.a_only / sides.b_only page "
+            "together from one offset, cut to fit the response (follow either side's "
+            "next_offset); get_diff_meta carries the counts."
         ),
     ),
     "get_function_alignment": ToolCard(

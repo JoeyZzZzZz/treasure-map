@@ -85,6 +85,20 @@ CREATE TABLE IF NOT EXISTS binaries (
     -- script_hash, binexport, builder, pass_version, ghidra_version, budget_seconds, archive,
     -- report_archive, report summary). NULL with a NULL status.
     binexport_scan_meta TEXT,
+    -- What PromoteUndefined did in this binary's extraction session (analyze/ghidra/
+    -- PromoteUndefined.java): the functions it created, and the instructions still in no function
+    -- after it — their total and the three kinds (start: a code-block start no function was found
+    -- at; interior: inside such a block; unowned: in no block the block model gives), and those
+    -- instructions merged into contiguous ranges, JSON [["0x<lo>","0x<hi>"], ...] (inclusive, at
+    -- most 4096; truncated=1 when more). NULL = not recorded (extracted before this existed, or the
+    -- pass left no record) — never read as 0 / "nothing left outside a function".
+    promote_created INTEGER,
+    promote_residual_insns INTEGER,
+    promote_residual_start INTEGER,
+    promote_residual_interior INTEGER,
+    promote_residual_unowned INTEGER,
+    promote_residual_ranges TEXT,
+    promote_residual_ranges_truncated INTEGER,
     last_seen_at DATETIME,                 -- timestamp of most recent ingest scan
     analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -161,10 +175,15 @@ CREATE TABLE IF NOT EXISTS functions (
     -- nothing; this names the ones that crashed so a reader does not read a crash as a clean empty.
     detector_errors TEXT DEFAULT '[]',
     -- What this function's decompile came to: ok / timeout (still past the limit on the one
-    -- retry it gets) / error:<why> / skipped_micro (under 10 bytes, not decompiled). An empty
-    -- pseudocode alone cannot tell those apart. NULL = extracted before this was recorded.
+    -- retry it gets) / error / skipped_micro (under 10 bytes, not decompiled). An empty
+    -- pseudocode alone cannot tell those apart. NULL = extracted before this was recorded. A
+    -- database extracted before decompile_error existed holds error:<why> here instead of error.
     decompile_status TEXT,
     decompile_retried INTEGER DEFAULT 0,   -- 1 = it timed out once and was retried
+    decompile_error TEXT,                  -- the message of an error status; NULL otherwise
+    -- Which pass made this function: promoted (created by PromoteUndefined) / analysis (by
+    -- Ghidra's own analysis). A fact only — nothing ranks or judges by it. NULL = not recorded.
+    origin TEXT,
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 

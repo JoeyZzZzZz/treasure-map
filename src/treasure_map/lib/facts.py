@@ -230,6 +230,32 @@ def list_partially_incomplete_binaries(conn: sqlite3.Connection) -> list[dict[st
     ]
 
 
+def promote_residual_counts(conn: sqlite3.Connection) -> dict[str, int | None]:
+    """How many of the current scan's extracted binaries PromoteUndefined left instructions
+    outside any function in (binaries.promote_residual_insns > 0: ``promote_residual_binaries``),
+    and how many of those hold instructions in no code block at all (promote_residual_unowned > 0:
+    ``promote_unowned_binaries``, the sign of a block model that skipped part of the binary).
+
+    ★ Both None — not 0 — when any extracted binary (ghidra_ok = 1) carries no record (NULL, e.g.
+    extracted before the record existed) or the analysis.db has no such columns: an unrecorded
+    binary may hold residue, so a count over the recorded ones alone would read as a complete
+    count. A binary whose extraction did not succeed has nothing to record and is not counted."""
+    try:
+        row = conn.execute(
+            "SELECT SUM(CASE WHEN promote_residual_insns IS NULL "
+            "             OR promote_residual_unowned IS NULL THEN 1 ELSE 0 END), "
+            "       SUM(CASE WHEN promote_residual_insns > 0 THEN 1 ELSE 0 END), "
+            "       SUM(CASE WHEN promote_residual_unowned > 0 THEN 1 ELSE 0 END) "
+            "FROM current_binaries WHERE ghidra_ok = 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {"promote_residual_binaries": None, "promote_unowned_binaries": None}
+    unrecorded, residual, unowned = (int(v or 0) for v in row)
+    if unrecorded:
+        return {"promote_residual_binaries": None, "promote_unowned_binaries": None}
+    return {"promote_residual_binaries": residual, "promote_unowned_binaries": unowned}
+
+
 def analysis_run_counts(conn: sqlite3.Connection) -> dict[str, Any]:
     """Scan-lineage facts from an analysis.db: binary/function counts + the extraction build hash.
 
@@ -238,7 +264,8 @@ def analysis_run_counts(conn: sqlite3.Connection) -> dict[str, Any]:
     binaries (the extraction-pass content hash): one value = a uniform build; ``mixed:<n>`` = the
     scan spans more than one pass version; None when unknown. ``ghidra_version`` is the decompiler
     version behind the scan (see ``_run_ghidra_version``) and is ALWAYS a string, never None.
-    ``functions_empty`` reuses the partial-decompile red-line count. Every other field degrades to
+    ``functions_empty`` reuses the partial-decompile red-line count; ``promote_residual_binaries`` /
+    ``promote_unowned_binaries`` are ``promote_residual_counts``. Every other field degrades to
     None/0 on an older analysis.db that lacks a column (the lineage is best-effort, never a hard
     failure of the scan)."""
     try:
@@ -253,6 +280,8 @@ def analysis_run_counts(conn: sqlite3.Connection) -> dict[str, Any]:
             "functions_empty": None,
             "build_hash": None,
             "ghidra_version": UNKNOWN_VERSION,
+            "promote_residual_binaries": None,
+            "promote_unowned_binaries": None,
         }
     functions_empty = sum(b["functions_empty"] for b in list_partially_incomplete_binaries(conn))
     build_hash: str | None
@@ -278,6 +307,7 @@ def analysis_run_counts(conn: sqlite3.Connection) -> dict[str, Any]:
         "functions_empty": functions_empty,
         "build_hash": build_hash,
         "ghidra_version": _run_ghidra_version(conn),
+        **promote_residual_counts(conn),
     }
 
 

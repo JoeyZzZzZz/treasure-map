@@ -1,9 +1,10 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""D29: what each function's decompile came to is a recorded fact (ok / timeout / error:<why> /
-skipped_micro), stored by the ingest, and read by the diff view: a side whose decompile did not
-complete reads its sink candidate counts as unknown — its candidates, which the hunt reads from the
-pseudocode, are missing, not 0 — and the entry names that side.
+"""D29: what each function's decompile came to is a recorded fact (ok / timeout / error /
+skipped_micro, an error's message beside it in decompile_error), stored by the ingest, and read by
+the diff view: a side whose decompile did not complete reads its sink candidate counts as unknown —
+its candidates, which the hunt reads from the pseudocode, are missing, not 0 — and the entry names
+that side.
 
 Zero real data: a hand-written extractor output for the ingest, and test_patch_view's world.
 """
@@ -26,10 +27,15 @@ from treasure_map.lib.storage.connection import open_db
 
 
 def test_each_functions_decompile_outcome_is_stored(tmp_path: Path) -> None:
-    """★ ok / timeout (retried) / error:<why> / skipped_micro are stored as written; anything else
-    (an export predating the field, a value of another form) is NULL — not recorded, never guessed.
+    """★ ok / timeout (retried) / error / skipped_micro are stored as written, and an error's
+    message goes to decompile_error — the status stays one of four values a reader can group by.
+    An export written before the split (``error:<why>`` in the status) is read as error + <why>.
+    Anything else (an export predating the field, a value of another form) is NULL — not
+    recorded, never guessed.
 
-    MUTATION (verified RED): store the raw value whatever it is -> 'bogus' is stored -> RED."""
+    MUTATION (verified RED): store the raw value whatever it is -> 'bogus' is stored -> RED; keep
+    the old form's message in the status -> 'error:payload too large' is stored -> RED; drop the
+    decompile_error column from the INSERT -> RED."""
     out = tmp_path / "out"
     out.mkdir()
     rec = ElfRecord(path=tmp_path / "x", name="x", arch="a", elf_type="executable", sha256="a" * 64)
@@ -46,7 +52,8 @@ def test_each_functions_decompile_outcome_is_stored(tmp_path: Path) -> None:
             [
                 ("f_ok", "ok", False),
                 ("f_to", "timeout", True),
-                ("f_err", "error:payload too large", False),
+                ("f_err", "error", False),
+                ("f_legacy", "error:payload too large", False),
                 ("f_micro", "skipped_micro", False),
                 ("f_bogus", "bogus", False),
                 ("f_old", None, None),
@@ -54,6 +61,7 @@ def test_each_functions_decompile_outcome_is_stored(tmp_path: Path) -> None:
             start=1,
         )
     ]
+    funcs[2]["decompile_error"] = "Exception while decompiling 00401000: boom"
     (out / f"x_{rec.sha256[:8]}_ghidra.json").write_text(
         json.dumps({"functions": funcs, "imports": [], "exports": [], "strings": []})
     )
@@ -61,17 +69,20 @@ def test_each_functions_decompile_outcome_is_stored(tmp_path: Path) -> None:
     conn.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'x', ?)", (rec.sha256,))
     ingest_ghidra_output(conn, out, [rec], {rec.sha256: 1})
     got = {
-        r["name"]: (r["decompile_status"], r["decompile_retried"])
-        for r in conn.execute("SELECT name, decompile_status, decompile_retried FROM functions")
+        r["name"]: (r["decompile_status"], r["decompile_error"], r["decompile_retried"])
+        for r in conn.execute(
+            "SELECT name, decompile_status, decompile_error, decompile_retried FROM functions"
+        )
     }
     conn.close()
     assert got == {
-        "f_ok": ("ok", 0),
-        "f_to": ("timeout", 1),
-        "f_err": ("error:payload too large", 0),
-        "f_micro": ("skipped_micro", 0),
-        "f_bogus": (None, 0),
-        "f_old": (None, 0),
+        "f_ok": ("ok", None, 0),
+        "f_to": ("timeout", None, 1),
+        "f_err": ("error", "Exception while decompiling 00401000: boom", 0),
+        "f_legacy": ("error", "payload too large", 0),
+        "f_micro": ("skipped_micro", None, 0),
+        "f_bogus": (None, None, 0),
+        "f_old": (None, None, 0),
     }
 
 
@@ -98,7 +109,12 @@ def _timed_out_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: st
 
 @pytest.mark.parametrize(
     ("status", "reason"),
-    [("timeout", "decompile_timeout"), ("error:payload too large", "decompile_error")],
+    [
+        ("timeout", "decompile_timeout"),
+        ("error", "decompile_error"),
+        # an analysis.db extracted before the message moved to decompile_error
+        ("error:payload too large", "decompile_error"),
+    ],
 )
 def test_a_side_whose_decompile_did_not_complete_counts_unknown_never_zero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, reason: str
@@ -108,7 +124,8 @@ def test_a_side_whose_decompile_did_not_complete_counts_unknown_never_zero(
     side (a fact and a blind spot).
 
     MUTATION (verified RED): leave the decompile outcome out of the counts -> a 4 -> 0 delta ->
-    RED; drop the entry fact -> RED."""
+    RED; drop the entry fact -> RED; read only the old ``error:<why>`` form as an error -> the
+    ``error`` case floats 4 -> 0 -> RED."""
     w = _timed_out_world(tmp_path, monkeypatch, status)
     e = _view(w, sort_by="significance")["by_id"][_pair_id("00001000", "00002000")]
     counts = e["sink_candidate_counts"]

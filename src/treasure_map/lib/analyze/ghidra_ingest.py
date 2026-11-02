@@ -223,18 +223,109 @@ def drop_extraction(conn: sqlite3.Connection, sha256: str) -> None:
         return
     _delete_extraction_rows(conn, int(row[0]))
     conn.execute(
-        "UPDATE binaries SET pass_version = NULL, ghidra_version = NULL WHERE id = ?", (row[0],)
+        "UPDATE binaries SET pass_version = NULL, ghidra_version = NULL, "  # noqa: S608
+        + ", ".join(f"{c} = NULL" for c in PROMOTE_COLUMNS)
+        + " WHERE id = ?",
+        (row[0],),
     )
 
 
-def _decompile_status(value: Any) -> str | None:
-    """A function's recorded decompile outcome, or None when the export carries none (or carries
-    something that is not one of its forms: ok / timeout / skipped_micro / error:<why>)."""
+# The four values functions.decompile_status takes. WHY an error happened is decompile_error, so
+# the status stays a closed set a reader can group by (the message names the function's address).
+DECOMPILE_STATUSES: tuple[str, ...] = ("ok", "timeout", "skipped_micro", "error")
+
+
+def _decompile_outcome(value: Any, message: Any) -> tuple[str | None, str | None]:
+    """A function's recorded decompile outcome as (status, error message).
+
+    The status is one of DECOMPILE_STATUSES, or None when the export carries none (or something
+    of no known form) — not recorded, never guessed. The message is kept only for an error.
+    ★ An export written before the two were split carried ``error:<why>`` in the status; it is
+    read as status ``error`` with ``<why>`` as the message, so one database never holds both
+    forms."""
     if not isinstance(value, str):
+        return None, None
+    if value == "error":
+        return "error", message if isinstance(message, str) and message else None
+    if value.startswith("error:"):
+        return "error", value[len("error:") :] or None
+    if value in DECOMPILE_STATUSES:
+        return value, None
+    return None, None
+
+
+# functions.origin: which pass made the function. Anything else (an export from a session whose
+# PromoteUndefined left no record, or an older export) is NULL — not recorded, never "analysis".
+_ORIGINS = ("promoted", "analysis")
+
+
+def _origin(value: Any) -> str | None:
+    return value if isinstance(value, str) and value in _ORIGINS else None
+
+
+# The binaries.promote_* columns, in the order _promote_columns returns them.
+PROMOTE_COLUMNS: tuple[str, ...] = (
+    "promote_created",
+    "promote_residual_insns",
+    "promote_residual_start",
+    "promote_residual_interior",
+    "promote_residual_unowned",
+    "promote_residual_ranges",
+    "promote_residual_ranges_truncated",
+)
+
+
+def _count(value: Any) -> int | None:
+    """A non-negative integer count, or None (a bool is not a count)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
-    if value in ("ok", "timeout", "skipped_micro") or value.startswith("error:"):
-        return value
-    return None
+    return int(value)
+
+
+def _promote_columns(promote: Any) -> tuple[Any, ...]:
+    """The binaries.promote_* values (PROMOTE_COLUMNS order) from the export's ``promote`` object.
+
+    ★ All NULL when the export carries no such object, or one that does not hold together (a count
+    missing or negative, the residual kinds not summing to residual_insns, a range that is not a
+    pair of hex strings): NULL is "not recorded", which a reader must keep apart from 0 — "no
+    instruction was left outside a function" is a claim only a complete record makes."""
+    none: tuple[Any, ...] = (None,) * len(PROMOTE_COLUMNS)
+    if not isinstance(promote, dict):
+        return none
+    created = _count(promote.get("created"))
+    insns = _count(promote.get("residual_insns"))
+    start = _count(promote.get("residual_start"))
+    interior = _count(promote.get("residual_interior"))
+    unowned = _count(promote.get("residual_unowned"))
+    ranges = promote.get("residual_ranges")
+    truncated = promote.get("residual_ranges_truncated")
+    if (
+        created is None
+        or insns is None
+        or start is None
+        or interior is None
+        or unowned is None
+        or insns != start + interior + unowned
+        or not isinstance(truncated, bool)
+        or not isinstance(ranges, list)
+    ):
+        return none
+    for r in ranges:
+        if not (
+            isinstance(r, list)
+            and len(r) == 2
+            and all(isinstance(x, str) and x.startswith("0x") for x in r)
+        ):
+            return none
+    return (
+        created,
+        insns,
+        start,
+        interior,
+        unowned,
+        json.dumps(ranges, separators=(",", ":")),
+        1 if truncated else 0,
+    )
 
 
 def _exported_flag(func_name: Any, exports: frozenset[str] | None) -> int:
@@ -322,6 +413,9 @@ def _ingest_one_binary(
         else:
             callees_json = json.dumps(raw_callees, ensure_ascii=False)
             unresolved_json = "[]"
+        status, error = _decompile_outcome(
+            func.get("decompile_status"), func.get("decompile_error")
+        )
         func_rows.append(
             (
                 binary_id,
@@ -365,10 +459,14 @@ def _ingest_one_binary(
                 # which additive detectors threw on this function: a crash is named
                 # here, never read as a clean empty by the layer that consumes the detector.
                 json.dumps(func.get("detector_errors", []), ensure_ascii=False),
-                # what the decompile came to (ok / timeout / error:<why> / skipped_micro) and
-                # whether it was retried; an export predating them leaves NULL / 0 (not recorded).
-                _decompile_status(func.get("decompile_status")),
+                # what the decompile came to (ok / timeout / error / skipped_micro), an error's
+                # message, and whether it was retried; an export predating them leaves NULL / 0
+                # (not recorded).
+                status,
+                error,
                 1 if func.get("decompile_retried") is True else 0,
+                # which pass made the function (promoted / analysis); NULL = not recorded.
+                _origin(func.get("origin")),
             )
         )
     if func_rows:
@@ -379,8 +477,8 @@ def _ingest_one_binary(
                 sink_provenance, nvram_ops, nvram_wrapper, wrapper_call_args,
                 string_keyed_edges, address_taken, unresolved_external_calls,
                 call_tokens, body_ranges, detector_errors, decompile_status,
-                decompile_retried)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                decompile_error, decompile_retried, origin)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             func_rows,
         )
         stats.functions_ingested += len(func_rows)
@@ -446,6 +544,17 @@ def _ingest_one_binary(
         else None
     )
     conn.execute("UPDATE binaries SET stub_names = ? WHERE id = ?", (stub_names_json, binary_id))
+
+    # What PromoteUndefined did in this extraction's session: the functions it created and the
+    # instructions still in no function afterwards, by kind and as address ranges (see
+    # _promote_columns). Written on every ingest, so a re-extraction whose export carries no record
+    # clears the earlier one to NULL instead of leaving another session's numbers in place.
+    conn.execute(
+        "UPDATE binaries SET "  # noqa: S608 -- literal column list
+        + ", ".join(f"{c} = ?" for c in PROMOTE_COLUMNS)
+        + " WHERE id = ?",
+        (*_promote_columns(data.get("promote")), binary_id),
+    )
 
     # naming-bridge phase 1: the router_defaults web-settable-key table. Only a binary where the
     # symbol was LOCATED contributes rows (a resolved member -> key=name; a member whose name ptr

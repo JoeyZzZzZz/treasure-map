@@ -1,9 +1,9 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""D25: string_delta — the string literals a binary gained / lost between two runs, taken as the
-set difference of each side's ``strings`` values, with each value's resolved reference anchors read
-from the per-run ``string_refs`` table (NOT get_functions_referencing_string's substring match, and
-NOT string_edges' strcmp_gate counts).
+"""D25: string_delta — the string literals one side of a diff holds and the other does not
+(a_only / b_only), taken as the set difference of each side's ``strings`` values, with each value's
+resolved reference anchors read from the per-run ``string_refs`` table (NOT
+get_functions_referencing_string's substring match, and NOT string_edges' strcmp_gate counts).
 
 Honest reads: a ref in no function (ref_in_func NULL) is shown not dropped; a binary that exported
 no string_refs rows is refs UNKNOWN, never 'no references'; a NULL strings_truncated is unknown, not
@@ -12,6 +12,7 @@ no string_refs rows is refs UNKNOWN, never 'no references'; a NULL strings_trunc
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from tests.unit.lib.test_patch_view import DIFF, SHA_A, SHA_B, World, _pair_id  # noqa: F401
@@ -169,3 +170,144 @@ def test_direction_neutral(tmp_path: Path) -> None:
     sd = string_delta(w.atlas, DIFF)
     assert [v["value"] for v in sd["sides"]["a_only"]["values"]] == ["only_a"]
     assert [v["value"] for v in sd["sides"]["b_only"]["values"]] == ["only_b"]
+
+
+def test_a_truncated_or_unknown_side_marks_both_counts_and_lists_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    """A side whose strings list is a prefix (truncated) or unrecorded (NULL -> unknown) may hold,
+    past what it stored, a value the other side lists as one-sided: the counts and the lists are
+    then ``unconfirmed``, with the sides named — in string_delta AND in get_diff_meta's block. Two
+    clean sides are confirmed (``unconfirmed`` False, nothing named).
+
+    MUTATIONS (verified RED): (1) mark only a truncated side, not an unknown one -> b:unknown
+    missing; (2) get_diff_meta drops ``unconfirmed`` -> its block lacks it."""
+    from treasure_map.lib.query.diff_align import get_diff_meta
+
+    w = World(tmp_path)
+    _strings(w, "a", ["shared", "x"])
+    _strings(w, "b", ["shared", "y"])
+    w.commit()
+    clean = string_delta(w.atlas, DIFF)
+    assert clean["unconfirmed"] is False and clean["unconfirmed_by"] == []
+    _trunc(w, "a", 1)
+    _trunc(w, "b", None)
+    w.commit()
+    sd = string_delta(w.atlas, DIFF)
+    assert sd["unconfirmed"] is True
+    assert sd["unconfirmed_by"] == ["a:truncated", "b:unknown"]
+    block = get_diff_meta(w.atlas, DIFF)["string_delta"]
+    assert block.get("unconfirmed") is True
+    assert block.get("unconfirmed_by") == ["a:truncated", "b:unknown"]
+
+
+def _wide_world(tmp_path: Path, n_a: int, n_b: int, refs: int) -> World:
+    """``n_a`` A-only and ``n_b`` B-only strings, each with ``refs`` wide reference rows, so a
+    default page (limit 200) is far over the response budget."""
+    w = World(tmp_path)
+    a_vals = [f"a_only_value_{i:04d}_" + "x" * 60 for i in range(n_a)]
+    b_vals = [f"b_only_value_{i:04d}_" + "y" * 60 for i in range(n_b)]
+    _strings(w, "a", a_vals)
+    _strings(w, "b", b_vals)
+    for side, vals in (("a", a_vals), ("b", b_vals)):
+        for v in vals:
+            for r in range(refs):
+                _ref(
+                    w,
+                    side,
+                    v,
+                    ref_at=f"0x{0x400000 + r:x}",
+                    func=f"FUN_{0x410000 + r:08x}",
+                    func_addr=f"0x{0x410000 + r:x}",
+                )
+    w.commit()
+    return w
+
+
+def test_the_tool_fits_the_response_budget_and_pages_to_the_whole_set(tmp_path: Path) -> None:
+    """At the default limit the page is over 48,000 bytes before fitting: the tool cuts both lists
+    at one index, stays within the budget, and says where to resume (next_offset non-null,
+    values_truncated true). Following next_offset returns every value of both sides exactly once,
+    in order — a side that runs out first stops (next_offset null) while the other goes on.
+
+    MUTATION (verified RED): return the page unfitted -> the response is over the budget."""
+    from treasure_map.mcp_app import _RESPONSE_BYTE_BUDGET, make_tools
+
+    w = _wide_world(tmp_path, 120, 260, refs=4)
+    full = string_delta(w.atlas, DIFF)
+    tool = make_tools(w.path)["get_diff_string_delta"]
+    first = tool(DIFF)
+    assert len(json.dumps(first)) <= _RESPONSE_BYTE_BUDGET
+    a, b = first["sides"]["a_only"], first["sides"]["b_only"]
+    assert a["next_offset"] is not None and a["values_truncated"] is True
+    assert a["next_offset"] == b["next_offset"] == a["returned"] == b["returned"]
+    seen: dict[str, list[str]] = {"a_only": [], "b_only": []}
+    page, pages = first, 0
+    while True:
+        pages += 1
+        assert len(json.dumps(page)) <= _RESPONSE_BYTE_BUDGET
+        for name in seen:
+            seen[name] += [v["value"] for v in page["sides"][name]["values"]]
+        live = [page["sides"][n]["next_offset"] for n in seen]
+        live = [o for o in live if o is not None]
+        if not live:
+            break
+        assert len(set(live)) == 1  # one index for both lists
+        page = tool(DIFF, offset=live[0])
+    assert pages > 2
+    assert seen["a_only"] == [v["value"] for v in full["sides"]["a_only"]["values"]]
+    assert seen["b_only"] == [v["value"] for v in full["sides"]["b_only"]["values"]]
+    assert len(seen["a_only"]) == 120 and len(seen["b_only"]) == 260
+
+
+def test_the_tool_limit_is_capped_at_the_shared_maximum(tmp_path: Path) -> None:
+    """limit above _MAX_LIMIT (200) is refused, as on every other paged tool."""
+    from treasure_map.mcp_app import make_tools
+
+    w = World(tmp_path)
+    w.commit()
+    tool = make_tools(w.path)["get_diff_string_delta"]
+    assert "error" in tool(DIFF, limit=201)
+    assert "error" not in tool(DIFF, limit=200)
+
+
+def test_a_fitted_page_is_full_at_every_budget(tmp_path: Path) -> None:
+    """Swept one byte at a time over two indexes' width: each page is within the budget, and it
+    is FULL — the page measured with its paging fields back at their placeholders, plus the next
+    index's values and separators, would be over it. The placeholders are what was measured, so a
+    correct page may end a few bytes under; measuring the final width would misread it.
+
+    MUTATIONS (verified RED): (1) stop one index early (``>=`` for ``>``) -> a page one index short
+    of full at the budget it exactly fills; (2) measure with a narrower ``values_truncated``
+    placeholder (true) -> the page that just holds everything comes out over its budget."""
+    import copy
+
+    from treasure_map.mcp_app import _fit_string_delta
+
+    w = _wide_world(tmp_path, 30, 45, refs=2)
+    base = string_delta(w.atlas, DIFF)
+    base["note"] = "n"
+    vals = {n: base["sides"][n]["values"] for n in ("a_only", "b_only")}
+    one = sum(len(json.dumps(v[0])) + 2 for v in vals.values())
+    # the width of the page that holds every value (cut by nothing, values_truncated false)
+    whole = len(json.dumps(_fit_string_delta(copy.deepcopy(base), 0, 10**9)))
+    start = 6000
+    slack_seen: set[int] = set()
+    # a cut page, and the pages around the one that just holds everything (values_truncated false)
+    for budget in [*range(start, start + 2 * one), *range(whole - 2 * one, whole + 5)]:
+        page = _fit_string_delta(copy.deepcopy(base), 0, budget)
+        size = len(json.dumps(page))
+        assert size <= budget, budget
+        kept = page["sides"]["a_only"]["returned"]
+        slack_seen.add(budget - size)
+        held = copy.deepcopy(page)
+        for name in ("a_only", "b_only"):
+            n = held["sides"][name]["count"]  # the wider of null and the total
+            held["sides"][name]["next_offset"] = n if len(str(n)) > len("null") else None
+            held["sides"][name]["values_truncated"] = False
+            held["sides"][name]["returned"] = len(vals[name])
+        nxt = sum(len(json.dumps(v[kept])) + 2 for v in vals.values() if kept < len(v))
+        if nxt:
+            assert len(json.dumps(held)) + nxt > budget, budget
+    assert min(slack_seen) <= 10  # the sweep reached pages filled to within bytes of the budget
+    assert _fit_string_delta(copy.deepcopy(base), 0, whole)["sides"]["b_only"]["returned"] == 45

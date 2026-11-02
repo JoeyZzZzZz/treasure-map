@@ -115,6 +115,18 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # a re-scan (an empty pseudocode there stays unexplained). Must match schema.sql.
     ("functions", "decompile_status", "TEXT"),
     ("functions", "decompile_retried", "INTEGER DEFAULT 0"),
+    # What PromoteUndefined did in the extraction session, an error's decompile message, and which
+    # pass made each function. Back-fill NULL on older DBs: not recorded until a re-scan — never
+    # 0 / "nothing left outside a function" / "analysis". Must match schema.sql.
+    ("binaries", "promote_created", "INTEGER"),
+    ("binaries", "promote_residual_insns", "INTEGER"),
+    ("binaries", "promote_residual_start", "INTEGER"),
+    ("binaries", "promote_residual_interior", "INTEGER"),
+    ("binaries", "promote_residual_unowned", "INTEGER"),
+    ("binaries", "promote_residual_ranges", "TEXT"),
+    ("binaries", "promote_residual_ranges_truncated", "INTEGER"),
+    ("functions", "decompile_error", "TEXT"),
+    ("functions", "origin", "TEXT"),
 )
 
 

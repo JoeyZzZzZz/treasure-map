@@ -454,8 +454,9 @@ def add_function_presence(
     conn.executemany(
         """INSERT INTO function_presence
            (diff_id, side, addr, name, presence_state, decompiled, export_gap,
-            operand_markup_incomplete)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            operand_markup_incomplete, counterpart_probe, counterpart_addr, presence_reason,
+            counterpart_overlap)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.diff_id,
@@ -466,6 +467,10 @@ def add_function_presence(
                 r.decompiled,
                 r.export_gap,
                 r.operand_markup_incomplete,
+                r.counterpart_probe,
+                r.counterpart_addr,
+                r.presence_reason,
+                r.counterpart_overlap,
             )
             for r in rows
         ],
@@ -495,10 +500,13 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             export_entry_addresses_added_b, export_flow_graphs_dropped_a,
             export_flow_graphs_dropped_b, export_degenerate_functions_a,
             export_degenerate_functions_b, bindiff_vertex0_fallbacks, export_code_hash_a,
-            export_code_hash_b, toolchain_ghidra, toolchain_binexport, toolchain_bindiff)
+            export_code_hash_b, toolchain_ghidra, toolchain_binexport, toolchain_bindiff,
+            stub_table_a, stub_table_b, stub_pairs, stub_a_only, stub_b_only, stub_pair_mismatch,
+            export_gaps_on_stubs_a, export_gaps_on_stubs_b, export_gaps_on_code_a,
+            export_gaps_on_code_b)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             row.diff_id,
             row.run_a_id,
@@ -567,6 +575,16 @@ def add_diff_meta(conn: sqlite3.Connection, row: DiffMetaRow, *, commit: bool = 
             row.toolchain_ghidra,
             row.toolchain_binexport,
             row.toolchain_bindiff,
+            row.stub_table_a,
+            row.stub_table_b,
+            row.stub_pairs,
+            row.stub_a_only,
+            row.stub_b_only,
+            row.stub_pair_mismatch,
+            row.export_gaps_on_stubs_a,
+            row.export_gaps_on_stubs_b,
+            row.export_gaps_on_code_a,
+            row.export_gaps_on_code_b,
         ),
     )
     if commit:
@@ -888,6 +906,8 @@ def finish_run(
     binaries: int | None = None,
     functions: int | None = None,
     functions_empty: int | None = None,
+    promote_residual_binaries: int | None = None,
+    promote_unowned_binaries: int | None = None,
     hunt_commit: str | None = None,
     hunt_instances: int | None = None,
     hunt_input_fingerprint: str | None = None,
@@ -907,13 +927,16 @@ def finish_run(
     reproducible and skip re-hunting it: the commit says the same code would produce it, the count
     says the rows it produced are still in the table, and ``hunt_input_fingerprint`` says it read
     the same firmware. ``hunt_code_version`` and ``scan_stamp`` are the code-content stamps that
-    replace the commit for the currency decision; they are COALESCEd like ``hunt_commit``."""
+    replace the commit for the currency decision; they are COALESCEd like ``hunt_commit``.
+    ``promote_residual_binaries`` / ``promote_unowned_binaries`` are written like the counts
+    (lib/facts.promote_residual_counts): None is "not recorded", never 0."""
     if scan_status not in ("in_progress", "complete", "partial", "failed"):
         raise ConfigError(
             f"scan_status must be in_progress/complete/partial/failed; got {scan_status!r}"
         )
     cur = conn.execute(
         """UPDATE run SET scan_status = ?, binaries = ?, functions = ?, functions_empty = ?,
+               promote_residual_binaries = ?, promote_unowned_binaries = ?,
                hunt_commit = COALESCE(?, hunt_commit),
                hunt_instances = COALESCE(?, hunt_instances),
                hunt_input_fingerprint = COALESCE(?, hunt_input_fingerprint),
@@ -926,6 +949,8 @@ def finish_run(
             binaries,
             functions,
             functions_empty,
+            promote_residual_binaries,
+            promote_unowned_binaries,
             hunt_commit,
             hunt_instances,
             hunt_input_fingerprint,
@@ -937,16 +962,20 @@ def finish_run(
     if cur.rowcount == 0:
         conn.execute(
             """INSERT INTO run
-                   (run_id, scan_status, binaries, functions, functions_empty, hunt_commit,
+                   (run_id, scan_status, binaries, functions, functions_empty,
+                    promote_residual_binaries, promote_unowned_binaries, hunt_commit,
                     hunt_instances, hunt_input_fingerprint, hunt_code_version, scan_stamp,
                     scanned_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
             (
                 run_id,
                 scan_status,
                 binaries,
                 functions,
                 functions_empty,
+                promote_residual_binaries,
+                promote_unowned_binaries,
                 hunt_commit,
                 hunt_instances,
                 hunt_input_fingerprint,

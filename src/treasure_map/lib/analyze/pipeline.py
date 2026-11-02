@@ -17,6 +17,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -119,6 +120,35 @@ class AnalyzeResult:
     # extension_note says why the extension was or was not used (None when nothing to say).
     exports_by_status: dict[str, int] = field(default_factory=dict)
     extension_note: str | None = None
+    # What the function-promotion pass (PromoteUndefined) came to over this scan's extracted
+    # binaries (see promote_summary): functions created, instructions still in no function, the
+    # binaries with instructions in no code block, and how many binaries recorded nothing.
+    promote: dict[str, Any] = field(default_factory=dict)
+
+
+def promote_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The function-promotion record over the current scan's extracted binaries (ghidra_ok = 1).
+
+    ``created`` / ``residual_insns`` sum binaries.promote_created / promote_residual_insns over
+    the binaries that recorded them; ``unowned_binaries`` names those with an instruction in no
+    code block (promote_residual_unowned > 0); ``unrecorded`` counts the extracted binaries with
+    no record (NULL), whose numbers the sums therefore do not include. {} on an analysis.db without
+    the columns."""
+    try:
+        rows = conn.execute(
+            "SELECT name, promote_created, promote_residual_insns, promote_residual_unowned "
+            "FROM current_binaries WHERE ghidra_ok = 1 ORDER BY name"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    recorded = [r for r in rows if r[1] is not None and r[2] is not None and r[3] is not None]
+    return {
+        "binaries": len(rows),
+        "unrecorded": len(rows) - len(recorded),
+        "created": sum(int(r[1]) for r in recorded),
+        "residual_insns": sum(int(r[2]) for r in recorded),
+        "unowned_binaries": [str(r[0]) for r in recorded if int(r[3]) > 0],
+    }
 
 
 @dataclass(frozen=True)
@@ -519,6 +549,7 @@ def run_analyze(
         reanalyze_pending = conn.execute(
             "SELECT COUNT(*) FROM current_binaries WHERE reanalyze_pending = 1"
         ).fetchone()[0]
+        promote = promote_summary(conn)
         exports_by_status = {
             str(row[0]): int(row[1])
             for row in conn.execute(
@@ -574,4 +605,5 @@ def run_analyze(
         ghidra_no_functions=ghidra_no_functions,
         exports_by_status=exports_by_status,
         extension_note=extension.note,
+        promote=promote,
     )

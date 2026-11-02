@@ -119,6 +119,37 @@ def _safe_function_states(atlas: Any, diff_id: str) -> dict[str, Any] | None:
         return {"unreadable": f"{type(exc).__name__}: {exc}"}
 
 
+def _safe_string_delta(atlas: Any, diff_id: str) -> dict[str, Any]:
+    """lib/query/patch_view.string_delta's counts (no list) for the per-binary line, or
+    ``{"unreadable": why}`` when reading them fails — a display step, like _safe_function_states,
+    so an error here never ends the diff."""
+    from treasure_map.lib.query.patch_view import string_delta
+
+    try:
+        return string_delta(atlas, diff_id, want_refs=False)
+    except Exception as exc:  # a display step: report it on the line and let the sweep go on
+        return {"unreadable": f"{type(exc).__name__}: {exc}"}
+
+
+def _string_line(sd: dict[str, Any]) -> str:
+    """How many string literals one side of the diff holds and the other does not (D25). A side
+    that could not be read prints no counts — the other side's whole list would read as one-sided;
+    a truncated or unknown side keeps the counts but says they are unconfirmed. The caller names
+    the line ("strings")."""
+    if "unreadable" in sd:
+        return f"unreadable ({sd['unreadable']})"
+    if not sd.get("found"):
+        return "no diff row to read"
+    errors = sd.get("read_error") or {}
+    bad = [side.upper() for side in ("a", "b") if errors.get(side)]
+    if bad:
+        return f"unknown ({', '.join(bad)} could not be read; see get_diff_meta)"
+    line = f"A-only {sd['a_only_count']}, B-only {sd['b_only_count']}"
+    if sd.get("unconfirmed"):
+        line += f" (unconfirmed: {', '.join(sd.get('unconfirmed_by') or [])})"
+    return line
+
+
 def _function_line(states: dict[str, Any] | None) -> str:
     """One binary's functions as the diff left them (lib/query/patch_view.function_states): what
     its aligned pairs' pseudocode says, never similarity alone. A diff that did not run, or is
@@ -175,7 +206,12 @@ def _function_line(states: dict[str, Any] | None) -> str:
     return line + (f"; no counterpart — {sides}" if sides else "")
 
 
-def _echo_single_diff(summary: Any, resolved_atlas: Path, states: dict[str, Any] | None) -> None:
+def _echo_single_diff(
+    summary: Any,
+    resolved_atlas: Path,
+    states: dict[str, Any] | None,
+    strings: dict[str, Any] | None = None,
+) -> None:
     """Print one binary's diff result (the --binary or single-binary path)."""
     for w in summary.warnings:
         click.echo(f"warning: {w}", err=True)
@@ -185,6 +221,8 @@ def _echo_single_diff(summary: Any, resolved_atlas: Path, states: dict[str, Any]
     click.echo(f"  matched_pairs : {summary.matched_pairs}")
     click.echo(f"  version_skew  : {summary.version_skew}")
     click.echo(f"  functions     : {_function_line(states)}")
+    if strings is not None:
+        click.echo(f"  strings       : {_string_line(strings)}")
     if summary.baseline is not None:
         rows = summary.baseline_rows
         held = f" ({rows} candidate rows)" if rows is not None else ""
@@ -840,16 +878,22 @@ def hunt_diff(
         if outcome.error is not None:
             click.echo(f"  [{i}/{total}] {outcome.binary}: FAILED — {outcome.error}")
         else:
-            states = _safe_function_states(atlas, outcome.summary.diff_id)
-            click.echo(f"  [{i}/{total}] {outcome.binary}: {_function_line(states)}")
+            did = outcome.summary.diff_id
+            states = _safe_function_states(atlas, did)
+            strings_line = "strings " + _string_line(_safe_string_delta(atlas, did))
+            click.echo(
+                f"  [{i}/{total}] {outcome.binary}: {_function_line(states)}; {strings_line}"
+            )
 
     atlas = open_atlas(Path(resolved_atlas))
     states: dict[str, Any] | None = None
+    strings: dict[str, Any] | None = None
     coverage: dict[str, Any] | None = None
     try:
         if binary_name is not None:
             single = run_version_diff(atlas, before, after, binary_name, config=cfg, force=force)
             states = _safe_function_states(atlas, single.diff_id)
+            strings = _safe_string_delta(atlas, single.diff_id)
             full = None
         else:
             single = None
@@ -871,7 +915,7 @@ def hunt_diff(
         atlas.close()
 
     if single is not None:
-        _echo_single_diff(single, resolved_atlas, states)
+        _echo_single_diff(single, resolved_atlas, states, strings)
     else:
         _echo_full_diff(full, resolved_atlas, coverage, after)
         if full is not None and full.cancelled:

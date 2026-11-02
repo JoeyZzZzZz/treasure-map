@@ -114,6 +114,11 @@ CREATE TABLE IF NOT EXISTS run (
     binaries          INTEGER,          -- binaries in the analysis.db
     functions         INTEGER,          -- functions in the analysis.db
     functions_empty   INTEGER,          -- functions that never decompiled (partial-analysis count)
+    -- extracted binaries the function-promotion pass left instructions outside any function in,
+    -- and those holding instructions in no code block (lib/facts.promote_residual_counts). NULL =
+    -- not recorded for every extracted binary (an older scan) — never 0.
+    promote_residual_binaries INTEGER,
+    promote_unowned_binaries  INTEGER,
     scan_status       TEXT NOT NULL DEFAULT 'in_progress'
         CHECK (scan_status IN ('in_progress','complete','partial','failed')),
     scanned_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -536,6 +541,16 @@ CREATE TABLE IF NOT EXISTS function_presence (
                                     --   such a function is always 'unmatched_analysis_incomplete'
     operand_markup_incomplete INTEGER DEFAULT 0, -- 1 = its export wrote an operand of it in its
                                     --   default form: an additional fact, never a state
+    -- What the other side holds where this function maps through the nearest pair at or below it
+    -- (lib/diff/layer0.probe_counterparts): unpaired (a function in no pair: the state is then
+    -- 'counterpart_suspected', existence UNDETERMINED, never an add/delete) / occupied (a paired
+    -- function or an import stub) / uncovered (no function, and the other side's leftover code is
+    -- known not to reach it) / residual_code / coverage_unknown / unmappable (these three make a
+    -- would-be-complete row 'unmatched_analysis_incomplete'). NULL = not probed.
+    counterpart_probe TEXT,
+    counterpart_addr TEXT,          -- the other side's function at the mapped address
+    presence_reason TEXT,           -- why the probe left existence undetermined; NULL otherwise
+    counterpart_overlap TEXT,       -- JSON [["0x<lo>","0x<hi>"], ...] leftover-code ranges met
     UNIQUE(diff_id, side, addr)
 );
 CREATE INDEX IF NOT EXISTS idx_fpres ON function_presence(diff_id, side);
@@ -685,6 +700,21 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     toolchain_ghidra        TEXT,            -- the external toolchain the diff ran (Ghidra's
     toolchain_binexport     TEXT,            --   application.version, the BinExport extension's
     toolchain_bindiff       TEXT,            --   version, `bindiff --version`); NULL = not read
+    -- The import stubs, accounted by import name outside the pairs (lib/diff/layer0.StubLedger).
+    stub_table_a            TEXT,            -- per side: resolved | unknown (binaries.stub_names)
+    stub_table_b            TEXT,
+    stub_pairs              INTEGER,         -- import names stubbed on both sides; NULL unless both
+                                             --   tables are resolved (then the stubs are out of
+                                             --   function_alignment / function_presence)
+    stub_a_only             TEXT,            -- JSON: import names stubbed on one side only
+    stub_b_only             TEXT,
+    stub_pair_mismatch      TEXT,            -- JSON [[addr_a, addr_b], ...]: pairs joining a stub
+                                             --   to a function that is not one (its partner is
+                                             --   then unmatched)
+    export_gaps_on_stubs_a  INTEGER,         -- export gaps on an accounted stub (NULL: stubs not
+    export_gaps_on_stubs_b  INTEGER,         --   accounted, or no export report)
+    export_gaps_on_code_a   INTEGER,         -- the other export gaps (every gap when the stubs are
+    export_gaps_on_code_b   INTEGER,         --   not accounted); NULL = no export report
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

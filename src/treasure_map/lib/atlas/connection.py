@@ -269,6 +269,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("toolchain_ghidra", "TEXT"),
         ("toolchain_binexport", "TEXT"),
         ("toolchain_bindiff", "TEXT"),
+        # the import-stub accounting and the export gaps split by it (lib/diff/layer0)
+        ("stub_table_a", "TEXT"),
+        ("stub_table_b", "TEXT"),
+        ("stub_pairs", "INTEGER"),
+        ("stub_a_only", "TEXT"),
+        ("stub_b_only", "TEXT"),
+        ("stub_pair_mismatch", "TEXT"),
+        ("export_gaps_on_stubs_a", "INTEGER"),
+        ("export_gaps_on_stubs_b", "INTEGER"),
+        ("export_gaps_on_code_a", "INTEGER"),
+        ("export_gaps_on_code_b", "INTEGER"),
     ):
         if dm_cols and _dmcol not in dm_cols:
             conn.execute(f"ALTER TABLE diff_meta ADD COLUMN {_dmcol} {_dmtype}")  # noqa: S608
@@ -289,6 +300,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE function_presence ADD COLUMN operand_markup_incomplete INTEGER DEFAULT 0"
         )
+    # The counterpart probe (lib/diff/layer0.probe_counterparts). Nullable TEXT, no index
+    # references them; existing rows carry NULL (not probed) until re-diffed. Idempotent.
+    for _fpcol in (
+        "counterpart_probe",
+        "counterpart_addr",
+        "presence_reason",
+        "counterpart_overlap",
+    ):
+        if fp_cols and _fpcol not in fp_cols:
+            conn.execute(f"ALTER TABLE function_presence ADD COLUMN {_fpcol} TEXT")  # noqa: S608
 
     # instruction_match.facts_a/b: the call-site facts at each side's matched address (JSON).
     # Nullable TEXT, no index references them; existing rows carry NULL. Idempotent.
@@ -433,6 +454,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     run_cols = _column_names(conn, "run")
     if run_cols and "scan_stamp" not in run_cols:
         conn.execute("ALTER TABLE run ADD COLUMN scan_stamp TEXT")
+
+    # run.promote_residual_binaries / run.promote_unowned_binaries: how many extracted binaries the
+    # function-promotion pass left instructions outside any function in, and in no code block.
+    # Nullable — a run hunted before they existed carries NULL ("not recorded"), never 0, until it
+    # is re-hunted. No index references them. Idempotent; each runs only while missing.
+    for _rcol in ("promote_residual_binaries", "promote_unowned_binaries"):
+        if run_cols and _rcol not in _column_names(conn, "run"):
+            conn.execute(f"ALTER TABLE run ADD COLUMN {_rcol} INTEGER")  # noqa: S608
 
     # binary_path columns (added this round). Every one of these tables scoped a row to a binary by
     # its SHORT NAME, which is a label: one firmware ships two files under the same name, so a

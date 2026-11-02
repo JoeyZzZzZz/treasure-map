@@ -2050,6 +2050,8 @@ def run_analyzer2(
             binaries=lineage["binaries"],
             functions=lineage["functions"],
             functions_empty=lineage["functions_empty"],
+            promote_residual_binaries=lineage["promote_residual_binaries"],
+            promote_unowned_binaries=lineage["promote_unowned_binaries"],
             # Stamped only HERE, after the instance transaction committed: the stamp claims "this
             # commit produced these instances", so it must never outrun the instances themselves.
             hunt_commit=commit,

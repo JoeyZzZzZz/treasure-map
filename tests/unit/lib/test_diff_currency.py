@@ -1693,6 +1693,74 @@ def test_the_cli_counts_the_baselines_stored_and_not_with_why(
     assert "stored again" not in res.output
 
 
+def _sd(a: int, b: int, *, trunc: dict[str, str] | None = None, err: str | None = None) -> Any:
+    """A string_delta count block (want_refs=False shape) for the CLI line."""
+    states = trunc or {"a": "clean", "b": "clean"}
+    by = [f"{s}:{v}" for s, v in states.items() if v != "clean"]
+    return {
+        "found": True,
+        "a_only_count": a,
+        "b_only_count": b,
+        "strings_truncated": states,
+        "read_error": {"a": None, "b": err},
+        "unconfirmed": bool(by),
+        "unconfirmed_by": by,
+    }
+
+
+def test_the_cli_prints_each_binarys_one_sided_string_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each diffed binary's line carries how many string literals one side holds and the other does
+    not (D25) — on the full sweep's per-binary line and on the --binary result. A truncated or
+    unknown side keeps its counts but says they are unconfirmed; a side that could not be read
+    prints no counts (the other side's whole list would read as one-sided), never 0.
+
+    MUTATIONS (verified RED): (1) drop the strings part from the per-binary line; (2) print the
+    counts for an unreadable side; (3) drop the unconfirmed note; (4) not print the strings line
+    on the --binary path."""
+    from treasure_map.cli.main import main
+    from treasure_map.lib.query import patch_view
+
+    deltas = {
+        _did("liba"): _sd(2, 1),
+        _did("libb"): _sd(0, 3, trunc={"a": "truncated", "b": "clean"}),
+        _did("libc"): _sd(7, 0, err="analysis.db could not be opened"),
+    }
+    monkeypatch.setattr(patch_view, "function_states", lambda atlas, did: None)
+    monkeypatch.setattr(patch_view, "string_delta", lambda atlas, did, **kw: deltas[did])
+    monkeypatch.setattr(diff_align, "list_diffs", lambda *a, **k: {"coverage": None})
+
+    def fake_full(atlas: Any, a: str, b: str, **kw: Any) -> driver.FullDiffSummary:
+        names = ("liba", "libb", "libc")
+        oks = tuple(driver.BinaryDiffOutcome(n, _summary(n, 0, 0, 0), None) for n in names)
+        for i, o in enumerate(oks, start=1):
+            kw["on_outcome"](i, len(oks), o)
+        return driver.FullDiffSummary(
+            driver.FullDiffPlan(names, (), (), (), to_diff=names), oks, cancelled=False
+        )
+
+    monkeypatch.setattr(driver, "run_full_diff", fake_full)
+    _two(tmp_path)
+    args = ["diff", "--before", "run_a", "--after", "run_b", "--atlas", str(tmp_path / "atlas.db")]
+    res = CliRunner().invoke(main, args)
+    assert res.exit_code == 0, res.output
+    lines = {
+        ln.split("]", 1)[1].split(":", 1)[0].strip(): ln
+        for ln in res.output.splitlines()
+        if ln.lstrip().startswith("[")
+    }
+    assert lines["liba"].endswith("; strings A-only 2, B-only 1")
+    assert lines["libb"].endswith("; strings A-only 0, B-only 3 (unconfirmed: a:truncated)")
+    assert "strings unknown (B could not be read" in lines["libc"]
+    assert "A-only 7" not in lines["libc"]
+
+    monkeypatch.setattr(driver, "run_version_diff", lambda *a, **k: _summary("liba", 0, 0, 0))
+    one = CliRunner().invoke(main, [*args, "--binary", "liba"])
+    assert one.exit_code == 0, one.output
+    assert "  strings       : A-only 2, B-only 1" in one.output
+
+
 _STATES = {
     "withheld": False,
     "aligned": 9,
@@ -2031,7 +2099,7 @@ _GOLDEN_SKIP = frozenset(
 )
 # The digest of the golden diff's output. An output regression test: the version stamped on a diff
 # is a hash of the code itself (lib/diff/code_version), not this value.
-_GOLDEN_OUTPUT = "3c08cd668cf1"
+_GOLDEN_OUTPUT = "bc5edad7b699"
 
 
 def _golden_analysis(path: Path, sha: str, side: str) -> None:
@@ -2040,9 +2108,12 @@ def _golden_analysis(path: Path, sha: str, side: str) -> None:
     walk_call = "0x101318" if side == "a" else "0x101329"
     conn = open_db(path)
     conn.execute(
+        # promote_residual_*: what the extraction's function promotion left outside a function
+        # (nothing), as a current extraction records it; the counterpart probe reads it.
         "INSERT INTO binaries (id, name, path, sha256, arch, pass_version, ghidra_version, "
-        "ghidra_ok, last_seen_at) VALUES (1, 'libshapes.so', 'lib/libshapes.so', ?, "
-        "'x86:LE:64:default', 'pvgolden', '11.4.3', 1, '2026-01-01T00:00:00')",
+        "ghidra_ok, last_seen_at, promote_residual_ranges, promote_residual_ranges_truncated) "
+        "VALUES (1, 'libshapes.so', 'lib/libshapes.so', ?, 'x86:LE:64:default', 'pvgolden', "
+        "'11.4.3', 1, '2026-01-01T00:00:00', '[]', 0)",
         (sha,),
     )
 

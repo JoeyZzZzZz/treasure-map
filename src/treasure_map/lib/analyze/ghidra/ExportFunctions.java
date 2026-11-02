@@ -2444,6 +2444,17 @@ public class ExportFunctions extends GhidraScript {
     private static final String DECOMPILE_OK = "ok";
     private static final String DECOMPILE_TIMEOUT = "timeout";
     private static final String DECOMPILE_SKIPPED_MICRO = "skipped_micro";
+    // decompile_status is one of these four; WHY an error happened goes to decompile_error, so the
+    // status stays a closed set a reader can group by (a message carries the function's address).
+    private static final String DECOMPILE_ERROR = "error";
+
+    // What PromoteUndefined left in this session's program (its OPTIONS_CATEGORY /
+    // BOOKMARK_CATEGORY, spelled the same). No record = that pass did not run to the end in this
+    // session: the export then writes neither "promote" nor any function's "origin" (not
+    // recorded), never zeros or "analysis".
+    private static final String PROMOTE_OPTIONS = "TreasureMap PromoteUndefined";
+    private static final String PROMOTE_BOOKMARK = "TreasureMap promoted";
+    private BookmarkManager promoteMarks = null;   // non-null only when the pass was recorded
 
     /** The retry budget the driver set (TMAP_DECOMPILE_RETRY_BUDGET_S), 0 when unset or bad. */
     private static long retryBudgetSeconds() {
@@ -2456,6 +2467,39 @@ public class ExportFunctions extends GhidraScript {
         }
     }
 
+    /**
+     * The "promote" object for the export (tried, created, the residual kinds and their sum, the
+     * residual ranges and whether they were truncated), or null when PromoteUndefined left no
+     * record in this session. Sets promoteMarks so each function's origin can be read.
+     */
+    private String promoteRecord() {
+        ghidra.framework.options.Options opts = currentProgram.getOptions(PROMOTE_OPTIONS);
+        if (!opts.contains("recorded") || !opts.getBoolean("recorded", false)) return null;
+        String ranges = opts.getString("residual_ranges", null);
+        if (ranges == null || !ranges.startsWith("[")) return null;
+        long start = opts.getLong("residual_start", -1);
+        long interior = opts.getLong("residual_interior", -1);
+        long unowned = opts.getLong("residual_unowned", -1);
+        int tried = opts.getInt("tried", -1);
+        int created = opts.getInt("created", -1);
+        if (start < 0 || interior < 0 || unowned < 0 || tried < 0 || created < 0) return null;
+        promoteMarks = currentProgram.getBookmarkManager();
+        return "{\"tried\":" + tried + ",\"created\":" + created
+                + ",\"residual_insns\":" + (start + interior + unowned)
+                + ",\"residual_start\":" + start + ",\"residual_interior\":" + interior
+                + ",\"residual_unowned\":" + unowned + ",\"residual_ranges\":" + ranges
+                + ",\"residual_ranges_truncated\":"
+                + opts.getBoolean("residual_ranges_truncated", false) + "}";
+    }
+
+    /** {@code "origin":"promoted"|"analysis",} for a function record, "" when not recorded. */
+    private String originField(Function func) {
+        if (promoteMarks == null) return "";
+        boolean promoted = promoteMarks.getBookmark(func.getEntryPoint(), BookmarkType.INFO,
+                PROMOTE_BOOKMARK) != null;
+        return "\"origin\":\"" + (promoted ? "promoted" : "analysis") + "\",";
+    }
+
     /** The first line of a message, at most 200 characters ("unknown" when there is none). */
     private static String firstLine(String msg) {
         if (msg == null || msg.trim().isEmpty()) return "unknown";
@@ -2465,8 +2509,9 @@ public class ExportFunctions extends GhidraScript {
 
     /**
      * One function's record for the "functions" array, decompiled with {@code timeoutSec}. Its
-     * decompile outcome is put in {@code statusOut[0]} (ok / timeout / error:<why> / skipped_micro),
-     * so the caller can retry a timed-out function once at a larger limit.
+     * decompile outcome is put in {@code statusOut[0]} (ok / timeout / error / skipped_micro),
+     * so the caller can retry a timed-out function once at a larger limit; an error's message is
+     * written to the record's decompile_error.
      */
     private String exportFunction(Function func, DecompInterface decomp, FunctionManager fm,
             Set<String> knownNames, int timeoutSec, boolean retried, String[] statusOut) {
@@ -2483,16 +2528,19 @@ public class ExportFunctions extends GhidraScript {
         String pseudocode = "";
         HighFunction hf = null;   // Varnode/def-use + block graph from the SAME decompile (design B)
         DecompileResults drKeep = null;   // D4 bridge: kept so the C markup can be walked below
-        // What the decompile of this function came to, as a fact: ok / timeout / error:<why> /
-        // skipped_micro. An empty pseudocode alone cannot tell those apart.
+        // What the decompile of this function came to, as a fact: ok / timeout / error /
+        // skipped_micro (an error's message in decompileError). An empty pseudocode alone cannot
+        // tell those apart.
         String decompileStatus;
+        String decompileError = null;   // the message of an error, never part of the status
         if (funcSize < 10) {
             // Leave pseudocode empty — ghidra_ingest handles null pseudocode fine.
             decompileStatus = DECOMPILE_SKIPPED_MICRO;
         } else try {
             DecompileResults dr = decomp.decompileFunction(func, timeoutSec, monitor);
             if (dr == null) {
-                decompileStatus = "error:no_result";
+                decompileStatus = DECOMPILE_ERROR;
+                decompileError = "no_result";
             } else if (dr.decompileCompleted()) {
                 DecompiledFunction df = dr.getDecompiledFunction();
                 if (df != null) {
@@ -2500,16 +2548,18 @@ public class ExportFunctions extends GhidraScript {
                 }
                 hf = dr.getHighFunction();   // reused, not a second decompile
                 drKeep = dr;                 // D4 bridge: same decompile, no second pass
-                decompileStatus = df != null ? DECOMPILE_OK : "error:no_decompiled_function";
+                decompileStatus = df != null ? DECOMPILE_OK : DECOMPILE_ERROR;
+                if (df == null) decompileError = "no_decompiled_function";
             } else if (dr.isTimedOut()) {
                 decompileStatus = DECOMPILE_TIMEOUT;
             } else {
-                decompileStatus = "error:" + firstLine(
-                    dr.isCancelled() ? "cancelled" : dr.getErrorMessage());
+                decompileStatus = DECOMPILE_ERROR;
+                decompileError = firstLine(dr.isCancelled() ? "cancelled" : dr.getErrorMessage());
             }
         } catch (Exception e) {
             pseudocode = "/* decompile_error: " + e.getMessage() + " */";
-            decompileStatus = "error:" + firstLine(e.getMessage());
+            decompileStatus = DECOMPILE_ERROR;
+            decompileError = firstLine(e.getMessage());
         }  // end if (funcSize >= 10)
         statusOut[0] = decompileStatus;
 
@@ -2695,6 +2745,9 @@ public class ExportFunctions extends GhidraScript {
                  .append(listing)             // ",\"listing\":{...}" or ",\"listing\":null"
                  .append(",\"detector_errors\":").append(deArr).append(",")
                  .append("\"decompile_status\":\"").append(esc(decompileStatus)).append("\",")
+                 .append(decompileError == null ? ""
+                         : "\"decompile_error\":\"" + esc(decompileError) + "\",")
+                 .append(originField(func))
                  .append("\"decompile_retried\":").append(retried).append(",")
                  .append("\"pseudocode\":")  .append("\"").append(esc(pseudocode)).append("\"")
                  .append("}");
@@ -2765,6 +2818,9 @@ public class ExportFunctions extends GhidraScript {
         FunctionManager  fm     = currentProgram.getFunctionManager();
         SymbolTable      st     = currentProgram.getSymbolTable();
         ExternalManager  extMgr = currentProgram.getExternalManager();
+
+        // What PromoteUndefined recorded in this session (see PROMOTE_OPTIONS); null = not recorded.
+        String promoteJson = promoteRecord();
 
         // 1. Functions + pseudocode
         int funcCount = 0;
@@ -3049,6 +3105,8 @@ public class ExportFunctions extends GhidraScript {
             // Which stub table this run actually read (content hash, or "none" when none was handed
             // in). The driver and the ingest compare it with the table they meant for this binary.
             pw.print("\"stub_marker\":\"" + esc(stubMarker) + "\",");
+            // What PromoteUndefined did in this session; absent when it recorded nothing.
+            if (promoteJson != null) pw.print("\"promote\":" + promoteJson + ",");
             // Written record by record: no second copy of the array is built.
             pw.print("\"functions\":[");
             for (int k = 0; k < entries.size(); k++) {

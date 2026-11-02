@@ -102,6 +102,11 @@ class RunRow:
     binaries: int | None = None
     functions: int | None = None
     functions_empty: int | None = None
+    # Extracted binaries the function-promotion pass left instructions outside any function in,
+    # and those holding instructions in no code block (lib/facts.promote_residual_counts). None =
+    # not recorded for every extracted binary — never 0.
+    promote_residual_binaries: int | None = None
+    promote_unowned_binaries: int | None = None
     scan_status: str = "in_progress"
     scanned_at: str | None = None
     updated_at: str | None = None
@@ -333,6 +338,15 @@ class FunctionPresenceRow:
     export_gap: str | None = None
     # 1 when its export wrote an operand of this function in its default form (additional fact).
     operand_markup_incomplete: int = 0
+    # What the other side holds where this function maps through the nearest pair at or below it
+    # (lib/diff/layer0.probe_counterparts): unpaired / occupied / uncovered / residual_code /
+    # coverage_unknown / unmappable; the other side's function there (counterpart_addr); the
+    # leftover-code ranges the mapped span meets (JSON, counterpart_overlap); and why the probe
+    # made the state undetermined (presence_reason). None = not probed (a diff written before).
+    counterpart_probe: str | None = None
+    counterpart_addr: str | None = None
+    presence_reason: str | None = None
+    counterpart_overlap: str | None = None
     id: int | None = None
 
 
@@ -435,6 +449,23 @@ class DiffMetaRow:
     toolchain_ghidra: str | None = None
     toolchain_binexport: str | None = None
     toolchain_bindiff: str | None = None
+    # The import stubs, accounted by import name outside the pairs (lib/diff/layer0.StubLedger):
+    # each side's stub table resolved / unknown; with both resolved, the import names on both
+    # sides (stub_pairs), on one side only (JSON name lists), and the pairs the diff tool made
+    # between a stub and a function that is not one (JSON [[addr_a, addr_b], ...]). NULL = not
+    # accounted (a table unknown, or a diff written before).
+    stub_table_a: str | None = None
+    stub_table_b: str | None = None
+    stub_pairs: int | None = None
+    stub_a_only: str | None = None
+    stub_b_only: str | None = None
+    stub_pair_mismatch: str | None = None
+    # Each side's export gaps split by whether the function is an accounted import stub; with the
+    # stubs not accounted, on_stubs is NULL and on_code holds every gap. NULL = no export report.
+    export_gaps_on_stubs_a: int | None = None
+    export_gaps_on_stubs_b: int | None = None
+    export_gaps_on_code_a: int | None = None
+    export_gaps_on_code_b: int | None = None
 
 
 @dataclass(frozen=True)

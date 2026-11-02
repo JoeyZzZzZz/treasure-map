@@ -316,9 +316,11 @@ def _analysis(w: _World, side: str, sha: str, funcs: dict[int, str]) -> Path:
     so_path.write_bytes(b"\x7fELF")
     w.so_sha[str(so_path)] = sha
     conn.execute(
+        # promote_residual_*: a current extraction recorded that it left no code outside a
+        # function, so an unmatched function with nothing at its mapped address reads determined.
         "INSERT INTO binaries (id, name, path, sha256, arch, pass_version, ghidra_version, "
-        "ghidra_ok, last_seen_at) VALUES (1, 'liba', ?, ?, 'ARM:LE:32:v7', ?, ?, 1, "
-        "'2026-01-01T00:00:00')",
+        "ghidra_ok, last_seen_at, promote_residual_ranges, promote_residual_ranges_truncated) "
+        "VALUES (1, 'liba', ?, ?, 'ARM:LE:32:v7', ?, ?, 1, '2026-01-01T00:00:00', '[]', 0)",
         (str(so_path), sha, _PV, _GV),
     )
     for addr, name in funcs.items():
@@ -694,10 +696,12 @@ def test_an_unreadable_report_fails_the_diff_as_no_file(
 def test_a_gap_on_one_side_marks_only_that_sides_unmatched_function(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """helper is unmatched on both sides; only side b's export dropped it.
+    """helper is unmatched on both sides; only side b's export dropped it. Side a's helper is not
+    marked by the gap: it reads counterpart_suspected — b's helper, itself in no pair, sits where
+    it maps (lib/diff/layer0.probe_counterparts).
 
     MUTATION (verified RED): compute side b's presence with side a's gaps -> b's helper reads
-    unmatched_analysis_complete."""
+    counterpart_suspected, not the gap."""
     w = _world(tmp_path, pairs=((0x1000, 0x1000),), reports={"b": _report(dropped=(0x2000,))})
     _stub(monkeypatch, w)
     _diff(w)
@@ -705,7 +709,7 @@ def test_a_gap_on_one_side_marks_only_that_sides_unmatched_function(
         "unmatched_analysis_incomplete",
         "flow_graph_dropped",
     )
-    assert _presence(w)[("a", "00002000")] == ("unmatched_analysis_complete", None)
+    assert _presence(w)[("a", "00002000")] == ("counterpart_suspected", None)
 
 
 def test_an_edge_only_side_b_has_is_checked_against_side_bs_gaps(

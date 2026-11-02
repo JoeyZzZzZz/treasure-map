@@ -25,8 +25,10 @@ BUCKETS (``bucket``):
   R  the pair itself is undetermined (its alignment confidence is low, or its export could not hold
      one of the two functions as it is).
   C  a changed pair (similarity below 1) with no sink candidate on either side.
-  P  a function with no counterpart (``presence_state`` from function_presence, ``absent`` when the
-     function has no presence record at all).
+  P  a function in no matched pair (``presence_state`` from function_presence, ``absent`` when the
+     function has no presence record at all). ``counterpart_probe`` says what the other side holds
+     where it maps (lib/diff/layer0.probe_counterparts); ``counterpart_suspected`` (a function in
+     no pair there) and ``unmatched_analysis_incomplete`` never read as an existence.
   E  an aligned, similarity-1 pair that would otherwise place no entry, whose called function has a
      direct caller on the A side and none found (or none provable) on the B side — a caller-set edge
      fact (``callers_a`` / ``callers_b``) similarity is blind to. The ONE bucket this build adds.
@@ -347,6 +349,12 @@ _CAVEATS = {
         "every initialized block was stored in full. a_only = A has such a word, B none found — "
         "not that B cannot reach the function."
     ),
+    "sink_callsite_counts": (
+        "Calls of a sink name in the decompiled call tokens, a repeated call counted again. A "
+        "side with no decompiled text (skipped_micro, text_unavailable) or an unreadable count is "
+        "unknown, never 0. Not part of the order: significance, attention, sort and summary do "
+        "not read it."
+    ),
 }
 
 _LEGEND = {
@@ -357,7 +365,11 @@ _LEGEND = {
     ),
     "R": "the pair itself is undetermined (low confidence, or an export gap)",
     "C": "changed pair, no sink candidate on either side",
-    "P": "function with no counterpart",
+    "P": (
+        "function in no matched pair; counterpart_probe says what the other side holds at the "
+        "mapped address (subclass = presence_state: only unmatched_analysis_complete is a "
+        "determined existence; counterpart_suspected and unmatched_analysis_incomplete are not)"
+    ),
     "E": (
         "similarity-1 pair whose function has a direct caller on the A side and none found (or "
         "none provable) on the B side — a caller-set edge (callers_a / callers_b)"
@@ -388,6 +400,10 @@ _LEGEND = {
         "image never reads same_shape. Left out = both sides read in "
         "full with no comparable word (a function with no counterpart: its one side). A side "
         "that could not be read at all is named once, in entry_words_counts.unavailable"
+    ),
+    "sink_callsite_counts": (
+        "per sink name, how many times each function of the pair calls it (unit callsite); delta "
+        "/ unknown with why"
     ),
 }
 
@@ -685,6 +701,13 @@ class _Unpaired:
     presence_state: str  # from function_presence; ``absent`` with no record
     export_gap: str | None
     markup: int = 0  # 1 when its export wrote an operand of it in its default form
+    # What the other side holds where this function maps (lib/diff/layer0.probe_counterparts):
+    # the probe, the function found there, why it left existence undetermined, and the
+    # leftover-code ranges met (JSON text). None: not probed (a diff written before the probe).
+    counterpart_probe: str | None = None
+    counterpart_addr: str | None = None
+    presence_reason: str | None = None
+    counterpart_overlap: str | None = None
 
 
 @dataclass(frozen=True)
@@ -695,7 +718,8 @@ class _Fn:
     callees: tuple[str, ...] | None  # None: the list could not be read
     truncated: bool | None  # None: not recorded by that analysis.db
     unresolved: frozenset[str] | None  # stub addresses the extractor could not name; None: unknown
-    # What its decompile came to (ok / timeout / error:<why> / skipped_micro); None: not recorded.
+    # What its decompile came to (ok / timeout / error / skipped_micro; an older analysis.db holds
+    # error:<why> for error); None: not recorded.
     decompile: str | None = None
     # D29: each SINK_CALLEE_NAMES callee's call count in this function's call_tokens (opcode-7 CALL
     # tokens, NOT deduplicated — repeated calls count). None: the call_tokens column is absent or
@@ -799,7 +823,11 @@ def _decompile_gap(fn: _Fn | None) -> str | None:
         return None
     if fn.decompile == "timeout":
         return "timeout"
-    return "error" if fn.decompile.startswith("error:") else None
+    # ``error`` is the status now; an analysis.db extracted before the message moved to
+    # decompile_error holds ``error:<why>`` instead, and both read as an error.
+    if fn.decompile == "error" or fn.decompile.startswith("error:"):
+        return "error"
+    return None
 
 
 def _read_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side:
@@ -1079,10 +1107,11 @@ def _load_diff(atlas: sqlite3.Connection, diff_id: str) -> _Diff | None:
         )
     ]
     unpaired = {
-        (side, addr): _Unpaired(side, addr, name, state, gap, markup)
-        for side, addr, name, state, gap, markup in atlas.execute(
+        (r[0], r[1]): _Unpaired(*r)
+        for r in atlas.execute(
             "SELECT side, addr, name, presence_state, export_gap, "
-            "COALESCE(operand_markup_incomplete, 0) FROM function_presence WHERE diff_id = ?",
+            "COALESCE(operand_markup_incomplete, 0), counterpart_probe, counterpart_addr, "
+            "presence_reason, counterpart_overlap FROM function_presence WHERE diff_id = ?",
             (diff_id,),
         )
     }
@@ -1157,6 +1186,11 @@ class _Entry:
     # pseudocode differs (``listed_view``) — never written by the build, so ``bucket`` (and the
     # judgement basis read from it) stays empty for such a pair.
     listed_as: str = ""
+    # The pair's two functions carry different symbol names while one side also holds a function
+    # under the other side's name (``_pairing_name_conflict``): the other-side addresses of those
+    # same-name functions. A fact on any pair; on a proposed pairing it also keeps the entry out
+    # of the swap lift (``_lift_basis``). None when there is no such conflict.
+    pairing_name_conflict: dict[str, Any] | None = None
 
     @property
     def shown_bucket(self) -> str:
@@ -1293,6 +1327,7 @@ class _Builder:
         if p is not None:
             e.sink_candidate_counts = self._sink_candidate_counts(p)
             e.sink_callsite_counts = self._sink_callsite_counts(p)
+            e.pairing_name_conflict = _pairing_name_conflict(p, self.sides["a"], self.sides["b"])
         landings = [v["landing"] for v in e.row_views]
         if e.unpaired is not None:
             e.bucket, e.subclass = "P", e.unpaired.presence_state
@@ -2154,6 +2189,8 @@ def _default_key(r: dict[str, Any], band: int = 0, e_mention: int = 0) -> tuple[
 
 # attention 0 floats, 1 is the similarity-ordered middle, 2 sinks; every entry stays listed.
 ATTENTION_FLOAT, ATTENTION_MIDDLE, ATTENTION_SINK = 0, 1, 2
+# The basis of an entry held at attention 1 by the caller-set edge (a proven none_found B side).
+LOST_CALLERS_NEVER_SUNK = "lost_every_direct_caller_never_sunk"
 
 # ── an undetermined pair that is confidently paired and reads differs ──
 
@@ -2342,10 +2379,46 @@ def _sink_callee_swap(e: _Entry) -> dict[str, Any] | None:
     }
 
 
+# How many same-name addresses a pairing_name_conflict lists per side (the count is always given).
+_NAME_CONFLICT_ADDRS = 4
+
+
+def _real_symbol(name: str | None) -> bool:
+    """A name the binary gave the function, not the decompiler's address-derived ``FUN_``."""
+    return bool(name) and not str(name).startswith("FUN_")
+
+
+def _pairing_name_conflict(p: _Pair, side_a: _Side, side_b: _Side) -> dict[str, Any] | None:
+    """The pair's two functions both carry a symbol name (not ``FUN_``), the names differ, and the
+    B side also holds a function named as the A one (or the A side one named as the B one): the
+    addresses of those same-name functions, else None. Names are each side's own analysis.db
+    names; a side that could not be read gives none."""
+    name_a, name_b = side_a.names.get(p.addr_a), side_b.names.get(p.addr_b)
+    if not (_real_symbol(name_a) and _real_symbol(name_b)) or name_a == name_b:
+        return None
+    assert name_a is not None and name_b is not None
+    on_b = sorted(a for a in side_b.by_name.get(name_a, []) if a != p.addr_b)
+    on_a = sorted(a for a in side_a.by_name.get(name_b, []) if a != p.addr_a)
+    if not on_b and not on_a:
+        return None
+    return {
+        "name_a": name_a,
+        "name_b": name_b,
+        "a_name_on_b": on_b[:_NAME_CONFLICT_ADDRS],
+        "a_name_on_b_count": len(on_b),
+        "b_name_on_a": on_a[:_NAME_CONFLICT_ADDRS],
+        "b_name_on_a_count": len(on_a),
+    }
+
+
 def _lift_basis(e: _Entry) -> str | None:
     """Why an attention-1 entry leads its tier (``swap_lift``): ``sink_callee_swap`` (a sink name
     in its callee-set difference), else ``sink_candidate_counts`` (a sink's candidate count
-    differs), else None."""
+    differs), else None. None for a proposed pairing with a ``pairing_name_conflict``: the
+    difference read there may be the pairing's, not the code's, so it does not lead the tier (the
+    entry stays listed where its basis puts it, never sunk)."""
+    if e.pair is not None and not e.pair.aligned and e.pairing_name_conflict is not None:
+        return None
     if _sink_callee_swap(e) is not None:
         return "sink_callee_swap"
     counts = e.sink_candidate_counts
@@ -2389,7 +2462,10 @@ def significance(
         the other a real body) -> 1, labelled ``one_side_skipped_micro``: held at attention 1, never
         sunk to 2 as an otherwise identical / bucket-C pair would be;
       * pseudocode ``identical``, a proposed ``identical_unique``, or bucket C -> 2 — unless the
-        entry is R (an undetermined pair is never buried under the pairs that were read) or its
+        entry is R (an undetermined pair is never buried under the pairs that were read: 1,
+        ``undetermined_never_sunk``, or ``lost_every_direct_caller_never_sunk`` when its proposed
+        reading is ``identical_unique`` and its B side a proven none_found — read first, so the
+        caller-set edge is not hidden by the R close) or its
         judgement is held up (changed_real, needs_recheck / needs_relabel, inconclusive), which
         stops it at 1; or, last, the caller-set edge: an E entry -> 1 (basis
         ``lost_every_direct_caller_never_sunk`` for a proven-none B side, else
@@ -2414,7 +2490,7 @@ def significance(
     if e.bucket == "E":
         cb = e.callers_b
         if cb is not None and cb["state"] == "none_found":
-            return ATTENTION_MIDDLE, "lost_every_direct_caller_never_sunk"
+            return ATTENTION_MIDDLE, LOST_CALLERS_NEVER_SUNK
         return ATTENTION_MIDDLE, "caller_signal_undetermined_never_sunk"
     if e.bucket == "A":
         return ATTENTION_FLOAT, "matched_call_other_callee"
@@ -2440,6 +2516,17 @@ def significance(
         return ATTENTION_MIDDLE, "one_side_skipped_micro"
     if state == sameness.IDENTICAL or u_state == sameness.U_IDENTICAL_UNIQUE or e.bucket == "C":
         basis = "pseudocode_identical" if state == sameness.IDENTICAL else "no_sink_candidate"
+        # An undetermined pair whose proposed reading is identical_unique (the other side holds
+        # exactly one function with this text, so the callers read are that function's) and
+        # whose B side has a proven none_found keeps the caller-set edge as its basis: read
+        # before the R close below, which would otherwise end its tier and hide that edge.
+        if (
+            e.bucket == "R"
+            and u_state == sameness.U_IDENTICAL_UNIQUE
+            and e.callers_b is not None
+            and e.callers_b["state"] == "none_found"
+        ):
+            return ATTENTION_MIDDLE, LOST_CALLERS_NEVER_SUNK
         if e.bucket == "R":
             return ATTENTION_MIDDLE, "undetermined_never_sunk"
         if _held_up(item):
@@ -2448,7 +2535,7 @@ def significance(
         # a basis above, and only when the B side is a proven none — an undetermined edge on an
         # already-listed entry does not move it (E, which IS listed for the edge, is handled first).
         if e.callers_b is not None and e.callers_b["state"] == "none_found":
-            return ATTENTION_MIDDLE, "lost_every_direct_caller_never_sunk"
+            return ATTENTION_MIDDLE, LOST_CALLERS_NEVER_SUNK
         return ATTENTION_SINK, basis
     if e.bucket == "P":
         return ATTENTION_MIDDLE, "no_counterpart"
@@ -2483,7 +2570,8 @@ def _sort(
     highest first) so that next the anchored_differs pairs at or above the floor come, then those
     below it, then the rest; the band only when it is on
     (judgements move nothing unless asked); ``settled`` (1 for an R entry whose proposed reading
-    is ``identical_unique``, so it closes its tier, still ahead of every sunk entry); similarity
+    is ``identical_unique``, so it closes its tier, still ahead of every sunk entry — not when its
+    basis is the caller-set edge, ``lost_every_direct_caller_never_sunk``); similarity
     lowest first; then the candidate_tier order."""
 
     def key(e: _Entry) -> tuple[Any, ...]:
@@ -2571,6 +2659,8 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
             # Said only when true: an operand of the function written in its default form by
             # those sides' exports. An additional fact — the entry's state does not rest on it.
             out["operand_markup_incomplete"] = markup
+        if e.pairing_name_conflict is not None:
+            out["pairing_name_conflict"] = e.pairing_name_conflict
     else:
         assert e.unpaired is not None
         u = e.unpaired
@@ -2581,8 +2671,16 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
                 "name": u.name,
                 "presence_state": u.presence_state,
                 "export_gap": u.export_gap,
+                # what the other side holds where this function maps; null: not probed
+                "counterpart_probe": u.counterpart_probe,
             }
         )
+        if u.counterpart_addr is not None:
+            out["counterpart_addr"] = u.counterpart_addr
+        if u.presence_reason is not None:
+            out["presence_reason"] = u.presence_reason
+        if u.counterpart_overlap is not None:
+            out["counterpart_overlap"] = json.loads(u.counterpart_overlap)
         if u.markup:
             out["operand_markup_incomplete"] = [u.side]
     coclaimed = sorted(
@@ -4886,8 +4984,12 @@ def get_diff_patch_view(
             )
             for e in chosen
         }
+        # An R entry whose proposed reading is identical_unique closes its tier — unless the
+        # caller-set edge is its basis (significance): that edge is what it is listed for.
         settled = {
-            k: 1 for k, (state, _read) in proposed.items() if state == sameness.U_IDENTICAL_UNIQUE
+            k: 1
+            for k, (state, _read) in proposed.items()
+            if state == sameness.U_IDENTICAL_UNIQUE and lens[k][1] != LOST_CALLERS_NEVER_SUNK
         }
         # After the attention is known. Every attention-1 entry carrying a sink name in its
         # callee-set difference, or a changed sink candidate count, leads its tier whatever its
@@ -5240,12 +5342,12 @@ def _count(keys: Any) -> dict[str, int]:
     return dict(sorted(out.items()))
 
 
-# ── D25: string_delta — the string literals a binary gained / lost between two runs ──
+# ── D25: string_delta — the string literals one side of a diff holds and the other does not ──
 
 
 def _trunc_state(t: Any) -> str:
     """A ``strings_truncated`` flag read honestly: 1 = the list is a prefix (truncated), 0 = whole,
-    NULL = unknown — NEVER folded into 'not truncated'. An unknown side's added/removed is as
+    NULL = unknown — NEVER folded into 'not truncated'. An unknown side's a_only/b_only is as
     unconfirmable as a truncated side's."""
     return "truncated" if t == 1 else ("clean" if t == 0 else "unknown")
 
@@ -5294,7 +5396,7 @@ def _string_values_side(
 def _string_refs_for(
     atlas: sqlite3.Connection, run_id: str, sha: str | None, values: list[str]
 ) -> dict[str, list[dict[str, Any]]]:
-    """Each value's resolved reference anchors on one side (A for removed, B for added): a
+    """Each value's resolved reference anchors on one side (A for a_only, B for b_only): a
     data/pointer reference at ``ref_at`` inside ``ref_in_func`` (NULL ref_in_func kept, shown as a
     reference in no function — NOT dropped, NOT counted as 'no references'). ``truncated`` 1 means
     this string's ref list was capped. Looked up only for the paged values, so the per-value query
@@ -5350,7 +5452,9 @@ def string_delta(
     are different firmware builds); ``a_only`` and ``b_only`` are symmetric, neither before the
     other. ``strings_truncated`` is each side's honest truncation state (clean / truncated /
     unknown): a side whose strings list was capped — or whose flag is NULL — makes its one-sided set
-    unconfirmable, said rather than hidden. With ``want_refs`` each listed value carries its
+    unconfirmable, said rather than hidden: ``unconfirmed`` is True and ``unconfirmed_by`` names
+    those sides (``a:truncated``, ``b:unknown``), for the counts and the lists alike. With
+    ``want_refs`` each listed value carries its
     resolved reference anchors on its own side, ``refs_exported`` False meaning that side exported
     no string_refs at all (unknown, never 'no references'). ``found`` False for an unknown diff_id;
     ``side`` selects ``a_only`` / ``b_only`` / ``both``."""
@@ -5365,6 +5469,13 @@ def string_delta(
     b_vals, b_trunc, b_refs_ok, b_err = _string_values_side(atlas, run_b, sha_b)
     a_only = sorted(a_vals - b_vals)
     b_only = sorted(b_vals - a_vals)
+    # A side whose strings list is a prefix, unknown, or unreadable may hold a value past what was
+    # stored: then a value listed on the other side only may be on both, and the counts are not
+    # exact. Both counts and both lists are then marked unconfirmed, with the sides that make them
+    # so — never presented as a complete one-sided set.
+    unconfirmed_by = [
+        f"{s}:{state}" for s, state in (("a", a_trunc), ("b", b_trunc)) if state != "clean"
+    ]
     out: dict[str, Any] = {
         "found": True,
         "diff_id": diff_id,
@@ -5373,6 +5484,8 @@ def string_delta(
         "b_only_count": len(b_only),
         "strings_truncated": {"a": a_trunc, "b": b_trunc},
         "read_error": {"a": a_err, "b": b_err},
+        "unconfirmed": bool(unconfirmed_by),
+        "unconfirmed_by": unconfirmed_by,
     }
     if not want_refs:
         return out

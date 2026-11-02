@@ -86,6 +86,31 @@ def report_extraction_state(result: Any, reanalyze: str | None) -> None:
     _report_exports(
         getattr(result, "exports_by_status", {}), getattr(result, "extension_note", None)
     )
+    _report_promote(getattr(result, "promote", {}))
+
+
+def _report_promote(promote: dict[str, Any]) -> None:
+    """What the function-promotion pass came to: the functions it created and the instructions
+    still in no function after it, summed over the binaries that recorded them — and, on stderr,
+    the binaries holding instructions in no code block at all (the block model skipped part of
+    them, so their function set may be short) and how many binaries recorded nothing."""
+    if not promote or not promote.get("binaries"):
+        return
+    unrecorded = int(promote.get("unrecorded") or 0)
+    line = (
+        f"      → promoted functions: {promote.get('created', 0)} created; "
+        f"{promote.get('residual_insns', 0)} instructions left outside any function"
+    )
+    if unrecorded:
+        line += f" (not recorded for {unrecorded} binaries)"
+    click.echo(line)
+    unowned = list(promote.get("unowned_binaries") or [])
+    if unowned:
+        click.echo(
+            f"  ⚠ {len(unowned)} binaries have instructions in no code block after function "
+            f"promotion — their function set may be incomplete: {_shown(unowned)}",
+            err=True,
+        )
 
 
 # binexport_status values a diff can read (lib/binexport_archive.USABLE_STATUSES).

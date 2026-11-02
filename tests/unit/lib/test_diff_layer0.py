@@ -101,8 +101,11 @@ def _mk_analysis(path: Path, binary: str, sha: str, funcs: list[tuple]) -> Path:
         # ★ last_seen_at is LOAD-BEARING, not decoration: current_binaries selects rows whose
         # last_seen_at equals the maximum, and NULL = NULL is never true, so a fixture that omits
         # it yields an EMPTY view and every binary resolution misses. Real scans always write it.
-        "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
-        "VALUES (1, ?, ?, ?, '2026-01-01T00:00:00')",
+        # A current extraction records what its function promotion left outside every function
+        # ('[]': nothing, and not truncated), which a counterpart probe reads; without it an
+        # unmatched function with nothing at its mapped address reads undetermined.
+        "INSERT INTO binaries (id, name, path, sha256, last_seen_at, promote_residual_ranges, "
+        "promote_residual_ranges_truncated) VALUES (1, ?, ?, ?, '2026-01-01T00:00:00', '[]', 0)",
         (binary, binary, sha),
     )
     for addr, name, pc, size in funcs:
@@ -779,8 +782,9 @@ def _mk_analysis_multi(path: Path, bins: list) -> Path:  # type: ignore[type-arg
     con = open_db(path)
     for bid, (binary, sha, funcs) in enumerate(bins, start=1):
         con.execute(
-            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) "
-            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00')",  # last_seen_at: see _mk_analysis
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at, promote_residual_ranges, "
+            "promote_residual_ranges_truncated) "
+            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00', '[]', 0)",  # both: see _mk_analysis
             (bid, binary, binary, sha),
         )
         for addr, name, pc, size in funcs:

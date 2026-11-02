@@ -6375,6 +6375,8 @@ def test_the_anchor_template_rebuilds_every_entrys_anchor(
 # Re-recorded when bucket S, sink_candidate_counts, lift_basis and swap_pairing_note were added
 # (the diff against the earlier recording held only those, checked entry by entry); the
 # not-listed page it read then is empty now — its pair is the bucket S entry ("bucket_s").
+# Re-recorded when P entries gained ``counterpart_probe`` (the only difference, checked entry by
+# entry: every other key of every entry byte for byte as recorded before).
 _FULL_GOLDEN = Path(__file__).resolve().parents[2] / "fixtures" / "patch_view_full_entries.json"
 _GOLDEN_CALLS: dict[str, dict[str, Any]] = {
     "default": {"sort_by": "candidate_tier"},
@@ -7775,3 +7777,149 @@ def test_no_start_diff_review_label_says_what_a_change_means(tmp_path: Path, cur
     for label in labels:
         words = set(re.split(r"[^a-z0-9]+", label.lower()))
         assert not words & _WORDS, label
+
+
+# ── W5: a proposed pairing whose symbol names provably conflict is not lifted ────────────────
+
+
+def _name_conflict_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
+    """Proposed pairings whose callee sets swap a sink (each would be lifted): one joins two
+    symbol names while the B side also holds the A name elsewhere (``r_conflict``), one joins two
+    names neither side repeats (``r_control``), one joins two FUN_ names (``r_fun``); and an
+    ALIGNED pair joining two names, the A side holding the B name elsewhere (``aligned``)."""
+    w = World(tmp_path)
+
+    def swap_pair(a: str, b: str, conf: float, name_a: str, name_b: str) -> str:
+        w.pair(a, b, conf, 0.5, name_a=name_a, name_b=name_b)
+        n = int(a, 16) // 0x1000
+        w.fn("a", a, ["memcpy"], name=name_a, pseudocode=f"x = g({n});", size_bytes=16)
+        w.fn("b", b, ["strcpy"], name=name_b, pseudocode=f"x = g({n}) + 7;", size_bytes=16)
+        return _pair_id(a, b)
+
+    ids = {
+        "r_conflict": swap_pair("00020000", "00021000", 0.5, "onDisconnect", "onDealData"),
+        "r_control": swap_pair("00040000", "00041000", 0.5, "cbOne", "cbTwo"),
+        "r_fun": swap_pair("00050000", "00051000", 0.5, "FUN_00050000", "FUN_00051000"),
+        "aligned": swap_pair("00030000", "00031000", 0.97, "alpha", "beta"),
+    }
+    w.fn("b", "00022000", ["foo"], name="onDisconnect", pseudocode="foo();", size_bytes=16)
+    w.fn("a", "00032000", ["foo"], name="beta", pseudocode="foo();", size_bytes=16)
+    # The B side holds the A FUN_ name elsewhere as well: only the FUN_ exclusion keeps r_fun
+    # free of a conflict.
+    w.fn("b", "00052000", ["foo"], name="FUN_00050000", pseudocode="foo();", size_bytes=16)
+    w.commit()
+    return w, ids
+
+
+def test_a_proposed_pairing_with_a_name_conflict_is_listed_but_not_lifted(
+    tmp_path: Path, current: None
+) -> None:
+    """★ W5. r_conflict carries ``pairing_name_conflict`` (the B side's other onDisconnect) and is
+    not lifted (no lift_basis, swap_lift 0), still listed at attention 1; r_control and r_fun,
+    the same shape without a conflict, are lifted.
+
+    MUTATION (verified RED, 1 failed each): drop the conflict check from ``_lift_basis`` ->
+    r_conflict is lifted again -> RED; read FUN_ names as symbols (``_real_symbol`` returns
+    ``bool(name)``) -> r_fun carries a conflict and is not lifted -> RED."""
+    w, ids = _name_conflict_world(tmp_path)
+    v = _view(w, sort_by="significance")
+    for k in ids.values():
+        assert k in v["by_id"], k
+    conflict = v["by_id"][ids["r_conflict"]]
+    assert conflict.get("pairing_name_conflict") == {
+        "name_a": "onDisconnect",
+        "name_b": "onDealData",
+        "a_name_on_b": ["00022000"],
+        "a_name_on_b_count": 1,
+        "b_name_on_a": [],
+        "b_name_on_a_count": 0,
+    }
+    assert conflict["sink_callee_swap"]["pairing"] == "proposed"
+    assert conflict["significance"]["attention"] == 1
+    assert (conflict["lift_basis"], conflict["rank_key"]["sink_callee_swap"]) == (None, 0)
+    for key in ("r_control", "r_fun"):
+        e = v["by_id"][ids[key]]
+        assert e.get("pairing_name_conflict") is None, key
+        assert (e["lift_basis"], e["rank_key"]["sink_callee_swap"]) == ("sink_callee_swap", 1), key
+
+
+def test_an_aligned_pair_with_a_name_conflict_only_records_it(
+    tmp_path: Path, current: None
+) -> None:
+    """An aligned pair's conflict is a fact only: it still floats on its swap.
+
+    MUTATION (verified RED, 1 failed): compute the conflict on proposed pairings only -> the
+    aligned pair carries no ``pairing_name_conflict`` -> RED."""
+    w, ids = _name_conflict_world(tmp_path)
+    e = _entry(w, ids["aligned"], sort_by="significance")
+    assert e.get("pairing_name_conflict", {}).get("b_name_on_a") == ["00032000"]
+    assert e["significance"] == {"attention": 0, "basis": "sink_callee_swap"}
+
+
+# ── W10: the caller-set edge is not closed away by the R tier close ─────────────────────────
+
+
+def _lost_callers_r_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
+    """Undetermined pairs (confidence 0.5): ``r_lost`` reads identical_unique and its function
+    has a direct caller on A, none on B; ``r_plain`` reads differs (similarity 0.3); ``r_settled``
+    reads identical_unique with no caller signal (similarity 0.1); ``r_kept`` reads
+    identical_unique with a caller on both sides; ``r_differs_lost`` reads differs and lost its
+    caller."""
+    w = World(tmp_path)
+
+    def r_pair(a: str, b: str, sim: float, name: str, same: bool) -> str:
+        # A differing pair carries no alignment name, so it is not anchored by one (an anchored
+        # differing pair would read first, ahead of the similarity order this test reads).
+        label = name if same else None
+        w.pair(a, b, 0.5, sim, name_a=label, name_b=label)
+        n = int(a, 16) // 0x1000
+        w.fn("a", a, ["foo"], name=name, pseudocode=f"x = foo({n});", size_bytes=16)
+        tail = ";" if same else " + 7;"
+        w.fn("b", b, ["foo"], name=name, pseudocode=f"x = foo({n})" + tail, size_bytes=16)
+        return _pair_id(a, b)
+
+    ids = {
+        "r_lost": r_pair("00005000", "00006000", 0.2, "tgt_lost", True),
+        "r_plain": r_pair("00007000", "00008000", 0.3, "tgt_plain", False),
+        "r_settled": r_pair("00009000", "0000a000", 0.1, "tgt_settled", True),
+        "r_kept": r_pair("0000b000", "0000c000", 0.15, "tgt_kept", True),
+        "r_differs_lost": r_pair("0000d000", "0000e000", 0.35, "tgt_dl", False),
+    }
+    w.fn("a", "00000100", ["tgt_lost", "tgt_kept", "tgt_dl"], name="a_caller")
+    w.fn("b", "00000200", ["tgt_kept"], name="b_caller")
+    w.commit()
+    return w, ids
+
+
+def test_an_r_entry_read_identical_unique_keeps_its_lost_caller_basis_and_its_place(
+    tmp_path: Path, current: None
+) -> None:
+    """★ W10. r_lost (identical_unique, B side none_found) reads
+    ``lost_every_direct_caller_never_sunk`` and does not close its tier: it sorts by similarity
+    among the open R entries (0.2 ahead of r_plain's 0.3), ahead of every settled one. r_kept (a B
+    caller) and r_settled still close the tier as undetermined_never_sunk; r_differs_lost (not
+    identical_unique) keeps its own basis.
+
+    MUTATION (verified RED, 1 failed each): drop the new branch in ``significance`` -> r_lost
+    reads undetermined_never_sunk and sorts last -> RED; keep the branch but drop the ``settled``
+    exclusion -> r_lost closes the tier (after r_settled, 0.1) -> RED."""
+    w, ids = _lost_callers_r_world(tmp_path)
+    v = _view(w, sort_by="significance")
+    for k in ids.values():
+        assert k in v["by_id"], k
+    by = v["by_id"]
+    assert _reading(v, ids["r_lost"])["state"] == "identical_unique"
+    assert by[ids["r_lost"]]["callers_b"] == {"state": "none_found"}
+    assert by[ids["r_lost"]]["significance"] == {
+        "attention": 1,
+        "basis": "lost_every_direct_caller_never_sunk",
+    }
+    for key in ("r_kept", "r_settled"):
+        assert by[ids[key]]["significance"] == {"attention": 1, "basis": "undetermined_never_sunk"}
+    assert by[ids["r_differs_lost"]]["significance"]["basis"] != (
+        "lost_every_direct_caller_never_sunk"
+    )
+    order = [e["entry_id"] for e in v["entries"] if e["entry_id"] in ids.values()]
+    assert order.index(ids["r_lost"]) < order.index(ids["r_plain"])
+    assert order.index(ids["r_plain"]) < order.index(ids["r_kept"])
+    assert order.index(ids["r_plain"]) < order.index(ids["r_settled"])

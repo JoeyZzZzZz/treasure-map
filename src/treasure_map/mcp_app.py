@@ -238,6 +238,51 @@ def _fit_page(
     return result
 
 
+def _fit_string_delta(
+    result: dict[str, Any], offset: int, budget: int | None = None
+) -> dict[str, Any]:
+    """A get_diff_string_delta page fitted to the response budget (or ``budget`` bytes).
+
+    The two lists share one ``offset``, so they are cut at ONE index: values are taken index by
+    index — ``a_only[i]`` and ``b_only[i]`` together, a side that has run out adding none — while
+    the response still fits, so the next page resumes both lists from the same index. Each side's
+    ``next_offset`` (null = that side is done) and ``values_truncated`` (true = the byte ceiling,
+    not ``limit``, ended this page) are set to placeholders at least as wide as their final values
+    before the envelope is measured, as in ``_fit_page``. At least one index is always kept; a page
+    still over the budget says so with ``over_budget: true``. A result without ``sides`` (unknown
+    diff, refusal) is returned as it is."""
+    sides = result.get("sides")
+    if "error" in result or not isinstance(sides, dict) or not sides:
+        return result
+    limit = _RESPONSE_BYTE_BUDGET if budget is None else budget
+    full = {name: list(page["values"]) for name, page in sides.items()}
+    for page in sides.values():
+        n = page["count"]
+        page["next_offset"] = n if len(json.dumps(n)) > len(json.dumps(None)) else None
+        page["values_truncated"] = False
+        page["values"] = []
+    running = len(json.dumps(result))
+    width = max(len(v) for v in full.values())
+    kept = 0
+    for i in range(width):
+        cost = sum(
+            len(json.dumps(vals[i])) + (2 if i else 0) for vals in full.values() if i < len(vals)
+        )
+        if kept and running + cost > limit:
+            break
+        running += cost
+        kept += 1
+    for name, page in sides.items():
+        page["values"] = full[name][:kept]
+        page["returned"] = len(page["values"])
+        end = offset + kept
+        page["next_offset"] = end if end < page["count"] else None
+        page["values_truncated"] = kept < len(full[name])
+    if len(json.dumps(result)) > limit:
+        result["over_budget"] = True
+    return result
+
+
 def _hunk_page_budget(hunk: dict[str, Any]) -> dict[str, Any]:
     """An inline_hunk that would not fit the page, as withheld (its two gate counts kept). A hunk
     already withheld stays as it is."""
@@ -524,6 +569,18 @@ _AGENT_GUIDE = (
     "and list_overlays(anchor_kind='diff_subject', run_id='<run_a>::<run_b>') reviews them with "
     "the progress over the whole run pair. same_shape_siblings(diff_id, evidence_ref=...) names "
     "the other calls of one call's shape in the same binary and where each landed in the diff. "
+    "Per entry, sink_candidate_counts counts hunt candidates and sink_callsite_counts counts "
+    "calls (unit callsite: each call of a sink name in the decompiled call tokens, a repeated "
+    "call counted again); a side with no decompiled text is unknown (skipped_micro or "
+    "text_unavailable), never 0, and sink_callsite_counts never moves the order. "
+    "get_diff_string_delta(diff_id) lists the string literals one side holds and the other does "
+    "not, with their reference anchors (get_diff_meta carries the counts). "
+    "A P entry is a function in no matched pair: its counterpart_probe says what the other side "
+    "holds where it maps, and only presence_state unmatched_analysis_complete is a determined "
+    "existence (counterpart_suspected and unmatched_analysis_incomplete are not). Import stubs "
+    "are paired by import name outside the function pairs (get_diff_meta import_stubs). A "
+    "proposed pairing with a pairing_name_conflict is not lifted; an R entry read "
+    "identical_unique whose B side lost every direct caller keeps that basis. "
     "The non-binary files (scripts, configs, credentials, web assets) are compared by "
     "get_file_diff(run_pair='<run_a>::<run_b>') — any two runs from list_runs, with or without a "
     "binary diff — and one file is judged with annotate_diff(anchor_ref, verdict, rationale, "
@@ -557,7 +614,7 @@ _AGENT_INSTRUCTIONS = (
     "list_candidates(overlay=true) re-ranks by your own conclusions (off by default, the base map "
     "unchanged); list_overlays(run_id=...) reviews what you concluded last time and flags any "
     "whose facts have since moved. A row already marked in_exploit_ledger was confirmed by a "
-    "person, and it is usually not worth re-verifying. DIFF: " + DIFF_WORKFLOW + " "
+    "person, and usually not worth re-verifying. DIFF: " + DIFF_WORKFLOW + " "
     "get_diff_patch_view(diff_id) — rows_limit=0 scans the ranking with each entry's summary and "
     "inline_hunk, detail='summary' gives each entry only its counts plus "
     "annotation.anchor_ref_template; annotate_diff(anchor_ref, "
@@ -566,8 +623,9 @@ _AGENT_INSTRUCTIONS = (
     "onto one of the entry's candidates, and list_overlays(anchor_kind='diff_subject', "
     "run_id='<run_a>::<run_b>') reviews them. Unread is not 'nothing found': read every P entry, "
     "attention-1 entry with a lift_basis, bucket S entry, binary_presence binary and every "
-    "candidate row of a function; sink_candidate_counts counts hunt candidates (unknown is not "
-    "'no change'). Every tool's first line lists its required "
+    "candidate row of a function; sink_candidate_counts counts hunt candidates and "
+    "get_diff_string_delta one-sided strings (unknown is not 'no change'). Every tool's first "
+    "line lists its required "
     "parameters; get_tool_reference(name) returns a tool's full description, "
     'get_tool_reference(name="guide") the full guide, get_tool_reference(name="parameters") the '
     "parameter-name table."
@@ -882,8 +940,10 @@ def make_tools(
         """A hint to append to a refusal when this server's code stamp no longer matches the code on
         disk — so a reader who runs a rescan and still sees the refusal knows why: the rescan used
         the newer on-disk code, but the server is still grading against the code it started with.
-        Recomputes the on-disk stamp (uncached), so it is called only when a refusal is being made,
-        at most once per tool call. None when they match."""
+        Also the ``server`` block's ``code_moved_on_disk`` (D33: list_runs / start_diff_review /
+        get_diff_meta call it on every response, not only on a refusal). Recomputes the on-disk
+        stamp (uncached), so it is called at most once per tool call: a refusal on those three
+        tools reuses the head's result (``_MOVED_UNSET``). None when they match."""
         disk = rescan_version.on_disk_code_stamp(_config)
         if disk == _current:
             return None
@@ -2281,7 +2341,12 @@ def make_tools(
         ``sink_presence_signal:*`` sorts first, then ``sink_arg_constant_delta``, then the rest;
         ``R`` = the pair itself is undetermined; ``C`` = a changed pair with no sink candidate on
         either side (``no_sink_candidate_unchecked`` when the callee lists could not be read);
-        ``P`` = a function with no counterpart; ``E`` = a similarity-1 pair whose function has a
+        ``P`` = a function in no matched pair (subclass = its ``presence_state``: only
+        ``unmatched_analysis_complete`` is a determined existence; ``counterpart_suspected`` — a
+        function itself in no pair sits where it maps on the other side — and
+        ``unmatched_analysis_incomplete`` are not; ``counterpart_probe`` says what the other side
+        holds at the mapped address, with ``counterpart_addr`` / ``presence_reason`` /
+        ``counterpart_overlap``); ``E`` = a similarity-1 pair whose function has a
         direct caller on the A side and none found (or none provable) on the B side — a caller-set
         edge (``callers_a`` / ``callers_b``) similarity is blind to. ``S`` = an aligned similarity-1
         pair that places no other bucket and whose normalized pseudocode differs (subclass
@@ -2315,13 +2380,18 @@ def make_tools(
         rest, lowest similarity first, R and B entries ordered together — the entries with a
         ``lift_basis`` first inside it (``rank_key.sink_callee_swap`` = 1, ``lift_basis``
         ``sink_callee_swap`` / ``sink_candidate_counts``: an R entry's proposed swap or count
-        delta, with ``swap_pairing_note``; their basis stays their own), then the
+        delta, with ``swap_pairing_note``; their basis stays their own; a proposed pairing that
+        carries ``pairing_name_conflict`` — two different symbol names, one side also holding a
+        function under the other's name — is not lifted, and the field is a fact on an aligned
+        pair), then the
         ``anchored_differs`` pairs at or above the read-first floor, then those below it (and the
         demoted ``__FILE__``/``__LINE__`` and micro-side pairs), then the rest. Attention 0 holds
         B entries too (a row's ``sink_arg_constant_delta``) beside A. An aligned swap or count
         delta floats C and S entries there as well. Never sunk: an R entry
         (attention 2 never holds one; one whose proposed reading is ``identical_unique`` closes
-        attention 1), a ``sink_present_no_visible_delta`` B (labelled
+        attention 1, unless its B side lost every direct caller: then its basis is
+        ``lost_every_direct_caller_never_sunk`` and it does not close the tier), a
+        ``sink_present_no_visible_delta`` B (labelled
         ``recheckable_no_visible_delta``), an S entry (``aligned_pseudocode_differs``), an
         ``identical_text_unverified`` entry outside bucket C, a bucket E entry or any entry whose
         B side lost every direct caller (caller-set edge: basis
@@ -2443,6 +2513,16 @@ def make_tools(
         name is unreadable, ``sink: null`` when no sink of that side is named). An ``unknown`` is
         not "no change". Counted over every candidate the function holds, whichever entry its row
         sits in; an aligned delta floats the entry like a swap, a proposed one lifts it.
+        ``sink_callsite_counts`` (unit ``callsite``, ``pairing`` aligned / proposed): per sink
+        name, how many times each function CALLS it, read from its decompiled call tokens — every
+        call counted, a repeated call again (not deduplicated), so it sees a call repeated more or
+        fewer times where the callee set does not. ``delta`` the sinks both sides count
+        differently; ``unknown`` the side / sink pairs not counted, with why — above all a side
+        with no decompiled text, ``skipped_micro`` (a micro-function the decompiler skips by
+        design) or ``text_unavailable`` (a decompile with no text), whose empty call tokens are
+        NOT a 0 — and ``side_unreadable``, ``function_not_in_scan_inventory``,
+        ``call_tokens_unavailable``, ``call_counts_incomplete`` (its callee list was cut). It is
+        never part of the order: no significance, attention, sort or summary reads it.
 
         Two signals BinDiff similarity is blind to, on the function-pair view: each aligned entry
         carries ``pseudocode_sameness`` — ``identical`` (address-normalised pseudocode AND callees
@@ -2992,8 +3072,17 @@ def make_tools(
         ``listed_in`` says and judged with annotate_diff(..., run_pair=...).
         ``functions.changed`` also counts the pairs carrying a ``sink_callee_swap`` (by pairing and
         by side), a ``sink_candidate_counts`` delta or unknown, and ``listed_as_s`` — the aligned
-        similarity-1 pairs listed as bucket S. ``server`` reports the running server's own build
-        (D33; see list_runs)."""
+        similarity-1 pairs listed as bucket S. ``string_delta``: how many string literals sit on
+        one side only (``a_only_count`` / ``b_only_count``; the list is get_diff_string_delta),
+        each side's ``strings_truncated`` state and ``read_error``, and ``unconfirmed`` (with
+        ``unconfirmed_by``) when a truncated or unknown side makes the counts unconfirmable.
+        ``import_stubs``: the lazy-binding import stubs, paired by the import each calls and kept
+        out of the function pairs and presence rows when both sides' stub tables are resolved
+        (``table_a`` / ``table_b``: resolved / unknown; ``pairs``, the one-sided names ``a_only``
+        / ``b_only``, ``pair_mismatch`` = pairs the diff tool made between a stub and a function
+        that is not one, each side's ``export_gaps_on_stubs`` / ``export_gaps_on_code``; null
+        counts = not accounted); null on a diff written before.
+        ``server`` reports the running server's own build (D33; see list_runs)."""
         server, moved = _server_block()
         conn = open_atlas(atlas_path)
         try:
@@ -3022,12 +3111,16 @@ def make_tools(
         in no function, shown not dropped. ``refs_exported`` False = that side exported no
         string_refs at all — the refs are UNKNOWN, never 'no references'. ``strings_truncated`` is
         each side's state (clean / truncated / unknown): a truncated or unknown side is NOT
-        'complete'. ``sides.a_only`` / ``sides.b_only`` page independently by ``limit`` /
-        ``offset`` (follow ``next_offset``). get_diff_meta carries the counts."""
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 2000:
+        'complete', and then ``unconfirmed`` is true and ``unconfirmed_by`` names the side — the
+        counts and lists may hold a value the other side also has past what it stored.
+        ``sides.a_only`` / ``sides.b_only`` are paged together from one ``offset`` (``limit``
+        values each, at most 200) and cut at one index to fit the response; follow either side's
+        ``next_offset`` (null = that side is done; ``values_truncated`` true = the page was cut
+        to fit, not by ``limit``). get_diff_meta carries the counts."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _MAX_LIMIT:
             return {
                 "diff_id": diff_id,
-                "error": f"limit must be an integer in 1..2000, got {limit!r}",
+                "error": f"limit must be an integer in 1..{_MAX_LIMIT}, got {limit!r}",
             }
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             return {"diff_id": diff_id, "error": f"offset must be an integer >= 0, got {offset!r}"}
@@ -3038,7 +3131,7 @@ def make_tools(
                 return refusal
             out = _get_diff_string_delta(conn, diff_id, limit=limit, offset=offset)
             out["note"] = _DERIVED_SIGNAL_NOTE
-            return out
+            return _fit_string_delta(out, offset)
         finally:
             conn.close()
 
