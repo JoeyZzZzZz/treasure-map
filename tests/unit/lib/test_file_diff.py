@@ -29,6 +29,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.writer import begin_run, finish_run
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import file_diff as fd
+from treasure_map.lib.query import ko_changes as kc
 from treasure_map.lib.storage.connection import open_db
 
 PAIR = "runA::runB"
@@ -120,8 +121,54 @@ class FW:
         finally:
             conn.close()
 
+    def _pf(self) -> fd.PairFiles:
+        conn = self.atlas()
+        try:
+            return fd.read_pair(conn, "runA", "runB")
+        finally:
+            conn.close()
+
     def tools(self) -> dict[str, Any]:
         return mcp_app.make_tools(self.path)
+
+    def inv(
+        self,
+        side: str,
+        path: str,
+        *,
+        file_type: str,
+        data: bytes | str | None = None,
+        sha: str | None | bool = True,
+        inventoried_as: str | None = None,
+        reason: str | None = None,
+        write: bool = True,
+    ) -> None:
+        """One file_inventory row (the full ledger). Exactly one of ``inventoried_as`` /
+        ``reason`` is set (schema CHECK); when neither is given the file is a no_ingester one. The
+        bytes are written under the side's root unless ``write`` is False."""
+        raw = data.encode() if isinstance(data, str) else (data or b"")
+        if write and path is not None:
+            target = self.root[side] / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+        digest = _sha(raw) if sha is True else (sha or None)
+        if inventoried_as is None and reason is None:
+            reason = "no_ingester"
+        self.db[side].execute(
+            "INSERT INTO file_inventory (path, sha256, size, file_type, inventoried_as, "
+            "not_inventoried_reason) VALUES (?, ?, ?, ?, ?, ?)",
+            (path, digest, len(raw), file_type, inventoried_as, reason),
+        )
+        self.db[side].commit()
+
+    def symlink(self, side: str, link_path: str, target_raw: str) -> None:
+        """One fs_symlinks row."""
+        self.db[side].execute(
+            "INSERT INTO fs_symlinks (link_path, link_name, target_raw, target_name, resolved) "
+            "VALUES (?, ?, ?, ?, 0)",
+            (link_path, Path(link_path).name, target_raw, Path(target_raw).name),
+        )
+        self.db[side].commit()
 
 
 @pytest.fixture
@@ -1249,3 +1296,222 @@ def test_a_withheld_binary_diff_does_not_hold_back_its_files(tmp_path: Path, cur
         "unchanged",
         None,
     )
+
+
+# ── the file-subject domain: file_inventory, pairing, .ko, symlinks ─────────────────────────
+
+
+def test_a_no_ingester_file_is_a_subject_read_by_its_inventory_sha256(fw: FW) -> None:
+    """A file the ingesters did not recognise (file_inventory only, no non_binary_files row) is a
+    file subject all the same: it is listed, carries an anchor, and its text difference is read by
+    verifying the bytes against file_inventory.sha256.
+
+    MUTATION (verified RED): drop file_inventory from the subject domain (read non_binary_files
+    only) -> the file is no subject, the list is empty -> RED."""
+    fw.inv("a", "etc/notes.txt", file_type="text", data="alpha\n")
+    fw.inv("b", "etc/notes.txt", file_type="text", data="beta\n")
+    out = fw.diff()
+    by = _by_path(out)
+    assert set(by) == {"etc/notes.txt"}
+    e = by["etc/notes.txt"]
+    assert e["change"] == "content_differs"
+    assert e["anchor_ref"] == "runA::runB#non_binary#etc/notes.txt"
+    assert out["file_subject_counts"]["content_differs"] == 1
+    one = fw.diff(path="etc/notes.txt")["entry"]
+    assert [x for x in one["hunk"]["lines"] if x.startswith(("+", "-"))] == ["-alpha", "+beta"]
+
+
+def test_a_no_ingester_file_whose_bytes_moved_since_the_scan_has_no_hunk(fw: FW) -> None:
+    """The hunk of a no_ingester file is read only when the bytes on disk are the ones the scan
+    hashed; if file_inventory's sha256 does not match, the text is withheld.
+
+    MUTATION (verified RED): read the file without checking file_inventory.sha256 -> a hunk is
+    shown -> RED."""
+    fw.inv("a", "etc/moved.txt", file_type="text", data="one\n", sha="0" * 64, write=True)
+    fw.inv("b", "etc/moved.txt", file_type="text", data="two\n")
+    one = fw.diff(path="etc/moved.txt")["entry"]
+    assert "hunk" not in one
+    assert one["hunk_unavailable"] == "content_differs_from_scan"
+
+
+def test_lib_modules_version_dir_is_normalised_only_with_one_dir_each_side(fw: FW) -> None:
+    """Two files that differ only by a single lib/modules version-dir segment pair (status by
+    sha, paired_by=path_normalized); an identical one is a normalised ``same`` and is not a
+    subject. With more than one first-level dir under lib/modules on a side, nothing normalises.
+
+    MUTATION (verified RED): normalise whatever the first-level-dir count -> the two-dir side
+    pairs across versions it must not -> RED; never normalise -> modules.builtin reads as two
+    single-sided files -> RED."""
+    fw.inv("a", "lib/modules/v1/modules.builtin", file_type="text", data="same\n")
+    fw.inv("b", "lib/modules/v2/modules.builtin", file_type="text", data="same\n")
+    fw.inv("a", "lib/modules/v1/kv.conf", file_type="text", data="k=1\n")
+    fw.inv("b", "lib/modules/v2/kv.conf", file_type="text", data="k=2\n")
+    aligned = {(af.path_a, af.path_b): af for af in fd.aligned_files(fw._pf())}
+    builtin = aligned[("lib/modules/v1/modules.builtin", "lib/modules/v2/modules.builtin")]
+    assert (builtin.status, builtin.paired_by) == ("same", "path_normalized")
+    conf = aligned[("lib/modules/v1/kv.conf", "lib/modules/v2/kv.conf")]
+    assert (conf.status, conf.paired_by) == ("content_differs", "path_normalized")
+    # the normalised 'same' is not a judgeable subject / not in the denominator
+    assert "lib/modules/v1/modules.builtin=>lib/modules/v2/modules.builtin" not in {
+        af.path for af in fd._listed_subjects(fw._pf())
+    }
+    # a second first-level dir on side A turns normalisation off
+    fw.inv("a", "lib/modules/extra/x.conf", file_type="text", data="x\n")
+    statuses = {af.status for af in fd.aligned_files(fw._pf())}
+    assert "content_differs" not in statuses and "a_only" in statuses and "b_only" in statuses
+
+
+def test_a_file_moved_to_a_new_path_pairs_by_sha256_as_one_two_path_subject(fw: FW) -> None:
+    """A file with the same content at a different path is one ``renamed`` subject with a two-path
+    anchor (``{path_a}=>{path_b}``), not two single-sided subjects.
+
+    MUTATION (verified RED): skip the sha256 rename step -> two subjects (a_only + b_only), no
+    renamed -> RED."""
+    fw.inv("a", "www/img/logo_5.png", file_type="binary", data=b"\x89PNGdata")
+    fw.inv("b", "www/img/logo_brand_5.png", file_type="binary", data=b"\x89PNGdata")
+    afs = [af for af in fd.aligned_files(fw._pf()) if af.status == "renamed"]
+    assert len(afs) == 1
+    af = afs[0]
+    assert (af.path_a, af.path_b, af.paired_by) == (
+        "www/img/logo_5.png",
+        "www/img/logo_brand_5.png",
+        "sha",
+    )
+    e = _by_path(fw.diff(change="renamed"))["www/img/logo_5.png=>www/img/logo_brand_5.png"]
+    assert e["anchor_ref"] == ("runA::runB#non_binary#www/img/logo_5.png=>www/img/logo_brand_5.png")
+    assert out_denom(fw) == {"renamed": 1}
+
+
+def out_denom(fw: FW) -> dict[str, int]:
+    counts = fw.diff()["file_subject_counts"]
+    return {k: v for k, v in counts.items() if v and k != "same"}
+
+
+def test_an_ingested_file_paired_by_path_keeps_its_anchor_and_facts(fw: FW) -> None:
+    """An ingested file paired by exact path keeps a single-path anchor and the same facts as
+    before the domain widened: its kind, both sha256 and its structured-comparison counts, so a
+    judgement stored on it still resolves.
+
+    MUTATION (verified RED): give every subject the two-path facts shape (status + sha only) ->
+    the ingested file loses its kind / structured facts -> RED."""
+    a = fw.file("a", "etc/s.sh", "shell_script", "echo 1\n")
+    fw.file("b", "etc/s.sh", "shell_script", "echo 2\n")
+    fw.row("a", "script_calls", a, command="c", raw_line="c 1", line_number=1)
+    subjects = fd.file_subjects(fw._pf())
+    anchor = "runA::runB#non_binary#etc/s.sh"
+    assert anchor in subjects
+    facts = subjects[anchor].facts
+    assert facts["kind"] == "shell_script"
+    assert facts["change"] == "content_differs"
+    assert "structured" in facts and "sha_a" in facts and "sha_b" in facts
+    assert "=>" not in anchor
+
+
+def test_ko_parse_reads_unknown_for_oversize_mismatch_or_garbage(
+    fw: FW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .ko is read only inside the firmware root, only when its bytes match file_inventory's
+    sha256, and only up to a size limit; anything else, and any parse failure, reads ``unknown``
+    with its reason — never 0 / false.
+
+    MUTATION (verified RED): read a parse failure as 'no sections differ' (an empty list) instead
+    of unknown -> RED."""
+    (fw.root["a"] / "m.ko").write_bytes(b"not an elf")
+    # bytes on disk are not the ones the scan hashed
+    assert kc._parse(str(fw.root["a"]), "m.ko", "f" * 64) == (
+        "unknown",
+        "content_differs_from_scan",
+    )
+    # the bytes match the hash but are not a valid ELF
+    ok, reason = kc._parse(str(fw.root["a"]), "m.ko", _sha(b"not an elf"))
+    assert ok == "unknown" and reason.startswith("parse_failed")
+    assert kc._parse(str(fw.root["a"]), "absent.ko", None) == ("unknown", "file_missing")
+    # over the size limit: not read at all
+    monkeypatch.setattr(kc, "MAX_KO_BYTES", 4)
+    assert kc._parse(str(fw.root["a"]), "m.ko", None) == ("unknown", "over_size_limit")
+
+
+def test_ko_gives_function_deltas_only_when_an_executable_section_differs(
+    fw: FW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A content-different .ko reports which sections differ; it reports function-symbol deltas
+    (funcs_a_only / funcs_b_only / funcs_resized) ONLY when a differing section is executable.
+
+    MUTATION (verified RED): report function deltas whenever any section differs (ignore the
+    executable flag) -> the data-only .ko gets a spurious funcs block -> RED."""
+    fw.inv("a", "etc/exec.ko", file_type="elf_rel", reason="et_rel", data=b"A", sha="aa" * 32)
+    fw.inv("b", "etc/exec.ko", file_type="elf_rel", reason="et_rel", data=b"B", sha="bb" * 32)
+    fw.inv("a", "etc/data.ko", file_type="elf_rel", reason="et_rel", data=b"C", sha="cc" * 32)
+    fw.inv("b", "etc/data.ko", file_type="elf_rel", reason="et_rel", data=b"D", sha="dd" * 32)
+
+    def fake_parse(root, path, sha):  # type: ignore[no-untyped-def]
+        if path == "etc/exec.ko":
+            exec_sec = ("digA" if sha == "aa" * 32 else "digB", True, 10, "SHT_PROGBITS")
+            funcs = {"shared": 1} if sha == "aa" * 32 else {"shared": 2, "added_fn": 3}
+            return "ok", {"sections": {".text": exec_sec}, "funcs": funcs}
+        datadig = ("dA" if sha == "cc" * 32 else "dB", False, 4, "SHT_PROGBITS")
+        return "ok", {"sections": {".data": datadig}, "funcs": {}}
+
+    monkeypatch.setattr(kc, "_parse", fake_parse)
+    blk = kc.ko_changes(fw._pf())
+    by = {e["path_a"]: e for e in blk["content_differs"]}
+    assert by["etc/exec.ko"]["sections_differ"] == [".text"]
+    assert by["etc/exec.ko"]["funcs_b_only"]["names"] == ["added_fn"]
+    assert by["etc/exec.ko"]["funcs_resized"]["names"] == ["shared"]
+    assert by["etc/data.ko"]["sections_differ"] == [".data"]
+    assert "funcs_b_only" not in by["etc/data.ko"] and "funcs_a_only" not in by["etc/data.ko"]
+
+
+def test_ko_unknown_from_one_side_is_surfaced_not_swallowed(
+    fw: FW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When either side of a content-different .ko cannot be parsed, sections_differ reads
+    ``unknown`` with the per-side reason — the comparison is never faked as empty.
+
+    MUTATION (verified RED): on an unknown side, fall through to comparing the one parsed side
+    against {} (every section 'differs' or none) -> RED."""
+    fw.inv("a", "etc/x.ko", file_type="elf_rel", reason="et_rel", data=b"A", sha="aa" * 32)
+    fw.inv("b", "etc/x.ko", file_type="elf_rel", reason="et_rel", data=b"B", sha="bb" * 32)
+
+    def half_parse(root, path, sha):  # type: ignore[no-untyped-def]
+        if sha == "aa" * 32:
+            return "ok", {"sections": {".text": ("d", True, 1, "T")}, "funcs": {}}
+        return "unknown", "over_size_limit"
+
+    monkeypatch.setattr(kc, "_parse", half_parse)
+    e = kc.ko_changes(fw._pf())["content_differs"][0]
+    assert e["sections_differ"] == "unknown"
+    assert e["unknown_reason"]["b"] == "over_size_limit"
+
+
+def test_a_single_sided_ko_is_listed_as_an_information_line(fw: FW) -> None:
+    """A .ko one run holds alone is listed (a_only / b_only), never a file subject, never in the
+    denominator.
+
+    MUTATION (verified RED): route a .ko into the file-subject domain -> it appears in
+    file_subject_counts -> RED."""
+    fw.inv("b", "etc/new.ko", file_type="elf_rel", reason="et_rel", data=b"ko")
+    blk = kc.ko_changes(fw._pf())
+    assert [e["path"] for e in blk["b_only"]] == ["etc/new.ko"]
+    assert blk["a_only"] == []
+    assert fw.diff()["file_subject_counts"] == dict.fromkeys(fd.STATUSES, 0)
+
+
+def test_symlink_changes_lists_one_sided_links_and_retargets(fw: FW) -> None:
+    """Symbolic links that changed are listed read-only: a link one run holds alone (a_only /
+    b_only) and a link whose target differs (target_differs); a link with an unchanged target is
+    not listed. Symlinks are not file subjects and not in the denominator.
+
+    MUTATION (verified RED): compare the final resolved target_name instead of target_raw -> a
+    retarget to a differently-written path to the same file is missed -> RED."""
+    fw.symlink("a", "bin/sh", "busybox")
+    fw.symlink("b", "bin/sh", "busybox")  # unchanged
+    fw.symlink("a", "bin/gone", "busybox")  # a_only
+    fw.symlink("b", "bin/new", "busybox")  # b_only
+    fw.symlink("a", "bin/ctl", "./tool")
+    fw.symlink("b", "bin/ctl", "../bin/tool")  # target differs
+    s = fd.symlink_changes(fw._pf())
+    assert [x["link_path"] for x in s["a_only"]] == ["bin/gone"]
+    assert [x["link_path"] for x in s["b_only"]] == ["bin/new"]
+    assert [x["link_path"] for x in s["target_differs"]] == ["bin/ctl"]
+    assert s["in_denominator"] is False

@@ -3186,6 +3186,16 @@ def make_tools(
         difference was read (the file is missing, outside the firmware root, not the bytes the scan
         hashed, binary...).
 
+        The subject domain is every NON-ELF file of the inventory (text and binaries the scan did
+        not parse too), paired by exact path, then a normalised lib/modules version-dir segment,
+        then an equal sha256 (a move: one ``renamed`` subject with a two-path anchor
+        ``{path_a}=>{path_b}``, not two one-sided ones). ``file_subject_counts`` counts the subjects
+        by status; the CHANGED ones (everything but ``same``) are the pair's completion denominator.
+        The first page also carries ``ko_changes`` — the .ko kernel modules (ELF relocatables, not
+        diff subjects): which ELF sections differ and, when a differing section is executable, the
+        function symbols one run has and the other does not — and ``symlink_changes`` — the symbolic
+        links added, removed or retargeted. Both are read-only information, not in the denominator.
+
         Each file has an ``anchor_ref`` and ``review_state``: judge one with annotate_diff(
         anchor_ref, verdict, rationale, run_pair=...). A stale run on either side is refused."""
         atlas = open_atlas(atlas_path)

@@ -155,6 +155,11 @@ class _Side:
     null_path: int
     duplicate_path: int
     rows: dict[str, dict[int, list[dict[str, Any]]]] = field(default_factory=dict)
+    # file_inventory: path -> {sha256, size, file_type, inventoried_as, not_inventoried_reason};
+    # empty on an analysis.db scanned before file_inventory existed.
+    inv: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # fs_symlinks: link_path -> {target_raw, target_name, corrupt_reason}; empty on an older db.
+    syms: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 _SUB_TABLES = {
@@ -164,6 +169,46 @@ _SUB_TABLES = {
     "web_endpoints": "file_id, asset_type, method, path, source",
     "web_form_fields": "file_id, field_keyword",
 }
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _read_inventory(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """``file_inventory`` by path: every file the scan saw, ELF and non-binary alike (the full
+    ledger). Empty on an analysis.db scanned before the table existed — the reading then falls back
+    to the ``non_binary_files`` domain. A path recorded twice keeps the first."""
+    if not _has_table(conn, "file_inventory"):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for r in conn.execute(
+        "SELECT path, sha256, size, file_type, inventoried_as, not_inventoried_reason "
+        "FROM file_inventory WHERE path IS NOT NULL ORDER BY id"
+    ):
+        row = dict(r)
+        out.setdefault(row["path"], row)
+    return out
+
+
+def _read_symlinks(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """``fs_symlinks`` by link_path: the rootfs symbolic links, read-only. Empty on an older db. A
+    link_path recorded twice keeps the first."""
+    if not _has_table(conn, "fs_symlinks"):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for r in conn.execute(
+        "SELECT link_path, target_raw, target_name, corrupt_reason FROM fs_symlinks "
+        "WHERE link_path IS NOT NULL ORDER BY id"
+    ):
+        row = dict(r)
+        out.setdefault(row["link_path"], row)
+    return out
 
 
 def _read_side(atlas: sqlite3.Connection, run_id: str) -> _Side:
@@ -202,13 +247,15 @@ def _read_side(atlas: sqlite3.Connection, run_id: str) -> _Side:
             for r in conn.execute(f"SELECT {cols} FROM {table} ORDER BY id"):  # noqa: S608
                 by_file.setdefault(r["file_id"], []).append(dict(r))
             rows[table] = by_file
+        inv = _read_inventory(conn)
+        syms = _read_symlinks(conn)
     except sqlite3.Error as exc:
         raise FileDiffError(
             f"run {run_id!r}: its non-binary records cannot be read ({exc})"
         ) from exc
     finally:
         conn.close()
-    return _Side(run_id, run.firmware_path, files, null_path, duplicate_path, rows)
+    return _Side(run_id, run.firmware_path, files, null_path, duplicate_path, rows, inv, syms)
 
 
 def _sub(side: _Side, table: str, row: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -235,6 +282,260 @@ class PairFiles:
 def read_pair(atlas: sqlite3.Connection, run_a: str, run_b: str) -> PairFiles:
     a, b = _read_side(atlas, run_a), _read_side(atlas, run_b)
     return PairFiles(run_a, run_b, a, b, sorted(set(a.files) | set(b.files)))
+
+
+# ── the file-subject domain ─────────────────────────────────────────────────────────────────
+#
+# An earlier reading aligned the ``non_binary_files`` the ingesters recognised, by exact path. The
+# subject domain is now every NON-ELF file of ``file_inventory`` — the no_ingester text and
+# binaries too — paired by: exact path, then a normalised lib/modules version-dir segment, then an
+# equal sha256 (a rename). ELF files (``elf_*``) are not file subjects: a .ko (et_rel) is an
+# information line (``ko_changes``), any other ELF goes through the binary diff / binary_presence.
+# The ``non_binary_files`` records still carry the per-file structured comparison and hunk, joined
+# by path; a no_ingester file has neither, only its byte hunk and sha256.
+
+STATUSES = ("same", "content_differs", "renamed", "a_only", "b_only", "undetermined")
+# A changed subject is one of these — a member of the completion denominator; ``same`` is not.
+CHANGED_STATUSES = ("content_differs", "renamed", "a_only", "b_only", "undetermined")
+PAIRED_BY = ("path", "path_normalized", "sha")
+_MODULES_PREFIX = "lib/modules/"
+_MODULE_VER = "\x00"  # internal placeholder for a normalised version-dir segment (never displayed)
+
+
+def _is_elf(file_type: str | None) -> bool:
+    return bool(file_type) and str(file_type).startswith("elf_")
+
+
+def _is_ko(row: dict[str, Any]) -> bool:
+    return _is_elf(row.get("file_type")) and row.get("not_inventoried_reason") == "et_rel"
+
+
+@dataclass(frozen=True)
+class AlignedFile:
+    """One file subject of the run pair: the paths it holds on each side (one may be None), how the
+    two were paired, the status that pairing gives, and each side's sha256."""
+
+    path_a: str | None
+    path_b: str | None
+    status: str
+    paired_by: str
+    sha_a: str | None
+    sha_b: str | None
+    ingested: bool  # a side has a non_binary_files record (structured comparison + hunk)
+
+    @property
+    def path(self) -> str:
+        """The one path to read a single-path subject by (both sides share it, or one side holds
+        it); for a two-path subject it is ``{path_a}=>{path_b}`` — the anchor key."""
+        if self.path_a is not None and self.path_b is not None and self.path_a != self.path_b:
+            return f"{self.path_a}=>{self.path_b}"
+        return self.path_a if self.path_a is not None else str(self.path_b)
+
+    @property
+    def two_path(self) -> bool:
+        return self.paired_by in ("path_normalized", "sha") and self.path_a != self.path_b
+
+
+def _file_domain(side: _Side) -> dict[str, dict[str, Any]]:
+    """path -> {sha, file_type, ingested} for every NON-ELF file of one side: file_inventory when
+    it holds any (production), else the non_binary_files paths (an older db, or a synthetic fixture
+    that records no inventory)."""
+    out: dict[str, dict[str, Any]] = {}
+    for path, r in side.inv.items():
+        if _is_elf(r["file_type"]):
+            continue
+        out[path] = {
+            "sha": r["sha256"],
+            "file_type": r["file_type"],
+            "ingested": bool(r["inventoried_as"]),
+        }
+    for path, r in side.files.items():
+        if path in out:
+            out[path]["ingested"] = True
+        else:
+            out[path] = {"sha": r["sha256"], "file_type": None, "ingested": True}
+    return out
+
+
+def _module_first_level(paths: Iterable[str]) -> set[str]:
+    out: set[str] = set()
+    for p in paths:
+        if p.startswith(_MODULES_PREFIX):
+            seg = p[len(_MODULES_PREFIX) :].split("/", 1)[0]
+            if seg:
+                out.add(seg)
+    return out
+
+
+def _normalize_active(pf: PairFiles) -> bool:
+    """Whether the lib/modules version-dir segment is normalised for this pair: each side has
+    EXACTLY ONE first-level directory under ``lib/modules/``, counting files and symlinks together.
+    A pair with none, or more than one, on either side does not normalise."""
+
+    def paths(side: _Side) -> set[str]:
+        base = side.inv or side.files
+        return set(base) | set(side.syms)
+
+    return len(_module_first_level(paths(pf.a))) == 1 and len(_module_first_level(paths(pf.b))) == 1
+
+
+def _normalize_module_path(p: str) -> str:
+    if not p.startswith(_MODULES_PREFIX):
+        return p
+    rest = p[len(_MODULES_PREFIX) :]
+    tail = rest.split("/", 1)
+    return _MODULES_PREFIX + _MODULE_VER + (("/" + tail[1]) if len(tail) == 2 else "")
+
+
+def _status(
+    pa: str | None, pb: str | None, sha_a: str | None, sha_b: str | None, paired_by: str
+) -> str:
+    if pa is not None and pb is not None:
+        if paired_by == "sha":
+            return "renamed"
+        if sha_a is None or sha_b is None:
+            return "undetermined"
+        return "same" if sha_a == sha_b else "content_differs"
+    return "a_only" if pa is not None else "b_only"
+
+
+def _align(
+    da: dict[str, dict[str, Any]], db: dict[str, dict[str, Any]], norm_active: bool
+) -> list[AlignedFile]:
+    """Pair two sides of one domain (path -> {sha, file_type, ingested}) by exact path, then a
+    normalised lib/modules version-dir segment, then an equal sha256 rename. Deterministic;
+    ``same`` included. Shared by the file-subject domain and the .ko information line, so both pair
+    identically."""
+    a_un, b_un = dict(da), dict(db)
+    out: list[AlignedFile] = []
+
+    def emit(pa: str | None, pb: str | None, by: str) -> None:
+        sha_a = da[pa]["sha"] if pa is not None else None
+        sha_b = db[pb]["sha"] if pb is not None else None
+        ingested = bool(
+            (pa is not None and da[pa]["ingested"]) or (pb is not None and db[pb]["ingested"])
+        )
+        out.append(
+            AlignedFile(pa, pb, _status(pa, pb, sha_a, sha_b, by), by, sha_a, sha_b, ingested)
+        )
+
+    # 1. exact path
+    for p in sorted(set(a_un) & set(b_un)):
+        emit(p, p, "path")
+        del a_un[p], b_un[p]
+    # 2. normalised lib/modules version-dir segment
+    if norm_active:
+        bn: dict[str, list[str]] = {}
+        for p in b_un:
+            bn.setdefault(_normalize_module_path(p), []).append(p)
+        for p in sorted(a_un):
+            np = _normalize_module_path(p)
+            if np != p and bn.get(np):
+                bp = sorted(bn[np])[0]
+                bn[np].remove(bp)
+                emit(p, bp, "path_normalized")
+                del a_un[p], b_un[bp]
+    # 3. rename by equal sha256 (exactly one each side)
+    a_by: dict[str | None, list[str]] = {}
+    b_by: dict[str | None, list[str]] = {}
+    for p, r in a_un.items():
+        a_by.setdefault(r["sha"], []).append(p)
+    for p, r in b_un.items():
+        b_by.setdefault(r["sha"], []).append(p)
+    taken_a: set[str] = set()
+    taken_b: set[str] = set()
+    for sha in sorted(s for s in set(a_by) & set(b_by) if s is not None):
+        la, lb = sorted(a_by[sha]), sorted(b_by[sha])
+        if len(la) == 1 and len(lb) == 1:
+            emit(la[0], lb[0], "sha")
+            taken_a.add(la[0])
+            taken_b.add(lb[0])
+        else:  # one sha to many files: no unambiguous rename — each stays single-side
+            for p in la:
+                emit(p, None, "sha_ambiguous")
+                taken_a.add(p)
+            for p in lb:
+                emit(None, p, "sha_ambiguous")
+                taken_b.add(p)
+    # 4. leftovers, single-side
+    for p in sorted(a_un):
+        if p not in taken_a:
+            emit(p, None, "path")
+    for p in sorted(b_un):
+        if p not in taken_b:
+            emit(None, p, "path")
+    return out
+
+
+def aligned_files(pf: PairFiles) -> list[AlignedFile]:
+    """Every NON-ELF file subject of the pair, paired by exact path / normalised version dir /
+    equal sha256."""
+    return _align(_file_domain(pf.a), _file_domain(pf.b), _normalize_active(pf))
+
+
+def _ko_domain(side: _Side) -> dict[str, dict[str, Any]]:
+    """path -> {sha, file_type, ingested=False} for every .ko (ELF ``et_rel``) of one side."""
+    return {
+        path: {"sha": r["sha256"], "file_type": r["file_type"], "ingested": False}
+        for path, r in side.inv.items()
+        if _is_ko(r)
+    }
+
+
+def aligned_ko(pf: PairFiles) -> list[AlignedFile]:
+    """Every .ko of the pair, paired as the file subjects are — an information line, not a file
+    subject."""
+    return _align(_ko_domain(pf.a), _ko_domain(pf.b), _normalize_active(pf))
+
+
+SYMLINK_NOTE = (
+    "Rootfs symbolic links that changed between the two runs, read-only: a link one run holds "
+    "alone (a_only / b_only), and a link whose target differs (target_differs). Links paired by "
+    "path or by a normalised lib/modules version dir with an unchanged target are not a change and "
+    "are not listed. A symbolic link is pure information — it is not a diff subject, has no "
+    "direction and is not in the completion denominator."
+)
+
+
+def symlink_changes(pf: PairFiles) -> dict[str, Any]:
+    """The run pair's changed symbolic links (one-sided, or whose target differs), paired by exact
+    path then a normalised lib/modules version-dir segment, comparing the verbatim target.
+    Read-only; not a diff subject and not in the completion denominator."""
+    a, b = dict(pf.a.syms), dict(pf.b.syms)
+    target_differs: list[dict[str, Any]] = []
+    same = 0
+
+    def compare(ea: dict[str, Any], eb: dict[str, Any], **extra: Any) -> None:
+        nonlocal same
+        if ea["target_raw"] == eb["target_raw"]:
+            same += 1
+        else:
+            target_differs.append(
+                {**extra, "target_a": ea["target_raw"], "target_b": eb["target_raw"]}
+            )
+
+    for lp in sorted(set(a) & set(b)):
+        compare(a.pop(lp), b.pop(lp), link_path=lp)
+    if _normalize_active(pf):
+        bn: dict[str, list[str]] = {}
+        for lp in b:
+            bn.setdefault(_normalize_module_path(lp), []).append(lp)
+        for lp in sorted(a):
+            nlp = _normalize_module_path(lp)
+            if nlp != lp and bn.get(nlp):
+                blp = sorted(bn[nlp])[0]
+                bn[nlp].remove(blp)
+                compare(a.pop(lp), b.pop(blp), link_path_a=lp, link_path_b=blp)
+    a_only = [{"link_path": lp, "target_raw": a[lp]["target_raw"]} for lp in sorted(a)]
+    b_only = [{"link_path": lp, "target_raw": b[lp]["target_raw"]} for lp in sorted(b)]
+    return {
+        "a_only": a_only,
+        "b_only": b_only,
+        "target_differs": target_differs,
+        "same_count": same,
+        "in_denominator": False,
+        "note": SYMLINK_NOTE,
+    }
 
 
 def change_of(ra: dict[str, Any] | None, rb: dict[str, Any] | None) -> str:
@@ -656,6 +957,32 @@ def hunk(pf: PairFiles, path: str) -> Hunk:
     return pf.hunks[path]
 
 
+def aligned_hunk(pf: PairFiles, af: AlignedFile) -> Hunk:
+    """The line difference of a file subject: an ingested file paired by exact path reads exactly as
+    the existing per-path ``hunk``; a no_ingester file, or a two-path (renamed / normalised)
+    subject, reads each side at its own path, verifying the bytes against file_inventory's sha256.
+    Read once per subject and reading, keyed by the subject's anchor key."""
+    if not af.two_path and af.ingested and (af.path in pf.a.files or af.path in pf.b.files):
+        return hunk(pf, af.path)
+    key = af.path
+    if key in pf.hunks:
+        return pf.hunks[key]
+    texts: list[list[str]] = []
+    for side, p, sha in ((pf.a, af.path_a, af.sha_a), (pf.b, af.path_b, af.sha_b)):
+        if p is None:
+            texts.append([])
+            continue
+        lines, why = _read_file(side.root, p, sha)
+        if lines is None:
+            pf.hunks[key] = Hunk(None, unavailable=why)
+            return pf.hunks[key]
+        texts.append(lines)
+    diff = list(difflib.unified_diff(texts[0], texts[1], n=HUNK_CONTEXT, lineterm=""))[2:]
+    h = Hunk(diff, suppressed="embedded_secret") if _embedded_secret(diff) else Hunk(diff)
+    pf.hunks[key] = h
+    return h
+
+
 def _hunk(pf: PairFiles, path: str) -> Hunk:
     ra, rb = pf.row("a", path), pf.row("b", path)
     texts: list[list[str]] = []
@@ -803,10 +1130,124 @@ def subject_facts(entry: dict[str, Any]) -> dict[str, Any]:
     return facts
 
 
+def _af_ingested_exact(pf: PairFiles, af: AlignedFile) -> bool:
+    """Whether this subject is an ingested file paired by exact path — the case that reads exactly
+    as the pre-existing per-path machinery (identical entry, facts and hunk)."""
+    return not af.two_path and af.ingested and (af.path in pf.a.files or af.path in pf.b.files)
+
+
+def _entry_for(pf: PairFiles, af: AlignedFile) -> dict[str, Any]:
+    """One subject's entry without its hunk. An ingested file paired by exact path keeps the
+    per-path entry unchanged; a no_ingester file, or a two-path (renamed / normalised) subject,
+    carries its status, both sha256, and (for two paths) each side's path and how they were
+    paired."""
+    if _af_ingested_exact(pf, af):
+        return file_entry(pf, af.path)
+    out: dict[str, Any] = {
+        "path": af.path,
+        "change": af.status,
+        "sha_a": af.sha_a,
+        "sha_b": af.sha_b,
+    }
+    if af.two_path:
+        out["path_a"] = af.path_a
+        out["path_b"] = af.path_b
+        out["paired_by"] = af.paired_by
+    return out
+
+
+def _af_kinds(pf: PairFiles, af: AlignedFile) -> set[str]:
+    out: set[str] = set()
+    for side, p in (("a", af.path_a), ("b", af.path_b)):
+        if p is not None:
+            r = pf.row(side, p)
+            if r is not None:
+                out.add(str(r["kind"]))
+    return out
+
+
+def _listed_subjects(pf: PairFiles) -> list[AlignedFile]:
+    """The file subjects a page can list / a path can read — every aligned subject except a
+    normalised-``same`` file (not judged, no anchor), in display-path order."""
+    return sorted(
+        (
+            af
+            for af in aligned_files(pf)
+            if not (af.status == "same" and af.paired_by == "path_normalized")
+        ),
+        key=lambda af: af.path,
+    )
+
+
+def _subject_index(pf: PairFiles) -> dict[str, AlignedFile]:
+    """Resolve a ``path`` argument to its subject: by the anchor key (a single path, or
+    ``{path_a}=>{path_b}``), or by either side's path for a two-path subject."""
+    idx: dict[str, AlignedFile] = {}
+    for af in _listed_subjects(pf):
+        idx[af.path] = af
+        if af.two_path:
+            idx.setdefault(str(af.path_a), af)
+            idx.setdefault(str(af.path_b), af)
+    return idx
+
+
+def file_subject_counts(pf: PairFiles) -> dict[str, int]:
+    """The file subjects by status (the completion-denominator view): a normalised-``same`` file is
+    not a subject, so not counted."""
+    out = dict.fromkeys(STATUSES, 0)
+    for af in _listed_subjects(pf):
+        out[af.status] += 1
+    return out
+
+
+def _subject_facts_for(pf: PairFiles, af: AlignedFile) -> dict[str, Any]:
+    """What a judgement on one file subject rests on. An ingested file paired by exact path keeps
+    its existing facts unchanged (its kind, both sha256 and its structured-comparison counts); a
+    no_ingester file, or a two-path (renamed / normalised) subject, rests on its status and both
+    sha256 only."""
+    if not af.two_path and af.ingested and (af.path in pf.a.files or af.path in pf.b.files):
+        return subject_facts(file_entry(pf, af.path))
+    return {"change": af.status, "sha_a": af.sha_a, "sha_b": af.sha_b}
+
+
 def file_subjects(pf: PairFiles) -> dict[str, dr.Subject]:
-    """anchor -> subject for every aligned path of the pair (``same`` included)."""
-    facts = {p: subject_facts(file_entry(pf, p)) for p in pf.paths}
+    """anchor -> subject for every file subject of the pair: the non-ELF files of file_inventory,
+    paired by exact path / normalised version dir / equal sha256. ``same`` files paired by exact
+    path are kept (a judged file whose sides became equal reads as moved, not gone); a
+    normalised-``same`` file (e.g. modules.builtin under a renamed version dir) is not judged and
+    has no anchor."""
+    facts: dict[str, dict[str, Any]] = {}
+    for af in aligned_files(pf):
+        if af.status == "same" and af.paired_by == "path_normalized":
+            continue
+        facts[af.path] = _subject_facts_for(pf, af)
     return dr.non_binary_subjects_of(facts, pf.run_a, pf.run_b)
+
+
+def file_subject_items(pf: PairFiles, judged: dict[str, dr.DiffAnnotation]) -> list[dr.Item]:
+    """Each CHANGED file subject as a completion-denominator item (bucket ``non_binary_file``),
+    ordered after every diff's entries and the binary_presence binaries: unjudged until a judgement
+    exists on its anchor. ``same`` files are not changed, so not counted; a .ko (an ELF information
+    line) is not a file subject and never reaches here."""
+    items: list[dr.Item] = []
+    for af in aligned_files(pf):
+        if af.status not in CHANGED_STATUSES:
+            continue
+        anchor = non_binary_anchor(pf.run_a, pf.run_b, af.path)
+        j = judged.get(anchor)
+        items.append(
+            dr.Item(
+                entry_id=anchor,
+                anchor_ref=anchor,
+                bucket="non_binary_file",
+                subclass=af.status,
+                tier=af.paired_by,
+                state=dr.review_state(j),
+                verdict=j.verdict if j is not None else None,
+                order=(2, af.path),
+            )
+        )
+    return items
 
 
 def is_non_binary_anchor(anchor_ref: str) -> bool:
@@ -878,8 +1319,8 @@ def file_diff(
     has read them already. Raises FileDiffError on an argument or a side it cannot read."""
     if detail not in DETAILS:
         raise FileDiffError(f"detail must be one of {list(DETAILS)}; got {detail!r}")
-    if change is not None and change not in CHANGES:
-        raise FileDiffError(f"change must be one of {list(CHANGES)}; got {change!r}")
+    if change is not None and change not in STATUSES:
+        raise FileDiffError(f"change must be one of {list(STATUSES)}; got {change!r}")
     if kind is not None and kind not in KINDS:
         raise FileDiffError(f"kind must be one of {list(KINDS)}; got {kind!r}")
     for name, value, low in (("offset", offset, 0), ("hunk_offset", hunk_offset, 0)):
@@ -897,12 +1338,13 @@ def file_diff(
         "run_b": run_b,
         "detail": detail,
         **counts_by_kind(pf),
+        "file_subject_counts": file_subject_counts(pf),
         "legend": LEGEND,
         "caveats": CAVEATS,
     }
 
-    def decorate(entry: dict[str, Any], *, full: bool) -> dict[str, Any]:
-        anchor = non_binary_anchor(run_a, run_b, entry["path"])
+    def decorate(af: AlignedFile, entry: dict[str, Any], *, full: bool) -> dict[str, Any]:
+        anchor = non_binary_anchor(run_a, run_b, af.path)
         out = dict(entry)
         block = out.pop("structured", None)
         if block is not None:
@@ -918,20 +1360,21 @@ def file_diff(
             else:
                 out["structured"] = block if full else _cut_lists(block, LIST_PAGE_ITEMS)
         if entry["change"] != "same":
-            out.update(_hunk_fields(hunk(pf, entry["path"])))
+            out.update(_hunk_fields(aligned_hunk(pf, af)))
         out["anchor_ref"] = anchor
         out["review_state"] = review.get(anchor, dr.STATES[0])
         return out
 
     if path is not None:
-        if path not in pf.a.files and path not in pf.b.files:
+        af = _subject_index(pf).get(path)
+        if af is None:
             raise FileDiffError(f"no file with path {path!r} is recorded on either side of {pair}")
         if offset > 0 and hunk_offset > 0:
             raise FileDiffError(
                 "offset pages a file's structured lists and hunk_offset its line difference: "
                 "pass one of them above 0, not both"
             )
-        entry = decorate(file_entry(pf, path), full=True)
+        entry = decorate(af, _entry_for(pf, af), full=True)
         if detail == "full":
             block = entry.pop("structured", None)
             if block is not None:
@@ -940,7 +1383,7 @@ def file_diff(
                 else:
                     entry["structured_on_page"] = "hunk_offset=0"
             if entry["change"] != "same":
-                h = hunk(pf, path)
+                h = aligned_hunk(pf, af)
                 if h.lines is not None and offset > 0:
                     entry["hunk_on_page"] = "offset=0"
                 elif h.lines is not None and h.suppressed is not None:
@@ -949,19 +1392,16 @@ def file_diff(
                     entry["hunk"] = hunk_page(h, hunk_offset)
         return {**envelope, "entry": entry}
 
-    wanted = (change,) if change is not None else LISTED_CHANGES
-    chosen = []
-    for p in pf.paths:
-        ra, rb = pf.row("a", p), pf.row("b", p)
-        if change_of(ra, rb) not in wanted:
-            continue
-        if kind is not None and kind not in {r["kind"] for r in (ra, rb) if r is not None}:
-            continue
-        chosen.append(p)
+    wanted = (change,) if change is not None else CHANGED_STATUSES
+    chosen = [
+        af
+        for af in _listed_subjects(pf)
+        if af.status in wanted and (kind is None or kind in _af_kinds(pf, af))
+    ]
     page = chosen[offset : offset + limit]
-    entries = [decorate(file_entry(pf, p), full=False) for p in page]
+    entries = [decorate(af, _entry_for(pf, af), full=False) for af in page]
     end = offset + len(page)
-    return {
+    result = {
         **envelope,
         "filters": {"kind": kind, "change": change},
         "entries": entries,
@@ -970,6 +1410,12 @@ def file_diff(
         "truncated_by_bytes": False,
         "read_one_with": f'get_file_diff(run_pair={json.dumps(pair)}, path="<path>")',
     }
+    if offset == 0:  # whole-pair information lines, given once with the first page
+        from treasure_map.lib.query.ko_changes import ko_changes
+
+        result["ko_changes"] = ko_changes(pf)
+        result["symlink_changes"] = symlink_changes(pf)
+    return result
 
 
 def file_summary(atlas: sqlite3.Connection, run_a: str, run_b: str) -> dict[str, Any]:
@@ -984,5 +1430,6 @@ def file_summary(atlas: sqlite3.Connection, run_a: str, run_b: str) -> dict[str,
     return {
         "counts": counts["counts"],
         "counts_by_kind": counts["counts_by_kind"],
+        "file_subject_counts": file_subject_counts(pf),
         "next": f"get_file_diff(run_pair={json.dumps(pair)})",
     }

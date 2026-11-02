@@ -861,6 +861,26 @@ def pair_progress(
     # Each binary_presence binary is one more subject to judge: in the denominator, after every
     # diff's entries in the order next_page names them.
     items += bp.presence_items(presence, presence_judged)
+    # Each CHANGED non-binary file of the pair is one more subject, after the binary_presence
+    # binaries. A .ko (ELF information line) and a file identical on both sides are
+    # not counted. If the pair's files cannot be read, their subjects are unknown, not zero —
+    # 'complete' is withheld rather than claimed.
+    from treasure_map.lib.query import file_diff as _fd
+
+    files_unavailable: str | None = None
+    try:
+        pf = _fd.read_pair(atlas, run_a, run_b)
+        file_judged = _fd.file_review(
+            atlas,
+            run_a,
+            run_b,
+            source_stale=staleness.get("source_stale"),
+            source_stale_reason=staleness.get("source_stale_reason"),
+            pf=pf,
+        )
+        items += _fd.file_subject_items(pf, file_judged)
+    except _fd.FileDiffError as exc:
+        files_unavailable = str(exc)
     blind_not_diffed, identical_not_diffed = split_not_diffed(
         not_diffed_binaries(atlas, run_a, run_b, exclude=presence.excluded, groups=groups)
     )
@@ -892,8 +912,15 @@ def pair_progress(
                 "block keeps separate"
             ),
         },
+        # The pair's files, when they could not be read: their subjects are unknown, so 'complete'
+        # is withheld. None when they were read (the file subjects are in the counts above).
+        "non_binary_files_unavailable": files_unavailable,
         "complete": (
-            numbers["not_looked_at"] == 0 and not failed and not withheld and not blind_not_diffed
+            numbers["not_looked_at"] == 0
+            and not failed
+            and not withheld
+            and not blind_not_diffed
+            and files_unavailable is None
         ),
         "note": (
             dr.PROGRESS_NOTE
@@ -902,9 +929,11 @@ def pair_progress(
             "having judged every listed entry does not reach them. A binary byte-identical on both "
             "sides is not one of those — it needed no diff (identical_not_diffed_binaries). A "
             "binary one run holds alone is a subject of its own (binary_presence, bucket "
-            "binary_presence in the counts): 'complete' needs a judgment on each, written with "
+            "binary_presence in the counts); each CHANGED non-binary file of the pair is one too "
+            "(bucket non_binary_file): 'complete' needs a judgment on each, written with "
             "annotate_diff(anchor_ref=<its anchor_ref>, run_pair=...). next_page here is in the "
-            "candidate_tier order, the binary_presence binaries after every diff's entries; "
-            "get_diff_patch_view names the next ones in the order its page is read in."
+            "candidate_tier order, the binary_presence binaries then the file subjects after every "
+            "diff's entries; get_diff_patch_view names the next ones in the order its page is read "
+            "in."
         ),
     }

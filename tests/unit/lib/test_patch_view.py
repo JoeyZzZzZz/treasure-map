@@ -7345,8 +7345,9 @@ def test_the_run_pair_progress_stays_in_the_candidate_tier_order(
     assert named == unjudged[: progress["page_size"]]
     assert named[0] == _T2_FIRST["candidate_tier"]
     assert progress["note"].endswith(
-        "next_page here is in the candidate_tier order, the binary_presence binaries after every "
-        "diff's entries; get_diff_patch_view names the next ones in the order its page is read in."
+        "next_page here is in the candidate_tier order, the binary_presence binaries then the file "
+        "subjects after every diff's entries; get_diff_patch_view names the next ones in the order "
+        "its page is read in."
     )
 
 

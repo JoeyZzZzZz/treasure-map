@@ -421,6 +421,23 @@ def _judge_all(w: World, tags: tuple[str, ...]) -> None:
             )
 
 
+def _judge_files(w: World) -> None:
+    """Judge every CHANGED non-binary file subject of the pair — a Spec 2b denominator member, so
+    'complete' now needs them too, beside the diffs and binary_presence binaries."""
+    from treasure_map.lib.query import file_diff as fd
+
+    pf = fd.read_pair(w.atlas, "runA", "runB")
+    for af in fd.aligned_files(pf):
+        if af.status in fd.CHANGED_STATUSES:
+            overlay.annotate_diff(
+                w.atlas,
+                anchor_ref=fd.non_binary_anchor("runA", "runB", af.path),
+                verdict="change_inconclusive",
+                rationale="read the file difference",
+                run_pair=PAIR,
+            )
+
+
 @pytest.mark.parametrize("side", ["a_only", "b_only"])
 def test_an_unjudged_one_sided_binary_keeps_the_run_pair_incomplete(
     world: World, side: str
@@ -441,6 +458,28 @@ def test_an_unjudged_one_sided_binary_keeps_the_run_pair_incomplete(
     assert progress["complete"] is False
     assert progress["by_bucket"]["binary_presence"]["none"] > 0
     _judge_all(world, (side,))
+    _judge_files(world)  # the pair's changed files are denominator members too (Spec 2b D26(c))
+    assert _progress(world)["complete"] is True
+
+
+def test_a_changed_non_binary_file_keeps_the_run_pair_incomplete_until_judged(
+    world: World,
+) -> None:
+    """★ Each CHANGED non-binary file is in the completion denominator too: with every binary diff
+    entry and every binary_presence binary judged, a still-unjudged changed file keeps the run pair
+    incomplete; judging the files completes it.
+
+    MUTATION (verified RED): leave the file subjects out of the progress denominator -> the pair
+    reads complete with changed files still unjudged -> RED."""
+    for name in ("blind.cgi", "linked", "samename"):  # clear the blind spots: files are the blocker
+        world.adb["a"].execute("DELETE FROM binaries WHERE path LIKE ?", (f"%/{name}",))
+        world.atlas.execute("DELETE FROM instance WHERE binary_path LIKE ?", (f"%/{name}",))
+    world.commit()
+    _judge_all(world, ("a_only", "b_only"))  # every binary_presence binary judged
+    progress = _progress(world)
+    assert progress["by_bucket"]["non_binary_file"]["none"] > 0  # changed files still unjudged
+    assert progress["complete"] is False
+    _judge_files(world)
     assert _progress(world)["complete"] is True
 
 
