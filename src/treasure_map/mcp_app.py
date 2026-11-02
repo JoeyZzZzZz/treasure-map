@@ -52,6 +52,7 @@ from treasure_map.lib.analyze.ghidra_runner import current_pass_version as _curr
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import RunRow
 from treasure_map.lib.config.config import Config, load_config
+from treasure_map.lib.diff.code_version import diff_code_version as _diff_code_version
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.notice import LEGAL_NOTICE
 from treasure_map.lib.overlay import _DIFF_VERDICTS
@@ -99,6 +100,7 @@ from treasure_map.lib.query.diff_align import diffs_source_staleness as _diffs_s
 from treasure_map.lib.query.diff_align import get_diff_capabilities as _get_diff_capabilities
 from treasure_map.lib.query.diff_align import get_diff_deltas as _get_diff_deltas
 from treasure_map.lib.query.diff_align import get_diff_meta as _get_diff_meta
+from treasure_map.lib.query.diff_align import get_diff_string_delta as _get_diff_string_delta
 from treasure_map.lib.query.diff_align import list_diff_blindspots as _list_diff_blindspots
 from treasure_map.lib.query.diff_align import list_diffs as _list_diffs
 from treasure_map.lib.query.diff_align import (
@@ -121,6 +123,7 @@ from treasure_map.lib.query.sink_overlay import filter_by_side as _overlay_filte
 from treasure_map.lib.query.sink_overlay import page_overlay as _page_overlay
 from treasure_map.lib.query.sink_overlay import summarize_overlay as _summarize_overlay
 from treasure_map.lib.query.triage import anchor_facts
+from treasure_map.version import __version__ as _pkg_version
 from treasure_map.version import installed_commit as _installed_commit
 
 # A standing reminder attached to every candidate-listing / aggregation result: the ordering and
@@ -160,6 +163,11 @@ _MAX_LIMIT = 200
 # of those is what this constant is set against, and it does not promise that every client keeps
 # a page inline.
 _RESPONSE_BYTE_BUDGET = 48_000
+
+# D33: the default for a refusal's ``moved`` argument meaning "compute _server_code_moved here".
+# A tool that already probed the disk for its ``server`` head passes the value in instead, so the
+# response probes once. Distinct from None, which is a real result ("the code has not moved").
+_MOVED_UNSET: Any = object()
 
 
 def _fit_candidates(
@@ -856,6 +864,19 @@ def make_tools(
     ws_root = Path(workspaces_root) if workspaces_root is not None else None
     _config = config if config is not None else load_config(None)
     _current = rescan_version.current_code_stamp(_config)
+    # D33: the server's own version fields, every one the IN-PROCESS loaded value, fixed once here
+    # at startup (``_current`` is this process's code stamp; _current_pass_version and
+    # _diff_code_version are cached on first call, so calling them here pins them). The one thing
+    # compared against disk is code_moved_on_disk, added per response below. Reported on list_runs,
+    # start_diff_review and get_diff_meta so every agent run can record which server answered.
+    _server_base: dict[str, Any] = {
+        "commit": _installed_commit(),
+        "version": _pkg_version,
+        "hunt_code": _current.hunt,
+        "scan_code": _current.scan,
+        "pass_version": _current_pass_version(),
+        "diff_code_version": _diff_code_version(),
+    }
 
     def _server_code_moved() -> str | None:
         """A hint to append to a refusal when this server's code stamp no longer matches the code on
@@ -873,6 +894,14 @@ def make_tools(
             "server: a rescan from the command line uses the code on disk and cannot make runs "
             "current for this server."
         )
+
+    def _server_block() -> tuple[dict[str, Any], str | None]:
+        """The response's ``server`` object and the on-disk-moved hint, computing
+        ``_server_code_moved`` ONCE. A tool that reports ``server`` passes the returned ``moved``
+        on to its refusal, so a single response probes the disk at most once — head and refusal
+        share it (``code_moved_on_disk`` is ``moved is not None``)."""
+        moved = _server_code_moved()
+        return {**_server_base, "code_moved_on_disk": moved is not None}, moved
 
     def _error(atlas: sqlite3.Connection, msg: str) -> dict[str, Any]:
         """A hard-error fact result: never a silent empty. Carries ``runs_in_atlas`` so the
@@ -965,8 +994,14 @@ def make_tools(
             "warning": warning,
         }
 
-    def _stale_refusal(atlas: sqlite3.Connection, run: RunRow) -> dict[str, Any] | None:
+    def _stale_refusal(
+        atlas: sqlite3.Connection, run: RunRow, moved: str | None = _MOVED_UNSET
+    ) -> dict[str, Any] | None:
         """The refusal for a PROVABLY stale run, or None when it is servable.
+
+        ``moved`` is the ``_server_code_moved`` hint; left at ``_MOVED_UNSET`` it is computed here
+        (one probe per refusal). A D33 tool that already probed the disk for its ``server`` head
+        passes the value in, so the response probes the disk once.
 
         Only a proven mismatch gets here (see run_staleness): the stored run was demonstrably
         produced by different code than is answering now, so every fact it would return is an
@@ -987,11 +1022,13 @@ def make_tools(
             return None
         err = _error(atlas, f"run '{run.run_id}' is a STALE scan ({stale.axis}): {stale.detail}")
         err["stale_scan"] = {"axis": stale.axis, "detail": stale.detail}
-        moved = _server_code_moved()
-        err["remedy"] = f"{stale.remedy} {moved}" if moved else stale.remedy
+        m = _server_code_moved() if moved is _MOVED_UNSET else moved
+        err["remedy"] = f"{stale.remedy} {m}" if m else stale.remedy
         return err
 
-    def _refuse_stale_run(atlas: sqlite3.Connection, run_id: str | None) -> dict[str, Any] | None:
+    def _refuse_stale_run(
+        atlas: sqlite3.Connection, run_id: str | None, moved: str | None = _MOVED_UNSET
+    ) -> dict[str, Any] | None:
         """The refusal for a tool call SCOPED to one run, or None (unscoped, unknown, or servable).
 
         An unknown run_id is left alone: "no such run in this atlas" is a different answer, and
@@ -1002,7 +1039,7 @@ def make_tools(
         run = _get_run(atlas, run_id)
         if run is None:
             return None
-        err = _stale_refusal(atlas, run)
+        err = _stale_refusal(atlas, run, moved)
         if err is not None:
             err["resolved_run"] = run.run_id
             err["run_lineage"] = _lineage_inline(run, _current)
@@ -1058,7 +1095,9 @@ def make_tools(
             for rid, entry in sorted(index.items())
         ]
 
-    def _refuse_stale_diff(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] | None:
+    def _refuse_stale_diff(
+        atlas: sqlite3.Connection, diff_id: str, moved: str | None = _MOVED_UNSET
+    ) -> dict[str, Any] | None:
         """The refusal for a diff whose A or B side is a PROVABLY stale run, else None.
 
         A diff is a claim about two scans, so it is only as current as the older of them: reading a
@@ -1075,7 +1114,7 @@ def make_tools(
             run = _get_run(atlas, run_id) if run_id else None
             if run is None:
                 continue
-            err = _stale_refusal(atlas, run)
+            err = _stale_refusal(atlas, run, moved)
             if err is not None:
                 err["stale_scan"]["diff_side"] = side
                 err["diff_id"] = diff_id
@@ -2139,13 +2178,16 @@ def make_tools(
                 "diff_id": diff_id,
                 "error": f"limit must be an integer in 1..200, got {limit!r}",
             }
+        server, moved = _server_block()
         conn = open_atlas(atlas_path)
         try:
-            refusal = _refuse_stale_diff(conn, diff_id)
+            refusal = _refuse_stale_diff(conn, diff_id, moved)
             if refusal is not None:
+                refusal["server"] = server
                 return refusal
             page = _get_diff_patch_view(conn, diff_id, detail="summary", limit=limit)
             if "error" in page:
+                page["server"] = server
                 return page
             head = _get_diff_patch_view(conn, diff_id, limit=1, rows_limit=0)
             meta_full = _get_diff_meta(conn, diff_id)
@@ -2174,6 +2216,7 @@ def make_tools(
         def compose(head_entry: dict[str, Any] | None) -> dict[str, Any]:
             out: dict[str, Any] = {
                 "diff_id": diff_id,
+                "server": server,
                 "workflow": DIFF_WORKFLOW,
                 "meta": meta,
                 "headline": head_entry,
@@ -2949,17 +2992,52 @@ def make_tools(
         ``listed_in`` says and judged with annotate_diff(..., run_pair=...).
         ``functions.changed`` also counts the pairs carrying a ``sink_callee_swap`` (by pairing and
         by side), a ``sink_candidate_counts`` delta or unknown, and ``listed_as_s`` — the aligned
-        similarity-1 pairs listed as bucket S."""
+        similarity-1 pairs listed as bucket S. ``server`` reports the running server's own build
+        (D33; see list_runs)."""
+        server, moved = _server_block()
+        conn = open_atlas(atlas_path)
+        try:
+            refusal = _refuse_stale_diff(conn, diff_id, moved)
+            if refusal is not None:
+                refusal["server"] = server
+                return refusal
+            out = _get_diff_meta(conn, diff_id)
+            out["server"] = server
+            if out.get("found"):
+                files = _file_block(conn, diff_id)
+                if files is not None:
+                    out["non_binary"] = files
+            return out
+        finally:
+            conn.close()
+
+    def get_diff_string_delta(diff_id: str, limit: int = 200, offset: int = 0) -> dict[str, Any]:
+        """The string literals present on ONE side only between the diff's two runs — ``a_only`` =
+        A\\B, ``b_only`` = B\\A — of ``diff_id`` = ``{run_a}::{run_b}::{binary}`` (see list_diffs),
+        each with its resolved reference anchors.
+
+        A FACT about the extracted strings, NOT proof a string was created or deleted (the two
+        sides are different builds): ``a_only`` and ``b_only`` are symmetric. Each value's ``refs``
+        are its own side's data/pointer references; a ref with ``ref_in_func`` null is a reference
+        in no function, shown not dropped. ``refs_exported`` False = that side exported no
+        string_refs at all — the refs are UNKNOWN, never 'no references'. ``strings_truncated`` is
+        each side's state (clean / truncated / unknown): a truncated or unknown side is NOT
+        'complete'. ``sides.a_only`` / ``sides.b_only`` page independently by ``limit`` /
+        ``offset`` (follow ``next_offset``). get_diff_meta carries the counts."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 2000:
+            return {
+                "diff_id": diff_id,
+                "error": f"limit must be an integer in 1..2000, got {limit!r}",
+            }
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            return {"diff_id": diff_id, "error": f"offset must be an integer >= 0, got {offset!r}"}
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
             if refusal is not None:
                 return refusal
-            out = _get_diff_meta(conn, diff_id)
-            if out.get("found"):
-                files = _file_block(conn, diff_id)
-                if files is not None:
-                    out["non_binary"] = files
+            out = _get_diff_string_delta(conn, diff_id, limit=limit, offset=offset)
+            out["note"] = _DERIVED_SIGNAL_NOTE
             return out
         finally:
             conn.close()
@@ -3685,17 +3763,24 @@ def make_tools(
         ``build_hash`` (extraction pass_version — differing build_hash for the same firmware means a
         STALE scan), ``scanned_at``, counts, and ``resolved`` (False for a pre-existing run with no
         lineage row: visible but its analysis.db is not recorded — re-scan to enable fact tools).
-        Use this to pick a ``run_id`` for the fact tools and to catch "auditing an old scan"."""
+        Use this to pick a ``run_id`` for the fact tools and to catch "auditing an old scan".
+
+        ``server`` reports the running server's own build (D33): its ``commit`` / ``version``, the
+        ``hunt_code`` / ``scan_code`` stamps and ``pass_version`` / ``diff_code_version`` it loaded,
+        and ``code_moved_on_disk`` (the on-disk code has since changed — restart to serve it). Every
+        value but that last flag is the IN-PROCESS value, so it is stable across a session."""
         atlas = open_atlas(atlas_path)
         try:
             runs = _list_runs(atlas)
         finally:
             atlas.close()
+        server, _ = _server_block()
         return {
             "note": _DERIVED_SIGNAL_NOTE,
             "atlas": str(atlas_path),
             "count": len(runs),
             "runs": [asdict(r) for r in runs],
+            "server": server,
         }
 
     def list_verified_exploits(reveal: bool = False) -> dict[str, Any]:
@@ -4483,6 +4568,7 @@ def make_tools(
         "get_diff_sink_overlay": get_diff_sink_overlay,
         "same_shape_siblings": same_shape_siblings,
         "get_diff_meta": get_diff_meta,
+        "get_diff_string_delta": get_diff_string_delta,
         "get_function_alignment": get_function_alignment,
         "get_diff_capabilities": get_diff_capabilities,
         "list_diffs": list_diffs,

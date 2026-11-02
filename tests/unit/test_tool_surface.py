@@ -181,7 +181,7 @@ def test_the_descriptions_and_the_instructions_fit_what_a_client_shows(atlas: Pa
     (The counts in this file are of the whole file run against the mutation.)"""
     listed = asyncio.run(mcp_app.build_server(atlas).list_tools())
     sizes = {t.name: len(t.description or "") for t in listed}
-    assert len(sizes) == 40
+    assert len(sizes) == 41
     assert sum(sizes.values()) <= 25_000, sum(sizes.values())
     assert max(sizes.values()) <= 1_200, max(sizes.items(), key=lambda kv: kv[1])
     for t in listed:
@@ -205,6 +205,7 @@ EXPECTED_FIRST_LINES = {
     "get_diff_sink_overlay": "Required: exactly one of diff_id / run_a + run_b.",
     "same_shape_siblings": "Required: diff_id; exactly one of evidence_ref / candidate_anchor.",
     "get_diff_meta": "Required: diff_id.",
+    "get_diff_string_delta": "Required: diff_id.",
     "get_function_alignment": (
         "Required: diff_id, function (addr is its old name, accepted for this version)."
     ),
@@ -588,6 +589,7 @@ _DIFF_ID_TOOLS = (
     "get_diff_sink_overlay",
     "same_shape_siblings",
     "get_diff_meta",
+    "get_diff_string_delta",
     "get_function_alignment",
     "get_diff_capabilities",
     "annotate_diff",
@@ -694,7 +696,7 @@ def test_appendix_a_is_what_the_refusal_offers_and_nothing_outside_it_offers_any
     MUTATION (verified RED, 1 failed): drop the (stride, side) veto -> RED."""
     accepted = _accepted()
     want = {(w, t): offer for w, offer, ts in APPENDIX_A for t in ts}
-    assert len(want) == 252
+    assert len(want) == 253
     inputs = {p for ps in accepted.values() for p in ps} | set(cards._PARAM_SYNONYMS) | set(_TYPOS)
     seen = 0
     for wrong in sorted(inputs):
@@ -1059,6 +1061,11 @@ BOUNDARY: dict[str, tuple[str, ...]] = {
         "NOT 'noise'",
         "is a BLIND SPOT, never 'no change'",
     ),
+    "get_diff_string_delta": (
+        "NOT proof a string was created or deleted",
+        "UNKNOWN, never 'no references'",
+        "a truncated or unknown side is NOT 'complete'",
+    ),
     "get_function_alignment": (
         "Returns an ALIGNMENT FACT, never a verdict",
         "No match here is NOT proof the function was added or removed",
@@ -1335,7 +1342,7 @@ def test_the_old_name_addr_still_works_once_and_says_so(
 def test_the_cards_and_the_tools_are_the_same_set_and_the_reference_is_read_only() -> None:
     made = mcp_app.make_tools(Path("/nonexistent.db"))
     assert set(cards.TOOL_CARDS) == set(made)
-    assert len(made) == 40 and "get_tool_reference" in made
+    assert len(made) == 41 and "get_tool_reference" in made
     assert list(made)[-2:] == ["get_tool_reference", "legal_notice"]
     assert "get_tool_reference" not in mcp_app.WRITE_TOOLS
     assert mcp_app.tool_annotations("get_tool_reference").readOnlyHint is True

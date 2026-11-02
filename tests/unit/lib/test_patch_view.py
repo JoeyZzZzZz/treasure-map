@@ -139,11 +139,27 @@ class World:
         pseudocode: str | None = None,
         size_bytes: int | None = None,
         body_ranges: list[list[str]] | None = None,
+        calls: list[str] | None = None,
     ) -> None:
+        # D29: ``calls`` is the function-name call tokens the decompiler emitted, in order (a name
+        # repeated = called twice). Each becomes an opcode-7 CALL token, as ExportFunctions writes.
+        call_tokens = json.dumps(
+            [
+                {
+                    "call_token": n,
+                    "opcode": 7,
+                    "op_addr": f"0x{0x1000 + i:x}",
+                    "text_off": i * 10,
+                    "token_addr": "",
+                    "line": i,
+                }
+                for i, n in enumerate(calls or [])
+            ]
+        )
         self.adb[side].execute(
             "INSERT INTO functions (binary_id, name, address, callees, callees_truncated, "
-            "unresolved_external_calls, pseudocode, size_bytes, body_ranges) "
-            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "unresolved_external_calls, pseudocode, size_bytes, body_ranges, call_tokens) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 name,
                 addr,
@@ -153,6 +169,7 @@ class World:
                 pseudocode,
                 size_bytes,
                 json.dumps(body_ranges or []),
+                call_tokens,
             ),
         )
 
@@ -7486,6 +7503,7 @@ def test_the_default_order_places_each_shape(tmp_path: Path, current: None) -> N
 
 _START_KEYS = {
     "diff_id",
+    "server",
     "workflow",
     "meta",
     "headline",

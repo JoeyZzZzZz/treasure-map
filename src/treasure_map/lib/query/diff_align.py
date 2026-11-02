@@ -807,7 +807,11 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
             "note": "no diff_meta for this diff_id -- run `tmap diff` for it first.",
         }
     # patch_view imports this module, so the view is imported here, at call time.
-    from treasure_map.lib.query.patch_view import anchored_differs_banner, function_states
+    from treasure_map.lib.query.patch_view import (
+        anchored_differs_banner,
+        function_states,
+        string_delta,
+    )
 
     meta = dict(zip(_META_COLS, row, strict=True))
     runs = atlas.execute(
@@ -821,6 +825,7 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
         banners = list(functions.get("banners", []))
     elif (banner := anchored_differs_banner(functions)) is not None:
         banners.append(banner)
+    sd = string_delta(atlas, diff_id, want_refs=False)
     return {
         "found": True,
         "diff_id": diff_id,
@@ -828,9 +833,34 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
         "functions": functions,
         "banners": banners,
         "binary_presence": binary_presence_counts(atlas, *runs) if runs is not None else None,
+        # D25: how many string literals sit on one side only (list: get_diff_string_delta), with
+        # each side's truncation state so a capped / unknown side is not read as complete.
+        "string_delta": {
+            "a_only_count": sd["a_only_count"],
+            "b_only_count": sd["b_only_count"],
+            "strings_truncated": sd["strings_truncated"],
+            "read_error": sd["read_error"],
+        },
         **diff_source_staleness(atlas, diff_id),
         "note": _META_NOTE,
     }
+
+
+def get_diff_string_delta(
+    atlas: sqlite3.Connection,
+    diff_id: str,
+    *,
+    side: str = "both",
+    limit: int = 200,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """D25: the string literals present on one side only between the diff's two runs (``a_only`` =
+    A\\B, ``b_only`` = B\\A), with the resolved reference anchors of each. ``side`` = ``a_only`` /
+    ``b_only`` / ``both``; paged by ``limit`` / ``offset``. A projection of the two runs'
+    ``strings`` tables, never a verdict."""
+    from treasure_map.lib.query.patch_view import string_delta
+
+    return string_delta(atlas, diff_id, side=side, want_refs=True, limit=limit, offset=offset)
 
 
 def binary_presence_counts(

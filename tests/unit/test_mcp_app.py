@@ -50,6 +50,7 @@ _EXPECTED_TOOLS = {
     "get_diff_sink_overlay",
     "same_shape_siblings",
     "get_diff_meta",
+    "get_diff_string_delta",
     "get_function_alignment",
     "get_diff_capabilities",
     "list_diffs",

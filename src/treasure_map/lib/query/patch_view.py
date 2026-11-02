@@ -116,6 +116,7 @@ from typing import Any, Generic, TypeVar
 
 from treasure_map.lib.diff.code_version import diff_code_version, sink_overlay_logic_version
 from treasure_map.lib.diff.layer0 import norm_hex
+from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
 from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review, diff_sink_axes, entry_words, sameness
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN
@@ -696,6 +697,15 @@ class _Fn:
     unresolved: frozenset[str] | None  # stub addresses the extractor could not name; None: unknown
     # What its decompile came to (ok / timeout / error:<why> / skipped_micro); None: not recorded.
     decompile: str | None = None
+    # D29: each SINK_CALLEE_NAMES callee's call count in this function's call_tokens (opcode-7 CALL
+    # tokens, NOT deduplicated — repeated calls count). None: the call_tokens column is absent or
+    # unparseable (an older analysis.db), so the count is unknown, never 0.
+    sink_callsites: dict[str, int] | None = None
+    # Whether the decompiler produced any pseudocode text for this function. False means the
+    # call_tokens above are empty because there was nothing to read from, not because the function
+    # calls nothing — the D29 reader reports those sides unknown, never a 0 count.
+    has_text: bool | None = None  # None: pseudocode column not recorded by that analysis.db
+    size_bytes: int | None = None  # the function's byte size; < _DECOMPILE_MIN_SIZE = a micro-stub
 
 
 @dataclass
@@ -726,8 +736,43 @@ def _json_list(raw: Any) -> list[Any] | None:
     return data if isinstance(data, list) else None
 
 
+def _sink_callsites(call_tokens_raw: Any, has_column: bool) -> dict[str, int] | None:
+    """Each SINK_CALLEE_NAMES callee's CALL-token count in a function's ``call_tokens`` (opcode 7,
+    NOT deduplicated), or None when the count cannot be read.
+
+    None when the column is absent (an older analysis.db) or the JSON will not parse — the reader
+    reports that side unknown, never 0. An empty / '[]' value parses to ``{}``: the function's
+    decompiled text named no sink call, which is a real 0 only where there WAS text to read."""
+    if not has_column:
+        return None
+    if not call_tokens_raw:
+        return {}
+    toks = _json_list(call_tokens_raw)
+    if toks is None:
+        return None
+    counts: dict[str, int] = {}
+    for tok in toks:
+        if isinstance(tok, dict) and tok.get("opcode") == 7:
+            name = tok.get("call_token")
+            if isinstance(name, str) and name in SINK_CALLEE_NAMES:
+                counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
 def _parse_fn(raw: tuple[Any, ...]) -> _Fn:
-    name, callees_raw, truncated, unresolved_raw, has_truncated, has_unresolved, decompile = raw
+    (
+        name,
+        callees_raw,
+        truncated,
+        unresolved_raw,
+        has_truncated,
+        has_unresolved,
+        decompile,
+        call_tokens_raw,
+        has_call_tokens,
+        size_bytes,
+        has_text,
+    ) = raw
     callees = _json_list(callees_raw)
     unresolved = _json_list(unresolved_raw) if has_unresolved else None
     norm_unresolved = (
@@ -741,6 +786,9 @@ def _parse_fn(raw: tuple[Any, ...]) -> _Fn:
         truncated=bool(truncated) if has_truncated and truncated is not None else None,
         unresolved=norm_unresolved,
         decompile=decompile if isinstance(decompile, str) else None,
+        sink_callsites=_sink_callsites(call_tokens_raw, has_call_tokens),
+        has_text=bool(has_text) if has_text is not None else None,
+        size_bytes=int(size_bytes) if isinstance(size_bytes, int) else None,
     )
 
 
@@ -771,21 +819,43 @@ def _read_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side
             return _Side(error="the diffed binary is not in that analysis.db")
         cols = {r[1] for r in conn.execute("PRAGMA table_info(functions)")}
         has_t, has_u = "callees_truncated" in cols, "unresolved_external_calls" in cols
+        has_ct = "call_tokens" in cols
         select = "SELECT address, name, callees"
         select += ", callees_truncated" if has_t else ", NULL"
         select += ", unresolved_external_calls" if has_u else ", NULL"
         select += ", decompile_status" if "decompile_status" in cols else ", NULL"
+        # D29: call_tokens (parsed to per-sink counts), size_bytes, and whether there is any
+        # pseudocode text — the text itself is NOT selected (it is large and unneeded; only its
+        # presence decides whether an empty call_tokens is a real 0 or an unreadable side).
+        select += ", call_tokens" if has_ct else ", NULL"
+        select += ", size_bytes" if "size_bytes" in cols else ", NULL"
+        if "pseudocode" in cols:
+            select += ", (pseudocode IS NOT NULL AND pseudocode != '')"
+        else:
+            select += ", NULL"
         rows = conn.execute(select + " FROM functions WHERE binary_id = ?", (found[0],)).fetchall()
     except sqlite3.Error as e:
         return _Side(error=f"analysis.db could not be read: {e}")
     finally:
         conn.close()
     side = _Side()
-    for address, name, callees, truncated, unresolved, decompile in rows:
+    for address, name, callees, truncated, unresolved, decompile, ctoks, size_b, has_text in rows:
         addr = norm_hex(address) if address else None
         if addr is None:
             continue
-        side.raw[addr] = (name, callees, truncated, unresolved, has_t, has_u, decompile)
+        side.raw[addr] = (
+            name,
+            callees,
+            truncated,
+            unresolved,
+            has_t,
+            has_u,
+            decompile,
+            ctoks,
+            has_ct,
+            size_b,
+            has_text,
+        )
         if name:
             side.names[addr] = name
             side.by_name.setdefault(name, []).append(addr)
@@ -1078,6 +1148,11 @@ class _Entry:
     # Each sink's hunt-candidate count in the two functions (``_sink_candidate_counts``): None for a
     # function with no counterpart, or when both sides count alike with nothing unknown.
     sink_candidate_counts: dict[str, Any] | None = None
+    # D29: each sink's per-CALLSITE count (from call_tokens, not hunt candidates) in the two
+    # functions (``_sink_callsite_counts``). An independent key, unit "callsite" — NEVER mixed into
+    # sink_candidate_counts and NEVER read by significance / _sort / attention. None when neither
+    # side names a sink call, or every named sink counts alike with nothing unknown.
+    sink_callsite_counts: dict[str, Any] | None = None
     # "S" when the read face lists this entry as an aligned similarity-1 pair whose normalized
     # pseudocode differs (``listed_view``) — never written by the build, so ``bucket`` (and the
     # judgement basis read from it) stays empty for such a pair.
@@ -1217,6 +1292,7 @@ class _Builder:
             e.callee_set = self._callee_set(e)
         if p is not None:
             e.sink_candidate_counts = self._sink_candidate_counts(p)
+            e.sink_callsite_counts = self._sink_callsite_counts(p)
         landings = [v["landing"] for v in e.row_views]
         if e.unpaired is not None:
             e.bucket, e.subclass = "P", e.unpaired.presence_state
@@ -1409,6 +1485,80 @@ class _Builder:
             return None
         return {
             "unit": SINK_COUNTS_UNIT,
+            "pairing": "aligned" if p.aligned else "proposed",
+            "delta": delta,
+            "unknown": unknown,
+        }
+
+    # ── sink_callsite_counts (D29): each sink's CALL count, from call_tokens ──
+
+    def _callsite_side(self, side: str, addr: str) -> tuple[str | None, dict[str, int]]:
+        """``(unknown_reason, per-sink counts)`` for one side of a pair.
+
+        The reason is set, in this order, when the counts cannot be trusted: ``side_unreadable``
+        (the analysis.db could not be opened), ``function_not_in_scan_inventory`` (that scan does
+        not hold the function), ``call_tokens_unavailable`` (an older analysis.db with no
+        call_tokens column), then — the heart of D29 — no readable text: ``skipped_micro`` (empty
+        pseudocode AND size < _DECOMPILE_MIN_SIZE, a stub the exporter skips by design) or
+        ``text_unavailable`` (empty pseudocode at a real size: a decompile that did not complete).
+        An empty call_tokens read off empty text is NOT a 0, it is unknown. Last, ``call_counts_
+        incomplete`` when the function's callee list was truncated, so call_tokens may be too. The
+        decision never reads ``decompile_status`` (an r6 column): empty text + size alone decide it,
+        so a pre-r6 analysis.db is judged the same way."""
+        s = self.sides[side]
+        if s.error is not None:
+            return "side_unreadable", {}
+        fn = s.fn(addr)
+        if fn is None:
+            return "function_not_in_scan_inventory", {}
+        counts = fn.sink_callsites
+        if counts is None:
+            return "call_tokens_unavailable", {}
+        if fn.has_text is False:
+            if fn.size_bytes is not None and fn.size_bytes < _DECOMPILE_MIN_SIZE:
+                return "skipped_micro", {}
+            return "text_unavailable", {}
+        if fn.truncated is True:
+            return "call_counts_incomplete", counts
+        return None, counts
+
+    def _sink_callsite_counts(self, p: _Pair) -> dict[str, Any] | None:
+        """Per sink name, how many times each function of the pair CALLS it (``call_tokens``,
+        opcode-7 tokens, not deduplicated — unlike the callee SET, this catches a repeated call
+        appearing or disappearing). ``delta`` the sinks both sides count and count differently,
+        ``unknown`` the side / sink pairs that cannot be counted, with why.
+
+        Independent of ``_sink_candidate_counts`` (hunt candidates): built straight from the
+        decompiled call tokens, so it also covers pairs with no candidate at all (a recall-gap sink,
+        a bucket-S similarity-1 pair). A side whose text could not be read answers unknown for every
+        sink the OTHER side names, never a count — so N->0 is never forged from a blank side. None
+        when neither side names a sink call, or every named sink counts alike with nothing unknown.
+        Direction-neutral. NEVER consulted by significance / _sort / attention."""
+        sides = {
+            "a": self._callsite_side("a", p.addr_a),
+            "b": self._callsite_side("b", p.addr_b),
+        }
+        names: set[str] = set(sides["a"][1]) | set(sides["b"][1])
+        if not names:
+            return None
+        delta: list[dict[str, Any]] = []
+        unknown: list[dict[str, Any]] = []
+        for sink in sorted(names):
+            known: dict[str, int | None] = {}
+            for side in ("a", "b"):
+                reason, counts = sides[side]
+                if reason is not None:
+                    unknown.append({"sink": sink, "side": side, "reason": reason})
+                    known[side] = None
+                else:
+                    known[side] = counts.get(sink, 0)
+            a, b = known["a"], known["b"]
+            if a is not None and b is not None and a != b:
+                delta.append({"sink": sink, "a": a, "b": b})
+        if not delta and not unknown:
+            return None
+        return {
+            "unit": "callsite",
             "pairing": "aligned" if p.aligned else "proposed",
             "delta": delta,
             "unknown": unknown,
@@ -2453,6 +2603,11 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
             **(
                 {"sink_candidate_counts": e.sink_candidate_counts}
                 if e.sink_candidate_counts is not None
+                else {}
+            ),
+            **(
+                {"sink_callsite_counts": e.sink_callsite_counts}
+                if e.sink_callsite_counts is not None
                 else {}
             ),
             # The caller-set edge (S3): present only when it exists; a field on any pair entry,
@@ -5083,3 +5238,162 @@ def _count(keys: Any) -> dict[str, int]:
     for k in keys:
         out[k] = out.get(k, 0) + 1
     return dict(sorted(out.items()))
+
+
+# ── D25: string_delta — the string literals a binary gained / lost between two runs ──
+
+
+def _trunc_state(t: Any) -> str:
+    """A ``strings_truncated`` flag read honestly: 1 = the list is a prefix (truncated), 0 = whole,
+    NULL = unknown — NEVER folded into 'not truncated'. An unknown side's added/removed is as
+    unconfirmable as a truncated side's."""
+    return "truncated" if t == 1 else ("clean" if t == 0 else "unknown")
+
+
+def _string_values_side(
+    atlas: sqlite3.Connection, run_id: str, sha: str | None
+) -> tuple[set[str], str, bool, str | None]:
+    """``(distinct string values, strings_truncated state, string_refs exported?, error)`` for one
+    side's binary. ``error`` non-None means the side could not be read (never a silent empty set).
+    ``refs_exported`` is False when the string_refs table holds no row for the binary — refs are
+    then unknown, NEVER 'no references' (schema.sql)."""
+    row = atlas.execute("SELECT analysis_db_path FROM run WHERE run_id = ?", (run_id,)).fetchone()
+    if row is None or not row[0]:
+        return set(), "unknown", False, "the run records no analysis.db"
+    if not sha:
+        return set(), "unknown", False, "the diff records no content hash for this side"
+    try:
+        conn = ro_connect(row[0])
+    except sqlite3.Error as e:
+        return set(), "unknown", False, f"analysis.db could not be opened: {e}"
+    try:
+        found = conn.execute(
+            "SELECT id, strings_truncated FROM binaries WHERE sha256 = ?", (sha,)
+        ).fetchone()
+        if found is None:
+            return set(), "unknown", False, "the diffed binary is not in that analysis.db"
+        bid, trunc = found
+        values = {
+            v
+            for (v,) in conn.execute(
+                "SELECT DISTINCT value FROM strings WHERE binary_id = ? AND value IS NOT NULL",
+                (bid,),
+            )
+        }
+        refs_exported = (
+            conn.execute("SELECT 1 FROM string_refs WHERE binary_id = ? LIMIT 1", (bid,)).fetchone()
+            is not None
+        )
+    except sqlite3.Error as e:
+        return set(), "unknown", False, f"analysis.db could not be read: {e}"
+    finally:
+        conn.close()
+    return values, _trunc_state(trunc), refs_exported, None
+
+
+def _string_refs_for(
+    atlas: sqlite3.Connection, run_id: str, sha: str | None, values: list[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """Each value's resolved reference anchors on one side (A for removed, B for added): a
+    data/pointer reference at ``ref_at`` inside ``ref_in_func`` (NULL ref_in_func kept, shown as a
+    reference in no function — NOT dropped, NOT counted as 'no references'). ``truncated`` 1 means
+    this string's ref list was capped. Looked up only for the paged values, so the per-value query
+    count stays bounded."""
+    row = atlas.execute("SELECT analysis_db_path FROM run WHERE run_id = ?", (run_id,)).fetchone()
+    if row is None or not row[0] or not sha or not values:
+        return {}
+    try:
+        conn = ro_connect(row[0])
+    except sqlite3.Error:
+        return {}
+    try:
+        found = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", (sha,)).fetchone()
+        if found is None:
+            return {}
+        bid = found[0]
+        out: dict[str, list[dict[str, Any]]] = {v: [] for v in values}
+        placeholders = ",".join("?" * len(values))
+        rows = conn.execute(
+            "SELECT string_value, ref_at, ref_in_func, ref_in_func_addr, truncated "
+            f"FROM string_refs WHERE binary_id = ? AND string_value IN ({placeholders})",  # noqa: S608
+            (bid, *values),
+        ).fetchall()
+    except sqlite3.Error:
+        return {v: [] for v in values}
+    finally:
+        conn.close()
+    for value, ref_at, ref_in_func, ref_in_func_addr, truncated in rows:
+        out.setdefault(value, []).append(
+            {
+                "ref_at": ref_at,
+                "ref_in_func": ref_in_func,
+                "ref_in_func_addr": ref_in_func_addr,
+                "truncated": bool(truncated),
+            }
+        )
+    return out
+
+
+def string_delta(
+    atlas: sqlite3.Connection,
+    diff_id: str,
+    *,
+    side: str = "both",
+    want_refs: bool = True,
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """The string literals present on ONE side only between the diff's two runs — ``a_only`` =
+    A \\ B, ``b_only`` = B \\ A — the set difference of each side's ``strings`` values.
+
+    A FACT about the extracted strings, NOT proof a string was created or deleted (the two sides
+    are different firmware builds); ``a_only`` and ``b_only`` are symmetric, neither before the
+    other. ``strings_truncated`` is each side's honest truncation state (clean / truncated /
+    unknown): a side whose strings list was capped — or whose flag is NULL — makes its one-sided set
+    unconfirmable, said rather than hidden. With ``want_refs`` each listed value carries its
+    resolved reference anchors on its own side, ``refs_exported`` False meaning that side exported
+    no string_refs at all (unknown, never 'no references'). ``found`` False for an unknown diff_id;
+    ``side`` selects ``a_only`` / ``b_only`` / ``both``."""
+    meta = atlas.execute(
+        "SELECT run_a_id, run_b_id, sha256_a, sha256_b, binary_a FROM diff_meta WHERE diff_id = ?",
+        (diff_id,),
+    ).fetchone()
+    if meta is None:
+        return {"found": False, "diff_id": diff_id}
+    run_a, run_b, sha_a, sha_b, binary = meta
+    a_vals, a_trunc, a_refs_ok, a_err = _string_values_side(atlas, run_a, sha_a)
+    b_vals, b_trunc, b_refs_ok, b_err = _string_values_side(atlas, run_b, sha_b)
+    a_only = sorted(a_vals - b_vals)
+    b_only = sorted(b_vals - a_vals)
+    out: dict[str, Any] = {
+        "found": True,
+        "diff_id": diff_id,
+        "binary": binary,
+        "a_only_count": len(a_only),
+        "b_only_count": len(b_only),
+        "strings_truncated": {"a": a_trunc, "b": b_trunc},
+        "read_error": {"a": a_err, "b": b_err},
+    }
+    if not want_refs:
+        return out
+    sides = ("a_only", "b_only") if side == "both" else (side,)
+    pages: dict[str, dict[str, Any]] = {}
+    lists = {"a_only": a_only, "b_only": b_only}
+    refs_ok = {"a_only": a_refs_ok, "b_only": b_refs_ok}
+    ref_run = {"a_only": (run_a, sha_a), "b_only": (run_b, sha_b)}
+    for name in sides:
+        full = lists[name]
+        lo = max(0, offset)
+        hi = len(full) if limit is None else lo + max(0, limit)
+        page_vals = full[lo:hi]
+        refs = _string_refs_for(atlas, *ref_run[name], page_vals) if page_vals else {}
+        pages[name] = {
+            "count": len(full),
+            "returned": len(page_vals),
+            "offset": lo,
+            "next_offset": hi if hi < len(full) else None,
+            "refs_exported": refs_ok[name],
+            "values": [{"value": v, "refs": refs.get(v, [])} for v in page_vals],
+        }
+    out["sides"] = pages
+    return out

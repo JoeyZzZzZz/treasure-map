@@ -496,6 +496,25 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "source_stale and the run pair's non_binary counts."
         ),
     ),
+    "get_diff_string_delta": ToolCard(
+        required=("diff_id",),
+        example='get_diff_string_delta(diff_id="<diff_id>")',
+        boundary=(
+            "NOT proof a string was created or deleted",
+            "UNKNOWN, never 'no references'",
+            "a truncated or unknown side is NOT 'complete'",
+        ),
+        summary=(
+            "The string literals present on one side only between a diff's two runs — a_only = "
+            "A\\B, b_only = B\\A — each with its resolved reference anchors. A FACT, NOT proof a "
+            "string was created or deleted (the two sides are different builds); a_only and b_only "
+            "are symmetric. A ref with ref_in_func null is a reference in no function, shown not "
+            "dropped. refs_exported False means that side exported no string_refs at all — "
+            "UNKNOWN, never 'no references'. strings_truncated is each side's state (clean / "
+            "truncated / unknown): a truncated or unknown side is NOT 'complete'. sides.a_only / "
+            "sides.b_only page by limit / offset; get_diff_meta carries the counts."
+        ),
+    ),
     "get_function_alignment": ToolCard(
         required=("diff_id", "function"),
         aliases={"addr": "function"},
@@ -959,6 +978,7 @@ _DIFF_TOOLS = (
     "get_diff_sink_overlay",
     "same_shape_siblings",
     "get_diff_meta",
+    "get_diff_string_delta",
     "get_function_alignment",
     "get_diff_capabilities",
     "annotate_diff",
@@ -1223,6 +1243,7 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             "get_diff_patch_view",
             "get_diff_deltas",
             "get_diff_sink_overlay",
+            "get_diff_string_delta",
             "get_file_diff",
             "cross_firmware_patterns",
             "pattern_density",
@@ -1245,6 +1266,7 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             "get_diff_patch_view",
             "get_diff_deltas",
             "get_diff_sink_overlay",
+            "get_diff_string_delta",
             "get_file_diff",
             "cross_firmware_patterns",
             "pattern_density",

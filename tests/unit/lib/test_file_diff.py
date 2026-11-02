@@ -1221,7 +1221,8 @@ def test_a_file_anchor_beside_a_binary_diff(tmp_path: Path, current: None) -> No
     meta = tools["get_diff_meta"](DIFF)
     assert meta["non_binary"]["counts"]["content_differs"] == 1
     assert meta["non_binary"]["next"] == f'get_file_diff(run_pair="{PAIR}")'
-    assert {k: v for k, v in meta.items() if k != "non_binary"} == json.loads(
+    # server (D33) and non_binary are MCP-layer envelope, not part of the lib get_diff_meta
+    assert {k: v for k, v in meta.items() if k not in ("non_binary", "server")} == json.loads(
         json.dumps(get_diff_meta(w.atlas, DIFF))
     )
 
