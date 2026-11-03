@@ -51,6 +51,7 @@ _PROMOTE_COLS = (
     "promote_recovered",
     "promote_recover_rejected",
     "promote_recover_seeds",
+    "promote_recover_rejected_string",
     "promote_recover_lost_bytes",
     "promote_recover_noreturn_flips",
 )
@@ -71,6 +72,7 @@ _PROMOTE = {
     "recovered": 3,
     "recover_rejected": 1,
     "recover_seeds": 7,
+    "recover_rejected_string": 2,
     "recover_lost_insn_bytes": 0,
     "recover_noreturn_flips": 0,
 }
@@ -142,6 +144,7 @@ def test_origin_and_the_promote_record_are_stored(tmp_path: Path) -> None:
         "promote_recovered": 3,
         "promote_recover_rejected": 1,
         "promote_recover_seeds": 7,
+        "promote_recover_rejected_string": 2,
         "promote_recover_lost_bytes": 0,
         "promote_recover_noreturn_flips": 0,
     }
@@ -192,6 +195,8 @@ def test_truncated_ranges_are_flagged(tmp_path: Path) -> None:
         {"recovered": -1},
         {"recover_rejected": True},  # a bool is not a count
         {"recover_noreturn_flips": -1},
+        {"recover_rejected_string": -1},
+        {"recover_rejected_string": True},  # a bool is not a count
     ],
 )
 def test_a_record_that_does_not_hold_together_is_null(
@@ -217,6 +222,7 @@ def test_a_record_that_does_not_hold_together_is_null(
         "recovered",
         "recover_rejected",
         "recover_seeds",
+        "recover_rejected_string",
         "recover_lost_insn_bytes",
         "recover_noreturn_flips",
     ],

@@ -52,6 +52,23 @@ def _warn_incomplete(incomplete: list[str], no_functions: list[str] | None = Non
         )
 
 
+def _warn_analyzer_degraded(degraded: list[dict[str, Any]]) -> None:
+    """Name (on stderr) the binaries whose extraction finished while a Ghidra analyzer threw: they
+    have functions, so no incomplete list names them, but the analysis went on without that
+    analyzer and their function set may be short. The scan already re-ran each in a session of
+    its own; these kept the exception."""
+    if not degraded:
+        return
+    shown = ", ".join(f"{d['binary']} ({d.get('reason') or 'unknown'})" for d in degraded[:20])
+    if len(degraded) > 20:
+        shown += ", …"
+    click.echo(
+        f"⚠ {len(degraded)} binaries were extracted while a Ghidra analyzer threw an exception "
+        f"(their function set may be incomplete): {shown}",
+        err=True,
+    )
+
+
 def _warn_kept_earlier(kept: list[dict[str, Any]]) -> None:
     """Name (on stderr) the binaries that still hold an EARLIER pass's extraction because this
     pass failed on them — their candidates come from that earlier extraction."""
@@ -81,6 +98,7 @@ def _warn_reanalyze_pending(pending: int, reanalyze: str | None) -> None:
 def report_extraction_state(result: Any, reanalyze: str | None) -> None:
     """The stderr warnings both `tmap analyze` and `tmap scan` print after the extraction."""
     _warn_incomplete(result.incomplete_binaries, result.no_functions_binaries)
+    _warn_analyzer_degraded(getattr(result, "analyzer_degraded_binaries", []))
     _warn_kept_earlier(result.kept_earlier_binaries)
     _warn_reanalyze_pending(result.reanalyze_pending, reanalyze)
     _report_exports(
@@ -261,8 +279,9 @@ scopes that to just the binary you are validating.
     is_flag=True,
     default=False,
     help="Also re-attempt binaries that timed out at a budget this scan would repeat, which are "
-    "skipped by default (a timeout is deterministic — the same budget reproduces it). Use after "
-    "raising the timeout, or on a machine with more to spare.",
+    "skipped by default (a timeout is deterministic — the same budget reproduces it), and give an "
+    "isolated re-run to binaries whose large decompiles an earlier one at this budget did not "
+    "finish. Use after raising the timeout, or on a machine with more to spare.",
 )
 def analyze(
     fs_root: Path,

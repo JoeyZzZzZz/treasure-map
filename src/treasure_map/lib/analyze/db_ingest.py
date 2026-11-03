@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections import Counter
@@ -112,6 +113,69 @@ def _timeout_skips(
         if current > int(recorded):
             continue  # it would get more time now -> the retry is a different attempt
         skips.add(sha)
+    return skips
+
+
+def decompile_rerun_record(pass_version: str, ghidra_version: str, budget: int) -> str:
+    """The ``binaries.decompile_rerun`` value for an isolated re-run that still left decompiles
+    unfinished (see ``decompile_rerun_skips``)."""
+    return json.dumps(
+        {"pass_version": pass_version, "ghidra_version": ghidra_version, "budget": int(budget)},
+        sort_keys=True,
+    )
+
+
+def decompile_rerun_skips(
+    conn: sqlite3.Connection,
+    records: list[ElfRecord],
+    *,
+    pass_version: str | None,
+    timeout_base: int,
+    ghidra_version: str | None,
+) -> set[str]:
+    """sha256 of binaries an isolated re-run would not be re-run for their unfinished decompiles.
+
+    An isolated (phase-2) re-run of a binary whose decompile left a large body unfinished, or an
+    output past the decompiler's limit, that STILL left them unfinished is recorded with what it
+    ran under (``decompile_rerun``). The same as ``_timeout_skips``: at the same budget with the
+    same code and decompiler, a second isolated re-run is the same attempt, bought at up to half an
+    hour. So it is skipped only when every axis is positively the same: this pass, this Ghidra
+    (both known), and a budget this scan would hand it that is no larger. Anything unrecorded or
+    unreadable re-runs.
+
+    It decides only that re-run; the binary's extraction itself is never skipped on it, and its
+    unfinished decompiles stay recorded on its functions (decompile_status)."""
+    shas = [r.sha256 for r in records]
+    if not shas or pass_version is None or not ghidra_version or ghidra_version == UNKNOWN_VERSION:
+        return set()
+    ph = ",".join("?" * len(shas))
+    try:
+        rows = conn.execute(
+            f"SELECT sha256, decompile_rerun FROM binaries "  # noqa: S608
+            f"WHERE sha256 IN ({ph}) AND decompile_rerun IS NOT NULL",
+            shas,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    rec_by_sha = {r.sha256: r for r in records}
+    skips: set[str] = set()
+    for row in rows:
+        try:
+            meta = json.loads(row["decompile_rerun"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        budget = meta.get("budget")
+        if isinstance(budget, bool) or not isinstance(budget, int):
+            continue
+        if meta.get("pass_version") != pass_version or meta.get("ghidra_version") != ghidra_version:
+            continue
+        rec = rec_by_sha.get(row["sha256"])
+        current = retry_budget_seconds(rec.path, timeout_base) if rec is not None else None
+        if current is None or current > budget:
+            continue
+        skips.add(row["sha256"])
     return skips
 
 

@@ -1060,7 +1060,12 @@ def test_the_success_stamp_is_what_lets_the_next_scan_skip_ghidra(tmp_path: Path
     # Ghidra ran (mocked by the JSON on disk) and ingest stamps the binary in the same txn
     _write_ghidra_json(out, "test_bin", "a" * 64, _marked("a" * 64, _PASS))
     ingest_ghidra_output(
-        conn, out, [rec], sha_to_id, pass_version=_PASS, success_stamp={"a" * 64: ("ok", "11.4.3")}
+        conn,
+        out,
+        [rec],
+        sha_to_id,
+        pass_version=_PASS,
+        success_stamp={"a" * 64: ("ok", "11.4.3", None)},
     )
 
     # second scan at the SAME pass: cached, Ghidra is NOT re-run
@@ -1109,7 +1114,7 @@ def test_the_success_stamp_and_the_function_rows_are_one_transaction(tmp_path: P
                 recs,
                 sha_to_id,
                 pass_version=_PASS,
-                success_stamp={"a" * 64: ("ok", "11.4.3"), "b" * 64: ("ok", "11.4.3")},
+                success_stamp={"a" * 64: ("ok", "11.4.3", None), "b" * 64: ("ok", "11.4.3", None)},
             )
     finally:
         ingest_mod._ingest_one_binary = real

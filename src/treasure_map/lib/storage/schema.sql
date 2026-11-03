@@ -37,10 +37,12 @@ CREATE TABLE IF NOT EXISTS binaries (
                                            --   does not re-run it, and NOT clean (still listed
                                            --   incomplete)
     ghidra_status_reason TEXT,             -- WHY a failed run failed: timeout / import_failed /
-                                           --   no_output / incomplete / stale_output; NULL on
-                                           --   success. Lets the
+                                           --   no_output / incomplete / stale_output. Lets the
                                            --   incomplete surfacing distinguish a recoverable
-                                           --   timeout from a structural failure
+                                           --   timeout from a structural failure. On an extracted
+                                           --   row (ghidra_ok=1): its blind spot,
+                                           --   analyzer_exception:<analyzer>:<class> (an analyzer
+                                           --   threw during the analysis), else NULL
     pass_version TEXT,                     -- content hash of the per-binary extraction PIPELINE
                                            --   this row's output; a mismatch re-dirties it so a pass
                                            --   edit re-extracts automatically (no manual JSON delete)
@@ -125,14 +127,22 @@ CREATE TABLE IF NOT EXISTS binaries (
     promote_undefined_ranges_truncated INTEGER,
     promote_undefined_bytes INTEGER,
     -- W14: functions recovered from pointers in the binary's data (origin='recovered'), the seeds
-    -- rejected (disassembly raised an error) and seeds tried, and the guard counts that must both
-    -- be 0 — existing code lost (promote_recover_lost_bytes) and existing functions newly marked
-    -- non-returning (promote_recover_noreturn_flips). NULL = not recorded — never read as 0.
+    -- rejected (disassembly raised an error) and seeds tried, the seeds refused before any
+    -- disassembly because their bytes read as a C string (promote_recover_rejected_string), and the
+    -- guard counts that must both be 0 — existing code lost (promote_recover_lost_bytes) and
+    -- existing functions newly marked non-returning (promote_recover_noreturn_flips). NULL = not
+    -- recorded — never read as 0.
     promote_recovered INTEGER,
     promote_recover_rejected INTEGER,
     promote_recover_seeds INTEGER,
+    promote_recover_rejected_string INTEGER,
     promote_recover_lost_bytes INTEGER,
     promote_recover_noreturn_flips INTEGER,
+    -- An isolated re-run of this binary still left decompiles unfinished (a large body timed out,
+    -- or an output passed the decompiler's limit): JSON {"pass_version","ghidra_version","budget"}
+    -- of that re-run. A later scan under the same pass and Ghidra, at a budget no larger, does not
+    -- re-run it for them again. NULL = no such re-run recorded.
+    decompile_rerun TEXT,
     last_seen_at DATETIME,                 -- timestamp of most recent ingest scan
     analyzed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );

@@ -2438,9 +2438,24 @@ public class ExportFunctions extends GhidraScript {
         return "0x" + Long.toHexString(op.getSeqnum().getTarget().getOffset());
     }
 
-    // The decompile limit of the main loop, and of the one retry a timed-out function gets after it.
+    // The decompile limit of the main loop; a function of DECOMPILE_LARGE_BODY_BYTES or more gets
+    // the longer one (a body that size rarely finishes in the short one, and would only queue for
+    // the retry).
     private static final int DECOMPILE_TIMEOUT_S = 20;
-    private static final int DECOMPILE_RETRY_TIMEOUT_S = 120;
+    private static final int DECOMPILE_TIMEOUT_LARGE_S = 60;
+    private static final long DECOMPILE_LARGE_BODY_BYTES = 32768;
+    // The most the one retry a timed-out function gets may take. Within the retry budget the
+    // retries share what is left, smallest body first, each at most an equal part of it.
+    private static final int DECOMPILE_RETRY_TIMEOUT_S = 600;
+    // A function this large still unfinished after the retries is counted in "decompile_counts",
+    // so the driver can re-run the binary in a session of its own.
+    private static final long DECOMPILE_UNFINISHED_LARGE_BYTES = 8192;
+    // The decompiler's output limit (MB), unless the driver raised it (TMAP_DECOMPILE_PAYLOAD_MB).
+    private static final int DECOMPILE_PAYLOAD_MB = 64;
+    private static final int DECOMPILE_PAYLOAD_MAX_MB = 1024;
+    // decompile_error of a function whose output passed that limit (Ghidra: "Response buffer size
+    // exceeded"): a limit, not a timeout — more time does not finish it, a larger limit may.
+    private static final String DECOMPILE_PAYLOAD_EXCEEDED = "payload_exceeded";
     private static final String DECOMPILE_OK = "ok";
     private static final String DECOMPILE_TIMEOUT = "timeout";
     private static final String DECOMPILE_SKIPPED_MICRO = "skipped_micro";
@@ -2457,9 +2472,9 @@ public class ExportFunctions extends GhidraScript {
     private static final String PROMOTE_RECOVERED = "TreasureMap recovered";
     private BookmarkManager promoteMarks = null;   // non-null only when the pass was recorded
 
-    /** The retry budget the driver set (TMAP_DECOMPILE_RETRY_BUDGET_S), 0 when unset or bad. */
-    private static long retryBudgetSeconds() {
-        String raw = System.getenv("TMAP_DECOMPILE_RETRY_BUDGET_S");
+    /** A non-negative number from the environment, 0 when unset or bad. */
+    private static long envCount(String name) {
+        String raw = System.getenv(name);
         if (raw == null) return 0;
         try {
             return Math.max(0, Long.parseLong(raw.trim()));
@@ -2468,13 +2483,45 @@ public class ExportFunctions extends GhidraScript {
         }
     }
 
+    /** The retry budget the driver set (TMAP_DECOMPILE_RETRY_BUDGET_S), 0 when unset or bad. */
+    private static long retryBudgetSeconds() {
+        return envCount("TMAP_DECOMPILE_RETRY_BUDGET_S");
+    }
+
+    /**
+     * The time (epoch ms) by which the retries must end so the rest of the session — the export
+     * included — still fits its wall clock (TMAP_DECOMPILE_DEADLINE_MS); 0 when unset or bad.
+     */
+    private static long retryDeadlineMs() {
+        return envCount("TMAP_DECOMPILE_DEADLINE_MS");
+    }
+
+    /** The decompiler's output limit for this session, in MB. */
+    private static int payloadMBytes() {
+        long mb = envCount("TMAP_DECOMPILE_PAYLOAD_MB");
+        if (mb < DECOMPILE_PAYLOAD_MB) return DECOMPILE_PAYLOAD_MB;
+        return (int) Math.min(DECOMPILE_PAYLOAD_MAX_MB, mb);
+    }
+
+    /** The main loop's decompile limit for {@code func} (seconds). */
+    private static int firstLimit(Function func) {
+        return func.getBody().getNumAddresses() >= DECOMPILE_LARGE_BODY_BYTES
+                ? DECOMPILE_TIMEOUT_LARGE_S : DECOMPILE_TIMEOUT_S;
+    }
+
+    /** Whether a decompile message says the output passed the decompiler's output limit. */
+    private static boolean payloadExceeded(String msg) {
+        return msg != null && msg.toLowerCase(java.util.Locale.ROOT).contains("buffer size exceeded");
+    }
+
     /**
      * The "promote" object for the export, or null when PromoteUndefined left no record in this
      * session. It carries, all together, the block-promotion counts (tried, created), the residual
      * instructions left outside every function (kinds, sum, ranges, truncation), the executable
      * bytes never disassembled (W11: undefined_ranges, undefined_ranges_truncated, undefined_bytes)
      * and the pointer-reached recovery counts (W14: recovered, recover_rejected, recover_seeds,
-     * recover_lost_insn_bytes, recover_noreturn_flips). Missing or malformed ANY of them yields null
+     * recover_rejected_string, recover_lost_insn_bytes, recover_noreturn_flips). Missing or
+     * malformed ANY of them yields null
      * (the whole record, never a partial one — the same all-or-nothing rule the W1 fields had). Sets
      * promoteMarks so each function's origin can be read.
      */
@@ -2494,11 +2541,12 @@ public class ExportFunctions extends GhidraScript {
         int recovered = opts.getInt("recovered", -1);
         int recoverRejected = opts.getInt("recover_rejected", -1);
         int recoverSeeds = opts.getInt("recover_seeds", -1);
+        int recoverRejectedString = opts.getInt("recover_rejected_string", -1);
         long recoverLostBytes = opts.getLong("recover_lost_insn_bytes", -1);
         int recoverFlips = opts.getInt("recover_noreturn_flips", -1);
         if (start < 0 || interior < 0 || unowned < 0 || tried < 0 || created < 0 || undefBytes < 0
-                || recovered < 0 || recoverRejected < 0 || recoverSeeds < 0 || recoverLostBytes < 0
-                || recoverFlips < 0) {
+                || recovered < 0 || recoverRejected < 0 || recoverSeeds < 0
+                || recoverRejectedString < 0 || recoverLostBytes < 0 || recoverFlips < 0) {
             return null;
         }
         promoteMarks = currentProgram.getBookmarkManager();
@@ -2515,6 +2563,7 @@ public class ExportFunctions extends GhidraScript {
                 + ",\"recovered\":" + recovered
                 + ",\"recover_rejected\":" + recoverRejected
                 + ",\"recover_seeds\":" + recoverSeeds
+                + ",\"recover_rejected_string\":" + recoverRejectedString
                 + ",\"recover_lost_insn_bytes\":" + recoverLostBytes
                 + ",\"recover_noreturn_flips\":" + recoverFlips + "}";
     }
@@ -2545,8 +2594,9 @@ public class ExportFunctions extends GhidraScript {
 
     /**
      * One function's record for the "functions" array, decompiled with {@code timeoutSec}. Its
-     * decompile outcome is put in {@code statusOut[0]} (ok / timeout / error / skipped_micro),
-     * so the caller can retry a timed-out function once at a larger limit; an error's message is
+     * decompile outcome is put in {@code statusOut[0]} (ok / timeout / error / skipped_micro) and
+     * an error's message in {@code statusOut[1]} (null otherwise), so the caller can retry a
+     * timed-out function once at a larger limit and count what is left; the message is also
      * written to the record's decompile_error.
      */
     private String exportFunction(Function func, DecompInterface decomp, FunctionManager fm,
@@ -2590,14 +2640,17 @@ public class ExportFunctions extends GhidraScript {
                 decompileStatus = DECOMPILE_TIMEOUT;
             } else {
                 decompileStatus = DECOMPILE_ERROR;
-                decompileError = firstLine(dr.isCancelled() ? "cancelled" : dr.getErrorMessage());
+                String msg = dr.isCancelled() ? "cancelled" : dr.getErrorMessage();
+                decompileError = payloadExceeded(msg) ? DECOMPILE_PAYLOAD_EXCEEDED : firstLine(msg);
             }
         } catch (Exception e) {
             pseudocode = "/* decompile_error: " + e.getMessage() + " */";
             decompileStatus = DECOMPILE_ERROR;
-            decompileError = firstLine(e.getMessage());
+            decompileError = payloadExceeded(e.getMessage())
+                    ? DECOMPILE_PAYLOAD_EXCEEDED : firstLine(e.getMessage());
         }  // end if (funcSize >= 10)
         statusOut[0] = decompileStatus;
+        statusOut[1] = decompileError;
 
         // Collect callee edges. Broaden beyond "CALL ref whose target is a Function AT that
         // address": PIC intra-.so calls go through PLT stubs / GOT slots, so the ref target is a
@@ -2836,7 +2889,9 @@ public class ExportFunctions extends GhidraScript {
         // Init decompiler
         DecompInterface decomp = new DecompInterface();
         DecompileOptions opts  = new DecompileOptions();
-        opts.setMaxPayloadMBytes(64);   // prevent OOM on large files
+        // A limit, so one huge output cannot exhaust the heap: 64 MB, unless the driver raised it
+        // (with the heap) for a re-run of a binary whose output passed it.
+        opts.setMaxPayloadMBytes(payloadMBytes());
         decomp.setOptions(opts);
         decomp.openProgram(currentProgram);
 
@@ -2887,6 +2942,8 @@ public class ExportFunctions extends GhidraScript {
         List<String> entries = new ArrayList<>();       // one record per exported function
         List<Function> entryFunctions = new ArrayList<>();
         List<Integer> timedOut = new ArrayList<>();     // indices whose decompile timed out
+        List<String> decompStatus = new ArrayList<>();  // per index: the decompile status
+        List<String> decompError = new ArrayList<>();   // per index: the error message, or null
         // W12: the thunks this export skips (PLT / lazy-binding stubs), recorded as entry + body
         // ranges only — not added to the exported function set. The diff's counterpart probe reads
         // them so a function mapping onto an other-side thunk is not read as "there is no function
@@ -2909,10 +2966,12 @@ public class ExportFunctions extends GhidraScript {
                 continue;
             }
 
-            String[] status = new String[1];
-            entries.add(exportFunction(func, decomp, fm, knownNames, DECOMPILE_TIMEOUT_S, false,
+            String[] status = new String[2];
+            entries.add(exportFunction(func, decomp, fm, knownNames, firstLimit(func), false,
                     status));
             if (DECOMPILE_TIMEOUT.equals(status[0])) timedOut.add(entries.size() - 1);
+            decompStatus.add(status[0]);
+            decompError.add(status[1]);
             entryFunctions.add(func);
             funcCount++;
         }
@@ -2921,27 +2980,60 @@ public class ExportFunctions extends GhidraScript {
         // at a time: under load a function can need more than the loop's limit, and its empty
         // pseudocode would otherwise silently take its sink calls and provenance with it. Still
         // timing out, it is recorded as timeout (retried) — never as an empty function.
-        // The retries share one budget (TMAP_DECOMPILE_RETRY_BUDGET_S, set by the driver from the
-        // session's wall clock): past it, the rest stay timeout, not retried — retrying past the
-        // wall clock would lose the whole extraction instead of a few functions' pseudocode.
-        long retryBudgetMs = retryBudgetSeconds() * 1000L;
+        // The retries share one budget: until the deadline the driver set
+        // (TMAP_DECOMPILE_DEADLINE_MS: what the session's wall clock leaves once the export and a
+        // margin are set aside), and never less than TMAP_DECOMPILE_RETRY_BUDGET_S. Past it, the
+        // rest stay timeout, not retried — retrying past the wall clock would lose the whole
+        // extraction instead of a few functions' pseudocode. Smallest body first, each at most an
+        // equal part of what is left, so time one finishes early with goes to the larger ones.
         long retryStart = System.currentTimeMillis();
+        long retryBudgetMs = retryBudgetSeconds() * 1000L;
+        long deadline = retryDeadlineMs();
+        if (deadline > 0) retryBudgetMs = Math.max(retryBudgetMs, deadline - retryStart);
+        long retryEnd = retryStart + retryBudgetMs;
+        List<Integer> retryOrder = new ArrayList<>(timedOut);
+        retryOrder.sort(java.util.Comparator.comparingLong(
+                k -> entryFunctions.get(k).getBody().getNumAddresses()));
         int recovered = 0;
         int retried = 0;
-        for (int k : timedOut) {
+        for (int i = 0; i < retryOrder.size(); i++) {
             if (monitor.isCancelled()) break;
-            long left = retryBudgetMs - (System.currentTimeMillis() - retryStart);
-            if (left < 1000L) break;
-            int limit = (int) Math.min(DECOMPILE_RETRY_TIMEOUT_S, left / 1000L);
-            String[] status = new String[1];
+            long leftS = (retryEnd - System.currentTimeMillis()) / 1000L;
+            if (leftS < 1) break;
+            int remaining = retryOrder.size() - i;
+            int limit = (int) Math.min(DECOMPILE_RETRY_TIMEOUT_S, Math.max(1L, leftS / remaining));
+            int k = retryOrder.get(i);
+            String[] status = new String[2];
             entries.set(k, exportFunction(entryFunctions.get(k), decomp, fm, knownNames,
                     limit, true, status));
+            decompStatus.set(k, status[0]);
+            decompError.set(k, status[1]);
             retried++;
             if (DECOMPILE_OK.equals(status[0])) recovered++;
         }
-        if (!timedOut.isEmpty()) {
+        // What is left unfinished, for the driver: every timeout, the timeouts of a body of
+        // DECOMPILE_UNFINISHED_LARGE_BYTES or more, and the outputs past the output limit.
+        int unfinishedTimeouts = 0;
+        int unfinishedLarge = 0;
+        int unfinishedPayload = 0;
+        for (int k = 0; k < decompStatus.size(); k++) {
+            if (DECOMPILE_TIMEOUT.equals(decompStatus.get(k))) {
+                unfinishedTimeouts++;
+                if (entryFunctions.get(k).getBody().getNumAddresses()
+                        >= DECOMPILE_UNFINISHED_LARGE_BYTES) {
+                    unfinishedLarge++;
+                }
+            } else if (DECOMPILE_PAYLOAD_EXCEEDED.equals(decompError.get(k))) {
+                unfinishedPayload++;
+            }
+        }
+        String decompileCounts = "{\"timeouts\":" + unfinishedTimeouts
+                + ",\"timeouts_large\":" + unfinishedLarge
+                + ",\"payload_exceeded\":" + unfinishedPayload + "}";
+        if (!timedOut.isEmpty() || unfinishedPayload > 0) {
             println("[ExportFunctions] decompile timeouts: " + timedOut.size() + ", retried: "
-                    + retried + ", recovered: " + recovered);
+                    + retried + ", recovered: " + recovered + ", retry budget: "
+                    + (retryBudgetMs / 1000L) + "s, left: " + decompileCounts);
         }
         println("[ExportFunctions] functions: " + funcCount);
 
@@ -3150,6 +3242,10 @@ public class ExportFunctions extends GhidraScript {
         try (PrintWriter pw = new PrintWriter(
                 new OutputStreamWriter(new FileOutputStream(tmpPath), "UTF-8"))) {
             pw.print("{");
+            // First, so the driver reads it from the head of the file without parsing the rest:
+            // what the decompile left unfinished (timeouts, of them the large bodies, and outputs
+            // past the output limit).
+            pw.print("\"decompile_counts\":" + decompileCounts + ",");
             pw.print("\"binary\":\"" + esc(binaryName) + "\",");
             // Self-description: which pass and which binary (the RESOLVED sha8, also when it was
             // computed from the file because SHA8 was not set) this output belongs to.

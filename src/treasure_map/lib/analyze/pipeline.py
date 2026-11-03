@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib import rescan_version
-from treasure_map.lib.analyze.db_ingest import ExportCheck, ingest_elfs, toolchain_changed
+from treasure_map.lib.analyze.db_ingest import (
+    ExportCheck,
+    decompile_rerun_record,
+    decompile_rerun_skips,
+    ingest_elfs,
+    toolchain_changed,
+)
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, scan_filesystem
 from treasure_map.lib.analyze.file_inventory import build_file_inventory
 from treasure_map.lib.analyze.ghidra_ingest import (
@@ -35,9 +41,11 @@ from treasure_map.lib.analyze.ghidra_ingest import (
 )
 from treasure_map.lib.analyze.ghidra_runner import (
     _INTERRUPTED,
+    ANALYZER_EXCEPTION_PREFIX,
     GhidraResult,
     GhidraRunner,
     export_paths,
+    unfinished_decompiles,
 )
 from treasure_map.lib.analyze.non_binary.orchestrator import NonBinaryStats, run_all_ingesters
 from treasure_map.lib.analyze.symlinks import SymlinkCollector, write_symlinks
@@ -107,6 +115,11 @@ class AnalyzeResult:
     # that is there (``ghidra_status='no_functions'``). Also named by ``incomplete_binaries``; this
     # list says why re-running the same pass will not change them.
     no_functions_binaries: list[str] = field(default_factory=list)
+    # Current-scan binaries whose stored extraction finished while a Ghidra analyzer threw during
+    # its analysis (``{binary, reason}``, reason ``analyzer_exception:<analyzer>:<class>``): they
+    # have functions, so they are not incomplete, but their function set may be short. A scan
+    # re-runs such a binary once in a session of its own; one listed here kept the exception.
+    analyzer_degraded_binaries: list[dict[str, Any]] = field(default_factory=list)
     # Current-scan binaries this scan's pass FAILED on while they still hold the rows an earlier
     # pass wrote. Each is ``{binary, reason, earlier_pass}``; their candidates read
     # ``extraction_current=false``.
@@ -244,7 +257,9 @@ def run_analyze(
 
     ``reanalyze`` (REANALYZE_ALL or a binary name/path) forces re-analysis ignoring the cache.
     ``force_retry`` re-attempts binaries that timed out at a budget this scan would repeat, which
-    are otherwise left alone (see ``db_ingest._timeout_skips``); it does not touch the cache.
+    are otherwise left alone (see ``db_ingest._timeout_skips``), and lets an extracted binary whose
+    large decompiles an earlier isolated re-run left unfinished have one again (see
+    ``db_ingest.decompile_rerun_skips``); it does not touch the cache.
 
     Fail-fast: discovers analyzeHeadless before scanning so a missing Ghidra
     installation is reported immediately rather than after a long ELF scan.
@@ -308,6 +323,7 @@ def run_analyze(
     ghidra_no_functions = 0
     incomplete_binaries: list[str] = []
     no_functions_binaries: list[str] = []
+    analyzer_degraded_binaries: list[dict[str, Any]] = []
     kept_earlier_binaries: list[dict[str, Any]] = []
     reanalyze_pending = 0
     timeout_skipped: list[dict[str, Any]] = []
@@ -339,6 +355,19 @@ def run_analyze(
             ),
         )
         dirty_records = [r for r in records if r.sha256 in dirty_shas]
+        # The binaries an isolated re-run already left with decompiles unfinished under this pass,
+        # Ghidra and budget: not re-run for them again (--force-retry re-runs them).
+        decompile_settled = (
+            set()
+            if force_retry
+            else decompile_rerun_skips(
+                conn,
+                dirty_records,
+                pass_version=pass_version,
+                timeout_base=config.ghidra.headless_timeout_seconds,
+                ghidra_version=ghidra_version,
+            )
+        )
 
         # What the skip cost, read back from the DECISION rather than re-derived: a timed-out
         # binary in this scan that is not in the dirty set is one nothing will be spent on. Deriving
@@ -448,14 +477,37 @@ def run_analyze(
                     [rec],
                     sha_to_id,
                     pass_version=pass_version,
-                    success_stamp={rec.sha256: (res.analysis_status, ghidra_version)},
+                    success_stamp={
+                        rec.sha256: (res.analysis_status, ghidra_version, res.degrade_reason)
+                    },
                     export_stamp={rec.sha256: (status, meta)},
                 )
                 stored = one.binaries_processed == 1
                 keep = (archived[0], archived[1]) if archived and stored else ()
                 remove_other_archives(export_ctx.archive_dir, rec.sha256, keep)
                 _drop_raw_export(rec)
+                if stored:
+                    _record_decompile_rerun(rec, res)
                 return one
+
+            def _record_decompile_rerun(rec: ElfRecord, res: GhidraResult) -> None:
+                """Record an isolated re-run that still left decompiles unfinished (so a later
+                scan under the same pass, Ghidra and budget does not re-run it for them), and
+                clear the record once a stored extraction has none left. Left as it is when the
+                stored extraction does not say (an output without the counts)."""
+                if res.decompile_rerun_budget is not None:
+                    value: str | None = decompile_rerun_record(
+                        pass_version, ghidra_version, res.decompile_rerun_budget
+                    )
+                elif unfinished_decompiles(res) == 0:
+                    value = None
+                else:
+                    return
+                conn.execute(
+                    "UPDATE binaries SET decompile_rerun = ? WHERE sha256 = ?",
+                    (value, rec.sha256),
+                )
+                conn.commit()
 
             def _drop_raw_export(rec: ElfRecord) -> None:
                 for path in export_paths(ghidra_output_dir, rec.path, rec.sha256[:8]):
@@ -478,6 +530,7 @@ def run_analyze(
                 )
                 conn.commit()
                 _drop_raw_export(rec)
+                _record_decompile_rerun(rec, res)
 
             finalized: set[str] = set()
             ghidra_output_dir = workspace.path / "ghidra_output"
@@ -489,6 +542,7 @@ def run_analyze(
                     progress_callback,
                     on_final=_persist_final,
                     on_export=_persist_export,
+                    decompile_settled=decompile_settled,
                 )
             except KeyboardInterrupt:
                 logger.warning(
@@ -540,6 +594,16 @@ def run_analyze(
             for row in conn.execute(
                 "SELECT name FROM current_binaries WHERE ghidra_status = 'no_functions' "
                 "ORDER BY name"
+            ).fetchall()
+        ]
+        # Extracted, with functions, while an analyzer threw during the analysis: not incomplete,
+        # and not clean either — named so a short function set is not read as the whole binary.
+        analyzer_degraded_binaries = [
+            {"binary": row["name"], "reason": row["ghidra_status_reason"]}
+            for row in conn.execute(
+                "SELECT name, ghidra_status_reason FROM current_binaries "
+                "WHERE ghidra_ok = 1 AND ghidra_status_reason GLOB ? ORDER BY name",
+                (ANALYZER_EXCEPTION_PREFIX + "*",),
             ).fetchall()
         ]
         # The same "this scan" as above. A failed binary whose pass_version still names another pass
@@ -611,6 +675,7 @@ def run_analyze(
         timeout_skipped=timeout_skipped,
         symlinks_recorded=symlinks_recorded,
         no_functions_binaries=no_functions_binaries,
+        analyzer_degraded_binaries=analyzer_degraded_binaries,
         kept_earlier_binaries=kept_earlier_binaries,
         reanalyze_pending=reanalyze_pending,
         ghidra_no_functions=ghidra_no_functions,

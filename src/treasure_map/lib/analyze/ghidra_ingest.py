@@ -10,6 +10,8 @@ Designed to align with partial invalidation:
   NOT lost by this skip: the pipeline already recorded it as ``ghidra_status='failed'`` with a
   ``ghidra_status_reason``, and it surfaces via ``facts.list_incomplete_binaries`` (MCP
   ``incomplete_binaries``). This skip is a tolerant fallback, not the only signal.
+- ``ghidra_status_reason`` is why a failure failed, or — on an extracted row — the blind spot of a
+  successful extraction (``analyzer_exception:<analyzer>:<class>``: an analyzer threw during it).
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ def ingest_ghidra_output(
     dirty_records: list[ElfRecord],
     sha_to_id: dict[str, int],
     pass_version: str | None = None,
-    success_stamp: dict[str, tuple[str, str]] | None = None,
+    success_stamp: dict[str, tuple[str, str, str | None]] | None = None,
     export_stamp: dict[str, tuple[str, str | None]] | None = None,
 ) -> IngestStats:
     """For each dirty binary, locate its <name>_<sha8>_ghidra.json,
@@ -80,6 +82,9 @@ def ingest_ghidra_output(
             the hash of THIS binary's resolved stub table, or "none" when none resolves. The scan
             pipeline always passes it; None skips the checks (a caller with no pass to compare
             against).
+        success_stamp: sha256 -> (analysis_status, ghidra_version, degrade_reason) of a finished
+            extraction, written with its rows: ghidra_ok = 1, and ghidra_status_reason = the
+            degrade reason (NULL when none).
         export_stamp: sha256 -> (binexport_status, binexport_scan_meta JSON) of the export
             written in the same session, stored with the success stamp in the same transaction —
             a binary is never left marked extracted with its export outcome missing.
@@ -164,11 +169,12 @@ def ingest_ghidra_output(
         # with no functions, which the next scan read as a finished extraction and skipped forever.
         stamp = (success_stamp or {}).get(rec.sha256)
         if stamp is not None:
-            analysis_status, ghidra_version = stamp
+            # The reason of an extracted row is its blind spot (an analyzer threw), else NULL.
+            analysis_status, ghidra_version, degrade_reason = stamp
             conn.execute(
                 "UPDATE binaries SET ghidra_ok = 1, ghidra_status = ?, "
-                "ghidra_status_reason = NULL, pass_version = ?, ghidra_version = ? WHERE id = ?",
-                (analysis_status, pass_version, ghidra_version, binary_id),
+                "ghidra_status_reason = ?, pass_version = ?, ghidra_version = ? WHERE id = ?",
+                (analysis_status, degrade_reason, pass_version, ghidra_version, binary_id),
             )
         export = (export_stamp or {}).get(rec.sha256)
         if export is not None:
@@ -282,6 +288,7 @@ PROMOTE_COLUMNS: tuple[str, ...] = (
     "promote_recovered",
     "promote_recover_rejected",
     "promote_recover_seeds",
+    "promote_recover_rejected_string",
     "promote_recover_lost_bytes",
     "promote_recover_noreturn_flips",
 )
@@ -333,6 +340,7 @@ def _promote_columns(promote: Any) -> tuple[Any, ...]:
     recovered = _count(promote.get("recovered"))
     recover_rejected = _count(promote.get("recover_rejected"))
     recover_seeds = _count(promote.get("recover_seeds"))
+    recover_rejected_string = _count(promote.get("recover_rejected_string"))
     recover_lost = _count(promote.get("recover_lost_insn_bytes"))
     recover_flips = _count(promote.get("recover_noreturn_flips"))
     if (
@@ -350,6 +358,7 @@ def _promote_columns(promote: Any) -> tuple[Any, ...]:
         or recovered is None
         or recover_rejected is None
         or recover_seeds is None
+        or recover_rejected_string is None
         or recover_lost is None
         or recover_flips is None
     ):
@@ -368,6 +377,7 @@ def _promote_columns(promote: Any) -> tuple[Any, ...]:
         recovered,
         recover_rejected,
         recover_seeds,
+        recover_rejected_string,
         recover_lost,
         recover_flips,
     )

@@ -252,11 +252,27 @@ class GhidraResult:
     analysis_status: str = "failed"
     function_count: int = 0  # functions in the output JSON (0 for ok_empty / no_functions / failed)
     # WHY a failed run failed, so a consumer distinguishes a recoverable timeout (re-scan may finish
-    # it) from a structural failure. None on success. One of: 'timeout' / 'import_failed' /
+    # it) from a structural failure. None on success (a success's blind spot is ``degrade_reason``,
+    # recorded onto the same column). One of: 'timeout' / 'import_failed' /
     # 'no_output' / 'incomplete' / 'stale_output' (a JSON another pass or binary wrote). Recorded
     # onto binaries.ghidra_status_reason for the incomplete surfacing -- degrade must be visible AND
     # explicable, not just a flat 'failed'.
     reason: str | None = None
+    # A SUCCESSFUL extraction's blind spot, kept apart from ``reason`` (which only a failure has):
+    # ``analyzer_exception:<analyzer>:<exception class>`` when one of Ghidra's analyzers threw
+    # during this attempt (``(+N)`` appended when N other distinct ones did too) — the analysis
+    # went on without it and can have missed functions. None when none threw. Recorded onto
+    # binaries.ghidra_status_reason of the extracted row.
+    degrade_reason: str | None = None
+    # What the extraction's decompile left unfinished, from its JSON's ``decompile_counts``: the
+    # timeouts of a body of 8KB or more, and the outputs past the decompiler's output limit. None
+    # when the output does not record them.
+    decompile_large_timeouts: int | None = None
+    decompile_payload_exceeded: int | None = None
+    # Set by run_all on a phase-2 result when that isolated re-run still left decompiles
+    # unfinished: the budget it ran under. Recorded so a later scan under the same pass, Ghidra and
+    # budget does not spend another isolated re-run on them (see db_ingest.decompile_rerun_skips).
+    decompile_rerun_budget: int | None = None
     # The wall-clock budget (seconds) the attempt behind THIS result actually ran under — recorded,
     # not re-derived, because "re-scan may finish it" is only true if the next scan hands it MORE
     # time. Measured rather than computed so a run that never reached the isolated retry (its phase
@@ -570,6 +586,25 @@ def _classify_analysis(
 # The decompile-retry budget of a session that does not export (its wall clock has no E share).
 _DECOMPILE_RETRY_NO_EXPORT_S = 30
 
+# What the decompile retries leave of a session's wall clock besides the export's reserve: the
+# extraction's work after them (measured at a few seconds), the JVM's exit and the project's
+# deletion.
+_RETRY_DEADLINE_MARGIN_S = 60
+
+# A re-run of a binary whose decompiler output passed the default limit (64 MB) runs with this
+# limit, and at least this heap (the output is read into it).
+_LARGE_PAYLOAD_MB = 256
+_LARGE_PAYLOAD_HEAP_MB = 1536
+
+
+def _retry_deadline_ms(session_start: float, wall: int, export_budget: int | None) -> int:
+    """When (epoch ms) a session's decompile retries must end: its wall clock less a reserve for
+    the export (half the export's own budget; the export measured at most a quarter of it) and
+    the margin. The extraction never retries for less than the fixed budget it is also handed."""
+    reserve = (export_budget // 2) if export_budget else 0
+    return int((session_start + wall - reserve - _RETRY_DEADLINE_MARGIN_S) * 1000)
+
+
 # The scripts a scan runs after Ghidra's analysis, in this order: create the functions the analysis
 # left out, extract, then (when the BinExport extension is available) export.
 PROMOTE_SCRIPT = "PromoteUndefined.java"
@@ -673,6 +708,78 @@ _EXCEPTION_LINE = re.compile(
 )
 
 
+# How Ghidra logs an analyzer that threw: the analysis carries on without it (exit code 0), so this
+# line is the only sign that what it produced may be short.
+_ANALYZER_EXCEPTION = re.compile(
+    rb"ERROR \((?P<analyzer>[^)\r\n]+)\) caught exception (?P<chain>[^\r\n]*)"
+)
+# A Java exception class in a cause chain; the simple name is the group.
+_EXCEPTION_CLASS = re.compile(rb"(?:[a-z][\w$]*\.)+([A-Z][\w$]*(?:Exception|Error))")
+# The wrapper the analysis framework puts around the exception an analyzer threw.
+_CONCURRENT_WRAPPER = b"ExecutionException"
+
+
+# The prefix of a degrade_reason (and of the binaries.ghidra_status_reason of an extracted row).
+ANALYZER_EXCEPTION_PREFIX = "analyzer_exception:"
+
+
+def _analyzer_exception(log_path: Path, offset: int) -> str | None:
+    """``analyzer_exception:<analyzer>:<class>`` for this attempt's part of the log (from
+    ``offset`` on) when an analyzer threw there, else None.
+
+    The class is the last exception class the line's cause chain names, the concurrency wrapper
+    left out. Several distinct (analyzer, class) pairs: the first, with ``(+N)`` for the others."""
+    try:
+        text = _log_since(log_path, offset)
+    except OSError:
+        return None
+    seen: list[tuple[str, str]] = []
+    for m in _ANALYZER_EXCEPTION.finditer(text):
+        analyzer = m.group("analyzer").decode(errors="replace").strip()
+        classes = [
+            c for c in _EXCEPTION_CLASS.findall(m.group("chain")) if c != _CONCURRENT_WRAPPER
+        ]
+        cls = classes[-1].decode() if classes else "unknown"
+        if (analyzer, cls) not in seen:
+            seen.append((analyzer, cls))
+    if not seen:
+        return None
+    analyzer, cls = seen[0]
+    more = f"(+{len(seen) - 1})" if len(seen) > 1 else ""
+    return f"{ANALYZER_EXCEPTION_PREFIX}{analyzer}:{cls}{more}"
+
+
+# The head of an extraction JSON: ExportFunctions writes "decompile_counts" first so it can be read
+# without parsing the rest. Anchored at the start of the file — nothing the binary supplies precedes
+# it.
+_DECOMPILE_COUNTS = re.compile(
+    rb'\{"decompile_counts":\{"timeouts":(\d+),"timeouts_large":(\d+),"payload_exceeded":(\d+)\}'
+)
+
+
+def _decompile_counts(output_file: Path) -> tuple[int | None, int | None]:
+    """(large timeouts, outputs past the limit) from the head of an extraction JSON; (None, None)
+    when it does not record them."""
+    try:
+        with output_file.open("rb") as f:
+            head = f.read(256)
+    except OSError:
+        return None, None
+    m = _DECOMPILE_COUNTS.match(head)
+    if m is None:
+        return None, None
+    return int(m.group(2)), int(m.group(3))
+
+
+def unfinished_decompiles(result: GhidraResult) -> int | None:
+    """How many decompiles a successful extraction left unfinished that an isolated re-run may
+    finish (large timeouts + outputs past the limit); None when the output did not record it."""
+    large, payload = result.decompile_large_timeouts, result.decompile_payload_exceeded
+    if large is None or payload is None:
+        return None
+    return large + payload
+
+
 def _export_failure_reason(log_path: Path, offset: int) -> str:
     """Why this attempt's export left no file: the first exception the log shows from the export
     script on (its class and the first part of its message), else ``no_file``."""
@@ -766,6 +873,29 @@ def _run_subprocess(
             _unregister_pgid(pgid)
 
 
+def _export_failed(result: GhidraResult) -> bool:
+    return (result.export_status or "").startswith("failed:")
+
+
+def _compare_extractions(first: GhidraResult, rerun: GhidraResult) -> int:
+    """>0 when the re-run's extraction is the better of two successful ones, <0 when phase 1's
+    is, 0 when neither is.
+
+    First, a clean analysis beats one during which an analyzer threw (it can have dropped
+    functions); of two during which one threw, more functions is better. Then fewer decompiles
+    left unfinished is better (compared only when both outputs record it)."""
+    first_threw = first.degrade_reason is not None
+    rerun_threw = rerun.degrade_reason is not None
+    if first_threw != rerun_threw:
+        return 1 if first_threw else -1
+    if first_threw and first.function_count != rerun.function_count:
+        return 1 if rerun.function_count > first.function_count else -1
+    first_left, rerun_left = unfinished_decompiles(first), unfinished_decompiles(rerun)
+    if first_left is not None and rerun_left is not None and first_left != rerun_left:
+        return 1 if rerun_left < first_left else -1
+    return 0
+
+
 class GhidraRunner:
     """Manages Ghidra headless analysis for one or many ELF binaries."""
 
@@ -815,6 +945,7 @@ class GhidraRunner:
         arch: str,
         sha8: str = "",
         retry: bool = True,
+        large_payload: bool = False,
     ) -> GhidraResult:
         """Run analyzeHeadless on a single binary with at most one retry.
 
@@ -829,13 +960,16 @@ class GhidraRunner:
         at an already-doubled budget (also retry=False), so a big binary retries with the CPU to
         itself instead of competing in the pool. A still-failing
         retry returns success=False with an explicit ``reason`` — never a fabricated 'ok'.
+
+        ``large_payload`` raises the decompiler's output limit (and the heap) for an isolated
+        re-run of a binary whose decompiles were left unfinished.
         """
         headless = self.get_headless()
         output_dir.mkdir(parents=True, exist_ok=True)
         if not sha8:
             sha8 = binary.name[:8]
 
-        r1 = self._run_once(binary, output_dir, arch, sha8, timeout, headless)
+        r1 = self._run_once(binary, output_dir, arch, sha8, timeout, headless, large_payload)
         if r1.success:
             return r1
         if r1.reason == _INTERRUPTED:
@@ -864,7 +998,7 @@ class GhidraRunner:
                 patched_file, tmpdir = patch_result
                 try:
                     r2 = self._run_once(
-                        patched_file, output_dir, arch, sha8, retry_timeout, headless
+                        patched_file, output_dir, arch, sha8, retry_timeout, headless, large_payload
                     )
                     did_retry = True
                     total_elapsed += r2.elapsed
@@ -883,7 +1017,9 @@ class GhidraRunner:
         elif retry:
             # the CPU-contending timeout retry — deferred to run_all's serial phase 2 (retry=False
             # in phase 1) so a big binary does not retry while competing for cores in the pool.
-            r2 = self._run_once(binary, output_dir, arch, sha8, retry_timeout, headless)
+            r2 = self._run_once(
+                binary, output_dir, arch, sha8, retry_timeout, headless, large_payload
+            )
             did_retry = True
             total_elapsed += r2.elapsed
             last = r2
@@ -930,6 +1066,7 @@ class GhidraRunner:
         sha8: str,
         timeout: int,
         headless: Path,
+        large_payload: bool = False,
     ) -> GhidraResult:
         t0 = time.monotonic()
         proj_dir: Path | None = None
@@ -969,6 +1106,9 @@ class GhidraRunner:
             # Where this attempt's lines will start in the appended log (see GhidraResult).
             log_offset = _log_size(output_dir / f"{binary.name}_{sha8}.log")
             heap_mb, xms_mb = adaptive_heap_mb(binary.stat().st_size)
+            if large_payload:
+                heap_mb = max(heap_mb, _LARGE_PAYLOAD_HEAP_MB)
+                xms_mb = max(64, heap_mb // 8)
             env: dict[str, str] = {
                 **dict(os.environ),
                 "OUTPUT_DIR": str(output_dir),
@@ -1002,6 +1142,16 @@ class GhidraRunner:
             env["TMAP_DECOMPILE_RETRY_BUDGET_S"] = str(
                 timeout // 2 if exporting else _DECOMPILE_RETRY_NO_EXPORT_S
             )
+            # ...and, at least that, until the deadline: whatever the session's wall clock still
+            # holds once the export's reserve and the margin are set aside. A session that analysed
+            # quickly has minutes left there, which a fixed budget left unspent.
+            env["TMAP_DECOMPILE_DEADLINE_MS"] = str(
+                _retry_deadline_ms(time.time(), wall, export_budget)
+            )
+            if large_payload:
+                env["TMAP_DECOMPILE_PAYLOAD_MB"] = str(_LARGE_PAYLOAD_MB)
+            else:
+                env.pop("TMAP_DECOMPILE_PAYLOAD_MB", None)
             rc, stderr_raw = _run_subprocess(cmd, env, wall, cwd=proj_dir)
         finally:
             for d in (proj_dir, ghidra_home_dir):
@@ -1090,6 +1240,14 @@ class GhidraRunner:
         if not success and reason is not None:
             # The export of a session whose extraction failed is never kept, whatever was written.
             export_status = f"scan_failed:{reason}"
+        degrade_reason: str | None = None
+        large_timeouts: int | None = None
+        payload_exceeded: int | None = None
+        if success:
+            # Both ways a session ends in a finished extraction (above): what it may have missed.
+            if log_path.exists():
+                degrade_reason = _analyzer_exception(log_path, log_offset)
+            large_timeouts, payload_exceeded = _decompile_counts(expected_out)
         usable = export_status in ("ok", "degraded") and exp is not None
         return GhidraResult(
             binary=binary,
@@ -1101,6 +1259,9 @@ class GhidraRunner:
             log_path=log_path if log_path.exists() else None,
             stderr_tail=stderr_raw if stderr_raw else None,
             reason=reason,
+            degrade_reason=degrade_reason,
+            decompile_large_timeouts=large_timeouts,
+            decompile_payload_exceeded=payload_exceeded,
             timeout_budget=budget,
             log_offset=log_offset,
             export_status=export_status,
@@ -1118,6 +1279,7 @@ class GhidraRunner:
         *,
         on_final: FinalCallback | None = None,
         on_export: ExportCallback | None = None,
+        decompile_settled: set[str] | None = None,
     ) -> list[GhidraResult]:
         """Two-phase Ghidra dispatch.
 
@@ -1144,6 +1306,16 @@ class GhidraRunner:
         standing (the re-run's export failed again, or its extraction did — then its export is
         dropped with it, and phase 1's export outcome and budget stand). The returned list holds
         each record's latest result.
+
+        ★ Two more kinds of phase-1 success are re-run in phase 2 the same way (finalized at once,
+        settled by ``on_export``), because an isolated session gets back what the pool lost:
+        one during whose analysis a Ghidra analyzer threw (``degrade_reason``; the analyzers race
+        under load and drop functions when they do), and one whose decompile left a large body
+        unfinished or an output past the decompiler's limit (re-run with the larger limit, which a
+        function that timed out before reaching it may need too). A binary in
+        ``decompile_settled`` (sha256) is not re-run for the second reason: an isolated re-run
+        under this pass, Ghidra and budget already left it unfinished. Of the two sessions, the
+        better extraction is kept whole, with its own export (``_settle_rerun``).
 
         Discovers analyzeHeadless once before spawning threads so GhidraNotFoundError is raised
         immediately rather than N times.
@@ -1232,10 +1404,27 @@ class GhidraRunner:
             for i in range(n)
             if by_idx[i].success and (by_idx[i].export_status or "").startswith("failed:")
         }
-        failed = [i for i in range(n) if not by_idx[i].success or i in export_retry]
+        # ...and the extractions an isolated session can make whole (see the docstring).
+        degraded = {i for i in range(n) if by_idx[i].success and by_idx[i].degrade_reason}
+        settled_shas = decompile_settled or set()
+        unfinished = {
+            i
+            for i in range(n)
+            if by_idx[i].success
+            and (unfinished_decompiles(by_idx[i]) or 0) > 0
+            and records[i].sha256 not in settled_shas
+        }
+        rerun_success = export_retry | degraded | unfinished
+        failed = [i for i in range(n) if not by_idx[i].success or i in rerun_success]
         if failed:
             logger.info(
-                "ghidra: retrying %d failed binary/ies serially (isolated CPU)", len(failed)
+                "ghidra: re-running %d binary/ies serially (isolated CPU): %d failed, %d export "
+                "failed, %d analyzer exception, %d decompile unfinished",
+                len(failed),
+                sum(1 for i in failed if not by_idx[i].success),
+                len(export_retry),
+                len(degraded),
+                len(unfinished),
             )
             try:
                 for k, i in enumerate(failed, 1):
@@ -1246,23 +1435,40 @@ class GhidraRunner:
                         # unscaled base, doubled and capped), so behaviour here is unchanged.
                         budget = min(_TIMEOUT_CEILING_SECONDS, base * 2)
                     retry_timeout = budget
+                    first = by_idx[i]
+                    # Any re-run for unfinished decompiles gets the larger output limit, not only
+                    # one whose output passed it: under load a function can time out before it
+                    # reaches the limit, and the isolated re-run would then pass it at 64 MB. The
+                    # limit is a ceiling, not an allocation; the heap is raised with it.
+                    large_payload = i in unfinished
                     try:
                         r = self.run_ghidra(
-                            rec.path, output_dir, retry_timeout, rec.arch, rec.sha256[:8], False
+                            rec.path,
+                            output_dir,
+                            retry_timeout,
+                            rec.arch,
+                            rec.sha256[:8],
+                            False,
+                            large_payload=large_payload,
                         )
                     except Exception as exc:
                         logger.error("Ghidra retry crashed for %s: %s", rec.name, exc)
                         # Phase 1's result stands as the final one. Reported outside the try
                         # above, so a failure of the callback is never taken for a crashed retry.
-                        # (An export re-run's binary was finalized in phase 1 already.)
-                        if on_final is not None and i not in export_retry:
+                        # (A re-run success's binary was finalized in phase 1 already.)
+                        if on_final is not None and i not in rerun_success:
                             on_final(rec, by_idx[i])
                         continue
                     r.retried = True
-                    if i in export_retry:
+                    if i in rerun_success:
                         if r.reason == _INTERRUPTED:
                             continue  # phase 1's extraction and export outcome stand
-                        settled = self._settle_export(by_idx[i], r)
+                        settled = self._settle_rerun(first, r)
+                        if r.success and (unfinished_decompiles(r) or 0) > 0:
+                            # An isolated session at this budget did not finish them either.
+                            settled = replace(
+                                settled, decompile_rerun_budget=r.timeout_budget or retry_timeout
+                            )
                         by_idx[i] = settled
                         if on_export is not None:
                             on_export(rec, settled)
@@ -1293,6 +1499,45 @@ class GhidraRunner:
                 raise
 
         return [by_idx[i] for i in range(n)]
+
+    @staticmethod
+    def _settle_rerun(first: GhidraResult, rerun: GhidraResult) -> GhidraResult:
+        """What a phase-2 re-run settles for a binary whose phase-1 extraction is already stored.
+
+        ★ A session is kept whole or not at all: the extraction chosen brings its own export (or
+        its own failed export) with it, never the other session's. The re-run is kept whole when
+        its extraction is the better one (``_compare_extractions``), even when its export failed — a
+        failed export is re-run by the next scan's export check. Phase 1's extraction and export
+        stand when phase 1's is the better one or the re-run failed; only a failed phase-1 export
+        then takes the re-run's failed export outcome (the larger budget it failed at). Neither
+        better: the export decides as before (``_settle_export``) when phase 1's export failed;
+        otherwise the re-run is kept when its export is as good as phase 1's."""
+        if not rerun.success:
+            return replace(first, retried=True, export_only=True)
+        cmp = _compare_extractions(first, rerun)
+        if cmp > 0:
+            return rerun
+        first_failed = _export_failed(first)
+        if cmp == 0:
+            if first_failed:
+                return GhidraRunner._settle_export(first, rerun)
+            if rerun.export_status in ("ok", "degraded") or (
+                rerun.export_status == first.export_status
+            ):
+                return rerun
+            return replace(first, retried=True, export_only=True)
+        if first_failed and _export_failed(rerun):
+            return replace(
+                first,
+                export_status=rerun.export_status,
+                export_budget=rerun.export_budget,
+                export_file=None,
+                export_report_file=None,
+                export_report=None,
+                retried=True,
+                export_only=True,
+            )
+        return replace(first, retried=True, export_only=True)
 
     @staticmethod
     def _settle_export(first: GhidraResult, rerun: GhidraResult) -> GhidraResult:

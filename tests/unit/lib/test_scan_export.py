@@ -225,6 +225,7 @@ class _Sessions:
         arch: str,
         sha8: str = "",
         retry: bool = True,
+        large_payload: bool = False,
     ) -> GhidraResult:
         self.calls.append((binary.name, timeout))
         outcome = self.plan[binary.name].pop(0)

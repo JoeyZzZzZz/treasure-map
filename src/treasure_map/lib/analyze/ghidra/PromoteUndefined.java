@@ -27,6 +27,10 @@
 //      Each pass seeds from every non-flow reference target and every aligned data word pointing
 //      into executable memory where nothing sits yet, disassembles following flow, and makes a
 //      function there unless the disassembly raised an error (then it is cleared again — rejected).
+//      ★ Before any disassembly, a seed is refused when it lies above the top of the code Ghidra's
+//      own analysis made into functions (taken before this script creates anything; with no such
+//      function every seed is refused), or when its bytes read as a C string. Both are data the
+//      analysis left in executable memory; disassembling them made functions out of strings.
 //      ★ No-return discovery is FROZEN for the whole of W14 and the second promotion: without it,
 //      re-analysis can newly, wrongly mark an existing command-wrapper non-returning and then
 //      delete every instruction after each call to it. The original value is restored at the end.
@@ -98,6 +102,10 @@ public class PromoteUndefined extends GhidraScript {
   // Shorter undefined runs are inter-function alignment padding, not missed code.
   static final int UNDEFINED_MIN = 16;
   static final int RECOVER_MAX_PASSES = 30;
+  // A seed whose bytes read as a C string (this many printable bytes, then NUL, within the probe)
+  // is data the analysis placed in executable memory, not an entry point.
+  static final int STRING_PROBE_BYTES = 64;
+  static final int STRING_MIN_PRINTABLE = 4;
   static final String NO_RETURN_OPTION = "Non-Returning Functions - Discovered";
 
   private FunctionManager fm;
@@ -112,6 +120,10 @@ public class PromoteUndefined extends GhidraScript {
     fm = currentProgram.getFunctionManager();
     bm = currentProgram.getBookmarkManager();
     int before = fm.getFunctionCount();
+    // The top of the code Ghidra's own analysis made into functions, taken HERE — before any
+    // function this script creates — so nothing this script makes can raise it. W14 seeds nothing
+    // above it; null (no function at all) makes W14 seed nothing.
+    Address nativeCeiling = maxFunctionBodyEnd();
 
     // 1. Promote the code blocks no function contains, then re-analyse (nothing recorded on cancel).
     int[] p1 = promoteBlocks();
@@ -130,8 +142,9 @@ public class PromoteUndefined extends GhidraScript {
     Set<Address> funcsBefore = functionEntries();
     Set<Address> nrBefore = noReturnEntries();
     String nrWas = freezeNoReturn();
-    long[] rec = {0, 0, 0}; // {recovered, rejected, seeds}
-    if (recoverFromPointers(exec, data, rec)) {
+    // {recovered, rejected, seeds, above_native, rejected_string}
+    long[] rec = {0, 0, 0, 0, 0};
+    if (recoverFromPointers(exec, data, nativeCeiling, rec)) {
       restoreNoReturn(nrWas);
       return; // cancelled: nothing recorded
     }
@@ -254,6 +267,7 @@ public class PromoteUndefined extends GhidraScript {
     opts.setInt("recovered", (int) rec[0]);
     opts.setInt("recover_rejected", (int) rec[1]);
     opts.setInt("recover_seeds", (int) rec[2]);
+    opts.setInt("recover_rejected_string", (int) rec[4]);
     opts.setLong("recover_lost_insn_bytes", recoverLostBytes);
     opts.setInt("recover_noreturn_flips", recoverNoReturnFlips);
     opts.setBoolean("recorded", true);
@@ -270,8 +284,58 @@ public class PromoteUndefined extends GhidraScript {
         + (truncated ? " residual_ranges_truncated" : "") + " undefined_ranges=" + uCount
         + " undefined_bytes=" + uBytes + (uTruncated ? " undefined_ranges_truncated" : "")
         + " recovered=" + rec[0] + " recover_rejected=" + rec[1] + " recover_seeds=" + rec[2]
+        + " recover_above_native=" + rec[3] + " recover_rejected_string=" + rec[4]
+        + " native_ceiling=" + (nativeCeiling == null ? "none" : nativeCeiling.toString())
         + " recover_lost_insn_bytes=" + recoverLostBytes + " recover_noreturn_flips="
         + recoverNoReturnFlips);
+  }
+
+  /**
+   * The highest address of any function body in executable memory, or null when there is none.
+   * External functions do not count, and neither do the import thunks the ELF loader places in its
+   * EXTERNAL block past the end of the image (they are not external functions themselves, and
+   * counting them would put the ceiling above every byte of the binary).
+   */
+  private Address maxFunctionBodyEnd() {
+    Memory mem = currentProgram.getMemory();
+    Address max = null;
+    for (Function f : fm.getFunctions(true)) {
+      if (f.isExternal()) {
+        continue;
+      }
+      Address hi = f.getBody().getMaxAddress();
+      if (hi == null || !hi.isMemoryAddress()) {
+        continue;
+      }
+      MemoryBlock block = mem.getBlock(hi);
+      if (block == null || block.isExternalBlock() || !block.isExecute()) {
+        continue;
+      }
+      if (max == null || hi.compareTo(max) > 0) {
+        max = hi;
+      }
+    }
+    return max;
+  }
+
+  /**
+   * True when the bytes at {@code a} read as a C string: at least STRING_MIN_PRINTABLE printable
+   * ASCII bytes followed by a NUL, within the first STRING_PROBE_BYTES bytes. Unreadable bytes are
+   * not a string.
+   */
+  private static boolean looksLikeCString(Memory mem, Address a) {
+    byte[] b = new byte[STRING_PROBE_BYTES];
+    int n;
+    try {
+      n = mem.getBytes(a, b);
+    } catch (Exception ex) {
+      return false;
+    }
+    int run = 0;
+    while (run < n && b[run] >= 32 && b[run] < 127) {
+      run++;
+    }
+    return run >= STRING_MIN_PRINTABLE && run < n && b[run] == 0;
   }
 
   /**
@@ -334,16 +398,25 @@ public class PromoteUndefined extends GhidraScript {
   /**
    * W14: recover functions reached only through pointers in the binary's data. Returns true when
    * the pass was cancelled (caller records nothing); otherwise fills rec = {recovered, rejected,
-   * seeds} and leaves no-return discovery frozen for the caller to restore.
+   * seeds, above_native, rejected_string} and leaves no-return discovery frozen for the caller to
+   * restore.
+   *
+   * Two seeds are refused before anything is disassembled, each counted once by address: one
+   * above {@code nativeCeiling} (the top of the code the analysis itself made into functions —
+   * what lies above it in executable memory is data there, and every seed is refused when there
+   * is no such function), and one whose bytes read as a C string. A Thumb seed is judged at its
+   * real address (the pointer value with the low bit cleared).
    */
-  private boolean recoverFromPointers(AddressSet exec, AddressSet data, long[] rec)
-      throws Exception {
+  private boolean recoverFromPointers(
+      AddressSet exec, AddressSet data, Address nativeCeiling, long[] rec) throws Exception {
     Listing listing = currentProgram.getListing();
     Memory mem = currentProgram.getMemory();
     boolean arm = currentProgram.getLanguage().getProcessor().toString().equalsIgnoreCase("ARM");
     int align = Math.max(1, currentProgram.getLanguage().getInstructionAlignment());
     int ptr = currentProgram.getDefaultPointerSize();
     Set<Address> tried = new HashSet<>();
+    Set<Address> aboveNative = new HashSet<>();
+    Set<Address> rejectedString = new HashSet<>();
     int recovered = 0;
     int rejected = 0;
     int seedsTotal = 0;
@@ -420,6 +493,17 @@ public class PromoteUndefined extends GhidraScript {
             || listing.getDefinedDataContaining(a) != null) {
           continue; // something already sits there
         }
+        if (aboveNative.contains(a) || rejectedString.contains(a)) {
+          continue; // refused in an earlier pass
+        }
+        if (nativeCeiling == null || a.compareTo(nativeCeiling) > 0) {
+          aboveNative.add(a);
+          continue;
+        }
+        if (looksLikeCString(mem, a)) {
+          rejectedString.add(a);
+          continue;
+        }
         tried.add(a);
         seedsTotal++;
         int e0 = errorsIn(exec);
@@ -462,6 +546,8 @@ public class PromoteUndefined extends GhidraScript {
     rec[0] = recovered;
     rec[1] = rejected;
     rec[2] = seedsTotal;
+    rec[3] = aboveNative.size();
+    rec[4] = rejectedString.size();
     return false;
   }
 

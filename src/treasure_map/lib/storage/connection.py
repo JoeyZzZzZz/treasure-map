@@ -53,9 +53,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # to the explicit 'unknown' run-level sentinel (cannot confirm which decompiler ran) rather than
     # being read as "same version as the other side". Must match schema.sql.
     ("binaries", "ghidra_version", "TEXT"),
-    # WHY a failed Ghidra run failed (timeout/import_failed/no_output/incomplete/stale_output).
-    # Back-fills NULL on older DBs (a pre-feature failure carries no reason -> failed with an
-    # unknown cause).
+    # WHY a failed Ghidra run failed (timeout/import_failed/no_output/incomplete/stale_output), or
+    # the blind spot of an extracted row (analyzer_exception:...). Back-fills NULL on older DBs (a
+    # pre-feature failure carries no reason -> failed with an unknown cause).
     # Must match schema.sql.
     ("binaries", "ghidra_status_reason", "TEXT"),
     # What the LAST failed Ghidra attempt ran under: its wall-clock budget and the extraction
@@ -138,6 +138,11 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("binaries", "promote_recover_seeds", "INTEGER"),
     ("binaries", "promote_recover_lost_bytes", "INTEGER"),
     ("binaries", "promote_recover_noreturn_flips", "INTEGER"),
+    # W14 seeds refused because their bytes read as a C string, and the isolated re-run that still
+    # left decompiles unfinished (pass, Ghidra, budget). Back-fill NULL on older DBs: not recorded
+    # until a re-scan — never 0, and no re-run is skipped on it. Must match schema.sql.
+    ("binaries", "promote_recover_rejected_string", "INTEGER"),
+    ("binaries", "decompile_rerun", "TEXT"),
     # W13: does stub_names cover every stub (1/0; NULL = no resolution), and the stub regions. W12:
     # the thunks the export skipped. Back-fill NULL on older DBs (not determined until a re-scan —
     # NOT "no stubs"/"no thunks"). Must match schema.sql.

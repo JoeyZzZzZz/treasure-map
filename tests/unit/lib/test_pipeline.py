@@ -575,6 +575,7 @@ class _Decompiler:
         arch: str,
         sha8: str = "",
         retry: bool = True,
+        large_payload: bool = False,
     ) -> GhidraResult:
         self.calls.append(binary.name)
         outcome = self.outcomes.get(binary.name, "ok")
@@ -782,7 +783,13 @@ def test_results_not_handed_over_are_stored_once_after_the_batch(
     runner = _mock_runner(results)
 
     def run_all(
-        records: list[ElfRecord], out: Path, cb: Any, *, on_final: Any, on_export: Any = None
+        records: list[ElfRecord],
+        out: Path,
+        cb: Any,
+        *,
+        on_final: Any,
+        on_export: Any = None,
+        decompile_settled: Any = None,
     ) -> list[Any]:
         on_final(records[0], results[0])
         return results
@@ -818,7 +825,13 @@ def test_an_interrupted_result_handed_over_is_not_stored(tmp_path: Path) -> None
     runner = _mock_runner([cut])
 
     def run_all(
-        records: list[ElfRecord], out: Path, cb: Any, *, on_final: Any, on_export: Any = None
+        records: list[ElfRecord],
+        out: Path,
+        cb: Any,
+        *,
+        on_final: Any,
+        on_export: Any = None,
+        decompile_settled: Any = None,
     ) -> list[Any]:
         on_final(records[0], cut)
         return [cut]
