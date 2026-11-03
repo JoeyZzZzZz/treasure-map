@@ -299,6 +299,11 @@ class GhidraResult:
     # True on a result handed to ``on_export`` that carries only an export outcome: the extraction
     # phase 1 finalized stands, and only the export status is to be updated.
     export_only: bool = False
+    # True on an ``export_only`` result that records nothing at all: phase 1's session — its
+    # extraction AND its export outcome, archive included — stands whole as phase 1 stored it, and
+    # the re-run is dropped. Writing its export status again would write it without the archive
+    # phase 1 recorded (the archive is named only when the session is stored).
+    stored_stands: bool = False
 
 
 # ★ A binary that cannot finish within this even on an isolated retry is a genuine hang, not a
@@ -1513,7 +1518,7 @@ class GhidraRunner:
         better: the export decides as before (``_settle_export``) when phase 1's export failed;
         otherwise the re-run is kept when its export is as good as phase 1's."""
         if not rerun.success:
-            return replace(first, retried=True, export_only=True)
+            return replace(first, retried=True, export_only=True, stored_stands=True)
         cmp = _compare_extractions(first, rerun)
         if cmp > 0:
             return rerun
@@ -1525,7 +1530,7 @@ class GhidraRunner:
                 rerun.export_status == first.export_status
             ):
                 return rerun
-            return replace(first, retried=True, export_only=True)
+            return replace(first, retried=True, export_only=True, stored_stands=True)
         if first_failed and _export_failed(rerun):
             return replace(
                 first,
@@ -1537,7 +1542,7 @@ class GhidraRunner:
                 retried=True,
                 export_only=True,
             )
-        return replace(first, retried=True, export_only=True)
+        return replace(first, retried=True, export_only=True, stored_stands=True)
 
     @staticmethod
     def _settle_export(first: GhidraResult, rerun: GhidraResult) -> GhidraResult:
@@ -1559,4 +1564,4 @@ class GhidraRunner:
                 retried=True,
                 export_only=True,
             )
-        return replace(first, retried=True, export_only=True)
+        return replace(first, retried=True, export_only=True, stored_stands=True)

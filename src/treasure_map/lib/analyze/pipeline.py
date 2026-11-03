@@ -517,11 +517,16 @@ def run_analyze(
             def _persist_export(rec: ElfRecord, res: GhidraResult) -> None:
                 """Store what a phase-2 re-run settled for a binary whose extraction phase 1 stored:
                 a whole new session (extraction and usable export) in place of phase 1's, or only
-                the export outcome."""
+                the export outcome — or nothing, when phase 1's session stands whole: its row (the
+                export's archive name included) is what phase 1 stored, and is left as it is."""
                 if res.reason == _INTERRUPTED:
                     return
                 if not res.export_only:
                     _store_extraction(rec, res)
+                    return
+                if res.stored_stands:
+                    _drop_raw_export(rec)  # the re-run's, never archived
+                    _record_decompile_rerun(rec, res)
                     return
                 conn.execute(
                     "UPDATE binaries SET binexport_status = ?, binexport_scan_meta = ? "

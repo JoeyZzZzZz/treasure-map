@@ -31,6 +31,7 @@ import pytest
 
 from tests.unit.lib.test_ghidra_runner import _good_json, _make_runner, _write_small_elf
 from tests.unit.lib.test_pipeline import _NAMES, _e2e_cfg, _firmware, _ghidra
+from tests.unit.lib.test_scan_export import _report, _with_extension
 from treasure_map.lib.analyze import ghidra_ingest, ghidra_runner
 from treasure_map.lib.analyze.db_ingest import decompile_rerun_record, decompile_rerun_skips
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
@@ -40,6 +41,7 @@ from treasure_map.lib.analyze.ghidra_runner import (
     GhidraRunner,
     _analyzer_exception,
     _decompile_counts,
+    export_paths,
     retry_budget_seconds,
 )
 from treasure_map.lib.analyze.pipeline import AnalyzeResult, run_analyze
@@ -291,6 +293,11 @@ class _Plan:
         out = output_dir / f"{binary.name}_{sha8}_ghidra.json"
         out.write_text(json.dumps(data))
         export = o.get("export", "extension_missing")
+        exp, rep = export_paths(output_dir, binary, sha8)
+        usable = export == "ok"
+        if usable:
+            exp.write_bytes(b"export of " + binary.name.encode() + str(len(self.calls)).encode())
+            rep.write_text(json.dumps(_report()))
         return GhidraResult(
             binary=binary,
             output_file=out,
@@ -304,6 +311,9 @@ class _Plan:
             timeout_budget=timeout,
             export_status=export,
             export_budget=timeout,
+            export_file=exp if usable else None,
+            export_report_file=rep if usable else None,
+            export_report=_report() if usable else None,
         )
 
 
@@ -347,22 +357,22 @@ def test_an_extraction_during_which_an_analyzer_threw_is_rerun_isolated(tmp_path
     settle on phase 1 regardless -> RED."""
     plan = _Plan(
         {
-            "hconf": [{"threw": _THREW, "functions": 32}, {"functions": 46}],
-            "gpio": [{"functions": 125}],
+            "svc_a": [{"threw": _THREW, "functions": 5}, {"functions": 9}],
+            "svc_b": [{"functions": 12}],
         }
     )
-    _res, finals, exports, _r = _run_all(tmp_path, plan, ("hconf", "gpio"))
-    assert [c[0] for c in plan.calls].count("hconf") == 2
-    assert [c[0] for c in plan.calls].count("gpio") == 1
-    assert {f.binary.name for f in finals} == {"hconf", "gpio"}
+    _res, finals, exports, _r = _run_all(tmp_path, plan, ("svc_a", "svc_b"))
+    assert [c[0] for c in plan.calls].count("svc_a") == 2
+    assert [c[0] for c in plan.calls].count("svc_b") == 1
+    assert {f.binary.name for f in finals} == {"svc_a", "svc_b"}
     (settled,) = exports
     assert settled.export_only is False
-    assert (settled.degrade_reason, settled.function_count) == (None, 46)
+    assert (settled.degrade_reason, settled.function_count) == (None, 9)
 
 
 @pytest.mark.parametrize(
     ("first_n", "rerun_n", "kept"),
-    [(32, 40, "rerun"), (40, 32, "first")],
+    [(5, 7, "rerun"), (7, 5, "first")],
 )
 def test_two_extractions_during_which_an_analyzer_threw_keep_the_one_with_more_functions(
     tmp_path: Path, first_n: int, rerun_n: int, kept: str
@@ -373,13 +383,13 @@ def test_two_extractions_during_which_an_analyzer_threw_keep_the_one_with_more_f
     MUTATION (verified RED): always keep the re-run -> the second case -> RED."""
     plan = _Plan(
         {
-            "hconf": [
+            "svc_a": [
                 {"threw": _THREW, "functions": first_n},
                 {"threw": _THREW, "functions": rerun_n},
             ]
         }
     )
-    _res, _f, exports, _r = _run_all(tmp_path, plan, ("hconf",))
+    _res, _f, exports, _r = _run_all(tmp_path, plan, ("svc_a",))
     (settled,) = exports
     assert settled.degrade_reason == _THREW
     if kept == "rerun":
@@ -470,6 +480,8 @@ def test_the_settled_session_is_whole(
     which, export_only, status, budget = expect
     assert got.function_count == (11 if which == "rerun" else 10)
     assert (got.export_only, got.export_status, got.export_budget) == (export_only, status, budget)
+    # phase 1 kept whole, export outcome included: nothing of it is to be written again
+    assert got.stored_stands == (which == "first" and (status, budget) == (a.export_status, 300))
 
 
 # ── F-2: the two seeds W14 refuses, read in the script ───────────────────────────────────────
@@ -798,7 +810,7 @@ def test_the_scan_summary_names_the_binaries_that_kept_an_analyzer_exception() -
         no_functions_binaries: list[str] = []
         kept_earlier_binaries: list[dict[str, Any]] = []
         reanalyze_pending = 0
-        analyzer_degraded_binaries = [{"binary": "hconf", "reason": _THREW}]
+        analyzer_degraded_binaries = [{"binary": "svc_a", "reason": _THREW}]
 
     @click.command()
     def cmd() -> None:
@@ -807,7 +819,7 @@ def test_the_scan_summary_names_the_binaries_that_kept_an_analyzer_exception() -
     out = CliRunner().invoke(cmd, [])
     assert out.exit_code == 0, out.output
     assert "1 binaries were extracted while a Ghidra analyzer threw" in out.stderr
-    assert f"hconf ({_THREW})" in out.stderr
+    assert f"svc_a ({_THREW})" in out.stderr
 
 
 # ── F-3 in the extractor, read as text ───────────────────────────────────────────────────────
@@ -887,3 +899,44 @@ def test_the_schema_declares_the_rerun_record_in_both_places(tmp_path: Path) -> 
 def test_replace_keeps_the_rerun_budget_field() -> None:
     """The settled result is a dataclass copy: the budget field survives ``replace``."""
     assert replace(_ok(), decompile_rerun_budget=600).decompile_rerun_budget == 600
+
+
+_FIRST_THREW = {"threw": _THREW, "functions": 3, "export": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (_FIRST_THREW, {"fail": True}),  # the re-run's extraction failed
+        (_FIRST_THREW, {"threw": _THREW, "functions": 1, "export": "ok"}),  # fewer functions
+        # neither better (one large decompile left each); the re-run's export failed
+        ({"large": 1, "export": "ok"}, {"large": 1, "export": "failed:timeout"}),
+    ],
+    ids=["rerun_failed", "first_better", "tie_rerun_export_failed"],
+)
+def test_phase_ones_session_kept_whole_keeps_its_archive(
+    tmp_path: Path, first: dict[str, Any], second: dict[str, Any]
+) -> None:
+    """★ Phase 2 settles on phase 1's whole session: the row keeps the export status AND the
+    archive phase 1 stored (archive named, intact), and the next plain scan does not re-run the
+    binary for an archive it believes missing.
+
+    MUTATION (verified RED): write the kept session's export status again in _persist_export (the
+    old export-only write, which names no archive) -> archive None -> RED; never mark the kept
+    session (stored_stands) -> RED."""
+    from tests.unit.lib.test_scan_export import _exports
+    from treasure_map.lib.binexport_archive import archive_intact
+
+    a = _NAMES[0]
+    plan = _Plan({a: [first, second], **{n: [{"export": "ok"}] for n in _NAMES[1:]}})
+    fs = _firmware(tmp_path)
+    home = _ghidra(tmp_path)
+    _with_extension(home)
+    _scan(fs, tmp_path / "ws", home, plan)
+    status, meta = _exports(tmp_path / "ws" / "analysis.db")[a]
+    assert status == "ok"
+    assert meta is not None and meta.get("archive")
+    assert archive_intact(tmp_path / "ws" / "binexport", meta)
+    calls = len(plan.calls)
+    _scan(fs, tmp_path / "ws", home, plan)
+    assert len(plan.calls) == calls  # nothing re-run: every row is current, archive included
