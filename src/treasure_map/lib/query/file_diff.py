@@ -103,7 +103,25 @@ LEGEND = {
         "why no line difference was read: no_firmware_root, file_missing, file_unreadable, "
         "outside_firmware_root (the path resolves outside the firmware root), "
         "content_differs_from_scan (the bytes on disk are not the ones the scan hashed), "
-        "binary_content (a NUL byte), no_scan_hash (a side recorded no sha256)"
+        "binary_content (a NUL byte), no_scan_hash (a side recorded no sha256), over_size_limit "
+        "(the file is larger than this reading reads)"
+    ),
+    "renamed": (
+        "a file subject paired by an equal sha256 under two different paths (the same bytes "
+        "moved): one subject, not two one-sided ones; its anchor_ref ends in "
+        "{path_a}=>{path_b}, as does a two-path subject paired by a normalised lib/modules "
+        "version dir"
+    ),
+    "paired_by": (
+        "how a file's two sides were paired: path (the same path), path_normalized (the same path "
+        "but for the lib/modules version-dir segment), sha (an equal sha256: renamed); "
+        "sha_ambiguous = a one-sided file whose sha256 several files share, so no rename is "
+        "inferred for it"
+    ),
+    "whole_pair_blocks": (
+        "the first page carries ko_changes (the .ko kernel modules, by status, as counts) and "
+        "symlink_changes (its lists when small, else counts); ko_offset (from 0, alone) reads "
+        "their lists, every list cut at the same item; ko_paging.next_offset continues"
     ),
 }
 
@@ -538,6 +556,67 @@ def symlink_changes(pf: PairFiles) -> dict[str, Any]:
     }
 
 
+# The symbolic-link lists ride the first page while their JSON encoding stays within this; above it
+# the first page gives their counts and ko_offset pages them.
+SYMLINK_INLINE_BYTES = 4_000
+_SYMLINK_LISTS = ("a_only", "b_only", "target_differs")
+
+
+def symlink_first_page(pf: PairFiles) -> dict[str, Any]:
+    """The symlink block of the first page: the whole block when small, else its counts (the lists
+    are read with ko_offset) — a whole-pair block never takes the page's budget."""
+    block = symlink_changes(pf)
+    if len(json.dumps(block)) <= SYMLINK_INLINE_BYTES:
+        return block
+    out = {k: v for k, v in block.items() if k not in _SYMLINK_LISTS}
+    out.update({f"{k}_count": len(block[k]) for k in _SYMLINK_LISTS})
+    out["lists_paged_by"] = "ko_offset"
+    return out
+
+
+def whole_pair_page(pf: PairFiles, offset: int, limit: int) -> dict[str, Any]:
+    """One ``ko_offset`` page of the whole-pair lists: the .ko modules (content_differs — each one
+    parsed —, renamed, undetermined, a_only, b_only) and the symbolic links (a_only, b_only,
+    target_differs), every list cut at the same item, as many as fit the page."""
+    from treasure_map.lib.query import ko_changes as kc
+
+    groups, same = kc._groups(pf)
+    links = symlink_changes(pf)
+    lists: dict[str, list[Any]] = {f"ko.{k}": list(v) for k, v in groups.items()}
+    lists.update({f"symlink.{k}": links[k] for k in _SYMLINK_LISTS})
+    longest = max((len(v) for v in lists.values()), default=0)
+    if offset > 0 and offset >= longest:
+        raise FileDiffError(f"ko_offset {offset} is past the longest whole-pair list ({longest})")
+
+    def render(key: str, item: Any) -> dict[str, Any]:
+        block, name = key.split(".", 1)
+        return kc._item(pf, name, item) if block == "ko" else dict(item)
+
+    page, k = kc.paged_lists(lists, offset, limit, kc.KO_PAGE_BYTES, render)
+    end = offset + k
+    return {
+        "ko_changes": {
+            "scan_scope": "excluded",
+            "same_count": same,
+            **{name: page[f"ko.{name}"] for name in groups},
+            "totals": {name: len(v) for name, v in groups.items()},
+            "note": kc.KO_NOTE,
+        },
+        "symlink_changes": {
+            **{name: page[f"symlink.{name}"] for name in _SYMLINK_LISTS},
+            "totals": {name: len(links[name]) for name in _SYMLINK_LISTS},
+            "same_count": links["same_count"],
+            "in_denominator": False,
+            "note": SYMLINK_NOTE,
+        },
+        "ko_paging": {
+            "offset": offset,
+            "per_list": k,
+            "next_offset": end if end < longest else None,
+        },
+    }
+
+
 def change_of(ra: dict[str, Any] | None, rb: dict[str, Any] | None) -> str:
     if rb is None:
         return "a_only"
@@ -903,8 +982,15 @@ class Hunk:
         return out
 
 
+# Above this a file's line difference is not read (``over_size_limit``) — the same bound the .ko
+# reading keeps, so the process's memory never follows a file's size.
+MAX_READ_BYTES = 32 * 1024 * 1024
+_READ_CHUNK = 1 << 20
+
+
 def _read_file(root: str | None, path: str, sha: str | None) -> tuple[list[str] | None, str | None]:
-    """``(lines, None)`` of one side's file under its firmware root, or ``(None, why)``."""
+    """``(lines, None)`` of one side's file under its firmware root, or ``(None, why)``. Read in
+    chunks and hashed as it is read, never past MAX_READ_BYTES (``over_size_limit``)."""
     if not root:
         return None, "no_firmware_root"
     if not sha:
@@ -916,11 +1002,22 @@ def _read_file(root: str | None, path: str, sha: str | None) -> tuple[list[str] 
     if not os.path.lexists(os.path.join(root, path)) or not os.path.exists(real):
         return None, "file_missing"
     try:
+        if os.path.getsize(real) > MAX_READ_BYTES:
+            return None, "over_size_limit"
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        read = 0
         with open(real, "rb") as fh:
-            data = fh.read()
+            while chunk := fh.read(_READ_CHUNK):
+                read += len(chunk)
+                if read > MAX_READ_BYTES:  # grew since the size was read
+                    return None, "over_size_limit"
+                digest.update(chunk)
+                chunks.append(chunk)
     except OSError:
         return None, "file_unreadable"
-    if hashlib.sha256(data).hexdigest() != sha.lower():
+    data = b"".join(chunks)
+    if digest.hexdigest() != sha.lower():
         return None, "content_differs_from_scan"
     if b"\0" in data:
         return None, "binary_content"
@@ -1308,6 +1405,7 @@ def file_diff(
     detail: str = "full",
     review: dict[str, Any] | None = None,
     pf: PairFiles | None = None,
+    ko_offset: int | None = None,
 ) -> dict[str, Any]:
     """The run pair's non-binary files (see the module docstring). Without ``path``: a page of the
     files that differ (``change`` / ``kind`` filter; ``same`` only when asked for), each with its
@@ -1316,7 +1414,9 @@ def file_diff(
     suppressed shape paged by ``hunk_offset`` (on the page with ``offset`` 0). ``review`` maps an
     anchor to its review state (the caller's judgement read); a file with none reads the unjudged
     state, as an unjudged entry of a binary diff does. ``pf`` is the pair's files when the caller
-    has read them already. Raises FileDiffError on an argument or a side it cannot read."""
+    has read them already. ``ko_offset`` (alone: no ``path``, ``offset`` or ``hunk_offset``) reads
+    a page of the whole-pair lists — the .ko modules and the symbolic links — that the first page
+    gives as counts. Raises FileDiffError on an argument or a side it cannot read."""
     if detail not in DETAILS:
         raise FileDiffError(f"detail must be one of {list(DETAILS)}; got {detail!r}")
     if change is not None and change not in STATUSES:
@@ -1328,6 +1428,14 @@ def file_diff(
             raise FileDiffError(f"{name} must be an integer >= {low}; got {value!r}")
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
         raise FileDiffError(f"limit must be an integer in 1..{MAX_LIMIT}; got {limit!r}")
+    if ko_offset is not None:
+        if isinstance(ko_offset, bool) or not isinstance(ko_offset, int) or ko_offset < 0:
+            raise FileDiffError(f"ko_offset must be an integer >= 0; got {ko_offset!r}")
+        if path is not None or offset > 0 or hunk_offset > 0:
+            raise FileDiffError(
+                "ko_offset pages the whole-pair lists (.ko modules, symbolic links); offset pages "
+                "the files and path / hunk_offset read one file: pass ko_offset alone"
+            )
     if pf is None:
         pf = read_pair(atlas, run_a, run_b)
     review = review or {}
@@ -1361,9 +1469,13 @@ def file_diff(
                 out["structured"] = block if full else _cut_lists(block, LIST_PAGE_ITEMS)
         if entry["change"] != "same":
             out.update(_hunk_fields(aligned_hunk(pf, af)))
+        out["paired_by"] = af.paired_by
         out["anchor_ref"] = anchor
         out["review_state"] = review.get(anchor, dr.STATES[0])
         return out
+
+    if ko_offset is not None:
+        return {**envelope, **whole_pair_page(pf, ko_offset, limit)}
 
     if path is not None:
         af = _subject_index(pf).get(path)
@@ -1411,10 +1523,10 @@ def file_diff(
         "read_one_with": f'get_file_diff(run_pair={json.dumps(pair)}, path="<path>")',
     }
     if offset == 0:  # whole-pair information lines, given once with the first page
-        from treasure_map.lib.query.ko_changes import ko_changes
+        from treasure_map.lib.query.ko_changes import ko_counts
 
-        result["ko_changes"] = ko_changes(pf)
-        result["symlink_changes"] = symlink_changes(pf)
+        result["ko_changes"] = ko_counts(pf)
+        result["symlink_changes"] = symlink_first_page(pf)
     return result
 
 

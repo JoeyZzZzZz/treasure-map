@@ -301,6 +301,34 @@ def test_a_supported_pairing_with_a_lift_basis_floats_after_the_aligned_pairs(
     assert _e(v, BARE)["significance"]["attention"] == 1
 
 
+def test_a_supported_pairing_reads_after_every_attention_0_read_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Inside attention 0 the read signals come first and an R entry its pair evidence floated
+    follows them — whatever its similarity (0.09 here, against an aligned signal's 0.97) and its
+    read-first order (the floated entry's proposed reading orders 2 here; the aligned one has
+    none). Nothing else moves: attentions, bases and lift_basis are as before.
+
+    MUTATION (verified RED): drop supported_last from the key -> the 0.09 entry reads first ->
+    RED; put it after -read_first -> the read-first order lifts it ahead -> RED."""
+    w = World(tmp_path)
+    sup, real = ("00001000", "00002000"), ("00020000", "00021000")
+    _swap(w, *sup, sim=0.09)
+    _caller(w, *sup, "00011000", "00012000", calls_b=True)
+    w.pair(*real, 0.97, 0.97)
+    w.fn("a", real[0], ["system"])
+    w.fn("b", real[1], ["memcpy"])
+    w.commit()
+    monkeypatch.setattr(pv, "_read_first_order", lambda e, state: 2)
+    v = _view(w, sort_by="significance")
+    floated, signal = _e(v, sup), _e(v, real)
+    assert floated["significance"] == {"attention": 0, "basis": "supported_pair_swap"}
+    assert floated["lift_basis"] == "sink_callee_swap"
+    assert signal["significance"] == {"attention": 0, "basis": "sink_callee_swap"}
+    order = [e["entry_id"] for e in v["entries"]]
+    assert order.index(_pair_id(*real)) < order.index(_pair_id(*sup))
+
+
 def _entry(pair_evidence: dict[str, Any] | None, **kw: Any) -> pv._Entry:
     p = pv._Pair("00001000", "00002000", "f", "f", 0.5, 0.4, "alignment_undetermined", None, None)
     return pv._Entry(pair=p, unpaired=None, bucket="R", pair_evidence=pair_evidence, **kw)

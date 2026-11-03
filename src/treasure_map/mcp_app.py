@@ -72,6 +72,7 @@ from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import effective_float_filters as _effective_float_filters
 from treasure_map.lib.query import entry_words
 from treasure_map.lib.query import explain_candidate as _explain_candidate
+from treasure_map.lib.query import extraction_gaps as _gaps
 from treasure_map.lib.query import file_diff as _fd
 from treasure_map.lib.query import filter_candidates as _filter_candidates
 from treasure_map.lib.query import filter_match_count as _filter_match_count
@@ -1439,6 +1440,7 @@ def make_tools(
         incomplete: list[Any],
         partially_incomplete: list[Any],
         folded_xref: list[Any],
+        analyzer_degraded: list[Any] | None = None,
     ) -> dict[str, Any]:
         """Coverage for the listed scope, with everything needed to read it honestly attached.
 
@@ -1490,6 +1492,7 @@ def make_tools(
             "blind_spots": {
                 "incomplete_binaries": incomplete,
                 "partially_incomplete_binaries": partially_incomplete,
+                "analyzer_degraded_binaries": analyzer_degraded or [],
                 "folded_xref_symbols": {
                     "count": len(folded_xref),
                     "see": "folded_xref_symbols (top-level) — the full list + per-symbol counts",
@@ -1515,11 +1518,14 @@ def make_tools(
         list[dict[str, Any]],
         list[dict[str, Any]],
         list[dict[str, Any]],
+        list[dict[str, Any]],
         int,
         dict[str, Any] | None,
     ]:
         """The analysis-completeness red-lines for a SINGLE resolved run (they are a per-scan fact):
-        incomplete binaries, partially-incomplete binaries, folded high-fan-out xref symbols
+        incomplete binaries, partially-incomplete binaries, the binaries whose extraction finished
+        while a Ghidra analyzer threw (they hold functions, so neither list above names them, and
+        their function set may be short), folded high-fan-out xref symbols
         (whose constrained L0 edges are visible here, never silently dropped), and the COUNT of
         dependency edges whose soname named more than one binary (the same shape: an edge that was
         not written, surfaced as a number with a pointer to the detail, never a silent absence).
@@ -1533,18 +1539,19 @@ def make_tools(
         """
         run = _get_run(atlas, run_id)
         if run is None:
-            return [], [], [], 0, {"reason": "unknown_run", "run_id": run_id}
+            return [], [], [], [], 0, {"reason": "unknown_run", "run_id": run_id}
         db = _resolve_db(atlas, run)
         if isinstance(db, dict):
             # The resolver's own error, passed through whole: it already says whether the run has
             # no recorded analysis.db, the file has moved, or the scan is refused as stale, and
             # each needs a different fix.
-            return [], [], [], 0, db
+            return [], [], [], [], 0, db
         conn = facts.open_analysis_ro(db)
         try:
             return (
                 facts.list_incomplete_binaries(conn),
                 facts.list_partially_incomplete_binaries(conn),
+                _gaps.analyzer_degraded_binaries(conn),
                 facts.list_folded_xref_symbols(conn),
                 facts.count_unresolved_soname_edges(conn),
                 None,
@@ -1676,6 +1683,7 @@ def make_tools(
             (
                 incomplete,
                 partially_incomplete,
+                analyzer_degraded,
                 folded_xref,
                 unresolved_sonames,
                 completeness_unavailable,
@@ -1823,6 +1831,9 @@ def make_tools(
             # candidate is not proof of cleanliness.
             "incomplete_binaries": incomplete,
             "partially_incomplete_binaries": partially_incomplete,
+            # Extracted, with functions, while a Ghidra analyzer threw: not incomplete, and their
+            # function set may still be short ({binary, reason}).
+            "analyzer_degraded_binaries": analyzer_degraded,
             # ★ Red-line (scaling): high-fan-out L0 symbols whose constrained edges were NOT
             # materialized -- visible with per-symbol counts so a suppressed edge is a known
             # decision, never a silent drop. Empty unless scoped to one resolvable run.
@@ -1841,9 +1852,10 @@ def make_tools(
             "analysis_completeness": {
                 "unavailable": completeness_unavailable,
                 "note": (
-                    "incomplete_binaries / partially_incomplete_binaries / folded_xref_symbols "
-                    "COULD NOT BE COMPUTED for this listing — the empty lists above are "
-                    "UNAVAILABLE, not clean. See unavailable.error for what to do."
+                    "incomplete_binaries / partially_incomplete_binaries / "
+                    "analyzer_degraded_binaries / folded_xref_symbols COULD NOT BE COMPUTED for "
+                    "this listing — the empty lists above are UNAVAILABLE, not clean. See "
+                    "unavailable.error for what to do."
                     if completeness_unavailable is not None
                     else "computed for this run."
                 ),
@@ -1856,7 +1868,13 @@ def make_tools(
             # board. Every number is recomputed here from the annotations — no page number and no
             # "done" flag is stored anywhere, so the answer cannot drift from what was recorded.
             "coverage": _coverage_block(
-                ranked, whole_run, coverage_index, incomplete, partially_incomplete, folded_xref
+                ranked,
+                whole_run,
+                coverage_index,
+                incomplete,
+                partially_incomplete,
+                folded_xref,
+                analyzer_degraded,
             ),
             "corpus": corpus,
             "total": total,
@@ -3187,6 +3205,7 @@ def make_tools(
         limit: int = _fd.DEFAULT_LIMIT,
         hunk_offset: int = 0,
         detail: str = "full",
+        ko_offset: int | None = None,
     ) -> dict[str, Any]:
         """The NON-BINARY files of two runs compared by path (``run_pair`` = ``{run_a}::{run_b}``,
         any two runs from list_runs — with or without a binary diff between them): shell scripts,
@@ -3223,9 +3242,13 @@ def make_tools(
         ``{path_a}=>{path_b}``, not two one-sided ones). ``file_subject_counts`` counts the subjects
         by status; the CHANGED ones (everything but ``same``) are the pair's completion denominator.
         The first page also carries ``ko_changes`` — the .ko kernel modules (ELF relocatables, not
-        diff subjects): which ELF sections differ and, when a differing section is executable, the
-        function symbols one run has and the other does not — and ``symlink_changes`` — the symbolic
-        links added, removed or retargeted. Both are read-only information, not in the denominator.
+        diff subjects), as counts by status (content_differs / renamed / undetermined / a_only /
+        b_only / same) — and ``symlink_changes`` — the symbolic links one run holds alone or whose
+        target differs, listed when few, else counted. ``ko_offset`` (from 0, passed alone) reads
+        their lists, every list cut at the same item and paged by ``ko_paging.next_offset``: per
+        content-different module, which ELF sections differ and, when a differing section is
+        executable, the function symbols one run has and the other does not. Both blocks are
+        read-only information, not in the denominator.
 
         Each file has an ``anchor_ref`` and ``review_state``: judge one with annotate_diff(
         anchor_ref, verdict, rationale, run_pair=...). A stale run on either side is refused."""
@@ -3252,6 +3275,7 @@ def make_tools(
                     detail=detail,
                     review={a: j.state for a, j in judged.items()},
                     pf=pf,
+                    ko_offset=ko_offset,
                 )
             except _fd.FileDiffError as exc:
                 return {"run_pair": run_pair, "error": str(exc)}

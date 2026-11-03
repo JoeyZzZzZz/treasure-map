@@ -1618,3 +1618,25 @@ def test_a_misspelled_direction_or_side_is_refused(tmp_path: Path) -> None:
     assert "error" in res and "callers" in res["error"]
     aligned = tools["get_function_alignment"]("x::y::z", "00401000", side="B")
     assert "error" in aligned and "'a' or 'b'" in aligned["error"]
+
+
+def test_list_candidates_names_a_binary_an_analyzer_threw_on(tmp_path: Path) -> None:
+    """★ A binary extracted (ghidra_ok 1, with functions) while a Ghidra analyzer threw is in
+    neither incomplete list; list_candidates names it under analyzer_degraded_binaries, at the top
+    and in the coverage's blind spots. A clean scan lists nothing there.
+
+    MUTATION (verified RED): leave the list out of the top-level response -> RED; leave it out of
+    the coverage's blind_spots -> RED."""
+    tools = _tools(tmp_path)
+    clean = tools["list_candidates"](run_id="run_m")
+    assert clean.get("analyzer_degraded_binaries") == []
+    reason = "analyzer_exception:MipsAddressAnalyzer:AssertException"
+    conn = open_db(tmp_path / "analysis.db")
+    conn.execute("UPDATE binaries SET ghidra_ok = 1, ghidra_status_reason = ?", (reason,))
+    conn.commit()
+    conn.close()
+    out = tools["list_candidates"](run_id="run_m")
+    want = [{"binary": "webd", "reason": reason}]
+    assert out["incomplete_binaries"] == []
+    assert out.get("analyzer_degraded_binaries") == want
+    assert out["coverage"]["blind_spots"].get("analyzer_degraded_binaries") == want

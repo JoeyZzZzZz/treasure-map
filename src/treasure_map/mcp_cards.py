@@ -192,7 +192,18 @@ _PARAM_SYNONYMS: dict[str, tuple[_Synonym, ...]] = {
 }
 
 # Close spellings that are different parameters, so a near match must not be offered for them.
-_CLOSE_MATCH_VETO = frozenset({("stride", "side"), ("side", "stride")})
+_CLOSE_MATCH_VETO = frozenset(
+    {
+        ("stride", "side"),
+        ("side", "stride"),
+        # ko_offset pages get_file_diff's whole-pair lists; no other tool's cursor means that.
+        *(
+            (w, c)
+            for c in ("offset", "rows_offset")
+            for w, c in (("ko_offset", c), (c, "ko_offset"))
+        ),
+    }
+)
 _CLOSE_MATCH_CUTOFF = 0.8
 
 
@@ -600,7 +611,9 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "a_only / b_only (recorded on one side only — not proof it was created or deleted), "
             "content_differs, same, undetermined. A page lists the differing files (filter kind / "
             "change) with their structured row differences and hunk_stats; path reads one file "
-            "(offset pages its lists, hunk_offset its line difference); detail='summary' gives "
+            "(offset pages its lists, hunk_offset its line difference); the first page counts the "
+            ".ko modules and symbolic links, ko_offset (alone) pages their lists; "
+            "detail='summary' gives "
             "counts. Credential material and a sensitive config value are never given; every file "
             "carries its file-level sha256, and for a file whose whole content is one credential "
             "that sha256 is also the material's. Judge a file with annotate_diff(anchor_ref, ..., "
@@ -1287,6 +1300,7 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             ("rows_offset", "get_diff_patch_view"),
             ("members_offset", "same_shape_siblings"),
             ("hunk_offset", "get_file_diff"),
+            ("ko_offset", "get_file_diff"),
             ("not_listed_page", "get_diff_patch_view"),
         )
     ],

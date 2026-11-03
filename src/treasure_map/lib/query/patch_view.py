@@ -2856,8 +2856,8 @@ def significance(
       * an R entry on an undetermined pairing whose ``pair_evidence`` is ``supported`` (callers or
         anchors back the pairing, nothing contradicts it, the sources are current) and that
         carries a lift_basis (:func:`_supported_lift`) -> 0, labelled ``supported_pair_swap`` /
-        ``supported_pair_counts``. Its lift_basis is still given; its swap_lift is not, so it never
-        reads ahead of the aligned pairs there;
+        ``supported_pair_counts``. Its lift_basis is still given; its swap_lift is not, and it
+        reads after every other attention-0 entry (``supported_last`` in :func:`_sort`);
       * B ``sink_present_no_visible_delta`` -> 1, labelled ``recheckable_no_visible_delta``: it
         stays where similarity puts it, neither floated nor sunk; an S entry (``listed_view``)
         -> 1, labelled ``aligned_pseudocode_differs``, the same way;
@@ -2964,18 +2964,22 @@ def _sort(
     read_first: dict[str, int] | None = None,
     swap_lift: dict[str, int] | None = None,
     mention: dict[str, int] | None = None,
+    supported_last: dict[str, int] | None = None,
 ) -> list[_Entry]:
     """The candidate_tier order (``sort_by`` None or ``"candidate_tier"``), or ``sort_by`` (one
     named component) ahead of it. P stays last either way: a function with no counterpart is not
     ordered among the pairs. ``band`` maps an entry id to its judgement band
     (diff_review.band_bias); None leaves the order as it is.
 
-    ``sort_by="significance"`` orders by ``(attention, swap_lift, read_first, band, settled,
-    similarity, candidate_tier key)`` — ``attention`` from :func:`significance`; ``swap_lift`` (1
-    for an attention-1 entry carrying a :func:`_sink_callee_swap` or a ``sink_candidate_counts``
-    delta — an R entry's proposed one above all — whatever its basis or judgement; its
-    ``lift_basis`` names which; 0 for an R entry its supported pairing floated to 0) first inside
-    the tier; ``read_first`` (:func:`_read_first_order`,
+    ``sort_by="significance"`` orders by ``(attention, swap_lift, supported_last, read_first, band,
+    settled, similarity, candidate_tier key)`` — ``attention`` from :func:`significance`;
+    ``swap_lift`` (1 for an attention-1 entry carrying a :func:`_sink_callee_swap` or a
+    ``sink_candidate_counts`` delta — an R entry's proposed one above all — whatever its basis or
+    judgement; its ``lift_basis`` names which; 0 for an R entry its supported pairing floated to 0)
+    first inside the tier; ``supported_last`` (1 for an entry whose basis is ``supported_pair_*``)
+    after every other entry of its tier — inside attention 0 the read signals come first, and an
+    R entry floated by its pair evidence follows them, whatever its read-first order or
+    similarity; ``read_first`` (:func:`_read_first_order`,
     highest first) so that next the anchored_differs pairs at or above the floor come, then those
     below it, then the rest; the band only when it is on
     (judgements move nothing unless asked); ``settled`` (1 for an R entry whose proposed reading
@@ -2991,6 +2995,7 @@ def _sort(
                 p_last,
                 (attention or {}).get(e.entry_id, ATTENTION_MIDDLE),
                 -(swap_lift or {}).get(e.entry_id, 0),
+                (supported_last or {}).get(e.entry_id, 0),
                 -(read_first or {}).get(e.entry_id, 0),
                 band.get(e.entry_id, 0) if band else 0,
                 (settled or {}).get(e.entry_id, 0),
@@ -4758,7 +4763,8 @@ _ORDER_CANDIDATE_TIER = (
 # description, the short reading in lens.significance on every page.
 _ORDER_SIGNIFICANCE = (
     "significance: attention 0, then 1, then 2 (lens.significance); an R entry whose pair_evidence "
-    "supports its pairing and that has a lift_basis is in 0 (basis supported_pair_*); inside 1 — "
+    "supports its pairing and that has a lift_basis is in 0 (basis supported_pair_*); inside 0 — "
+    "the read signals first, then supported_pair_*; inside 1 — "
     "the entries with a lift_basis first (a sink name in the callee-set difference, or a changed "
     "sink candidate count, on a proposed pairing), then the anchored_differs pairs at or above the "
     "floor, then those below it (and the demoted __FILE__/__LINE__ and micro-side pairs), then "
@@ -5429,6 +5435,7 @@ def get_diff_patch_view(
     lens: dict[str, tuple[int, str]] = {}
     settled: dict[str, int] = {}
     swap_lift: dict[str, int] = {}
+    supported_last: dict[str, int] = {}
     lift_basis: dict[str, str] = {}
     if effective == "significance":
         lens = {
@@ -5452,12 +5459,15 @@ def get_diff_patch_view(
         # basis — a judgement changes the basis it reads, never its place. On an aligned pair either
         # has floated it to 0 already, so what is lifted here is an R entry's proposed pairing. An
         # R entry the pair evidence floated to 0 (basis supported_pair_*) keeps its lift_basis but
-        # no swap_lift: it is read among attention 0, never ahead of the aligned pairs there.
+        # no swap_lift, and is read after every other attention-0 entry (supported_last): ahead
+        # of the read signals there it would bury them, its read-first order and low similarity
+        # notwithstanding.
         swap_lift = {
             e.entry_id: 1
             for e in chosen
             if lens[e.entry_id][0] == ATTENTION_MIDDLE and _lift_basis(e) is not None
         }
+        supported_last = {k: 1 for k, (_a, basis) in lens.items() if basis in SUPPORTED_PAIR_BASES}
         lift_basis = {
             e.entry_id: basis
             for e in chosen
@@ -5500,6 +5510,7 @@ def get_diff_patch_view(
             read_first,
             swap_lift,
             mention,
+            supported_last,
         )
     # The next unjudged entries are named in the order this page is read in.
     _progress({e.entry_id: i for i, e in enumerate(ordered)})

@@ -1040,6 +1040,7 @@ def hunt_pattern(
             f"  Data-gap skipped  : {stats.data_gap_skipped} "
             "(shape matches with no decompilable body — candidate set is INCOMPLETE)"
         )
+    _name_unfinished_decompiles(db, resolved_atlas, run_id, "  ")
     if stats.callee_parse_failed:
         # The other data gap, one stage earlier: the function was admitted for scanning and its
         # stored callee list would not parse, so no detector ever saw it.
@@ -2253,6 +2254,7 @@ def scan(
                 f"      → {h.data_gap_skipped} shape matches skipped (data gap: no decompilable "
                 "body) — candidate set INCOMPLETE"
             )
+        _name_unfinished_decompiles(result.db_path, resolved_atlas, effective_run_id, "      ")
         if h.callee_parse_failed:
             # The same honesty, one stage earlier: admitted for scanning, callee list unparseable.
             click.echo(
@@ -3060,3 +3062,39 @@ def _rescan_each(
             click.echo(f"  FAILED: {msg}", err=True)
             failed.append((r.run_id, msg))
     return failed
+
+
+# How many unfinished functions the hunt summary names one by one (the count is always exact).
+_UNFINISHED_SHOWN = 20
+
+
+def _name_unfinished_decompiles(
+    db: Path | str, atlas_path: Path | str | None, run_id: str | None, indent: str
+) -> None:
+    """Name the run's functions whose decompile did not finish: the hunt reads pseudocode, so each
+    holds no candidate whatever it calls. With the sinks its call list names and, where a stored
+    diff pairs it, the candidates the same function holds on the other side. Read-only."""
+    from treasure_map.lib.query import extraction_gaps
+    from treasure_map.lib.ro_db import ro_connect
+
+    atlas = None
+    if atlas_path is not None and Path(atlas_path).is_file():
+        try:
+            atlas = ro_connect(Path(atlas_path))
+        except sqlite3.Error:
+            atlas = None
+    try:
+        gaps = extraction_gaps.unfinished_decompiles(db, atlas=atlas, run_id=run_id)
+    finally:
+        if atlas is not None:
+            atlas.close()
+    if not gaps:
+        return
+    click.echo(
+        f"{indent}Decompile unfinished: {len(gaps)} function(s) with no pseudocode — no "
+        "candidate can come from them:"
+    )
+    for g in gaps[:_UNFINISHED_SHOWN]:
+        click.echo(f"{indent}  {extraction_gaps.describe(g)}")
+    if len(gaps) > _UNFINISHED_SHOWN:
+        click.echo(f"{indent}  … and {len(gaps) - _UNFINISHED_SHOWN} more")

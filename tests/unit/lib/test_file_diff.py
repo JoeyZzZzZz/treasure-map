@@ -1453,7 +1453,7 @@ def test_ko_gives_function_deltas_only_when_an_executable_section_differs(
         return "ok", {"sections": {".data": datadig}, "funcs": {}}
 
     monkeypatch.setattr(kc, "_parse", fake_parse)
-    blk = kc.ko_changes(fw._pf())
+    blk = fd.whole_pair_page(fw._pf(), 0, 200)["ko_changes"]
     by = {e["path_a"]: e for e in blk["content_differs"]}
     assert by["etc/exec.ko"]["sections_differ"] == [".text"]
     assert by["etc/exec.ko"]["funcs_b_only"]["names"] == ["added_fn"]
@@ -1479,7 +1479,7 @@ def test_ko_unknown_from_one_side_is_surfaced_not_swallowed(
         return "unknown", "over_size_limit"
 
     monkeypatch.setattr(kc, "_parse", half_parse)
-    e = kc.ko_changes(fw._pf())["content_differs"][0]
+    e = fd.whole_pair_page(fw._pf(), 0, 200)["ko_changes"]["content_differs"][0]
     assert e["sections_differ"] == "unknown"
     assert e["unknown_reason"]["b"] == "over_size_limit"
 
@@ -1491,7 +1491,7 @@ def test_a_single_sided_ko_is_listed_as_an_information_line(fw: FW) -> None:
     MUTATION (verified RED): route a .ko into the file-subject domain -> it appears in
     file_subject_counts -> RED."""
     fw.inv("b", "etc/new.ko", file_type="elf_rel", reason="et_rel", data=b"ko")
-    blk = kc.ko_changes(fw._pf())
+    blk = fd.whole_pair_page(fw._pf(), 0, 200)["ko_changes"]
     assert [e["path"] for e in blk["b_only"]] == ["etc/new.ko"]
     assert blk["a_only"] == []
     assert fw.diff()["file_subject_counts"] == dict.fromkeys(fd.STATUSES, 0)

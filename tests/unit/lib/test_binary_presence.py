@@ -26,6 +26,7 @@ from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query import binary_presence as bp
 from treasure_map.lib.query import diff_align as da
 from treasure_map.lib.query import diff_review as dr
+from treasure_map.lib.query import file_diff as fd
 from treasure_map.lib.query import patch_view as pv
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.version import UNKNOWN_VERSION
@@ -424,7 +425,6 @@ def _judge_all(w: World, tags: tuple[str, ...]) -> None:
 def _judge_files(w: World) -> None:
     """Judge every CHANGED non-binary file subject of the pair — a Spec 2b denominator member, so
     'complete' now needs them too, beside the diffs and binary_presence binaries."""
-    from treasure_map.lib.query import file_diff as fd
 
     pf = fd.read_pair(w.atlas, "runA", "runB")
     for af in fd.aligned_files(pf):
@@ -706,3 +706,26 @@ def test_checked_cites_its_own_anchor_or_its_own_candidates(world: World) -> Non
             verdict_basis={"why_unchanged": "x", "checked": ["read it by hand"]},
             run_pair=PAIR,
         )
+
+
+def test_files_that_cannot_be_read_hold_the_run_pair_incomplete(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D6: every binary judged, but the pair's files cannot be read: not complete — the files'
+    part of the denominator is unknown, not empty — and the reason is given.
+
+    MUTATION (verified RED): drop the files_unavailable term from complete -> complete -> RED."""
+    for name in ("blind.cgi", "linked", "samename"):
+        world.adb["a"].execute("DELETE FROM binaries WHERE path LIKE ?", (f"%/{name}",))
+        world.atlas.execute("DELETE FROM instance WHERE binary_path LIKE ?", (f"%/{name}",))
+    world.commit()
+    _judge_all(world, ("a_only", "b_only"))
+
+    def unreadable(*_a: Any, **_k: Any) -> Any:
+        raise fd.FileDiffError("cannot read the pair's files")
+
+    monkeypatch.setattr(fd, "read_pair", unreadable)
+    progress = _progress(world)
+    assert progress["non_binary_files_unavailable"] == "cannot read the pair's files"
+    assert progress["complete"] is False
