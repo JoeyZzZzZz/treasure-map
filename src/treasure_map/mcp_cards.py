@@ -392,7 +392,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "workflow, meta (with binary_presence: the binaries one run holds alone), headline "
             "(the first entry in full), view (a summary page of up to limit entries, cut to fit "
             "beside the rest), read_next and non_binary. An entry nobody judged is UNREAD, which "
-            'is not "nothing found": read the P entries, the attention-1 entries with a '
+            'is not "nothing found": read the P entries, the entries with a '
             "lift_basis, bucket S and each binary_presence binary too. A diff with a proven-stale "
             "side is refused."
         ),

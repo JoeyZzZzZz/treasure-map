@@ -585,7 +585,13 @@ _AGENT_GUIDE = (
     ".plt stubs, so when a side's complete is not 1 its a_only/b_only names are "
     "one_sided_unconfirmed (another stub may call them). A "
     "proposed pairing with a pairing_name_conflict is not lifted; an R entry read "
-    "identical_unique whose B side lost every direct caller keeps that basis. "
+    "identical_unique whose B side lost every direct caller keeps that basis. An R entry's "
+    "pair_evidence (supported / negated / none, from its callers and the counterpart_hint "
+    "anchors) floats it to attention 0 only when supported and carrying a lift_basis (basis "
+    "supported_pair_swap / supported_pair_counts); a counterpart_hint conflict keeps it in "
+    "attention 1 with its lift_basis, and nothing is re-paired. Unread is not 'nothing found': "
+    "read every P entry, every entry with a lift_basis (a floated R entry has one too), every "
+    "bucket S entry and each binary_presence binary. "
     "The non-binary files (scripts, configs, credentials, web assets) are compared by "
     "get_file_diff(run_pair='<run_a>::<run_b>') — any two runs from list_runs, with or without a "
     "binary diff — and one file is judged with annotate_diff(anchor_ref, verdict, rationale, "
@@ -627,7 +633,7 @@ _AGENT_INSTRUCTIONS = (
     "judgment on one entry, promote(diff_id, entry_id, row_ref, verdict, rationale) carries it "
     "onto one of the entry's candidates, and list_overlays(anchor_kind='diff_subject', "
     "run_id='<run_a>::<run_b>') reviews them. Unread is not 'nothing found': read every P entry, "
-    "attention-1 entry with a lift_basis, bucket S entry, binary_presence binary and every "
+    "entry with a lift_basis, bucket S entry, binary_presence binary and every "
     "candidate row of a function; sink_candidate_counts counts hunt candidates and "
     "get_diff_string_delta one-sided strings (unknown is not 'no change'). Every tool's first "
     "line lists its required "
@@ -2227,8 +2233,8 @@ def make_tools(
         one run of the pair holds alone, per side, with how many carry no judgment yet.
 
         An entry nobody judged is UNREAD, which is not "nothing found": the view's first page is
-        where reading starts, not where it ends. Read the P entries, every attention-1 entry with
-        a ``lift_basis``, every bucket S entry and each ``binary_presence`` binary (judged with
+        where reading starts, not where it ends. Read the P entries, every entry with a
+        ``lift_basis``, every bucket S entry and each ``binary_presence`` binary (judged with
         annotate_diff(..., run_pair=...)), and in an entry every candidate row of the function.
 
         The response keeps to the byte budget (~48KB) at every ``limit``: the view page gets the
@@ -2379,15 +2385,19 @@ def make_tools(
         ``tier`` / ``similarity`` / ``address`` (each puts that one component ahead of the
         candidate_tier order), or ``significance``. The significance order is a lens, not a
         relabel: attention 0 = bucket A, a row carrying ``sink_arg_constant_delta``, then an
-        ALIGNED pair (never an R entry) whose callee-set difference holds a sink name (basis
+        ALIGNED pair (not an R entry) whose callee-set difference holds a sink name (basis
         ``sink_callee_swap`` — narrow or wide, either side, whatever its judgment) or whose
-        ``sink_candidate_counts`` has a delta (basis ``sink_candidate_counts``); 2 (sunk, still
+        ``sink_candidate_counts`` has a delta (basis ``sink_candidate_counts``), then an R entry
+        whose ``pair_evidence`` is ``supported`` and that carries a ``lift_basis`` (basis
+        ``supported_pair_swap`` / ``supported_pair_counts``; ``rank_key.sink_callee_swap`` 0, so
+        it reads after the aligned pairs there); 2 (sunk, still
         listed) = pseudocode_sameness ``identical`` or bucket C (a C entry with an aligned swap
         floats instead; the basis ``sink_callee_swap_never_sunk`` is no longer produced); 1 = the
-        rest, lowest similarity first, R and B entries ordered together — the entries with a
+        rest, lowest similarity first, R and B entries ordered together — its entries with a
         ``lift_basis`` first inside it (``rank_key.sink_callee_swap`` = 1, ``lift_basis``
         ``sink_callee_swap`` / ``sink_candidate_counts``: an R entry's proposed swap or count
-        delta, with ``swap_pairing_note``; their basis stays their own; a proposed pairing that
+        delta whose pairing is not supported, with ``swap_pairing_note``; their basis stays their
+        own; a ``counterpart_hint`` conflict or mix never takes it away; a proposed pairing that
         carries ``pairing_name_conflict`` — two different symbol names, one side also holding a
         function under the other's name — is not lifted, and the field is a fact on an aligned
         pair), then the
@@ -2411,7 +2421,8 @@ def make_tools(
         with the ``body`` filter that lists them, counted over the entries the current filters
         keep.
         Each entry then carries ``significance`` (its tier and why) — never a verdict. It also
-        carries ``lift_basis`` (null unless it leads attention 1). Filters:
+        carries ``lift_basis`` (null unless it leads attention 1 or is an R entry floated to 0 by
+        its supported pairing). Filters:
         ``bucket``, ``subclass`` (an entry's or any of its rows'), ``tier`` (a number, ``no_sink``
         or ``unknown``), ``blind_spot`` (a key of the ``blind_spots`` ledger — page through the
         entries it covers). Page with ``limit``
@@ -2475,8 +2486,8 @@ def make_tools(
         not complete now; the judgments already written are unchanged.
 
         Reading a diff through: an entry nobody has opened is UNREAD, which is not "nothing found"
-        — only a judgment (annotate_diff) moves it. Read every P entry, every attention-1 entry
-        with a ``lift_basis``, every bucket S entry, and each ``binary_presence`` binary of the run
+        — only a judgment (annotate_diff) moves it. Read every P entry, every entry with a
+        ``lift_basis``, every bucket S entry, and each ``binary_presence`` binary of the run
         pair (get_diff_meta / start_diff_review ``meta.binary_presence``; judged with
         ``run_pair``); in an entry, walk every candidate row of the function (``rows_total``, page
         with ``entry_id`` + ``rows_offset``), not only the first. ``sink_candidate_counts`` counts
@@ -2506,8 +2517,26 @@ def make_tools(
         ``not_narrow`` says why not). Only the hunt's sink names count, and the field is absent
         whenever no sink is in the difference OR no difference could be read — absent is not "no
         sink changed". It moves an entry only in the significance order. An aligned one floats it
-        to attention 0, a proposed one lifts it inside attention 1 (``swap_pairing_note``: not
-        floated until the pairing is corroborated). ``sink_candidate_counts`` (on a pair whose
+        to attention 0, a proposed one lifts it inside attention 1 and floats it to 0 only when its
+        ``pair_evidence`` supports the pairing (``swap_pairing_note``). Every R entry on an
+        undetermined pairing carries ``pair_evidence``: ``supported`` / ``negated`` / ``none``,
+        read from ``caller_anchor`` (do the B counterparts, through aligned pairs, of a's direct
+        callers call b: ``corroborated`` / ``refuted`` / ``none`` with why — a thunk on either side
+        is ``none``) and the anchors in ``counterpart_hint`` (``consistent`` alone supports;
+        ``refuted`` makes ``negated`` and wins; a ``conflict`` or ``mixed`` hint keeps it off
+        ``supported``); ``thunk`` names a thunk side and its fact (``same_import_name``,
+        ``import_names_differ``, ``same_name_function_on_thunk_side``, ``other_side_thunk``). A
+        stale or unreadable source gives ``none`` with that ``reason`` and no hint. A bare
+        same-name pairing supports nothing alone. ``counterpart_hint`` (only when an anchor points
+        anywhere): ``state`` consistent / conflict / mixed, the ``anchors`` read (string: a
+        string only one function references on each side, format-only strings left out; key: a
+        dispatch key with one handler on each side; import_name; same_name_function), and
+        ``hints`` — each function an anchor points to other than the paired one, with
+        ``direction`` (to_a / to_b), its own ``pairing_state`` (aligned / proposed / unpaired),
+        the anchor and up to three ``evidence`` values (``evidence_count`` all). Neither moves the
+        pairing: R stays R, the pairs are BinDiff's, and nothing is re-paired. A ``negated``
+        pairing's B function is not thereby shown to be one-sided. ``sink_candidate_counts`` (on
+        a pair whose
         functions hold candidates): per sink name, how many hunt candidates each function holds —
         ``unit`` says it: callsite / wrapper_callsite keys, NOT every call of the name, so 0 means
         "no such candidate there", never "no such call". ``delta`` lists the sinks both sides count
@@ -3078,7 +3107,9 @@ def make_tools(
         judgment yet (``not_looked_at``); each is a subject of its own, listed where
         ``listed_in`` says and judged with annotate_diff(..., run_pair=...).
         ``functions.changed`` also counts the pairs carrying a ``sink_callee_swap`` (by pairing and
-        by side), a ``sink_candidate_counts`` delta or unknown, and ``listed_as_s`` — the aligned
+        by side), a ``sink_candidate_counts`` delta or unknown, ``with_supported_r_lift`` (R
+        entries floated by a supported pairing), ``with_counterpart_conflict`` (R entries whose
+        ``counterpart_hint`` conflicts with the pairing) and ``listed_as_s`` — the aligned
         similarity-1 pairs listed as bucket S. ``string_delta``: how many string literals sit on
         one side only (``a_only_count`` / ``b_only_count``; the list is get_diff_string_delta),
         each side's ``strings_truncated`` state and ``read_error``, and ``unconfirmed`` (with

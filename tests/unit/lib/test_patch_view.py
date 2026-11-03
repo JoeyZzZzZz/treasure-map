@@ -801,6 +801,8 @@ def test_function_states_count_each_function_once_by_the_views_own_facts(
         "with_sink_candidate_counts_delta": {"aligned": 1, "proposed": 0},
         "with_sink_candidate_counts_unknown": 0,
         # the similarity-1 pair whose local buffer moved reads differs: listed as bucket S
+        "with_supported_r_lift": 0,
+        "with_counterpart_conflict": 0,
         "listed_as_s": 1,
     }
     assert s["unverified"] == {
@@ -6069,6 +6071,8 @@ _S_REDUCED_OR_DERIVED = {
     "proposed_pair_summary",
     "entry_words",
     "sink_candidate_counts",
+    "pair_evidence",
+    "counterpart_hint",
 }
 _S_ENTRY_KEYS = set(_S_COPY) | _S_REDUCED_OR_DERIVED
 # Never in a summary entry, at any depth: the rows, the bodies, the guards and their listing.
@@ -6222,6 +6226,20 @@ def _rules_summary(full: dict[str, Any], micro: bool) -> dict[str, Any]:
                 "n": len(sc["unknown"]),
                 "reasons": sorted({u["reason"] for u in sc["unknown"]}),
             }
+    if "pair_evidence" in full:
+        pe = full["pair_evidence"]
+        out["pair_evidence"] = {"state": pe["state"]}
+        if "reason" in pe:
+            out["pair_evidence"]["reason"] = pe["reason"]
+        if "caller_anchor" in pe:
+            out["pair_evidence"]["caller_anchor"] = pe["caller_anchor"]["state"]
+        if (pe.get("thunk") or {}).get("fact") is not None:
+            out["pair_evidence"]["thunk"] = pe["thunk"]["fact"]
+    if "counterpart_hint" in full:
+        ch = full["counterpart_hint"]
+        out["counterpart_hint"] = _s_kept(
+            {"state": ch["state"], "hints": len(ch.get("hints", [])), "reason": ch.get("reason")}
+        )
     if full.get("callers_a"):
         out["callers_a"] = {"count": full["callers_a"]["count"]}
     if full["string_edges"] and full["string_edges"]["by_delta_kind"]:
@@ -6405,6 +6423,9 @@ def test_the_anchor_template_rebuilds_every_entrys_anchor(
 # not-listed page it read then is empty now — its pair is the bucket S entry ("bucket_s").
 # Re-recorded when P entries gained ``counterpart_probe`` (the only difference, checked entry by
 # entry: every other key of every entry byte for byte as recorded before).
+# Re-recorded when R entries on an undetermined pairing gained ``pair_evidence`` (the only
+# difference, checked entry by entry with the new key removed: every other key of every entry
+# byte for byte as recorded before; this world gives no ``counterpart_hint``).
 _FULL_GOLDEN = Path(__file__).resolve().parents[2] / "fixtures" / "patch_view_full_entries.json"
 _GOLDEN_CALLS: dict[str, dict[str, Any]] = {
     "default": {"sort_by": "candidate_tier"},

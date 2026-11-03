@@ -119,7 +119,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Generic, TypeVar
 
 from treasure_map.lib.diff.code_version import diff_code_version, sink_overlay_logic_version
-from treasure_map.lib.diff.layer0 import norm_hex
+from treasure_map.lib.diff.layer0 import _thunk_spans, norm_hex
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
 from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review, diff_sink_axes, entry_words, sameness
@@ -978,6 +978,9 @@ _OVERLAY_CACHE: _BoundedCache[tuple[str, ...], _OverlayHit] = _BoundedCache(16)
 # evidence_ref function-entries that hold a candidate, per (run, binary): the caller-set edge's
 # one-hop relevance lands on these. Keyed by the run's stamps so a re-hunt is not served stale.
 _CANDIDATE_ENTRY_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(16)
+# One side's pair-evidence anchors (_AnchorSide), per (run, binary). Keyed by the run's stamps so a
+# re-extraction is not served stale anchors.
+_ANCHOR_SIDE_CACHE: _BoundedCache[tuple[str, ...], _AnchorSide] = _BoundedCache(32)
 
 
 def _run_key(atlas: sqlite3.Connection, run_id: str) -> tuple[str, ...]:
@@ -1193,6 +1196,13 @@ class _Entry:
     # same-name functions. A fact on any pair; on a proposed pairing it also keeps the entry out
     # of the swap lift (``_lift_basis``). None when there is no such conflict.
     pairing_name_conflict: dict[str, Any] | None = None
+    # A read-face reading of an undetermined pairing (``_attach_pair_evidence``), never part of
+    # diff_review.entry_facts: ``pair_evidence`` (supported / negated / none, from the callers and
+    # the anchors below) and ``counterpart_hint`` (what the unique strings, dispatch keys and
+    # import names point to, set only when one points anywhere). None until attached, and on every
+    # entry that is not an R entry on an undetermined pair.
+    pair_evidence: dict[str, Any] | None = None
+    counterpart_hint: dict[str, Any] | None = None
 
     @property
     def shown_bucket(self) -> str:
@@ -2414,11 +2424,13 @@ def _pairing_name_conflict(p: _Pair, side_a: _Side, side_b: _Side) -> dict[str, 
 
 
 def _lift_basis(e: _Entry) -> str | None:
-    """Why an attention-1 entry leads its tier (``swap_lift``): ``sink_callee_swap`` (a sink name
-    in its callee-set difference), else ``sink_candidate_counts`` (a sink's candidate count
-    differs), else None. None for a proposed pairing with a ``pairing_name_conflict``: the
-    difference read there may be the pairing's, not the code's, so it does not lead the tier (the
-    entry stays listed where its basis puts it, never sunk)."""
+    """Why an attention-1 entry leads its tier (``swap_lift``), or what an R entry floated by its
+    supported pairing (:func:`_supported_lift`) carries: ``sink_callee_swap`` (a sink name in its
+    callee-set difference), else ``sink_candidate_counts`` (a sink's candidate count differs), else
+    None. None for a proposed pairing with a ``pairing_name_conflict``: the difference read there
+    may be the pairing's, not the code's, so it does not lead the tier (the entry stays listed
+    where its basis puts it, never sunk). A ``counterpart_hint`` conflict does not reach here: it
+    only keeps the pairing from floating."""
     if e.pair is not None and not e.pair.aligned and e.pairing_name_conflict is not None:
         return None
     if _sink_callee_swap(e) is not None:
@@ -2427,6 +2439,391 @@ def _lift_basis(e: _Entry) -> str | None:
     if counts is not None and counts["delta"]:
         return "sink_candidate_counts"
     return None
+
+
+# ── pair evidence: what else ties an undetermined pairing's two functions together ───────────
+#
+# Read-only, on the R entries whose pair BinDiff proposed below the alignment threshold. Nothing
+# here re-pairs, re-buckets or changes the alignment: it reads the callers and three anchors and
+# says whether they back the proposed pairing (``supported``), contradict it (``negated``), or
+# cannot tell (``none``) — and, when an anchor points at another function, which one
+# (``counterpart_hint``). A ``supported`` pairing that carries a lift_basis floats to attention 0
+# (:func:`significance`); every other one stays where it was.
+
+PAIR_SUPPORTED, PAIR_NEGATED, PAIR_NONE = "supported", "negated", "none"
+HINT_CONSISTENT, HINT_CONFLICT, HINT_MIXED = "consistent", "conflict", "mixed"
+# The significance basis of a floated, supported pairing, by the lift_basis it carries.
+_SUPPORTED_BASIS = {
+    "sink_callee_swap": "supported_pair_swap",
+    "sink_candidate_counts": "supported_pair_counts",
+}
+SUPPORTED_PAIR_BASES = frozenset(_SUPPORTED_BASIS.values())
+# A printf-style conversion; a string that is little more than these says nothing of its function.
+_FORMAT_SPEC_RE = re.compile(
+    r"%[-+ #0']*(\d+|\*)?(\.(\d+|\*))?(hh|h|ll|l|L|q|j|z|t)?[diouxXeEfgGaAcspn%]"
+)
+_FORMAT_ONLY_ALNUM = 3  # fewer letters / digits than this outside the conversions: format-only
+_HINT_EVIDENCE_SAMPLE = 3  # values shown per hint (the count is always given)
+_HINT_EVIDENCE_CHARS = 80  # a long string value is cut to this many characters
+
+
+def _format_only(value: str) -> bool:
+    """A string that is (nearly) all printf conversions — ``"%s"``, ``"%d:%d"`` — and so ties no
+    function to another by its text."""
+    return sum(ch.isalnum() for ch in _FORMAT_SPEC_RE.sub("", value)) < _FORMAT_ONLY_ALNUM
+
+
+@dataclass(frozen=True)
+class _AnchorSide:
+    """One side's anchor facts for the diffed binary, from that run's analysis.db: each string
+    referenced from exactly one function (no reference outside a function, the list not cut), each
+    dispatch key with exactly one handler, and the thunk entries. Empty where a table or column is
+    not recorded — an anchor that cannot be read points nowhere, it is never read as absent."""
+
+    owner_of_string: dict[str, str] = field(default_factory=dict)
+    strings_of: dict[str, frozenset[str]] = field(default_factory=dict)
+    handler_of_key: dict[str, str] = field(default_factory=dict)
+    keys_of: dict[str, frozenset[str]] = field(default_factory=dict)
+    thunks: frozenset[str] = frozenset()
+
+
+def _read_anchor_side(path: str, sha: str) -> _AnchorSide:
+    try:
+        conn = ro_connect(path)
+    except sqlite3.Error:
+        return _AnchorSide()
+    try:
+        found = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", (sha,)).fetchone()
+        if found is None:
+            return _AnchorSide()
+        bid = found[0]
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        refs: dict[str, set[str]] = {}
+        spoiled: set[str] = set()
+        if "string_refs" in tables:
+            for value, func, cut in conn.execute(
+                "SELECT string_value, ref_in_func_addr, truncated FROM string_refs "
+                "WHERE binary_id = ?",
+                (bid,),
+            ):
+                if value is None:
+                    continue
+                entry = norm_hex(str(func)) if func else None
+                if entry is None or cut:
+                    spoiled.add(value)
+                else:
+                    refs.setdefault(value, set()).add(entry)
+        handlers: dict[str, set[str]] = {}
+        if "string_tables" in tables:
+            for key, func in conn.execute(
+                "SELECT key, func_addr FROM string_tables WHERE binary_id = ?", (bid,)
+            ):
+                entry = norm_hex(str(func)) if func else None
+                if key is not None and entry is not None:
+                    handlers.setdefault(key, set()).add(entry)
+        thunks: frozenset[str] = frozenset()
+        if "thunk_spans" in {r[1] for r in conn.execute("PRAGMA table_info(binaries)")}:
+            row = conn.execute("SELECT thunk_spans FROM binaries WHERE id = ?", (bid,)).fetchone()
+            thunks = frozenset(_thunk_spans(row[0] if row else None))
+    except sqlite3.Error:
+        return _AnchorSide()
+    finally:
+        conn.close()
+    owner = {v: next(iter(fs)) for v, fs in refs.items() if len(fs) == 1 and v not in spoiled}
+    strings_of: dict[str, set[str]] = {}
+    for value, entry in owner.items():
+        strings_of.setdefault(entry, set()).add(value)
+    handler = {k: next(iter(hs)) for k, hs in handlers.items() if len(hs) == 1}
+    keys_of: dict[str, set[str]] = {}
+    for key, entry in handler.items():
+        keys_of.setdefault(entry, set()).add(key)
+    return _AnchorSide(
+        owner_of_string=owner,
+        strings_of={k: frozenset(v) for k, v in strings_of.items()},
+        handler_of_key=handler,
+        keys_of={k: frozenset(v) for k, v in keys_of.items()},
+        thunks=thunks,
+    )
+
+
+def _anchor_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _AnchorSide:
+    """:func:`_read_anchor_side` for one run's binary, cached per run (its stamps in the key, so a
+    re-extraction is not served stale anchors) and content hash."""
+    if not sha:
+        return _AnchorSide()
+    key = (*_run_key(atlas, run_id), sha)
+    hit = _ANCHOR_SIDE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    path = _run_source(atlas, run_id)[0]
+    side = _read_anchor_side(path, sha) if path else _AnchorSide()
+    _ANCHOR_SIDE_CACHE[key] = side
+    return side
+
+
+def _pairing_state(pair_of: dict[str, _Pair], addr: str) -> str:
+    """How a hinted function is itself paired: ``aligned``, ``proposed`` (an undetermined pairing,
+    this one included) or ``unpaired``."""
+    p = pair_of.get(addr)
+    return "unpaired" if p is None else "aligned" if p.aligned else "proposed"
+
+
+def _readable_name(name: str | None, addr: str) -> str | None:
+    """A thunk's import name as BinDiff recorded it, or None when it is made up from an address."""
+    return None if _is_synthetic_name(name, addr) else (name or "").strip() or None
+
+
+class _PairEvidence:
+    """The anchors of one diff, read once, and the evidence of each of its undetermined pairs."""
+
+    def __init__(self, atlas: sqlite3.Connection, built: BuiltDiff, builder: _Builder) -> None:
+        d = built.diff
+        self.diff = d
+        self.builder = builder
+        self.anchors = {
+            "a": _anchor_side(atlas, d.run_a, d.sha_a),
+            "b": _anchor_side(atlas, d.run_b, d.sha_b),
+        }
+        # import name -> the thunks of that name BinDiff paired with anything (the only thunk
+        # names the diff records), per side
+        self.thunk_names: dict[str, dict[str, set[str]]] = {"a": {}, "b": {}}
+        for p in d.pairs:
+            for side, addr, name in (("a", p.addr_a, p.name_a), ("b", p.addr_b, p.name_b)):
+                n = _readable_name(name, addr)
+                if addr in self.anchors[side].thunks and n is not None:
+                    self.thunk_names[side].setdefault(n, set()).add(addr)
+
+    def _pair_of(self, side: str) -> dict[str, _Pair]:
+        return self.diff.pair_of_a if side == "a" else self.diff.pair_of_b
+
+    def caller_anchor(self, p: _Pair, thunk_a: bool, thunk_b: bool) -> dict[str, Any]:
+        """Whether the B counterparts (through aligned pairs) of a's direct callers call b:
+        ``corroborated`` (one does), ``refuted`` (there are some, every list was read in full, and
+        none does), else ``none`` with why. A thunk on either side is ``none``: a callee list holds
+        names, so a call to the import X cannot be told from a call to a function named X."""
+        if thunk_b:
+            return {"state": PAIR_NONE, "reason": "b_is_thunk"}
+        if thunk_a:
+            return {"state": PAIR_NONE, "reason": "a_is_thunk"}
+        bld = self.builder
+        sa, sb = bld.sides["a"], bld.sides["b"]
+        if sa.fn(p.addr_a) is None:
+            return {"state": PAIR_NONE, "reason": "not_in_inventory", "side": "a"}
+        callers = bld._direct_callers("a", p.addr_a)
+        if not callers:
+            return {"state": PAIR_NONE, "reason": "no_caller_a"}
+        mapped = sorted(
+            {
+                q.addr_b
+                for c in callers
+                if (q := self.diff.pair_of_a.get(c)) is not None and q.aligned
+            }
+        )
+        if not mapped:
+            return {"state": PAIR_NONE, "reason": "no_aligned_caller", "callers_a": len(callers)}
+        if sb.fn(p.addr_b) is None:  # its name cannot be read, so no call to it can be told
+            return {"state": PAIR_NONE, "reason": "not_in_inventory", "side": "b"}
+        name_b = sb.names.get(p.addr_b)
+        targets = {f"FUN_{p.addr_b}"} | ({name_b} if name_b else set())
+        calling = incomplete = 0
+        for x in mapped:
+            fn = sb.fn(x)
+            if fn is None or fn.callees is None:
+                incomplete += 1
+            elif targets & set(fn.callees):
+                calling += 1
+            elif fn.truncated is not False:
+                incomplete += 1
+        counts = {"callers_a": len(callers), "callers_b_aligned": len(mapped)}
+        if calling:
+            return {"state": "corroborated", **counts, "calling_b": calling}
+        if incomplete:
+            return {"state": PAIR_NONE, "reason": "callees_may_be_truncated", **counts}
+        return {"state": "refuted", **counts}
+
+    def _string_and_key_hints(self, p: _Pair) -> list[dict[str, Any]]:
+        """Each function the unique strings and single-handler keys of one side point to on the
+        other, both ways: {direction, addr, anchor, evidence}."""
+        out: list[dict[str, Any]] = []
+        for here, there, own, direction in (
+            ("a", "b", p.addr_a, "to_b"),
+            ("b", "a", p.addr_b, "to_a"),
+        ):
+            src, dst = self.anchors[here], self.anchors[there]
+            for anchor, values, owner in (
+                (
+                    "string",
+                    (v for v in src.strings_of.get(own, ()) if not _format_only(v)),
+                    dst.owner_of_string,
+                ),
+                ("key", iter(src.keys_of.get(own, ())), dst.handler_of_key),
+            ):
+                by_target: dict[str, list[str]] = {}
+                for v in values:
+                    target = owner.get(v)
+                    if target is not None:
+                        by_target.setdefault(target, []).append(v)
+                for target, vs in by_target.items():
+                    out.append(
+                        {"direction": direction, "addr": target, "anchor": anchor, "evidence": vs}
+                    )
+        return out
+
+    def _thunk_reading(
+        self, p: _Pair, thunk_a: bool, thunk_b: bool
+    ) -> tuple[str | None, bool, list[dict[str, Any]]]:
+        """(the thunk fact, whether it contradicts the pairing, the functions it points to). Two
+        thunks: the same import name is ``same_import_name`` (no hint), different names
+        ``import_names_differ`` (a contradiction, pointing at the other side's paired thunks of the
+        same name, if any). One thunk: a function of the thunk's import name on the thunk's own side
+        is ``same_name_function_on_thunk_side`` (a contradiction, pointing at it — the design keeps
+        a real function and an import stub out of one pair), else ``other_side_thunk``."""
+        if thunk_a and thunk_b:
+            na, nb = _readable_name(p.name_a, p.addr_a), _readable_name(p.name_b, p.addr_b)
+            if na is None or nb is None:
+                return None, False, []
+            if na == nb:
+                return "same_import_name", False, []
+            hints = [
+                {"direction": "to_b", "addr": x, "anchor": "import_name", "evidence": [na]}
+                for x in sorted(self.thunk_names["b"].get(na, set()) - {p.addr_b})
+            ] + [
+                {"direction": "to_a", "addr": x, "anchor": "import_name", "evidence": [nb]}
+                for x in sorted(self.thunk_names["a"].get(nb, set()) - {p.addr_a})
+            ]
+            return "import_names_differ", True, hints
+        side, addr, name = ("b", p.addr_b, p.name_b) if thunk_b else ("a", p.addr_a, p.name_a)
+        n = (name or "").strip()
+        same = (
+            sorted(x for x in self.builder.sides[side].by_name.get(n, []) if x != addr) if n else []
+        )
+        if not same:
+            return "other_side_thunk", False, []
+        direction = "to_b" if side == "b" else "to_a"
+        hints = [
+            {"direction": direction, "addr": x, "anchor": "same_name_function", "evidence": [n]}
+            for x in same
+        ]
+        return "same_name_function_on_thunk_side", True, hints
+
+    def of(self, p: _Pair) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """(pair_evidence, counterpart_hint or None) of one undetermined pair."""
+        thunk_a = p.addr_a in self.anchors["a"].thunks
+        thunk_b = p.addr_b in self.anchors["b"].thunks
+        caller = self.caller_anchor(p, thunk_a, thunk_b)
+        hints = self._string_and_key_hints(p)
+        states: set[str] = set()
+        for direction, own in (("to_b", p.addr_b), ("to_a", p.addr_a)):
+            for anchor in ("string", "key"):
+                targets = {
+                    h["addr"]
+                    for h in hints
+                    if h["direction"] == direction and h["anchor"] == anchor
+                }
+                if targets:
+                    states.add(
+                        HINT_CONSISTENT
+                        if targets == {own}
+                        else HINT_MIXED
+                        if own in targets
+                        else HINT_CONFLICT
+                    )
+        thunk_fact: str | None = None
+        if thunk_a or thunk_b:
+            thunk_fact, contradicts, thunk_hints = self._thunk_reading(p, thunk_a, thunk_b)
+            hints += thunk_hints
+            if contradicts:
+                states.add(HINT_CONFLICT)
+        hint_state = (
+            None
+            if not states
+            else next(iter(states))
+            if len(states) == 1 and states <= {HINT_CONSISTENT, HINT_CONFLICT}
+            else HINT_MIXED
+        )
+        if caller["state"] == "refuted":
+            state = PAIR_NEGATED
+        elif hint_state in (HINT_CONFLICT, HINT_MIXED):
+            state = PAIR_NONE
+        elif caller["state"] == "corroborated" or hint_state == HINT_CONSISTENT:
+            state = PAIR_SUPPORTED
+        else:
+            state = PAIR_NONE
+        evidence: dict[str, Any] = {"state": state, "caller_anchor": caller}
+        if hint_state is not None:
+            evidence["counterpart"] = hint_state
+        if thunk_a or thunk_b:
+            evidence["thunk"] = {
+                "sides": [s for s, t in (("a", thunk_a), ("b", thunk_b)) if t],
+                "fact": thunk_fact,
+            }
+        if hint_state is None:
+            return evidence, None
+        hint: dict[str, Any] = {
+            "state": hint_state,
+            "anchors": sorted({h["anchor"] for h in hints}),
+        }
+        others = [
+            h for h in hints if h["addr"] != (p.addr_b if h["direction"] == "to_b" else p.addr_a)
+        ]
+        if others:
+            hint["hints"] = [
+                {
+                    "direction": h["direction"],
+                    "addr": h["addr"],
+                    "pairing_state": _pairing_state(
+                        self._pair_of("b" if h["direction"] == "to_b" else "a"), h["addr"]
+                    ),
+                    "anchor": h["anchor"],
+                    "evidence": [
+                        v[:_HINT_EVIDENCE_CHARS]
+                        for v in sorted(h["evidence"])[:_HINT_EVIDENCE_SAMPLE]
+                    ],
+                    "evidence_count": len(h["evidence"]),
+                }
+                for h in sorted(others, key=lambda h: (h["direction"], h["anchor"], h["addr"]))
+            ]
+        elif hint_state == HINT_CONFLICT:
+            hint["reason"] = "import_names_differ"
+        return evidence, hint
+
+
+def _attach_pair_evidence(atlas: sqlite3.Connection, built: BuiltDiff) -> None:
+    """Attach ``pair_evidence`` / ``counterpart_hint`` to every R entry on an undetermined pair,
+    once per build. On a diff whose sources are not shown current, or whose analysis.db could not
+    be read (the build's ``callee_block``), every such entry gets ``none`` with that reason and no
+    hint: the pair's addresses are the diff's, and a re-extracted analysis.db may hold another
+    function there."""
+    if built.pair_evidence_attached or built.builder is None:
+        return
+    built.pair_evidence_attached = True
+    targets = [
+        e for e in built.entries if e.bucket == "R" and e.pair is not None and not e.pair.aligned
+    ]
+    if not targets:
+        return
+    block = built.builder.callee_block
+    if block is not None:
+        for e in targets:
+            e.pair_evidence, e.counterpart_hint = {"state": PAIR_NONE, "reason": block}, None
+        return
+    reader = _PairEvidence(atlas, built, built.builder)
+    for e in targets:
+        assert e.pair is not None
+        e.pair_evidence, e.counterpart_hint = reader.of(e.pair)
+
+
+def _supported_lift(e: _Entry) -> str | None:
+    """The significance basis of an R entry whose undetermined pairing the evidence supports and
+    that carries a lift_basis (``supported_pair_swap`` / ``supported_pair_counts``), else None. A
+    ``counterpart_hint`` conflict or mix already keeps the evidence off ``supported``; it never
+    touches the lift_basis itself."""
+    if e.bucket != "R" or e.pair is None or e.pair.aligned:
+        return None
+    if (e.pair_evidence or {}).get("state") != PAIR_SUPPORTED:
+        return None
+    basis = _lift_basis(e)
+    return _SUPPORTED_BASIS.get(basis) if basis is not None else None
 
 
 def _held_up(item: diff_review.Item | None) -> bool:
@@ -2454,9 +2851,13 @@ def significance(
       * a sink name in an ALIGNED pair's callee-set difference (:func:`_sink_callee_swap`,
         pairing aligned, either direction, narrow or not, whatever the judgement) -> 0, labelled
         ``sink_callee_swap``; then an aligned pair whose ``sink_candidate_counts`` has a delta ->
-        0, labelled ``sink_candidate_counts``. Never an R entry: an R entry is never floated (a
-        proposed swap or count delta lifts it inside attention 1 instead, ``swap_lift`` in
-        :func:`_sort`);
+        0, labelled ``sink_candidate_counts``. Never an R entry on these: an R entry's proposed swap
+        or count delta lifts it inside attention 1 instead (``swap_lift`` in :func:`_sort`);
+      * an R entry on an undetermined pairing whose ``pair_evidence`` is ``supported`` (callers or
+        anchors back the pairing, nothing contradicts it, the sources are current) and that
+        carries a lift_basis (:func:`_supported_lift`) -> 0, labelled ``supported_pair_swap`` /
+        ``supported_pair_counts``. Its lift_basis is still given; its swap_lift is not, so it never
+        reads ahead of the aligned pairs there;
       * B ``sink_present_no_visible_delta`` -> 1, labelled ``recheckable_no_visible_delta``: it
         stays where similarity puts it, neither floated nor sunk; an S entry (``listed_view``)
         -> 1, labelled ``aligned_pseudocode_differs``, the same way;
@@ -2508,6 +2909,11 @@ def significance(
         counts = e.sink_candidate_counts
         if counts is not None and counts["pairing"] == "aligned" and counts["delta"]:
             return ATTENTION_FLOAT, "sink_candidate_counts"
+    # An R entry's undetermined pairing that the pair evidence supports, carrying a proposed swap
+    # or count delta (its lift_basis): floated, under its own basis.
+    supported = _supported_lift(e)
+    if supported is not None:
+        return ATTENTION_FLOAT, supported
     if e.subclass == "sink_present_no_visible_delta":
         return ATTENTION_MIDDLE, "recheckable_no_visible_delta"
     if not e.bucket and e.listed_as == "S":
@@ -2568,7 +2974,8 @@ def _sort(
     similarity, candidate_tier key)`` — ``attention`` from :func:`significance`; ``swap_lift`` (1
     for an attention-1 entry carrying a :func:`_sink_callee_swap` or a ``sink_candidate_counts``
     delta — an R entry's proposed one above all — whatever its basis or judgement; its
-    ``lift_basis`` names which) first inside the tier; ``read_first`` (:func:`_read_first_order`,
+    ``lift_basis`` names which; 0 for an R entry its supported pairing floated to 0) first inside
+    the tier; ``read_first`` (:func:`_read_first_order`,
     highest first) so that next the anchored_differs pairs at or above the floor come, then those
     below it, then the rest; the band only when it is on
     (judgements move nothing unless asked); ``settled`` (1 for an R entry whose proposed reading
@@ -2663,6 +3070,10 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
             out["operand_markup_incomplete"] = markup
         if e.pairing_name_conflict is not None:
             out["pairing_name_conflict"] = e.pairing_name_conflict
+        if e.pair_evidence is not None:
+            out["pair_evidence"] = e.pair_evidence
+        if e.counterpart_hint is not None:
+            out["counterpart_hint"] = e.counterpart_hint
     else:
         assert e.unpaired is not None
         u = e.unpaired
@@ -2893,6 +3304,9 @@ class BuiltDiff:
     # no-mention reading tokenises the B bodies for these names); empty when withheld
     # What listed_view found for this build (bucket S added), once it has been asked; None before.
     listed: ListedView | None = None
+    # The build's sides and callee lists, kept for the read-face pair evidence; None when withheld.
+    builder: _Builder | None = None
+    pair_evidence_attached: bool = False
 
 
 def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None:
@@ -2927,6 +3341,7 @@ def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None
     unavailable: dict[str, str] = {}
     b_names: dict[str, str] = {}
     unattributed = 0
+    builder: _Builder | None = None
     if any(b.startswith("diff_undetermined:") for b in banners):
         by_reason: dict[str, int] = {}
         for r in overlay.rows:
@@ -2962,6 +3377,7 @@ def build_diff_view(atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None
         withheld=withheld,
         unavailable=unavailable,
         b_names=b_names,
+        builder=builder,
     )
 
 
@@ -3045,6 +3461,7 @@ def _clear_view_caches() -> None:
     _B_MENTIONS_CACHE.clear()
     _SIZE_FACT_CACHE.clear()
     _CANDIDATE_ENTRY_CACHE.clear()
+    _ANCHOR_SIDE_CACHE.clear()
     _ENTRY_WORDS_IMAGE_CACHE.clear()
     _OVERLAY_CACHE.clear()
     _DIFFERS_CACHE.clear()
@@ -4161,6 +4578,21 @@ def _summary_sink_counts(counts: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _summary_pair_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    """pair_evidence as a summary prints it: its state (and why, when the source could not be
+    read), the caller anchor's state, and the thunk fact — no counts."""
+    out: dict[str, Any] = {"state": evidence["state"]}
+    if "reason" in evidence:
+        out["reason"] = evidence["reason"]
+    caller = evidence.get("caller_anchor")
+    if caller is not None:
+        out["caller_anchor"] = caller["state"]
+    thunk = evidence.get("thunk")
+    if thunk is not None and thunk.get("fact") is not None:
+        out["thunk"] = thunk["fact"]
+    return out
+
+
 def _summary_entry(full: dict[str, Any], *, micro_side: bool) -> dict[str, Any]:
     """One listed entry as ``detail='summary'`` prints it, projected from ``full`` (what _render
     printed with no inline row), field by field in its order. ``micro_side``: the entry is an
@@ -4193,6 +4625,16 @@ def _summary_entry(full: dict[str, Any], *, micro_side: bool) -> dict[str, Any]:
             out[key] = _kept({k: value[k] for k in _SUMMARY_SWAP if k in value})
         elif key == "sink_candidate_counts":
             out[key] = _summary_sink_counts(value)
+        elif key == "pair_evidence":
+            out[key] = _summary_pair_evidence(value)
+        elif key == "counterpart_hint":
+            out[key] = _kept(
+                {
+                    "state": value["state"],
+                    "hints": len(value.get("hints", ())),
+                    "reason": value.get("reason"),
+                }
+            )
         elif key == "callers_a":
             if value:
                 out[key] = _kept({"count": value.get("count")})
@@ -4315,11 +4757,12 @@ _ORDER_CANDIDATE_TIER = (
 # The significance order (lens.order on such a page's first page); its rules are in the tool's
 # description, the short reading in lens.significance on every page.
 _ORDER_SIGNIFICANCE = (
-    "significance: attention 0, then 1, then 2 (lens.significance); inside 1 — the entries with a "
-    "lift_basis first (a sink name in the callee-set difference, or a changed sink candidate "
-    "count, on a proposed pairing), then the anchored_differs pairs at or above the floor, then "
-    "those below it (and the demoted __FILE__/__LINE__ and micro-side pairs), then lowest "
-    "similarity first; an R entry reading identical_unique closes 1; P last."
+    "significance: attention 0, then 1, then 2 (lens.significance); an R entry whose pair_evidence "
+    "supports its pairing and that has a lift_basis is in 0 (basis supported_pair_*); inside 1 — "
+    "the entries with a lift_basis first (a sink name in the callee-set difference, or a changed "
+    "sink candidate count, on a proposed pairing), then the anchored_differs pairs at or above the "
+    "floor, then those below it (and the demoted __FILE__/__LINE__ and micro-side pairs), then "
+    "lowest similarity first; an R entry reading identical_unique closes 1; P last."
 )
 # lens.band (band on, first page): the groups the page's order forms.
 _BAND_CANDIDATE_TIER = (
@@ -4402,6 +4845,7 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     undetermined = sum(1 for p in d.pairs if not p.aligned)
     readings = _pseudo_readings(atlas, built)
     _annotate_entries(built, readings)
+    _attach_pair_evidence(atlas, built)
     listed = listed_view(atlas, built, readings)
     tally: dict[str, int] = {}
     by_body = {cls: 0 for cls in sameness.BODY_CLASSES}
@@ -4414,7 +4858,12 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
     swaps = {pairing: {"a_only": 0, "b_only": 0, "both": 0} for pairing in ("aligned", "proposed")}
     count_deltas = {"aligned": 0, "proposed": 0}
     count_unknown = 0
+    supported_lift = counterpart_conflict = 0
     for e in built.placed:
+        if significance(e, None, None)[1] in SUPPORTED_PAIR_BASES:
+            supported_lift += 1
+        if (e.counterpart_hint or {}).get("state") == HINT_CONFLICT:
+            counterpart_conflict += 1
         swap = _sink_callee_swap(e)
         if swap is not None:
             a, b = bool(swap["sinks_only_in_a"]), bool(swap["sinks_only_in_b"])
@@ -4484,6 +4933,10 @@ def function_states(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] |
             "with_sink_callee_swap": swaps,
             "with_sink_candidate_counts_delta": count_deltas,
             "with_sink_candidate_counts_unknown": count_unknown,
+            # R entries on an undetermined pairing: floated by supported pair evidence, and
+            # carrying a counterpart_hint that conflicts with the pairing.
+            "with_supported_r_lift": supported_lift,
+            "with_counterpart_conflict": counterpart_conflict,
             "listed_as_s": len(listed.s_ids),
         },
         "unverified": {"total": sum(unverified.values()), **unverified},
@@ -4791,6 +5244,7 @@ def get_diff_patch_view(
         }
     readings = _pseudo_readings(atlas, built)
     _annotate_entries(built, readings)
+    _attach_pair_evidence(atlas, built)
     # The listed entries, bucket S included, decided from this view's own readings.
     shown = listed_view(atlas, built, readings)
     if entry_id is not None:
@@ -4996,13 +5450,20 @@ def get_diff_patch_view(
         # After the attention is known. Every attention-1 entry carrying a sink name in its
         # callee-set difference, or a changed sink candidate count, leads its tier whatever its
         # basis — a judgement changes the basis it reads, never its place. On an aligned pair either
-        # has floated it to 0 already, so what is lifted here is an R entry's proposed pairing.
+        # has floated it to 0 already, so what is lifted here is an R entry's proposed pairing. An
+        # R entry the pair evidence floated to 0 (basis supported_pair_*) keeps its lift_basis but
+        # no swap_lift: it is read among attention 0, never ahead of the aligned pairs there.
+        swap_lift = {
+            e.entry_id: 1
+            for e in chosen
+            if lens[e.entry_id][0] == ATTENTION_MIDDLE and _lift_basis(e) is not None
+        }
         lift_basis = {
             e.entry_id: basis
             for e in chosen
-            if lens[e.entry_id][0] == ATTENTION_MIDDLE and (basis := _lift_basis(e)) is not None
+            if (e.entry_id in swap_lift or lens[e.entry_id][1] in SUPPORTED_PAIR_BASES)
+            and (basis := _lift_basis(e)) is not None
         }
-        swap_lift = {k: 1 for k in lift_basis}
         envelope["lens"]["significance"] = _SIGNIFICANCE_LENS_SHORT
         envelope["lens"]["sunk_with_body_size_differs"] = {
             "count": sum(

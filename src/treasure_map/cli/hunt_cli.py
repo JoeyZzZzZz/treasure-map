@@ -199,6 +199,12 @@ def _function_line(states: dict[str, Any] | None) -> str:
             f"({changed.get('with_sink_candidate_counts_unknown', 0)} with a count unknown), "
             f"{changed.get('listed_as_s', 0)} listed as S"
         )
+        lifted = changed.get("with_supported_r_lift")
+        if lifted is not None:
+            line += (
+                f", {lifted} R floated by supported pair evidence, "
+                f"{changed.get('with_counterpart_conflict', 0)} R with a counterpart conflict"
+            )
     sides = "; ".join(
         f"{side.upper()} " + ", ".join(f"{n} {state}" for state, n in by_state.items())
         for side, by_state in states["one_sided"].items()
