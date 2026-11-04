@@ -48,6 +48,7 @@ from mcp.types import ToolAnnotations
 
 from treasure_map import mcp_cards as _cards
 from treasure_map.lib import facts, rescan_version
+from treasure_map.lib import tool_call_log as _tool_call_log
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version as _current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import RunRow
@@ -4781,43 +4782,63 @@ class _CheckedFastMCP(FastMCP[Any]):
     reports it itself, in its own order and with its own structured fields."""
 
     _accepted: dict[str, tuple[str, ...]]
+    _call_log: _tool_call_log.ToolCallLog | None = None
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         accepted = self._accepted.get(name)
         if accepted is not None:
             unknown = set(arguments or {}) - set(accepted)
             if unknown:
-                raise ToolError(
-                    _cards.unknown_param_message(
-                        name, unknown, arguments or {}, _cards.TOOL_CARDS[name], accepted
-                    )
+                message = _cards.unknown_param_message(
+                    name, unknown, arguments or {}, _cards.TOOL_CARDS[name], accepted
                 )
+                if self._call_log is not None:
+                    self._call_log.record(name, arguments or {}, error=message)
+                raise ToolError(message)
         return await super().call_tool(name, arguments)
 
 
 def _with_usage_hint(
-    name: str, fn: Callable[..., Any], card: _cards.ToolCard
+    name: str,
+    fn: Callable[..., Any],
+    card: _cards.ToolCard,
+    call_log: _tool_call_log.ToolCallLog | None = None,
 ) -> Callable[..., Any]:
     """``fn`` as the MCP path calls it: when the tool's own answer is an error AND the call, read
     by the tool's card, lacks a parameter it needs, the answer also gets the card's first line
     (``required``), a ``minimal_call`` and the ``reference`` call. Nothing else changes: the error
     text, every other field and the order the tool checks in are the tool's own. A card that is
     wrong costs only those three keys, never a refused call. ``functools.wraps`` keeps the
-    signature, so the schema FastMCP derives is the tool's own."""
+    signature, so the schema FastMCP derives is the tool's own. ``call_log`` records the call (the
+    tool-call log, best effort: it never changes the answer or fails the call)."""
     sig = inspect.signature(fn)
 
     @functools.wraps(fn)
     def call(*args: Any, **kwargs: Any) -> Any:
-        result = fn(*args, **kwargs)
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as exc:
+            if call_log is not None:
+                call_log.record(name, _bound(sig, args, kwargs), error=str(exc) or repr(exc))
+            raise
         if isinstance(result, dict) and "error" in result:
             bound = sig.bind_partial(*args, **kwargs).arguments
             if _cards.missing_parts(card, bound):
                 result["required"] = _cards.render_requires(card)
                 result["minimal_call"] = card.example
                 result["reference"] = _cards.reference_call(name)
+        if call_log is not None:
+            call_log.record(name, _bound(sig, args, kwargs), result)
         return result
 
     return call
+
+
+def _bound(sig: inspect.Signature, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return dict(sig.bind_partial(*args, **kwargs).arguments)
+    except TypeError:
+        return dict(kwargs)
 
 
 def build_server(
@@ -4833,15 +4854,18 @@ def build_server(
     stamp reads (None loads them). The server's standing instructions are the short form of the
     agent workflow guide (the whole guide is get_tool_reference(name="guide")); each tool is sent
     with its card's short description, its docstring kept as the full reference; the legal notice
-    stays reachable via the legal_notice tool. ``mcp`` is a core dependency (the server is the
-    substrate's primary consumer), so FastMCP is imported at top level."""
+    stays reachable via the legal_notice tool. Every call is recorded in the tool-call log next to
+    the atlas (lib/tool_call_log: best effort, outside the atlas). ``mcp`` is a core dependency
+    (the server is the substrate's primary consumer), so FastMCP is imported at top level."""
     server = _CheckedFastMCP("treasure-map", instructions=_AGENT_INSTRUCTIONS)
     server._accepted = {}
+    call_log = _tool_call_log.ToolCallLog(_tool_call_log.log_path_for(atlas_db))
+    server._call_log = call_log
     for name, fn in make_tools(atlas_db, workspaces_root=workspaces_root, config=config).items():
         card = _cards.TOOL_CARDS[name]
         server._accepted[name] = tuple(inspect.signature(fn).parameters)
         server.add_tool(
-            _with_usage_hint(name, fn, card),
+            _with_usage_hint(name, fn, card, call_log),
             name=name,
             description=_cards.render_description(name, card),
             annotations=tool_annotations(name),
