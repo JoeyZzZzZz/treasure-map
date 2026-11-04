@@ -1091,10 +1091,10 @@ def _atlas_tables(path: Path) -> dict[str, list[Any]]:
         out = {
             n: conn.execute(f"SELECT * FROM {n}").fetchall()  # noqa: S608
             for n in sorted(names)
-            if n not in ("overlay", "sqlite_sequence")
+            if n not in ("overlay", "overlay_history", "sqlite_sequence")
         }
         out["sqlite_sequence"] = conn.execute(
-            "SELECT * FROM sqlite_sequence WHERE name <> 'overlay'"
+            "SELECT * FROM sqlite_sequence WHERE name NOT IN ('overlay', 'overlay_history')"
         ).fetchall()
         return out
     finally:
@@ -1103,7 +1103,8 @@ def _atlas_tables(path: Path) -> dict[str, list[Any]]:
 
 def test_reading_and_judging_files_stores_nothing_but_the_judgement(fw: FW) -> None:
     """get_file_diff and a judgement on a file leave both analysis databases byte for byte and
-    every atlas table but overlay as they were; the firmware roots are only read."""
+    every atlas table but the judgement layer (overlay and its history) as they were; the
+    firmware roots are only read."""
     fw.file("a", "etc/rc", "shell_script", "a\n")
     fw.file("b", "etc/rc", "shell_script", "b\n")
     for conn in fw.db.values():
@@ -1515,3 +1516,23 @@ def test_symlink_changes_lists_one_sided_links_and_retargets(fw: FW) -> None:
     assert [x["link_path"] for x in s["b_only"]] == ["bin/new"]
     assert [x["link_path"] for x in s["target_differs"]] == ["bin/ctl"]
     assert s["in_denominator"] is False
+
+
+def test_a_binary_presence_anchor_on_a_file_is_refused_by_name(fw: FW) -> None:
+    """★ R4: an anchor of a binary one run holds alone, cited in a file's ``checked`` beside a
+    file anchor that resolves, is refused by name — never kept as plain text.
+
+    MUTATION (verified RED): leave binary_presence out of _anchor_marker's closed set -> it is
+    kept as a note and the write succeeds -> RED."""
+    fw.file("a", "etc/rc", "shell_script", "a\n")
+    fw.file("b", "etc/rc", "shell_script", "b\n")
+    out = fw.tools()["annotate_diff"](
+        _anchor("etc/rc"),
+        "no_real_change",
+        None,
+        checked=[_anchor("etc/rc"), f"{PAIR}#binary_presence#a_only:usr/sbin/old"],
+        why_unchanged="w",
+        run_pair=PAIR,
+    )
+    assert out.get("written") is False
+    assert "is a binary_presence anchor" in str(out.get("error"))

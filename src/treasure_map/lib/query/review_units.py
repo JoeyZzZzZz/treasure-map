@@ -42,6 +42,7 @@ judgements against the cached facts.
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
@@ -49,7 +50,7 @@ from typing import Any
 
 from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review as dr
-from treasure_map.lib.query.coverage import CONCLUDED, OPEN, UNSEEN
+from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, OPEN, UNSEEN
 
 PREDICATE_VERSION = "v0"
 DEFAULT_K = 4
@@ -74,14 +75,24 @@ REASONS = (
 )
 
 # Unit kinds.
-ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER = (
+ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT = (
     "entry",
     "s_batch",
     "binary_presence",
     "non_binary_file",
     "second_tier_batch",
+    "audit",
 )
-UNIT_KINDS = (ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER)
+UNIT_KINDS = (ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT)
+# How many of a binary_presence binary's candidates (its first, in the triage order) its judgement
+# must cite before the binary counts as disposed.
+PRESENCE_TOP = 20
+# How many disagreements the report lists (the count is always exact).
+DISAGREEMENTS_SHOWN = 20
+# The judgements an audit reads blind: why one is opened.
+AUDIT_SOURCES = ("change_inconclusive", "no_real_change", "unread_before_verdict")
+# The writes a person makes: never audited, and what settles a disagreement.
+HUMAN = "human"
 DISPOSED_STATES = frozenset({OPEN, CONCLUDED})
 PRESENCE_STREAM, FILE_STREAM = "binary_presence", "non_binary_file"
 
@@ -129,8 +140,9 @@ class Unit:
     stream_index: int  # its stream's place among the streams
 
     @property
-    def order(self) -> tuple[int, int, str]:
-        return (self.position, self.stream_index, self.unit_id)
+    def order(self) -> tuple[int, int, int, str]:
+        # An audit follows the unit its member came from: same place, after it.
+        return (self.position, self.stream_index, int(self.kind == AUDIT), self.unit_id)
 
 
 def unit_id(kind: str, anchors: Iterable[str], predicate_version: str = PREDICATE_VERSION) -> str:
@@ -497,11 +509,231 @@ def read_progress(
     return out
 
 
+# ── the binary_presence binaries: their first candidates, and whether a judgement cites them ─
+
+_PRESENCE_TOP_CACHE: dict[tuple[str, ...], list[str]] = {}
+
+
+def presence_ranked(atlas: sqlite3.Connection, run_id: str, binary_path: str) -> list[Any]:
+    """The binary's candidates in its run, in the default triage order (list_candidates')."""
+    from treasure_map.lib.query import apply_view, triage
+
+    ranked = [c for c in triage(atlas, run_id=run_id) if c.binary_path == binary_path]
+    return list(apply_view(ranked, view=None, sort_by=None, dim_filters=[], only_filters=[]))
+
+
+def presence_top_refs(
+    atlas: sqlite3.Connection, run_id: str, binary_path: str, k: int = PRESENCE_TOP
+) -> list[str]:
+    """The evidence_refs of the binary's first ``k`` candidates (``presence_ranked``), cached by
+    the run's stamps (a re-hunt or a re-scan reads them again)."""
+    from treasure_map.lib.query.patch_view import _run_key
+
+    key = (*_run_key(atlas, run_id), binary_path, str(k))
+    hit = _PRESENCE_TOP_CACHE.get(key)
+    if hit is None:
+        hit = [c.evidence_ref for c in presence_ranked(atlas, run_id, binary_path)[:k]]
+        _PRESENCE_TOP_CACHE[key] = hit
+    return hit
+
+
+def _cited(verdict_basis: Any) -> set[str]:
+    try:
+        vb = json.loads(verdict_basis) if verdict_basis else {}
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(vb, dict):
+        return set()
+    out: set[str] = set()
+    for key in ("checked", "evidence"):
+        items = vb.get(key)
+        if isinstance(items, list):
+            out |= {str(x).strip() for x in items}
+    return out
+
+
+def presence_citations_short(
+    atlas: sqlite3.Connection, facts: PairFacts, states: dict[str, str]
+) -> dict[str, dict[str, Any]]:
+    """The disposed binary_presence judgements whose ``checked`` / ``evidence`` do not cite every
+    one of the binary's first PRESENCE_TOP candidates (all of them, when it has fewer) — anchor ->
+    what is missing. A change_inconclusive carries no basis and is held to its audit instead."""
+    out: dict[str, dict[str, Any]] = {}
+    pair = dr.run_pair(facts.run_a, facts.run_b)
+    rows = {
+        r[0]: (r[1], r[2])
+        for r in atlas.execute(
+            "SELECT anchor_ref, verdict, verdict_basis FROM overlay "
+            "WHERE anchor_kind = 'diff_subject' AND run_id = ?",
+            (pair,),
+        )
+    }
+    by_anchor = {facts.presence.anchor(b): b for b in facts.presence.items}
+    for m in facts.presence_members:
+        if not disposed(states.get(m.anchor_ref)) or m.anchor_ref not in rows:
+            continue
+        verdict, basis = rows[m.anchor_ref]
+        if verdict == "change_inconclusive":
+            continue
+        b = by_anchor.get(m.anchor_ref)
+        if b is None:
+            continue
+        top = presence_top_refs(atlas, b.run, b.path)
+        missing = [r for r in top if r not in _cited(basis)]
+        if missing:
+            out[m.anchor_ref] = {
+                "required": len(top),
+                "cited": len(top) - len(missing),
+                "missing_sample": missing[:5],
+            }
+    return out
+
+
+# ── audits and disagreements, read from the overlay and its history ────────────────────────
+
+
+@dataclass(frozen=True)
+class Audit:
+    """A judgement owed a blind second reading: why (``sources``), the write it reads (its history
+    row and session; None for a write older than the history), and its unit."""
+
+    member: Member
+    sources: tuple[str, ...]
+    write_id: int | None
+    write_session: str | None
+    unit: Unit
+
+
+@dataclass
+class Audits:
+    open: list[Audit] = field(default_factory=list)
+    disagreements: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _json(raw: Any) -> dict[str, Any]:
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) -> Audits:
+    """The open audits and the disagreements of the pair, from its judgements and their history.
+
+    An audit opens on a judgement that is change_inconclusive or no_real_change, or that was
+    written before anything of its subject was read (``unread_before_verdict``) — never on a
+    person's (``human``). It closes when a blind shadow judgement follows the write (one whose
+    session neither wrote it nor read the overlay's verdicts first: ``non_blind`` is not counted).
+    A disagreement is a blind shadow that reads otherwise than the current judgement, or a
+    judgement overwritten by another session with another verdict; a person's write settles it."""
+    pair = dr.run_pair(facts.run_a, facts.run_b)
+    current = {
+        r[0]: {"verdict": r[1], "attributed_to": r[2]}
+        for r in atlas.execute(
+            "SELECT anchor_ref, verdict, attributed_to FROM overlay "
+            "WHERE anchor_kind = 'diff_subject' AND run_id = ?",
+            (pair,),
+        )
+    }
+    history: dict[str, list[dict[str, Any]]] = {}
+    for row in atlas.execute(
+        "SELECT id, anchor_ref, event, before, after, attributed_to, read_basis, session "
+        "FROM overlay_history WHERE anchor_kind = 'diff_subject' AND run_id = ? ORDER BY id",
+        (pair,),
+    ):
+        history.setdefault(row[1], []).append(
+            {
+                "id": row[0],
+                "event": row[2],
+                "before": _json(row[3]),
+                "after": _json(row[4]),
+                "attributed_to": row[5],
+                "read_basis": _json(row[6]),
+                "session": row[7],
+            }
+        )
+    out = Audits()
+    index = {u.stream: u.stream_index for u in units}
+    seen: set[str] = set()
+    for u in units:
+        for m in u.members:
+            if m.anchor_ref in seen or m.anchor_ref not in current:
+                continue
+            seen.add(m.anchor_ref)
+            row = current[m.anchor_ref]
+            if row["attributed_to"] == HUMAN:
+                continue
+            hist = history.get(m.anchor_ref, [])
+            writes = [h for h in hist if h["event"] in ("insert", "update")]
+            last = writes[-1] if writes else None
+            after_id = last["id"] if last is not None else 0
+            blind = [
+                h
+                for h in hist
+                if h["event"] == "shadow"
+                and h["id"] > after_id
+                and not h["read_basis"].get("non_blind")
+            ]
+            differ = sorted({h["after"].get("verdict") for h in blind} - {row["verdict"]})
+            if differ:
+                out.disagreements.append(
+                    {
+                        "anchor_ref": m.anchor_ref,
+                        "why": "audit_reads_otherwise",
+                        "current": row["verdict"],
+                        "shadow": differ,
+                    }
+                )
+            if last is not None and last["event"] == "update" and len(writes) >= 2:
+                prev = writes[-2]
+                was = last["before"].get("verdict")
+                if (
+                    was != row["verdict"]
+                    and last["session"]
+                    and prev["session"]
+                    and last["session"] != prev["session"]
+                ):
+                    out.disagreements.append(
+                        {
+                            "anchor_ref": m.anchor_ref,
+                            "why": "overwritten_by_another_session",
+                            "current": row["verdict"],
+                            "before": was,
+                        }
+                    )
+            sources = []
+            if row["verdict"] in ("change_inconclusive", "no_real_change"):
+                sources.append(row["verdict"])
+            if last is not None and last["read_basis"].get("unread_before_verdict"):
+                sources.append("unread_before_verdict")
+            if not sources or blind:
+                continue
+            audited = replace(m, reasons=tuple(sources))
+            wid = last["id"] if last is not None else None
+            unit = Unit(
+                unit_id=unit_id(AUDIT, [f"{m.anchor_ref}@{wid if wid is not None else 'legacy'}"]),
+                kind=AUDIT,
+                must_read=u.must_read,
+                members=(audited,),
+                stream=m.stream,
+                position=m.position,
+                stream_index=index.get(m.stream, u.stream_index),
+            )
+            out.open.append(
+                Audit(audited, tuple(sources), wid, last["session"] if last else None, unit)
+            )
+    return out
+
+
 def disposed(state: str | None) -> bool:
     return state in DISPOSED_STATES
 
 
 def unit_disposed(u: Unit, states: dict[str, str]) -> bool:
+    """Every member disposed. An audit unit exists only while its audit is open, so it never is."""
+    if u.kind == AUDIT:
+        return False
     return all(disposed(states.get(m.anchor_ref)) for m in u.members)
 
 
@@ -510,10 +742,14 @@ def next_unit(
     states: dict[str, str],
     worker: int | None = None,
     workers: int | None = None,
+    skip: frozenset[str] = frozenset(),
 ) -> Unit | None:
     """The first unit, in the order they are handed out, of this shard with a member not yet
-    disposed."""
+    disposed — ``skip`` names units not to hand out here (the audits of the asking session's own
+    judgements, which it cannot read blind)."""
     for u in units:
+        if u.unit_id in skip:
+            continue
         if in_shard(u.unit_id, worker, workers) and not unit_disposed(u, states):
             return u
     return None
@@ -529,14 +765,19 @@ def report(
     *,
     k: int,
     server_commit: str | None,
+    audits: Audits | None = None,
+    presence_short: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The pair's report: the must-read set by unit kind and by reason, how much of it and of every
     listed subject is disposed, ``must_read_complete`` beside the existing ``complete``, what no
     unit can reach, and the one-line ``coverage_statement``."""
     states = progress.states
-    must = [u for u in units if u.must_read]
+    audits = audits or Audits()
+    presence_short = presence_short or {}
+    subjects = [u for u in units if u.kind != AUDIT]  # an audit re-reads a subject, it is none
+    must = [u for u in subjects if u.must_read]
     must_members = [m for u in must for m in u.members]
-    all_members = [m for u in units for m in u.members]
+    all_members = [m for u in subjects for m in u.members]
     by_kind: dict[str, dict[str, int]] = {}
     for u in units:
         row = by_kind.setdefault(u.kind, {"units": 0, "disposed": 0, "members": 0})
@@ -555,7 +796,13 @@ def report(
     must_done = sum(1 for m in must_members if disposed(states.get(m.anchor_ref)))
     all_done = sum(1 for m in all_members if disposed(states.get(m.anchor_ref)))
     unseen = sum(1 for m in all_members if states.get(m.anchor_ref, UNSEEN) == UNSEEN)
-    must_read_complete = must_done == len(must_members) and not withheld and not facts.failed_diffs
+    must_read_complete = (
+        must_done == len(must_members)
+        and not withheld
+        and not facts.failed_diffs
+        and not audits.open
+        and not audits.disagreements
+    )
     complete = (
         unseen == 0
         and not facts.failed_diffs
@@ -567,8 +814,13 @@ def report(
     statement = (
         f"must-read {len(must_members)} / disposed {must_done}; "
         f"all subjects {len(all_members)} / disposed {all_done}; "
-        f"open audits 0; reduce not run; predicate {PREDICATE_VERSION} (k={k}); server {server}"
+        f"open audits {len(audits.open)}; disagreements {len(audits.disagreements)}; "
+        f"reduce not run; predicate {PREDICATE_VERSION} (k={k}); server {server}"
     )
+    by_source: dict[str, int] = dict.fromkeys(AUDIT_SOURCES, 0)
+    for au in audits.open:
+        for src in au.sources:
+            by_source[src] += 1
     return {
         "run_pair": dr.run_pair(facts.run_a, facts.run_b),
         "predicate_version": PREDICATE_VERSION,
@@ -592,6 +844,13 @@ def report(
             "not_diffed_binaries": facts.not_diffed_binaries,
             "non_binary_files_unavailable": facts.files_unavailable,
         },
+        "audits": {"open": len(audits.open), "by_source": by_source},
+        "disagreements": {
+            "count": len(audits.disagreements),
+            "items": audits.disagreements[:DISAGREEMENTS_SHOWN],
+            "settled_by": "a judgement written by a person (tmap review judge / audit --apply)",
+        },
+        "presence_citations_short": presence_short,
         "not_seen": list(NOT_SEEN),
         "dangling_judgements": sorted(progress.dangling),
     }
@@ -673,12 +932,28 @@ class PairReview:
     progress: Progress
     report: dict[str, Any]
     k: int
+    audits: Audits = field(default_factory=Audits)
 
     def unit(self, uid: str) -> Unit | None:
         return next((u for u in self.units if u.unit_id == uid), None)
 
-    def next_unit(self, worker: int | None = None, workers: int | None = None) -> Unit | None:
-        return next_unit(self.units, self.progress.states, worker, workers)
+    def audit_of(self, uid: str) -> Audit | None:
+        return next((a for a in self.audits.open if a.unit.unit_id == uid), None)
+
+    def next_unit(
+        self,
+        worker: int | None = None,
+        workers: int | None = None,
+        session: str | None = None,
+    ) -> Unit | None:
+        """The next unit of the shard; an audit of a judgement ``session`` wrote is not handed
+        back to it (it cannot read it blind)."""
+        skip = frozenset(
+            a.unit.unit_id
+            for a in self.audits.open
+            if session is not None and a.write_session == session
+        )
+        return next_unit(self.units, self.progress.states, worker, workers, skip)
 
 
 def review_pair(
@@ -709,9 +984,22 @@ def review_pair(
         diff_staleness=lambda d: pv.view_staleness(atlas, d),
         group_review=_group_reader(atlas),
     )
-    return PairReview(
-        facts, units, progress, report(facts, units, progress, k=k, server_commit=server_commit), k
+    short = presence_citations_short(atlas, facts, progress.states)
+    for anchor in short:
+        # Judged without citing the binary's first candidates: read again, not disposed.
+        progress.states[anchor] = NEEDS_RECHECK
+    audits = read_audits(atlas, facts, units)
+    units = sorted([*units, *(a.unit for a in audits.open)], key=lambda u: u.order)
+    rep = report(
+        facts,
+        units,
+        progress,
+        k=k,
+        server_commit=server_commit,
+        audits=audits,
+        presence_short=short,
     )
+    return PairReview(facts, units, progress, rep, k, audits)
 
 
 def pair_staleness(

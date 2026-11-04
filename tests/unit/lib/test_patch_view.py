@@ -2457,6 +2457,12 @@ def test_the_judgement_facts_of_an_r_entry_do_not_carry_its_reading(
         "export_gap_b": None,
         "bucket": "R",
         "rows": [],
+        # R9: the read-face signals a judgement leans on (no pair evidence is read by a build)
+        "listed_as": None,
+        "subclass": "alignment_low_confidence",
+        "pair_evidence": None,
+        "counterpart_hint": None,
+        "sink_callsite_delta": None,
     }
 
 
@@ -4152,7 +4158,18 @@ def test_the_judgement_basis_rests_on_every_row_of_the_entry(
             ),
         },
     }
-    assert dann.capture_diff_basis(w.atlas, DIFF, _WIN_ANCHOR) == want
+    got = dann.capture_diff_basis(w.atlas, DIFF, _WIN_ANCHOR)
+    # R9's read-face facts ride beside these; this test is about the rows.
+    for key in (
+        "listed_as",
+        "subclass",
+        "pair_evidence",
+        "counterpart_hint",
+        "sink_callsite_delta",
+    ):
+        assert key in got["facts"], key
+        del got["facts"][key]
+    assert got == want
 
 
 # 27 rows: two did not persist, a size-constant and two size-kind rows past the 20th, the rest
@@ -4720,6 +4737,11 @@ def test_the_wider_identified_difference_moves_no_judgement_basis(
         "export_gap_b": None,
         "bucket": "C",
         "rows": [],
+        "listed_as": None,
+        "subclass": "no_sink_candidate",
+        "pair_evidence": None,
+        "counterpart_hint": None,
+        "sink_callsite_delta": None,
     }
     assert (e.bucket, e.subclass) == ("C", "no_sink_candidate")
     assert e.callee_set is not None and e.callee_set["state"] == "undetermined"
@@ -5136,6 +5158,11 @@ def test_the_edge_is_never_a_judgement_basis(tmp_path: Path, current: None) -> N
         "export_gap_b",
         "bucket",
         "rows",
+        "listed_as",
+        "subclass",
+        "pair_evidence",
+        "counterpart_hint",
+        "sink_callsite_delta",
     }
 
 
@@ -5885,6 +5912,17 @@ def test_the_s7_caches_are_dropped_with_the_others(tmp_path: Path, current: None
     assert len(pv._GUARD_CACHE) == 0 and len(pv._SINK_AXIS_CACHE) == 0
 
 
+def _judged_build(atlas: Any, build: Any) -> pv.BuiltDiff:
+    """A fresh build read as a judgement reads it — the pair evidence attached and bucket S
+    decided (diff_annotations.capture_diff_basis_on / ViewReview), so its entry_facts are the
+    facts a judgement is stored with and re-checked against."""
+    fresh = build(atlas, DIFF)
+    assert fresh is not None
+    pv._attach_pair_evidence(atlas, fresh)
+    pv.listed_view(atlas, fresh)
+    return fresh
+
+
 def test_rendering_guards_and_axes_never_writes_the_build(
     tmp_path: Path, current: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5906,8 +5944,7 @@ def test_rendering_guards_and_axes_never_writes_the_build(
     pv.get_diff_patch_view(w.atlas, DIFF)
     pv.get_diff_patch_view(w.atlas, DIFF, entry_id=ALIGNED)
     pv.get_diff_patch_view(w.atlas, DIFF, entry_id=PROPOSED)
-    fresh = real(w.atlas, DIFF)
-    assert fresh is not None
+    fresh = _judged_build(w.atlas, real)
     want = {e.entry_id: dr.entry_facts(e) for e in fresh.placed}
     rows = {e.entry_id: [dr.row_facts(v) for v in e.row_views] for e in fresh.placed}
     for built in builds:
@@ -6492,8 +6529,7 @@ def test_a_summary_page_leaves_what_it_read_as_it_was(
     monkeypatch.setattr(pv, "build_diff_view", real)
     assert builds and len(pv._DELTA_CACHE) > 0
     assert full_pages() == cold
-    fresh = real(w.atlas, DIFF)
-    assert fresh is not None
+    fresh = _judged_build(w.atlas, real)
     want = {e.entry_id: dr.entry_facts(e) for e in fresh.placed}
     rows = {e.entry_id: [dr.row_facts(v) for v in e.row_views] for e in fresh.placed}
     for built in builds:

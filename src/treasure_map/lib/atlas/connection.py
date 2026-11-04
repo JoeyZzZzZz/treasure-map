@@ -9,76 +9,16 @@ copying the main file without them yields "database disk image is malformed" on 
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from pathlib import Path
 
+from treasure_map.lib.atlas import overlay_schema
+
 _SCHEMA_PATH = Path(__file__).parent.parent / "storage" / "atlas_schema.sql"
-
-# The overlay table minus the verdict CHECK. Every other column, default, constraint and the
-# uniqueness rule are reproduced verbatim from the schema — the rebuild below copies column by
-# column, so anything dropped here would be silently lost rather than reported.
-_OVERLAY_REBUILT_DDL = """
-CREATE TABLE overlay_new (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    anchor_kind   TEXT NOT NULL DEFAULT 'evidence_ref'
-        CHECK (anchor_kind IN ('evidence_ref','diff_subject')),
-    anchor_ref    TEXT NOT NULL,
-    run_id        TEXT,
-    verdict       TEXT NOT NULL,
-    rationale     TEXT NOT NULL,
-    attributed_to TEXT
-        CHECK (attributed_to IS NULL OR attributed_to IN ('agent','agent-via-mcp')),
-    basis_state   TEXT,
-    created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (anchor_kind, anchor_ref)
-)
-"""
-
-# Named one place, used by both halves of the copy, so the two lists cannot drift apart.
-_OVERLAY_COLUMNS = (
-    "id,anchor_kind,anchor_ref,run_id,verdict,rationale,attributed_to,"
-    "basis_state,created_at,updated_at"
-)
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-
-
-def _rebuild_overlay_without_verdict_check(conn: sqlite3.Connection) -> None:
-    """Rebuild ``overlay`` with the verdict CHECK dropped, carrying every row across.
-
-    ★ This MUST be atomic, and getting there needs two non-obvious things. The connection uses
-    SQLite's default isolation, which opens a transaction before DML but NOT before DDL — so a
-    bare ``CREATE`` commits itself immediately. And ``executescript`` commits whatever is open
-    before it runs, so wrapping it in a transaction does not help either. Either way a crash
-    before the rename leaves ``overlay_new`` behind, and the next open cannot clean it up: the
-    wipe guard only permits dropping ``overlay``, never a temp table. That is a permanent
-    deadlock — every subsequent open would retry the rebuild and hit "table already exists".
-
-    Hence: an explicit ``BEGIN IMMEDIATE``, every statement through ``execute`` (never
-    ``executescript``), and the transaction closed HERE — the caller runs the schema script right
-    after, which would otherwise commit a half-finished rebuild by implication.
-    """
-    conn.commit()  # settle anything pending so BEGIN starts from a clean slate
-    conn.execute("BEGIN IMMEDIATE")  # explicit, so the CREATE below is inside the transaction too
-    try:
-        conn.execute(_OVERLAY_REBUILT_DDL)
-        conn.execute(  # explicit column lists on both sides — never SELECT *
-            f"INSERT INTO overlay_new ({_OVERLAY_COLUMNS}) "  # noqa: S608 -- fixed literal tuple
-            f"SELECT {_OVERLAY_COLUMNS} FROM overlay"
-        )
-        conn.execute("DROP TABLE overlay")
-        conn.execute("ALTER TABLE overlay_new RENAME TO overlay")
-        # The drop took the old index with it; the schema script's CREATE INDEX runs later, but
-        # relying on that would make this rebuild depend on statement order elsewhere.
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_overlay_verdict ON overlay(verdict)")
-        conn.commit()
-    except Exception:
-        conn.rollback()  # the CREATE rolls back with everything else: no temp table left behind
-        raise
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -356,68 +296,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             if _c7col not in dd_cols:
                 conn.execute(f"ALTER TABLE dimension_delta ADD COLUMN {_c7col} {_c7type}")  # noqa: S608
 
-    # overlay.run_id (added this round): which firmware an annotation belongs to. The value was
-    # always there, buried in the anchor_ref string; storing it as a column turns "show me this
-    # firmware's annotations" into an exact equality match instead of a prefix probe. Nullable, and
-    # a pure ADD — the UNIQUE(anchor_kind, anchor_ref) rule is untouched, since run_id is derived
-    # from anchor_ref and adds no identity of its own. Idempotent: the ADD runs only while the
-    # column is missing, and the backfill only touches rows that have no value yet.
-    ov_cols = _column_names(conn, "overlay")
-    if ov_cols and "run_id" not in ov_cols:
-        conn.execute("ALTER TABLE overlay ADD COLUMN run_id TEXT")
-    if ov_cols:
-        # Backfill from the anchor: everything before the first '#'. `> 1` (not `> 0`) so a ref
-        # that STARTS with '#' is left NULL rather than backfilled to an empty string — the same
-        # rule the write path applies, so a backfilled row and a freshly written one agree.
-        # Looked for first, then written: an UPDATE takes the write lock even when it matches
-        # nothing, so an unconditional one made every open wait on any running writer.
-        if conn.execute(
-            "SELECT 1 FROM overlay WHERE run_id IS NULL AND instr(anchor_ref, '#') > 1 LIMIT 1"
-        ).fetchone():
-            conn.execute(
-                "UPDATE overlay SET run_id = substr(anchor_ref, 1, instr(anchor_ref, '#') - 1) "
-                "WHERE run_id IS NULL AND instr(anchor_ref, '#') > 1"
-            )
-
-    # overlay.verdict CHECK removal (this round): the vocabulary is still moving, and pinning it in
-    # the schema made every wording change cost a rebuild that has to carry real annotations across.
-    # ★ Runs AFTER the run_id migration above, because the rebuild copies column by column — on an
-    # atlas that predates run_id, rebuilding first would try to read a column that is not there yet.
-    # Unlike every other migration here, what changes is a table-level constraint rather than a
-    # column, so PRAGMA table_info cannot see it — the test is the stored CREATE statement itself.
-    # The pattern points at the VERDICT check specifically: overlay carries three CHECKs, so a loose
-    # "does the SQL mention CHECK and verdict" would stay true forever and rebuild on every open.
-    ov_sql = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='overlay'"
-    ).fetchone()
-    # ov_sql is None on a database that has no overlay table yet — a brand-new one, since _migrate
-    # runs before the schema script creates anything. Both steps below are guarded by it.
-    if ov_sql:
-        if re.search(r"CHECK\s*\(\s*verdict\b", ov_sql[0], re.I):
-            _rebuild_overlay_without_verdict_check(conn)
-
-        # overlay.verdict rename (this round): 'to-review' -> 'inconclusive'. The old name described
-        # a task still to be done, but this layer records what was CONCLUDED — and "nothing decisive
-        # could be established" is itself a conclusion. Data-only, so no rebuild and no shape test:
-        # the statement is self-idempotent, matching nothing once it has run. It follows the rebuild
-        # so it updates the final table rather than one about to be replaced.
-        if conn.execute("SELECT 1 FROM overlay WHERE verdict = 'to-review' LIMIT 1").fetchone():
-            conn.execute("UPDATE overlay SET verdict = 'inconclusive' WHERE verdict = 'to-review'")
-
-        # overlay.verdict_basis (this round): the structured justification a `safe` or `exploitable`
-        # annotation must carry. Additive and nullable — existing rows keep NULL.
-        # ★ ORDER IS LOAD-BEARING: this MUST stay AFTER the rebuild above. That rebuild copies a
-        # FIXED ten-column list, so a column added before it would be silently dropped on any atlas
-        # old enough to be rebuilt. Adding it here means an old atlas is rebuilt to ten columns and
-        # then gains the eleventh, while a current one skips the rebuild and just gains it.
-        if "verdict_basis" not in _column_names(conn, "overlay"):
-            conn.execute("ALTER TABLE overlay ADD COLUMN verdict_basis TEXT")
-
-        # overlay.promoted_from (this round): the diff entry a candidate judgement was carried over
-        # from. Additive and nullable — existing rows keep NULL. Same ordering rule as
-        # verdict_basis above, for the same reason: it must follow the fixed-column rebuild.
-        if "promoted_from" not in _column_names(conn, "overlay"):
-            conn.execute("ALTER TABLE overlay ADD COLUMN promoted_from TEXT")
+    # The overlay's own migrations live with its schema (lib/atlas/overlay_schema), run by
+    # open_atlas after the atlas schema: they are not part of what the hunt reads or writes.
 
     # run.hunt_commit (added this round): which tmap commit produced this run's instances, so a
     # re-hunt can be skipped when the code that would run is the same code that already ran.
@@ -494,9 +374,10 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
     (adds instance.origin / binary_path / binary_content_hash / is_thin_cmd_wrapper /
     wrapped_sink / flow_evidence / dimension_delta.binary, renames pattern.recurrence_breadth ->
     device_spread, drops legacy pattern.device_category). The instance table is only ever moved
-    forward in place — never rebuilt — so its rows and every derived count are kept. Overlay is the
-    one exception: it IS rebuilt, once, to shed a legacy verdict CHECK (see
-    _rebuild_overlay_without_verdict_check), carrying every row across inside one transaction.
+    forward in place — never rebuilt — so its rows and every derived count are kept. The judgement
+    layer (overlay, overlay_history) is created and migrated by lib/atlas/overlay_schema.ensure,
+    LAST — after the schema script, on top of the atlas tables; it is the one table that is ever
+    rebuilt, once per retired CHECK, carrying every row across inside one transaction.
 
     ★ ORDER IS LOAD-BEARING: _migrate MUST run BEFORE executescript. The schema now carries an
     index/constraint that references a MIGRATED-IN column (idx_dimdelta_bin on
@@ -522,4 +403,5 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
     _migrate(conn)  # ★ BEFORE executescript — see the load-bearing-order note above
     conn.executescript(schema)
     conn.commit()
+    overlay_schema.ensure(conn)  # ★ AFTER the atlas schema — see lib/atlas/overlay_schema
     return conn

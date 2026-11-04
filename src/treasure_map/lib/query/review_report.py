@@ -137,6 +137,12 @@ def markdown(review: ru.PairReview, *, header: dict[str, Any] | None = None) -> 
             f'Read: `start_diff_review(run_pair="{_md_cell(rep["run_pair"])}", '
             f'unit="{u.unit_id}"' + (f", k={rep['k']}" if rep["k"] != ru.DEFAULT_K else "") + ")`"
         )
+        anchor = "" if len(u.members) == 1 else " --anchor <anchor_ref>"
+        out.append(
+            f"Judge (a person): `tmap review judge {u.unit_id} {_md_cell(rep['run_pair'])}"
+            f"{anchor} --verdict <changed_real|no_real_change|change_inconclusive> "
+            '--rationale "<why>"`'
+        )
         out.append("")
         out.append("| member | bucket | state | reasons |")
         out.append("|---|---|---|---|")

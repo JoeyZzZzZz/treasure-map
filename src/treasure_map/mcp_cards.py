@@ -861,7 +861,9 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "evidence), no_real_change (why_unchanged + checked, at least one anchor read in the "
             "current view; Plain-text notes are kept but do not count) or change_inconclusive. "
             "rationale is required except for no_real_change (it defaults to why_unchanged). "
-            "group_ref records a same-shape group the judgment leaned on. One judgment per "
+            "group_ref records a same-shape group the judgment leaned on; change_kind what a "
+            "changed_real does. unit_id (a work unit from start_diff_review(run_pair)) returns "
+            "the next one; on an audit unit the judgment is a shadow. One judgment per "
             "anchor: re-annotating OVERWRITES. Many entries at once: annotate_diff_batch."
         ),
     ),
@@ -873,12 +875,13 @@ TOOL_CARDS: dict[str, ToolCard] = {
             'annotate_diff_batch(annotations=[{"anchor_ref": "<anchor_ref>", '
             '"verdict": "change_inconclusive", "rationale": "<why>"}], diff_id="<diff_id>")'
         ),
-        boundary=("all of them or none", "Only those seven keys"),
+        boundary=("all of them or none", "Only those eight keys"),
         summary=(
             "Record YOUR judgments on many entries of one diff at once — all of them or none. "
             "annotations is 1..200 objects with annotate_diff's per-entry fields and no diff_id: "
             "anchor_ref + verdict, optionally rationale, checked, why_unchanged, evidence, "
-            "group_ref. Only those seven keys — a stray key fails that item. Every item is "
+            "group_ref, change_kind. Only those eight keys — a stray key fails that item. "
+            "unit_id as in annotate_diff. Every item is "
             "validated first; if any fails nothing is written and the failures come back merged "
             "by message with their indexes. The same anchor_ref twice refuses the batch."
         ),
@@ -1125,6 +1128,37 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
         _CONSISTENT,
     ),
     _param(
+        "worker",
+        "this shard's index (with workers)",
+        ("start_diff_review", "annotate_diff", "annotate_diff_batch"),
+        _CONSISTENT,
+    ),
+    _param(
+        "workers",
+        "how many shards (with worker)",
+        ("start_diff_review", "annotate_diff", "annotate_diff_batch"),
+        _CONSISTENT,
+    ),
+    _param(
+        "unit_id",
+        "the work unit a judgment is written for (from next_unit)",
+        ("annotate_diff", "annotate_diff_batch"),
+        _KEPT,
+        "start_diff_review reads one unit with unit=; a write names the unit it answers",
+    ),
+    _param(
+        "attributed_to",
+        "human-via-agent: a person's judgment written down by the agent",
+        ("annotate_diff", "annotate_diff_batch"),
+        _CONSISTENT,
+    ),
+    _param(
+        "change_kind",
+        "what a changed_real does (sink_removed / ... / unknown)",
+        ("annotate_diff",),
+        _SINGLE,
+    ),
+    _param(
         "run_a",
         "the before run's id",
         ("get_diff_sink_overlay",),
@@ -1328,8 +1362,6 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             ("body", "a body class of the text-unverified entries", "get_diff_patch_view"),
             ("anchored_differs", "only the anchored_differs pairs", "get_diff_patch_view"),
             ("anchored_micro_side", "only the anchored micro-side pairs", "get_diff_patch_view"),
-            ("worker", "this shard's index (with workers)", "start_diff_review"),
-            ("workers", "how many shards (with worker)", "start_diff_review"),
             ("unit", "one work unit's unit_id", "start_diff_review"),
             ("k", "how many first entries per diff are must-read", "start_diff_review"),
             ("rows_limit", "how many rows an entry carries inline", "get_diff_patch_view"),

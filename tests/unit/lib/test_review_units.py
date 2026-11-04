@@ -26,6 +26,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
     a_row,
 )
 from treasure_map import mcp_app
+from treasure_map.lib import overlay
 from treasure_map.lib.query import patch_view as pv
 from treasure_map.lib.query import review_units as ru
 
@@ -348,21 +349,35 @@ def test_a_judged_member_is_disposed_and_the_next_unit_moves_on(world: World) ->
     only — the second tier keeps ``complete`` false, not it.
 
     MUTATION (verified RED): count change_inconclusive as not disposed -> RED; let the second tier
-    hold must_read_complete -> RED."""
+    hold must_read_complete -> RED; hand a session the audit of its own judgement -> RED; let an
+    open audit leave must_read_complete true -> RED."""
     r = _review(world, k=0)
     first = r.next_unit()
     assert first is not None and first.members[0].entry_id == "pair:00001000:00001000"
     assert r.report["must_read_complete"] is False
-    world.judge(DX, _pair_anchor(DX, "00001000", "00001000"), "change_inconclusive")
+    writer = overlay.WriteContext(channel="mcp", session="writer")
+    world.judge(DX, _pair_anchor(DX, "00001000", "00001000"), "change_inconclusive", ctx=writer)
     world.judge(DX, _pair_anchor(DX, "00002000", "00002800"), "changed_real")  # second tier
     r = _review(world, k=0)
-    assert (
-        r.next_unit() is not None and r.next_unit().members[0].entry_id != first.members[0].entry_id
-    )
-    must = [m for u in r.units if u.must_read for m in u.members]
+    # Its audit follows it at once — but not for the session that wrote it (it cannot read it
+    # blind): that session moves on.
+    audit = r.next_unit()
+    assert audit is not None and audit.kind == ru.AUDIT
+    nxt = r.next_unit(session="writer")
+    assert nxt is not None and nxt.members[0].entry_id != first.members[0].entry_id
+    must = [m for u in r.units if u.must_read and u.kind != ru.AUDIT for m in u.members]
     for m in must:
         if m.entry_id and m.entry_id.startswith(("a:", "b:")):
             world.judge(m.stream, m.anchor_ref, "changed_real")
+    # The change_inconclusive opened an audit: a blind second reading that agrees closes it.
+    assert _review(world, k=0).report["must_read_complete"] is False
+    world.judge(
+        DX,
+        _pair_anchor(DX, "00001000", "00001000"),
+        "change_inconclusive",
+        shadow=True,
+        ctx=overlay.WriteContext(channel="mcp", session="auditor"),
+    )
     r = _review(world, k=0)
     assert r.report["must_read_complete"] is True
     assert r.report["complete"] is False  # second tier unjudged
@@ -546,3 +561,300 @@ def test_the_skill_prints_and_installs(tmp_path: Path) -> None:
     res = CliRunner().invoke(review, ["skill", "--install", str(tmp_path / "skills")])
     assert res.exit_code == 0
     assert (tmp_path / "skills" / "tmap-diff-review" / "SKILL.md").read_text() == out.output
+
+
+# ── audits and disagreements ─────────────────────────────────────────────────────────────────
+
+A1 = _pair_anchor(DX, "00001000", "00001000")
+
+
+def _ctx(session: str) -> Any:
+    return overlay.WriteContext(channel="mcp", session=session)
+
+
+def _nrc(anchor: str) -> dict[str, Any]:
+    return {"checked": [anchor], "why_unchanged": "same call"}
+
+
+def test_a_no_real_change_is_audited_blind_and_an_agreeing_reading_closes_it(
+    world: World,
+) -> None:
+    """★ A no_real_change opens an audit unit (its member read without its state); a shadow from
+    the session that wrote it is not blind and closes nothing; a blind shadow that agrees closes
+    it, and must_read_complete is no longer held by it.
+
+    MUTATION (verified RED): open no audit on no_real_change -> RED; count a non-blind shadow ->
+    the writer's own shadow closes it -> RED."""
+    world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
+    r = _review(world, k=0)
+    assert len(r.audits.open) == 1
+    audit = r.audits.open[0]
+    assert audit.sources == ("no_real_change",) and audit.write_session == "writer"
+    assert r.report["audits"]["open"] == 1
+    own = overlay.WriteContext(
+        channel="mcp", session="writer", read_basis={"basis": "fetched", "non_blind": True}
+    )
+    world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), shadow=True, ctx=own)
+    assert len(_review(world, k=0).audits.open) == 1
+    world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), shadow=True, ctx=_ctx("auditor"))
+    r = _review(world, k=0)
+    assert r.audits.open == [] and r.audits.disagreements == []
+
+
+def test_a_reading_otherwise_is_a_disagreement_that_a_person_settles(world: World) -> None:
+    """★ A blind shadow with another verdict is a disagreement (must_read_complete false); a
+    person's judgement settles it — and is not itself audited.
+
+    MUTATION (verified RED): let a human write be audited -> an audit remains -> RED; ignore a
+    disagreeing shadow -> RED."""
+    world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
+    world.judge(DX, A1, "changed_real", shadow=True, ctx=_ctx("auditor"))
+    r = _review(world, k=0)
+    assert len(r.audits.disagreements) == 1
+    d = r.audits.disagreements[0]
+    assert d["why"] == "audit_reads_otherwise" and d["shadow"] == ["changed_real"]
+    assert r.report["must_read_complete"] is False
+    world.judge(DX, A1, "changed_real", attributed_to="human", ctx=_ctx("person"))
+    r = _review(world, k=0)
+    assert r.audits.disagreements == [] and r.audits.open == []
+    # The person's judgement is the current one; the agent's and the audit's stay in the history.
+    row = world.atlas.execute(
+        "SELECT verdict, attributed_to FROM overlay WHERE anchor_ref = ?", (A1,)
+    ).fetchone()
+    assert tuple(row) == ("changed_real", "human")
+    events = [
+        tuple(e)
+        for e in world.atlas.execute(
+            "SELECT event, attributed_to FROM overlay_history WHERE anchor_ref = ? ORDER BY id",
+            (A1,),
+        )
+    ]
+    assert events == [
+        ("insert", "agent-via-mcp"),
+        ("shadow", "agent-via-mcp"),
+        ("update", "human"),
+    ]
+
+
+def test_an_overwrite_by_another_session_is_a_disagreement(world: World) -> None:
+    """★ Two sessions write the same anchor with different verdicts: the later stands and the pair
+    is a disagreement; the same session changing its mind is not.
+
+    MUTATION (verified RED): flag only the audit kind -> RED."""
+    world.judge(DX, A1, "changed_real", ctx=_ctx("s1"))
+    world.judge(DX, A1, "changed_real", ctx=_ctx("s1"))
+    assert _review(world, k=0).audits.disagreements == []
+    world.judge(DX, A1, "change_inconclusive", ctx=_ctx("s2"))
+    found = [x for x in _review(world, k=0).audits.disagreements if x["anchor_ref"] == A1]
+    assert len(found) == 1
+    assert found[0]["why"] == "overwritten_by_another_session"
+    assert found[0]["before"] == "changed_real"
+
+
+# ── the MCP writes: unit, shadow, read basis ─────────────────────────────────────────────────
+
+
+def _server_call(server: Any, name: str, args: dict[str, Any]) -> dict[str, Any]:
+    from tests.unit.test_tool_surface import _call
+
+    return _call(server, name, args)
+
+
+def test_a_write_naming_its_unit_records_what_was_read_and_hands_on_the_next(
+    world: World,
+) -> None:
+    """★ Through the server: the unit handed out by start_diff_review, judged with its unit_id,
+    records read_basis unit_delivered and answers with the next unit; a write on a must-read
+    member that read nothing first records unread_before_verdict — which opens an audit.
+
+    MUTATION (verified RED): leave read_basis out of the write's context -> RED; never mark
+    unread_before_verdict -> no audit -> RED."""
+    server = mcp_app.build_server(world.path)
+    head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
+    nxt = head["next_unit"]
+    anchor = nxt["members"][0]["anchor_ref"]
+    out = _server_call(
+        server,
+        "annotate_diff",
+        {
+            "anchor_ref": anchor,
+            "verdict": "changed_real",
+            "rationale": "r",
+            "diff_id": DX,
+            "unit_id": nxt["unit_id"],
+        },
+    )
+    assert out.get("written") is True, out
+    assert (out.get("read_basis") or {}).get("basis") == "unit_delivered"
+    assert out["next_unit"]["unit_id"] != nxt["unit_id"]
+    hist = world.atlas.execute(
+        "SELECT unit_id, read_basis, channel FROM overlay_history WHERE anchor_ref = ?", (anchor,)
+    ).fetchone()
+    assert hist[0] == nxt["unit_id"] and hist[2] == "mcp"
+    assert json.loads(hist[1] or "{}").get("basis") == "unit_delivered"
+    p_entry = f"{PAIR}#function_presence#libx::b:00004000"
+    blind = _server_call(
+        server,
+        "annotate_diff",
+        {"anchor_ref": p_entry, "verdict": "changed_real", "rationale": "r", "diff_id": DX},
+    )
+    assert blind.get("written") is True, blind
+    assert blind["read_basis"] == {"basis": "none", "unread_before_verdict": True}
+    audits = _review(world, k=0).audits.open
+    assert any(
+        a.member.anchor_ref == p_entry and "unread_before_verdict" in a.sources for a in audits
+    )
+
+
+def test_an_audit_unit_write_is_a_shadow_and_a_person_cannot_be_claimed_over_mcp(
+    world: World,
+) -> None:
+    """★ A write naming an audit unit is a shadow (the current judgement unchanged); a write
+    naming a unit it is not a member of is refused; attributed_to='human' is refused over MCP,
+    'human-via-agent' is recorded.
+
+    MUTATION (verified RED): write an audit unit's judgement as a normal write -> the current
+    verdict changes -> RED; accept 'human' over MCP -> RED."""
+    tool = mcp_app.make_tools(world.path)["annotate_diff"]
+    world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
+    opened = _review(world, k=0).audits.open
+    assert len(opened) == 1
+    uid = opened[0].unit.unit_id
+    out = tool(A1, "changed_real", "r", diff_id=DX, unit_id=uid)
+    assert out.get("written") is True and "SHADOW" in out["note"]
+    row = world.atlas.execute("SELECT verdict FROM overlay WHERE anchor_ref = ?", (A1,)).fetchone()
+    assert row[0] == "no_real_change"
+    other = _pair_anchor(DX, "00003000", "00003000")
+    stray = tool(other, "changed_real", "r", diff_id=DX, unit_id=uid)
+    assert stray.get("written") is False and "does not hold" in stray["error"]
+    refused = tool(other, "changed_real", "r", diff_id=DX, attributed_to="human")
+    assert refused.get("written") is False and "human-via-agent" in refused["error"]
+    relayed = tool(other, "changed_real", "r", diff_id=DX, attributed_to="human-via-agent")
+    assert relayed.get("written") is True
+    who = world.atlas.execute(
+        "SELECT attributed_to FROM overlay WHERE anchor_ref = ?", (other,)
+    ).fetchone()
+    assert who[0] == "human-via-agent"
+
+
+# ── a person's channels: judge and the worksheet ─────────────────────────────────────────────
+
+
+def test_judge_takes_a_person_only_on_an_interactive_terminal(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ --by human from a pipe is refused (nothing written); human-via-agent is written so; on a
+    terminal with an agent marker set it drops to human-via-agent; on a plain terminal with the
+    confirmation typed it is human.
+
+    MUTATION (verified RED): skip the terminal check -> the pipe writes 'human' -> RED; ignore the
+    marker -> RED."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli import review_cli
+
+    unit = next(u for u in _review(world, k=0).units if len(u.members) == 1)
+    anchor = unit.members[0].anchor_ref
+    base = [unit.unit_id, PAIR, "--verdict", "changed_real", "--rationale", "r", "--k", "0"]
+    base += ["--atlas", str(world.path)]
+    run = CliRunner().invoke
+    for var in review_cli.AGENT_ENV_MARKERS:
+        monkeypatch.delenv(var, raising=False)
+
+    def who() -> str | None:
+        row = world.atlas.execute(
+            "SELECT attributed_to FROM overlay WHERE anchor_ref = ?", (anchor,)
+        ).fetchone()
+        return row[0] if row else None
+
+    res = run(review_cli.review, ["judge", *base])
+    assert res.exit_code != 0 and "interactive terminal" in res.output and who() is None
+    assert run(review_cli.review, ["judge", *base, "--by", "human-via-agent"]).exit_code == 0
+    assert who() == "human-via-agent"
+    monkeypatch.setattr(review_cli, "_interactive", lambda: True)
+    monkeypatch.setenv(review_cli.AGENT_ENV_MARKERS[0], "1")
+    res = run(review_cli.review, ["judge", *base])
+    assert res.exit_code == 0 and "human-via-agent" in res.output
+    monkeypatch.delenv(review_cli.AGENT_ENV_MARKERS[0])
+    res = run(review_cli.review, ["judge", *base], input="human\n")
+    assert res.exit_code == 0, res.output
+    assert who() == "human"
+
+
+def test_the_worksheet_goes_out_and_comes_back_through_the_same_gates(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ --emit lists the open audits; --apply writes each filled item through annotate_diff (a
+    person's attribution, the worksheet channel) and refuses one whose checked names nothing in the
+    view — that one is not written.
+
+    MUTATION (verified RED): write the items straight to the overlay (no annotate_diff) -> the bad
+    item is taken -> RED."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli import review_cli
+
+    for var in review_cli.AGENT_ENV_MARKERS:
+        monkeypatch.delenv(var, raising=False)
+    a2 = _pair_anchor(DX, "00003000", "00003000")
+    world.judge(DX, A1, "change_inconclusive", ctx=_ctx("w"))
+    world.judge(DX, a2, "change_inconclusive", ctx=_ctx("w"))
+    sheet = tmp_path / "sheet.json"
+    run = CliRunner().invoke
+    at = ["--atlas", str(world.path)]
+    assert run(review_cli.review, ["audit", PAIR, "--emit", str(sheet), *at]).exit_code == 0
+    data = json.loads(sheet.read_text())
+    items = {it["anchor_ref"]: it for it in data["items"]}
+    assert {A1, a2} <= set(items)
+    items[A1].update(verdict="changed_real", rationale="the guard is gone")
+    items[a2].update(
+        verdict="no_real_change",
+        why_unchanged="w",
+        checked=["runA::runB#function_pair#libx::0dead::0beef"],
+    )
+    sheet.write_text(json.dumps(data))
+    res = run(
+        review_cli.review,
+        ["audit", PAIR, "--apply", str(sheet), "--by", "human-via-agent", *at],
+    )
+    assert res.exit_code == 0, res.output
+    assert "written 1, refused 1" in res.output
+    rows = dict(
+        world.atlas.execute(
+            "SELECT anchor_ref, verdict FROM overlay WHERE anchor_ref IN (?, ?)", (A1, a2)
+        ).fetchall()
+    )
+    assert rows == {A1: "changed_real", a2: "change_inconclusive"}
+    ch = world.atlas.execute(
+        "SELECT channel, attributed_to FROM overlay_history WHERE anchor_ref = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (A1,),
+    ).fetchone()
+    assert tuple(ch) == ("worksheet", "human-via-agent")
+
+
+def test_a_batch_naming_its_unit_records_it_and_hands_on_the_next(world: World) -> None:
+    """annotate_diff_batch with unit_id writes every item with the unit in its history and answers
+    with the next unit; an item outside the unit refuses the batch, nothing written.
+
+    MUTATION (verified RED): drop the context in the batch's write -> no unit_id in the history ->
+    RED."""
+    tool = mcp_app.make_tools(world.path)["annotate_diff_batch"]
+    unit = next(u for u in _review(world).units if u.kind == ru.ENTRY)
+    item = {"anchor_ref": unit.members[0].anchor_ref, "verdict": "changed_real", "rationale": "r"}
+    out = tool([item], diff_id=unit.stream, unit_id=unit.unit_id)
+    assert out.get("written") is True, out
+    assert "next_unit" in out
+    got = world.atlas.execute(
+        "SELECT unit_id FROM overlay_history WHERE anchor_ref = ?", (item["anchor_ref"],)
+    ).fetchone()
+    assert got is not None and got[0] == unit.unit_id
+    other = next(
+        m
+        for u in _review(world).units
+        for m in u.members
+        if m.stream == unit.stream and m.anchor_ref != item["anchor_ref"]
+    )
+    stray = dict(item, anchor_ref=other.anchor_ref)
+    bad = tool([stray], diff_id=unit.stream, unit_id=unit.unit_id)
+    assert bad.get("written") is False

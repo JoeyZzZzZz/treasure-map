@@ -532,23 +532,27 @@ def test_the_first_counts_name_the_floated_and_the_conflicting(tmp_path: Path) -
     assert s["changed"]["with_counterpart_conflict"] == 1
 
 
-def test_the_evidence_is_read_in_the_view_never_in_the_build_or_a_judgement(
+def test_the_evidence_is_not_read_in_the_build_and_once_read_it_is_a_judgements_fact(
     tmp_path: Path,
 ) -> None:
-    """The build leaves pair_evidence unset (annotate / promote never pay for it), and a
-    judgement's basis (diff_review.entry_facts) is the same with it attached.
+    """The build leaves pair_evidence unset (a promote that needs no facts never pays for it);
+    once attached — as the write and the re-check both attach it — what it and the counterpart
+    hint read is part of a judgement's facts (R9), so a change in either re-checks it.
 
-    MUTATION (verified RED, 1 failed): attach the evidence in build_diff_view -> RED."""
+    MUTATION (verified RED, 1 failed): attach the evidence in build_diff_view -> RED; leave the two
+    states out of entry_facts -> the facts do not change -> RED."""
     w = _evidence_world(tmp_path)
     built = pv.build_diff_view(w.atlas, DIFF)
     assert built is not None
     by_id = {e.entry_id: e for e in built.entries}
     e = by_id[_pair_id(*CONFLICT)]
     assert e.pair_evidence is None and e.counterpart_hint is None
-    before = json.dumps(dr.entry_facts(e), sort_keys=True)
+    assert dr.entry_facts(e).get("pair_evidence") is None
     pv._attach_pair_evidence(w.atlas, built)
     assert e.pair_evidence is not None and e.counterpart_hint is not None
-    assert json.dumps(dr.entry_facts(e), sort_keys=True) == before
+    facts = dr.entry_facts(e)
+    assert facts.get("pair_evidence") == e.pair_evidence["state"]
+    assert facts.get("counterpart_hint") == e.counterpart_hint["state"] == "conflict"
 
 
 def test_a_re_extraction_is_not_served_stale_anchors(tmp_path: Path) -> None:

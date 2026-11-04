@@ -5730,6 +5730,9 @@ class ViewReview:
     ) -> None:
         d = built.diff
         self.built = built
+        # The pair evidence is part of an entry's facts (diff_review.entry_facts): attach it before
+        # any judgement is read against them, as the write path does (once per build).
+        _attach_pair_evidence(atlas, built)
         # Bucket S marks its entries in place, and the same-shape group re-check below reads which
         # entries are listed: decide it before anything else reads the build.
         self.listed = listed if listed is not None else listed_view(atlas, built)

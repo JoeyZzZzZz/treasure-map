@@ -90,6 +90,7 @@ EXCLUDED_COLUMNS: dict[tuple[str, str, str], str] = {
     ("atlas", "diff_meta", "created_at"): "timestamp",
     ("atlas", "overlay", "created_at"): "timestamp",
     ("atlas", "overlay", "updated_at"): "timestamp",
+    ("atlas", "overlay_history", "at"): "timestamp",
     # the stamps themselves: they describe the code, which is what is being compared, not output
     ("analysis", "scan_stamp", "stamp"): "the scan stamp (pipeline code hash + deps + config)",
     ("atlas", "run", "scan_stamp"): "the scan stamp, copied onto the run row",

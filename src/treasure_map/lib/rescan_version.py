@@ -65,6 +65,10 @@ HUNT_ROOT = "lib.hunt.analyzer2"
 # Modules never entered when walking a closure, with the reason. This module computes the stamp, so
 # hashing it would make an edit to it read every run as stale.
 CLOSURE_EXCLUDED: dict[str, str] = {
+    "lib.atlas.overlay_schema": (
+        "only creates and migrates the judgement layer's tables (overlay, overlay_history); the "
+        "hunt neither reads nor writes them, and nothing it does enters a hunt content row"
+    ),
     "lib.rescan_version": (
         "computes the stamp itself; nothing it returns is written into a content row"
     ),

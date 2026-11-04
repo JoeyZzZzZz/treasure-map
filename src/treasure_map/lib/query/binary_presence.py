@@ -434,7 +434,7 @@ def require_presence_checked(
     own run. An item that looks like an anchor or an evidence_ref but is neither — another
     binary's candidate, another run's — is refused by name; plain text is kept but does not count;
     at least one item must resolve."""
-    from treasure_map.lib.query.diff_annotations import _anchor_marker
+    from treasure_map.lib.query.diff_annotations import _anchor_marker, elsewhere_refusal
 
     target = next((b for b in presence.items if presence.anchor(b) == anchor_ref), None)
     if target is None:  # the caller resolved the anchor already
@@ -458,6 +458,8 @@ def require_presence_checked(
                 f"{field}[{i}] is not a candidate of {target.name} ({target.rel_path}) in run "
                 f"{target.run!r}"
             )
+        if _anchor_marker(item) == "non_binary":
+            raise ConfigError(elsewhere_refusal(field, i, "non_binary"))
         if dr.is_binary_presence_anchor(item) or _anchor_marker(item) is not None:
             raise ConfigError(
                 f"{field}[{i}] looks like an anchor but is neither this binary's anchor_ref nor "

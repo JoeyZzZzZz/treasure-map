@@ -42,6 +42,7 @@ from treasure_map.lib.query.diff_align import (
 from treasure_map.lib.query.patch_view import (
     BuiltDiff,
     ViewReview,
+    _attach_pair_evidence,
     _Entry,
     build_diff_view,
     listed_view,
@@ -146,8 +147,11 @@ def capture_diff_basis_on(
     anchor_ref: str,
 ) -> dict[str, Any]:
     """``capture_diff_basis`` against an already-built view and ``_binary_diff`` meta — the batch
-    builds both once and reuses them. Same anchor check, same refusal, same snapshot."""
+    builds both once and reuses them. Same anchor check, same refusal, same snapshot. The pair
+    evidence is attached first, as the view's reading attaches it, so the facts stored are the
+    ones a later re-check reads."""
     _check_anchor(anchor_ref, meta)
+    _attach_pair_evidence(atlas, built)
     entries = listed_view(atlas, built).entries
     subjects = dr.subjects_of(entries, meta["run_a_id"], meta["run_b_id"], meta["binary_a"])
     subject = subjects.get(anchor_ref)
@@ -178,8 +182,18 @@ _ENTRY_ID_MARKER = re.compile(r"^(?:pair:[0-9a-fx]+:[0-9a-fx]+|[ab]:[0-9a-fx]+)$
 _EVIDENCE_REF_MARKER = re.compile(r"^[^#\s]+#[0-9a-f]{8,}:")
 
 
+# The two pair-level subjects: a non-binary file and a binary one run holds alone. Each is judged
+# on its own anchor (with run_pair); on any other subject it names something that is not there.
+_NON_BINARY_MARKER = re.compile(r"^[^\s#]+::[^\s#]+#non_binary#")
+_PAIR_SUBJECT_MARKERS = ("non_binary", "binary_presence")
+
+
 def _anchor_marker(item: str) -> str | None:
     """The kind of anchor ``item`` LOOKS like (a closed set), or None for a plain-text note."""
+    if _NON_BINARY_MARKER.match(item):
+        return "non_binary"
+    if dr.is_binary_presence_anchor(item):
+        return "binary_presence"
     if _PAIR_ANCHOR_MARKER.match(item):
         return "anchor_ref"
     if _ENTRY_ID_MARKER.match(item):
@@ -229,6 +243,17 @@ def is_diff_anchor(
     return None
 
 
+def elsewhere_refusal(field: str, i: int, marker: str) -> str:
+    """The refusal for an anchor of a pair-level subject (a non-binary file, a binary one run holds
+    alone) cited where it does not belong: it is never kept as plain text, and its own judgement is
+    named."""
+    what = "a non-binary file" if marker == "non_binary" else "a binary one run holds alone"
+    return (
+        f"{field}[{i}] is a {marker} anchor: it names {what}, which is judged on its own — "
+        "annotate_diff(anchor_ref=<that anchor>, run_pair=...) — not cited for this subject"
+    )
+
+
 def _rule_for(field: str) -> str:
     """``CHECKED_RULE`` worded for the field being checked (``checked`` or ``evidence``)."""
     return dr.CHECKED_RULE if field == "checked" else dr.CHECKED_RULE.replace("checked", field, 1)
@@ -267,6 +292,8 @@ def require_checked_anchor(
             hits += 1
             continue
         marker = _anchor_marker(item)
+        if marker in _PAIR_SUBJECT_MARKERS:
+            raise ConfigError(elsewhere_refusal(field, i, marker))
         if marker is not None:
             raise ConfigError(
                 f"{field}[{i}] looks like a {marker} anchor but names nothing in this diff's "
@@ -278,8 +305,6 @@ def require_checked_anchor(
 
 
 # ── a judgement on a non-binary file ─────────────────────────────────────────────────────────
-
-_NON_BINARY_MARKER = re.compile(r"^[^\s#]+::[^\s#]+#non_binary#")
 
 
 @dataclass
@@ -361,6 +386,8 @@ def require_file_checked_anchor(
                 f"lists for {scope.run_a}::{scope.run_b} now"
             )
         marker = _anchor_marker(item)
+        if marker == "binary_presence":
+            raise ConfigError(elsewhere_refusal(field, i, marker))
         if marker is not None:
             if scope.built is None:
                 raise ConfigError(
@@ -427,10 +454,12 @@ def check_promotion(
     3. WHETHER THE DIFF IS CURRENT — ``source_stale`` must be false; true or null is refused unless
        ``allow_stale_source``, which is then recorded in the origin.
 
-    The origin records the diff, the entry's anchor, and the carrying row's ``landing`` +
-    ``subclass`` — where the judgement was carried from. A recorded landing, ``persisted``
-    included, says where it came from, NOT that the code is unchanged; whether the basis has moved
-    is ``basis_state``, read separately.
+    The origin records the diff, the entry's anchor, the carrying ROW's ``landing`` + ``subclass``
+    (``subclass`` is the row's), and the ENTRY's ``entry_bucket`` + ``entry_subclass`` (the bucket
+    the entry is listed under and its subclass there) — where the judgement was carried from. An
+    origin written before the entry's two keys existed lacks them: the entry's subclass was not
+    recorded. A recorded landing, ``persisted`` included, says where it came from, NOT that the
+    code is unchanged; whether the basis has moved is ``basis_state``, read separately.
     """
     meta = _binary_diff(atlas, diff_id)
     built = _built(atlas, diff_id)
@@ -481,6 +510,8 @@ def check_promotion(
         "anchor_ref": anchor,
         "landing": promoted["landing"],
         "subclass": promoted["subclass"],
+        "entry_bucket": e.shown_bucket or None,
+        "entry_subclass": e.shown_subclass or None,
     }
     stale = built.staleness.get("source_stale")
     if stale is not False:

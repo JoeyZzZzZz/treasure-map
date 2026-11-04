@@ -179,6 +179,7 @@ def entry_facts(e: _Entry) -> dict[str, Any]:
             ([r.a_ref, r.b_ref, r.presence, r.presence_reason, r.counterpart_call] for r in e.rows),
             key=json.dumps,
         )
+        callsites = e.sink_callsite_counts
         return {
             "alignment_state": p.state,
             "similarity": p.similarity,
@@ -186,6 +187,20 @@ def entry_facts(e: _Entry) -> dict[str, Any]:
             "export_gap_b": p.export_gap_b,
             "bucket": e.bucket or None,
             "rows": rows,
+            # The read-face signals a judgement leans on (R9): whether the entry is listed as S
+            # (bucket stays empty there), its subclass where it is listed, what the pair evidence
+            # and the counterpart hint read, and which sinks are called a different number of
+            # times. A snapshot written before these keys existed is compared on its own keys
+            # only (facts_delta), so adding them moves no judgement.
+            "listed_as": e.listed_as or None,
+            "subclass": e.shown_subclass or None,
+            "pair_evidence": (e.pair_evidence or {}).get("state"),
+            "counterpart_hint": (e.counterpart_hint or {}).get("state"),
+            "sink_callsite_delta": (
+                sorted([d["sink"], d["a"], d["b"]] for d in callsites["delta"])
+                if callsites is not None
+                else None
+            ),
         }
     assert e.unpaired is not None
     u = e.unpaired
@@ -282,10 +297,14 @@ def stored_snapshot(raw: str | None) -> dict[str, Any] | None:
 
 def facts_delta(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     """What moved between two fact sets, per field: ``[then, now]`` for a value, the rows added and
-    removed for ``rows``. Empty when nothing moved."""
+    removed for ``rows``. Empty when nothing moved.
+
+    Only the keys the stored snapshot holds are compared: a fact added to ``entry_facts`` after a
+    judgement was written is not a move of that judgement (it never read it). A snapshot with no
+    facts at all is compared on every key — nothing it holds can show the subject unchanged."""
     old, new = _plain(old), _plain(new)
     moved: dict[str, Any] = {}
-    for key in sorted(set(old) | set(new)):
+    for key in sorted(set(old) if old else set(new)):
         then, now = old.get(key), new.get(key)
         if then == now:
             continue

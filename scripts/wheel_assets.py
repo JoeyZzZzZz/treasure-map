@@ -23,6 +23,7 @@ ASSETS: tuple[tuple[str, str], ...] = (
     ("treasure_map.lib.diff.ghidra", "FallbackBinExport2Builder.java"),
     ("treasure_map.lib.diff.ghidra", "StackVarnodeMarkup.java"),
     ("treasure_map.lib.storage", "atlas_schema.sql"),
+    ("treasure_map.lib.storage", "overlay_schema.sql"),
     ("treasure_map.lib.storage", "schema.sql"),
     ("treasure_map.lib.setup", "toolchain_lock.json"),
     ("treasure_map.skills", "diff-review.md"),

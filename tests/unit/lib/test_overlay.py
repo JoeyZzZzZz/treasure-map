@@ -59,14 +59,15 @@ def _dump_base(con: sqlite3.Connection) -> dict[str, list]:
 
 
 def test_overlay_source_only_writes_the_overlay_table() -> None:
-    # ★ static guard: every INSERT/UPDATE/DELETE in overlay.py targets the `overlay` table; the base
-    # map (instance/pattern) is only ever READ. A write to instance/pattern here would go red.
+    # ★ static guard: every INSERT/UPDATE/DELETE in overlay.py targets the judgement layer — the
+    # `overlay` table or its `overlay_history`; the base map (instance/pattern) is only ever READ.
+    # A write to instance/pattern here would go red.
     src = (
         Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib" / "overlay.py"
     ).read_text()
     writes = re.findall(r"(?:INSERT INTO|UPDATE|DELETE FROM)\s+(\w+)", src)
     assert writes, "expected to find the overlay writes"
-    assert all(tbl == "overlay" for tbl in writes), (
+    assert all(tbl in ("overlay", "overlay_history") for tbl in writes), (
         f"overlay.py writes a non-overlay table: {writes}"
     )
     assert "FROM instance" in src  # it DOES read the base map (for the basis snapshot)
@@ -702,7 +703,7 @@ _OVERLAY_WRITE_TOKEN = re.compile(
 # that has to be declared here too.
 _OVERLAY_WRITE_HOME = "lib/overlay.py"
 _OVERLAY_WRITE_BUDGET = {
-    "lib/atlas/connection.py": 2,  # the run_id backfill and the verdict rename
+    "lib/atlas/overlay_schema.py": 2,  # the run_id backfill and the verdict rename
 }
 
 

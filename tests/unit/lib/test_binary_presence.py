@@ -729,3 +729,66 @@ def test_files_that_cannot_be_read_hold_the_run_pair_incomplete(
     progress = _progress(world)
     assert progress["non_binary_files_unavailable"] == "cannot read the pair's files"
     assert progress["complete"] is False
+
+
+def test_a_non_binary_anchor_on_a_binary_is_refused_by_name(world: World) -> None:
+    """★ R4: a non-binary file's anchor, cited in a binary_presence judgement's ``checked`` beside
+    the binary's own anchor, is refused by name — never kept as plain text.
+
+    MUTATION (verified RED): leave non_binary out of _anchor_marker's closed set -> it is kept as
+    a note and the write succeeds -> RED."""
+    app = _anchor("a_only", "web/app/app.cgi")
+    with pytest.raises(ConfigError, match="is a non_binary anchor"):
+        overlay.annotate_diff(
+            world.atlas,
+            anchor_ref=app,
+            verdict="no_real_change",
+            rationale="x",
+            verdict_basis={"why_unchanged": "x", "checked": [app, f"{PAIR}#non_binary#etc/rc"]},
+            run_pair=PAIR,
+        )
+
+
+def test_a_presence_judgement_counts_only_when_it_cites_the_binarys_first_candidates(
+    world: World,
+) -> None:
+    """★ A binary_presence judgement that cites fewer than its binary's first candidates (all of
+    them, below 20) is not disposed — it reads needs_recheck in the pair review and the report
+    names it; citing every one disposes it.
+
+    MUTATION (verified RED): skip the citation check -> the judgement citing its own anchor only
+    is disposed -> RED."""
+    from treasure_map.lib.query import review_units as ru
+
+    app = _anchor("a_only", "web/app/app.cgi")
+    refs = [
+        r[0]
+        for r in world.atlas.execute(
+            "SELECT evidence_ref FROM instance WHERE binary_path LIKE '%/app.cgi'"
+        )
+    ]
+    assert len(refs) == 2
+
+    def judge(cited: list[str]) -> ru.PairReview:
+        overlay.annotate_diff(
+            world.atlas,
+            anchor_ref=app,
+            verdict="no_real_change",
+            rationale="x",
+            verdict_basis={"why_unchanged": "a debug cgi", "checked": cited},
+            run_pair=PAIR,
+        )
+        return ru.review_pair(
+            world.atlas,
+            "runA",
+            "runB",
+            pair_staleness={"source_stale": False, "source_stale_reason": None},
+            server_commit=None,
+        )
+
+    short = judge([app])
+    assert short.progress.states.get(app) == "needs_recheck"
+    assert short.report["presence_citations_short"].get(app, {}).get("required") == 2
+    whole = judge([app, *refs])
+    assert ru.disposed(whole.progress.states.get(app))
+    assert app not in whole.report["presence_citations_short"]

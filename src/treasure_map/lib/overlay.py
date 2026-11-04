@@ -77,7 +77,19 @@ _DIFF_VERDICTS = ("changed_real", "no_real_change", "change_inconclusive")
 _ANCHOR_KINDS = ("evidence_ref", "diff_subject")
 # Coarse attribution only. NULL means "not recorded"; a fabricated identity is never written (the
 # schema CHECK enforces this set). A real identity matters only at a later promotion boundary.
-_ATTRIBUTION = ("agent", "agent-via-mcp")
+# Who wrote a judgement (the schema's CHECK — lib/storage/overlay_schema.sql). 'human' is a
+# declaration typed and confirmed on an interactive terminal of this machine, not a proof; only the
+# command line's human channels write it. 'human-via-agent' is a person's judgement an agent wrote.
+_ATTRIBUTION = ("agent", "agent-via-mcp", "human", "human-via-agent")
+# The kinds of change a changed_real may name (any number of them): what the change does.
+CHANGE_KINDS = (
+    "sink_removed",
+    "sink_replaced",
+    "guard_added",
+    "constant_changed",
+    "restructured",
+    "unknown",
+)
 
 # The base-map dimensions an annotation rests on. Snapshotted per sibling instance so a later read
 # can report which fact moved under a standing annotation. pattern_id keys the sibling: it is
@@ -229,7 +241,8 @@ def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str
     anchors read) and ``why_unchanged``. It is the verdict that sinks an entry, and like ``safe`` a
     wrong one only comes back when the diff's facts move, so it has to say what was looked at and
     why nothing real changed. ``changed_real`` MAY carry ``evidence`` (a non-empty list of non-blank
-    items it rests on) and nothing else; the other verdicts carry no basis.
+    items it rests on) and ``change_kind`` (one or more of ``CHANGE_KINDS``: what the change does),
+    and nothing else; the other verdicts carry no basis.
 
     ★ Shape only. The anchor threshold — that an item which looks like an anchor actually resolves
     in the diff's current view, and that at least one does — is enforced separately against the
@@ -239,6 +252,8 @@ def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str
     vb = vb or None
     if vb is not None and "evidence" in vb and verdict != "changed_real":
         raise ConfigError("evidence applies to changed_real only")
+    if vb is not None and "change_kind" in vb and verdict != "changed_real":
+        raise ConfigError("change_kind applies to changed_real only")
     if verdict == "no_real_change":
         if not vb:
             raise ConfigError(
@@ -268,25 +283,43 @@ def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str
     if verdict == "changed_real":
         if vb is None:
             return None
-        extra = set(vb) - {"evidence"}
+        extra = set(vb) - {"evidence", "change_kind"}
         if extra:
             raise ConfigError(
-                "changed_real takes evidence only, not checked / why_unchanged — record what the "
-                "change does in rationale"
+                "changed_real takes evidence and change_kind only, not checked / why_unchanged — "
+                "record what the change does in rationale"
             )
+        out: dict[str, Any] = {"kind": "changed_real"}
         evidence = vb.get("evidence")
-        if evidence is None:
+        if evidence is not None:
+            if not (
+                isinstance(evidence, list)
+                and evidence
+                and all(isinstance(e, str) and e.strip() for e in evidence)
+            ):
+                raise ConfigError(
+                    "changed_real.evidence needs at least one non-blank item — the facts or "
+                    "anchors it rests on"
+                )
+            out["evidence"] = [e.strip() for e in evidence]
+        kinds = vb.get("change_kind")
+        if kinds is not None:
+            if isinstance(kinds, str):
+                kinds = [kinds]
+            if not (
+                isinstance(kinds, list)
+                and kinds
+                and all(k in CHANGE_KINDS for k in kinds)
+                and len(set(kinds)) == len(kinds)
+            ):
+                raise ConfigError(
+                    f"changed_real.change_kind takes one or more of {list(CHANGE_KINDS)}, each "
+                    f"once; got {kinds!r}"
+                )
+            out["change_kind"] = list(kinds)
+        if len(out) == 1:
             return None
-        if not (
-            isinstance(evidence, list)
-            and evidence
-            and all(isinstance(e, str) and e.strip() for e in evidence)
-        ):
-            raise ConfigError(
-                "changed_real.evidence needs at least one non-blank item — the facts or anchors it "
-                "rests on"
-            )
-        return json.dumps({"kind": "changed_real", "evidence": [e.strip() for e in evidence]})
+        return json.dumps(out)
     if vb is not None:
         raise ConfigError(
             f"verdict_basis applies to no_real_change or changed_real only, not {verdict!r}"
@@ -439,6 +472,77 @@ def _run_id_from_ref(anchor_ref: str) -> str | None:
     return head or None
 
 
+# Where a write came from (overlay_history.channel): the MCP tools, the command line's human
+# channels (judge, the worksheet), another command-line write, a library caller.
+CHANNELS = ("mcp", "judge", "worksheet", "cli", "api")
+
+
+@dataclass(frozen=True)
+class WriteContext:
+    """What overlay_history records about a write besides the row itself: its channel, the work
+    unit it was written for, what was read before it (``read_basis``, from the tool-call log) and
+    the writing server's session."""
+
+    channel: str = "api"
+    unit_id: str | None = None
+    read_basis: dict[str, Any] | None = None
+    session: str | None = None
+
+
+_API = WriteContext()
+
+
+def _row(atlas: sqlite3.Connection, overlay_id: int) -> dict[str, Any] | None:
+    row = atlas.execute("SELECT * FROM overlay WHERE id = ?", (overlay_id,)).fetchone()
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        return {k: row[k] for k in row.keys()}  # noqa: SIM118 — Row has no items()
+    cols = [d[0] for d in atlas.execute("SELECT * FROM overlay LIMIT 0").description]
+    return dict(zip(cols, row, strict=True))
+
+
+def record_history(
+    atlas: sqlite3.Connection,
+    *,
+    event: str,
+    anchor_kind: str | None,
+    anchor_ref: str | None,
+    overlay_id: int | None = None,
+    run_id: str | None = None,
+    before: dict[str, Any] | None = None,
+    after: dict[str, Any] | None = None,
+    attributed_to: str | None = None,
+    ctx: WriteContext | None = None,
+    note: dict[str, Any] | None = None,
+) -> int:
+    """Append one row to overlay_history (no commit: it rides the write's own transaction)."""
+    c = ctx or _API
+    cur = atlas.execute(
+        "INSERT INTO overlay_history (event, overlay_id, anchor_kind, anchor_ref, run_id, before, "
+        "after, attributed_to, channel, unit_id, read_basis, session, note) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event,
+            overlay_id,
+            anchor_kind,
+            anchor_ref,
+            run_id,
+            json.dumps(before, sort_keys=True) if before is not None else None,
+            json.dumps(after, sort_keys=True) if after is not None else None,
+            attributed_to,
+            c.channel,
+            c.unit_id,
+            json.dumps(c.read_basis, sort_keys=True) if c.read_basis is not None else None,
+            c.session,
+            json.dumps(note, sort_keys=True) if note is not None else None,
+        ),
+    )
+    hid = cur.lastrowid
+    assert hid is not None
+    return int(hid)
+
+
 def _write_row(
     atlas: sqlite3.Connection,
     *,
@@ -451,8 +555,11 @@ def _write_row(
     verdict_basis: str | None,
     promoted_from: str | None,
     basis_resolved: bool,
+    ctx: WriteContext | None = None,
 ) -> UpsertResult:
-    """Insert or overwrite the one row of ``(anchor_kind, anchor_ref)``, validated by the caller.
+    """Insert or overwrite the one row of ``(anchor_kind, anchor_ref)``, validated by the caller,
+    and append the change to overlay_history (the whole row before and after; event ``promote``
+    when the write carries an origin, else ``insert`` / ``update``).
 
     ★ ``promoted_from`` is written on BOTH branches, NULL included. An overwrite that left it out
     would keep the previous write's origin on a row whose judgement no longer came from there."""
@@ -461,6 +568,55 @@ def _write_row(
         "WHERE anchor_kind = ? AND anchor_ref = ?",
         (anchor_kind, anchor_ref),
     ).fetchone()
+    before = _row(atlas, int(prior["id"])) if prior is not None else None
+    result = _upsert_row(
+        atlas,
+        prior,
+        anchor_kind=anchor_kind,
+        anchor_ref=anchor_ref,
+        verdict=verdict,
+        rationale=rationale,
+        attributed_to=attributed_to,
+        basis_state=basis_state,
+        verdict_basis=verdict_basis,
+        promoted_from=promoted_from,
+        basis_resolved=basis_resolved,
+    )
+    after = _row(atlas, result.id)
+    if promoted_from is not None:
+        event = "promote"
+    else:
+        event = "update" if result.action == "updated" else "insert"
+    record_history(
+        atlas,
+        event=event,
+        anchor_kind=anchor_kind,
+        anchor_ref=anchor_ref,
+        overlay_id=result.id,
+        run_id=(after or {}).get("run_id"),
+        before=before,
+        after=after,
+        attributed_to=attributed_to,
+        ctx=ctx,
+    )
+    return result
+
+
+def _upsert_row(
+    atlas: sqlite3.Connection,
+    prior: Any,
+    *,
+    anchor_kind: str,
+    anchor_ref: str,
+    verdict: str,
+    rationale: str,
+    attributed_to: str | None,
+    basis_state: str,
+    verdict_basis: str | None,
+    promoted_from: str | None,
+    basis_resolved: bool,
+) -> UpsertResult:
+    """The upsert itself (``_write_row`` records it)."""
     if prior is not None:
         atlas.execute(
             "UPDATE overlay SET verdict = ?, rationale = ?, attributed_to = ?, basis_state = ?, "
@@ -513,6 +669,7 @@ def upsert_overlay(
     verdict_basis: dict[str, Any] | None = None,
     commit: bool = True,
     promoted_from: dict[str, Any] | None = None,
+    ctx: WriteContext | None = None,
 ) -> UpsertResult:
     """Write (or overwrite) the annotation for one ``evidence_ref`` — last write wins, one row per
     anchor. Rejects an unknown verdict, a blank rationale, or a fabricated attribution. Snapshots
@@ -542,6 +699,7 @@ def upsert_overlay(
         verdict_basis=basis_json,
         promoted_from=json.dumps(promoted_from) if promoted_from is not None else None,
         basis_resolved=basis.resolved,
+        ctx=ctx,
     )
     if commit:
         atlas.commit()
@@ -747,9 +905,40 @@ def prepare_presence_annotation(
     )
 
 
-def write_prepared(atlas: sqlite3.Connection, p: PreparedDiffWrite) -> UpsertResult:
+def write_prepared(
+    atlas: sqlite3.Connection,
+    p: PreparedDiffWrite,
+    ctx: WriteContext | None = None,
+    *,
+    shadow: bool = False,
+) -> UpsertResult:
     """Write one prepared diff annotation (upsert, no commit). ``promoted_from`` is NULL and
-    ``basis_resolved`` True, as a diff write always is."""
+    ``basis_resolved`` True, as a diff write always is. ``shadow``: an audit's judgement — validated
+    exactly as a write, recorded in overlay_history only (event ``shadow``), the current row left
+    as it is (``action`` ``shadow``, ``id`` the history row)."""
+    if shadow:
+        current = atlas.execute(
+            "SELECT id FROM overlay WHERE anchor_kind = 'diff_subject' AND anchor_ref = ?",
+            (p.anchor_ref,),
+        ).fetchone()
+        hid = record_history(
+            atlas,
+            event="shadow",
+            anchor_kind="diff_subject",
+            anchor_ref=p.anchor_ref,
+            overlay_id=int(current["id"]) if current is not None else None,
+            run_id=_run_id_from_ref(p.anchor_ref),
+            after={
+                "verdict": p.verdict,
+                "rationale": p.rationale.strip(),
+                "verdict_basis": p.verdict_basis,
+                "basis_state": p.basis_state,
+                "attributed_to": p.attributed_to,
+            },
+            attributed_to=p.attributed_to,
+            ctx=ctx,
+        )
+        return UpsertResult(action="shadow", id=hid, basis_resolved=True)
     return _write_row(
         atlas,
         anchor_kind="diff_subject",
@@ -761,6 +950,7 @@ def write_prepared(atlas: sqlite3.Connection, p: PreparedDiffWrite) -> UpsertRes
         verdict_basis=p.verdict_basis,
         promoted_from=None,
         basis_resolved=True,
+        ctx=ctx,
     )
 
 
@@ -776,9 +966,13 @@ def annotate_diff(
     commit: bool = True,
     diff_id: str | None = None,
     run_pair: str | None = None,
+    ctx: WriteContext | None = None,
+    shadow: bool = False,
 ) -> UpsertResult:
     """Write (or overwrite) the judgement on one entry of a diff's function-level view, on one
-    non-binary file of a run pair, or on one binary only one run of the pair holds.
+    non-binary file of a run pair, or on one binary only one run of the pair holds. Every write,
+    whatever its channel, passes through here and the same gates; ``ctx`` is recorded with it in
+    overlay_history, and ``shadow`` records an audit's judgement there only (``write_prepared``).
 
     Exactly one of ``diff_id`` (one binary's diff) and ``run_pair`` (``{run_a}::{run_b}``) names
     where ``anchor_ref`` is read. A function or candidate anchor needs ``diff_id``. A non-binary
@@ -838,7 +1032,7 @@ def annotate_diff(
             verdict_basis=verdict_basis,
             group_ref=group_ref,
         )
-        result = write_prepared(atlas, prepared)
+        result = write_prepared(atlas, prepared, ctx, shadow=shadow)
         if commit:
             atlas.commit()
         return result
@@ -854,7 +1048,7 @@ def annotate_diff(
             verdict_basis=verdict_basis,
             group_ref=group_ref,
         )
-        result = write_prepared(atlas, prepared)
+        result = write_prepared(atlas, prepared, ctx, shadow=shadow)
         if commit:
             atlas.commit()
         return result
@@ -879,7 +1073,7 @@ def annotate_diff(
         verdict_basis=verdict_basis,
         group_ref=group_ref,
     )
-    result = write_prepared(atlas, prepared)
+    result = write_prepared(atlas, prepared, ctx, shadow=shadow)
     if commit:
         atlas.commit()
     return result
@@ -906,6 +1100,7 @@ def promote(
     allow_stale_source: bool = False,
     attributed_to: str | None = "agent-via-mcp",
     commit: bool = True,
+    ctx: WriteContext | None = None,
 ) -> PromoteResult:
     """Carry a judgement reached on a diff entry onto one of its candidates, as a candidate verdict.
 
@@ -948,6 +1143,7 @@ def promote(
         verdict_basis=verdict_basis,
         commit=commit,
         promoted_from=origin,
+        ctx=ctx,
     )
     return PromoteResult(written=written, evidence_ref=row_ref, promoted_from=origin)
 
@@ -966,6 +1162,7 @@ def clear_overlay(
     anchor_kind: str = "evidence_ref",
     clear_all: bool = False,
     commit: bool = True,
+    ctx: WriteContext | None = None,
 ) -> int:
     """Delete annotations of one ``anchor_kind`` and return how many rows went. The base map is
     untouched either way, so it reads byte-identical afterward — this is scratch space a consumer
@@ -999,6 +1196,30 @@ def clear_overlay(
     if evidence_ref is not None and anchor_kind != "evidence_ref":
         raise ConfigError("evidence_ref names a candidate annotation; use anchor_ref for this kind")
     one = evidence_ref if evidence_ref is not None else anchor_ref
+    # Every row a delete takes is recorded whole first (overlay_history, event delete), so a
+    # cleared judgement — a whole kind cleared included — can be read and restored from there.
+    args: tuple[str, ...]
+    if one is not None:
+        where, args, scope = "anchor_kind = ? AND anchor_ref = ?", (anchor_kind, one), "anchor"
+    elif run_id is not None:
+        where, args, scope = "anchor_kind = ? AND run_id = ?", (anchor_kind, run_id), "run"
+    else:
+        where, args, scope = "anchor_kind = ?", (anchor_kind,), "kind"
+    ids = [int(r[0]) for r in atlas.execute(f"SELECT id FROM overlay WHERE {where}", args)]  # noqa: S608
+    for oid in ids:
+        before = _row(atlas, oid)
+        record_history(
+            atlas,
+            event="delete",
+            anchor_kind=anchor_kind,
+            anchor_ref=(before or {}).get("anchor_ref"),
+            overlay_id=oid,
+            run_id=(before or {}).get("run_id"),
+            before=before,
+            attributed_to=(before or {}).get("attributed_to"),
+            ctx=ctx,
+            note={"scope": scope, "value": one if one is not None else run_id},
+        )
     if one is not None:
         cur = atlas.execute(
             "DELETE FROM overlay WHERE anchor_kind = ? AND anchor_ref = ?",

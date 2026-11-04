@@ -9,7 +9,9 @@ Read-only.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -146,3 +148,329 @@ def skill(install_dir: str | None) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(text, encoding="utf-8")
     click.echo(f"wrote {dest}")
+
+
+# ── a person's judgements: judge (one) and the audit worksheet (many) ────────────────────────
+
+# Environment variables an agent's shell is known to set. Seeing one, a write declared "human" is
+# recorded as human-via-agent instead: best effort only — an agent that unsets them can still
+# claim "human", so "human" means "typed and confirmed on an interactive terminal of this
+# machine", never more.
+AGENT_ENV_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
+_BY = ("human", "human-via-agent")
+
+
+def _interactive() -> bool:
+    import sys
+
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def resolve_attribution(by: str) -> tuple[str, str | None]:
+    """``(attributed_to, note)`` for a write declared ``by``. ``human`` needs an interactive
+    terminal and a typed confirmation, and drops to ``human-via-agent`` (with a note) when an agent
+    environment marker is set; ``human-via-agent`` is taken as it is."""
+    import os
+
+    if by == "human-via-agent":
+        return by, None
+    marker = next((m for m in AGENT_ENV_MARKERS if os.environ.get(m)), None)
+    if marker is not None:
+        return "human-via-agent", (
+            f"{marker} is set: this looks like an agent's shell, so the judgement is recorded as "
+            "human-via-agent"
+        )
+    if not _interactive():
+        raise click.UsageError(
+            "--by human needs an interactive terminal (a person typing): from a pipe or a script, "
+            "record a person's judgement with --by human-via-agent"
+        )
+    typed = click.prompt('Type "human" to record this as your own judgement', default="")
+    if typed.strip() != "human":
+        raise click.ClickException("not confirmed: nothing was written")
+    return "human", None
+
+
+def _open(atlas_db: str | None, run_pair: str) -> tuple[sqlite3.Connection, str, str, str]:
+    from treasure_map.cli.mcp_cli import _resolve_mcp_target
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.query import file_diff as fd
+
+    atlas, _ = _resolve_mcp_target(atlas_db, None)
+    if not Path(atlas).is_file():
+        raise click.ClickException(f"no atlas at {atlas}: pass --atlas <path to atlas.db>")
+    conn = open_atlas(Path(atlas))
+    runs = fd.split_run_pair(conn, run_pair)
+    if runs is None:
+        conn.close()
+        raise click.ClickException(f"run pair {run_pair!r} does not name two runs of this atlas")
+    return conn, runs[0], runs[1], str(atlas)
+
+
+def _scope(member: object, run_pair: str) -> dict[str, str]:
+    """Where a member's judgement is written: its diff, or the run pair for a pair-level one."""
+    kind = getattr(member, "kind", "")
+    if kind == "entry":
+        return {"diff_id": str(getattr(member, "stream", ""))}
+    return {"run_pair": run_pair}
+
+
+def _basis(
+    checked: tuple[str, ...] | list[str] | None,
+    why_unchanged: str | None,
+    evidence: tuple[str, ...] | list[str] | None,
+    change_kind: tuple[str, ...] | list[str] | None,
+) -> dict[str, object] | None:
+    out: dict[str, object] = {}
+    if checked:
+        out["checked"] = list(checked)
+    if why_unchanged:
+        out["why_unchanged"] = why_unchanged
+    if evidence:
+        out["evidence"] = list(evidence)
+    if change_kind:
+        out["change_kind"] = list(change_kind)
+    return out or None
+
+
+@review.command(name="judge")
+@click.argument("unit_id")
+@click.argument("run_pair")
+@click.option(
+    "--verdict",
+    required=True,
+    type=click.Choice(["changed_real", "no_real_change", "change_inconclusive"]),
+)
+@click.option(
+    "--anchor", default=None, help="The member judged (needed when the unit has several)."
+)
+@click.option(
+    "--rationale", default=None, help="Why (no_real_change defaults it to --why-unchanged)."
+)
+@click.option("--checked", multiple=True, help="no_real_change: an anchor or fact read (repeat).")
+@click.option("--why-unchanged", default=None, help="no_real_change: why nothing real changed.")
+@click.option("--evidence", multiple=True, help="changed_real: an anchor or fact it rests on.")
+@click.option("--change-kind", multiple=True, help="changed_real: what the change does (repeat).")
+@click.option("--by", "by", type=click.Choice(_BY), default="human", show_default=True)
+@click.option(
+    "--k", "k", default=None, type=click.IntRange(0, None), help="The k the unit came with."
+)
+@click.option("--atlas", "atlas_db", default=None, help="Atlas DB path.")
+def judge(
+    unit_id: str,
+    run_pair: str,
+    verdict: str,
+    anchor: str | None,
+    rationale: str | None,
+    checked: tuple[str, ...],
+    why_unchanged: str | None,
+    evidence: tuple[str, ...],
+    change_kind: tuple[str, ...],
+    by: str,
+    k: int | None,
+    atlas_db: str | None,
+) -> None:
+    """Record a person's judgement on one member of UNIT_ID (a unit of RUN_PAIR, from the report or
+    start_diff_review). It goes through the same checks as any judgement and becomes the current
+    one — over an agent's, which stays in the history; on an audit unit too."""
+    from treasure_map.lib import overlay
+    from treasure_map.lib.errors import ConfigError
+    from treasure_map.lib.query import review_units as ru
+
+    attribution, note = resolve_attribution(by)
+    conn, run_a, run_b, _atlas = _open(atlas_db, run_pair)
+    try:
+        reading = ru.review_pair(
+            conn,
+            run_a,
+            run_b,
+            k=ru.DEFAULT_K if k is None else k,
+            pair_staleness=ru.pair_staleness(conn, run_a, run_b),
+            server_commit=None,
+        )
+        unit = reading.unit(unit_id)
+        if unit is None:
+            raise click.ClickException(
+                f"no unit {unit_id!r} in {run_pair} now (tmap review report)"
+            )
+        members = [m for m in unit.members if anchor is None or m.anchor_ref == anchor]
+        if len(members) != 1:
+            names = ", ".join(m.anchor_ref for m in unit.members[:5])
+            raise click.UsageError(f"pass --anchor: the unit holds {len(unit.members)} ({names})")
+        member = members[0]
+        if verdict == "no_real_change" and not rationale:
+            rationale = why_unchanged
+        try:
+            res = overlay.annotate_diff(
+                conn,
+                anchor_ref=member.anchor_ref,
+                verdict=verdict,
+                rationale=rationale or "",
+                attributed_to=attribution,
+                verdict_basis=_basis(checked, why_unchanged, evidence, change_kind),
+                ctx=overlay.WriteContext(
+                    channel="judge", unit_id=unit_id, read_basis={"basis": "human", "via": by}
+                ),
+                diff_id=_scope(member, run_pair).get("diff_id"),
+                run_pair=_scope(member, run_pair).get("run_pair"),
+            )
+        except ConfigError as exc:
+            raise click.ClickException(f"refused, nothing written: {exc}") from exc
+    finally:
+        conn.close()
+    if note:
+        click.echo(note)
+    click.echo(f"{res.action}: {member.anchor_ref} = {verdict} ({attribution})")
+
+
+@review.command(name="audit")
+@click.argument("run_pair")
+@click.option(
+    "--emit",
+    "emit_to",
+    default=None,
+    type=click.Path(dir_okay=False),
+    help="Write the audit worksheet (the open audits and the disagreements) here.",
+)
+@click.option(
+    "--apply",
+    "apply_from",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Write back the judgements filled in a worksheet.",
+)
+@click.option("--by", "by", type=click.Choice(_BY), default="human", show_default=True)
+@click.option("--atlas", "atlas_db", default=None, help="Atlas DB path.")
+def audit(
+    run_pair: str, emit_to: str | None, apply_from: str | None, by: str, atlas_db: str | None
+) -> None:
+    """The pair's audit worksheet: --emit writes the judgements owed a second reading and the
+    disagreements a person settles; fill in verdict / rationale / checked / why_unchanged /
+    evidence / change_kind for the ones you judge, then --apply it. Each filled item goes through
+    the same checks as any judgement: one that fails is reported and not written."""
+    import json
+
+    from treasure_map.lib import overlay
+    from treasure_map.lib.errors import ConfigError
+    from treasure_map.lib.query import review_units as ru
+
+    if (emit_to is None) == (apply_from is None):
+        raise click.UsageError("pass one of --emit <file> / --apply <file>")
+    attribution = note = None
+    if apply_from is not None:
+        attribution, note = resolve_attribution(by)
+    conn, run_a, run_b, _atlas = _open(atlas_db, run_pair)
+    try:
+        reading = ru.review_pair(
+            conn,
+            run_a,
+            run_b,
+            pair_staleness=ru.pair_staleness(conn, run_a, run_b),
+            server_commit=None,
+        )
+        if emit_to is not None:
+            Path(emit_to).write_text(
+                json.dumps(worksheet(conn, reading, run_pair), indent=2) + "\n", encoding="utf-8"
+            )
+            click.echo(f"wrote {emit_to}")
+            return
+        assert apply_from is not None and attribution is not None
+        sheet = json.loads(Path(apply_from).read_text(encoding="utf-8"))
+        written, refused, skipped = 0, [], 0
+        for i, item in enumerate(sheet.get("items") or []):
+            if not isinstance(item, dict) or not item.get("verdict"):
+                skipped += 1
+                continue
+            verdict = str(item["verdict"])
+            rationale = item.get("rationale") or (
+                item.get("why_unchanged") if verdict == "no_real_change" else None
+            )
+            try:
+                overlay.annotate_diff(
+                    conn,
+                    anchor_ref=str(item.get("anchor_ref")),
+                    verdict=verdict,
+                    rationale=str(rationale or ""),
+                    attributed_to=attribution,
+                    verdict_basis=_basis(
+                        item.get("checked"),
+                        item.get("why_unchanged"),
+                        item.get("evidence"),
+                        item.get("change_kind"),
+                    ),
+                    ctx=overlay.WriteContext(
+                        channel="worksheet",
+                        unit_id=item.get("unit_id"),
+                        read_basis={"basis": "human", "via": by},
+                    ),
+                    diff_id=(item.get("scope") or {}).get("diff_id"),
+                    run_pair=(item.get("scope") or {}).get("run_pair"),
+                )
+                written += 1
+            except (ConfigError, TypeError) as exc:
+                refused.append((i, str(item.get("anchor_ref")), str(exc)))
+    finally:
+        conn.close()
+    if note:
+        click.echo(note)
+    click.echo(f"written {written}, refused {len(refused)}, left blank {skipped}")
+    for i, anchor, why in refused:
+        click.echo(f"  refused item {i} ({anchor}): {why}")
+
+
+def worksheet(conn: sqlite3.Connection, reading: Any, run_pair: str) -> dict[str, object]:
+    """The worksheet of a pair: one item per open audit and per disagreement, with where it is
+    written and the fields to fill in."""
+    from treasure_map.lib.query import review_units as ru
+
+    assert isinstance(reading, ru.PairReview)
+    current = {
+        r[0]: {"verdict": r[1], "rationale": r[2], "attributed_to": r[3]}
+        for r in conn.execute(
+            "SELECT anchor_ref, verdict, rationale, attributed_to FROM overlay "
+            "WHERE anchor_kind = 'diff_subject' AND run_id = ?",
+            (run_pair,),
+        )
+    }
+    members = {m.anchor_ref: m for u in reading.units for m in u.members}
+    blank: dict[str, object] = {
+        "verdict": None,
+        "rationale": "",
+        "checked": [],
+        "why_unchanged": "",
+        "evidence": [],
+        "change_kind": [],
+    }
+    items: list[dict[str, object]] = []
+    for a in reading.audits.open:
+        items.append(
+            {
+                "unit_id": a.unit.unit_id,
+                "anchor_ref": a.member.anchor_ref,
+                "scope": _scope(a.member, run_pair),
+                "why": ["audit", *a.sources],
+                "current": current.get(a.member.anchor_ref),
+                **blank,
+            }
+        )
+    for d in reading.audits.disagreements:
+        m = members.get(str(d["anchor_ref"]))
+        items.append(
+            {
+                "unit_id": None,
+                "anchor_ref": d["anchor_ref"],
+                "scope": _scope(m, run_pair) if m is not None else {"run_pair": run_pair},
+                "why": ["disagreement", d["why"]],
+                "current": current.get(str(d["anchor_ref"])),
+                "other": {k: v for k, v in d.items() if k not in ("anchor_ref", "why")},
+                **blank,
+            }
+        )
+    return {
+        "run_pair": run_pair,
+        "fill_in": (
+            "verdict = changed_real | no_real_change | change_inconclusive; no_real_change needs "
+            "checked (an anchor read) and why_unchanged; leave verdict null to skip an item"
+        ),
+        "items": items,
+    }

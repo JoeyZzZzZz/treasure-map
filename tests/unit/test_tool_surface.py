@@ -847,6 +847,11 @@ RENAMES = (
 )
 # Sentences rewritten on purpose, each with why.
 REPLACED = {
+    "annotate_diff_batch": {
+        "Only those seven keys — a stray key fails that item, named.": (
+            "an item takes change_kind too now (what a changed_real does): eight keys"
+        ),
+    },
     "get_function_alignment": {
         "The BinDiff-aligned counterpart of one function address in a diff.": (
             "the lookup takes a function name or an address now, so it says function"
@@ -1156,7 +1161,7 @@ BOUNDARY: dict[str, tuple[str, ...]] = {
         "Plain-text notes are kept but do not count",
         "re-annotating OVERWRITES",
     ),
-    "annotate_diff_batch": ("all of them or none", "Only those seven keys"),
+    "annotate_diff_batch": ("all of them or none", "Only those eight keys"),
     "promote": ("Refused, with the facts that refused it", "it reads ``source_diff_stale`` there"),
     "list_overlays": (
         "These are AGENT decisions on the overlay, not tool facts",

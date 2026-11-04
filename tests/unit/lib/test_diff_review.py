@@ -312,6 +312,8 @@ def test_an_a_row_is_promoted_though_its_presence_is_undetermined(world: World) 
         "anchor_ref": _pair_anchor(DX, "00001000", "00002000"),
         "landing": "A",
         "subclass": "matched_call_other_callee",
+        "entry_bucket": "A",
+        "entry_subclass": "matched_call_other_callee",
     }
 
 
@@ -377,9 +379,11 @@ def test_a_landing_nobody_named_is_refused(world: World, monkeypatch: pytest.Mon
 def test_a_persisted_row_is_promoted(world: World) -> None:
     """★ The origin records the carrying row's landing + subclass; a persisted row lands
     (persisted, None). 'persisted' is where the judgement was carried from, NOT proof the code is
-    unchanged.
+    unchanged. R10: the entry's own bucket and subclass are recorded beside the row's — here they
+    differ (the row has no subclass, the entry is listed under B with its own).
 
-    MUTATION: drop landing/subclass from the origin in check_promotion -> RED."""
+    MUTATION: drop landing/subclass from the origin in check_promotion -> RED; drop entry_bucket /
+    entry_subclass -> only the row's subclass is left -> RED."""
     world.pair(DX, "00001000", "00002000")
     ref_a, ref_b = _ref("runA", "00001000"), _ref("runB", "00002000")
     world.rows[DX] = [_row(ref_a, ref_b, presence="persisted", call="present_same_callee")]
@@ -392,6 +396,9 @@ def test_a_persisted_row_is_promoted(world: World) -> None:
         "persisted",
         None,
     )
+    assert res.promoted_from.get("entry_bucket") == entry["bucket"]
+    assert res.promoted_from.get("entry_subclass") == entry["subclass"]
+    assert entry["subclass"] and entry["subclass"] != res.promoted_from.get("subclass")
 
 
 # ── promotion: is the counterpart determined ─────────────────────────────────────────────────
@@ -558,6 +565,8 @@ def test_the_origin_is_listed_and_a_plain_rewrite_drops_it(world: World) -> None
         "anchor_ref": _pair_anchor(DX, "00001000", "00002000"),
         "landing": "A",
         "subclass": "matched_call_other_callee",
+        "entry_bucket": "A",
+        "entry_subclass": "matched_call_other_callee",
         "source_stale": False,
         "source_stale_reason": None,
     }
@@ -685,7 +694,7 @@ def test_no_real_change_with_its_basis_is_stored(world: World) -> None:
     )
     stored = json.loads(world.atlas.execute("SELECT verdict_basis FROM overlay").fetchone()[0])
     assert stored["kind"] == "no_real_change" and len(stored["checked"]) == 2
-    with pytest.raises(ConfigError, match="changed_real takes evidence only"):
+    with pytest.raises(ConfigError, match="changed_real takes evidence and change_kind only"):
         world.judge(
             DX,
             _pair_anchor(DX, "00001000", "00002000"),
@@ -1529,7 +1538,7 @@ def test_batch_changed_real_evidence_is_recorded_and_echoed(world: World) -> Non
         ],
         diff_id=DX,
     )
-    assert bad["written"] is False and "evidence only" in bad["errors"][0]["error"]
+    assert bad["written"] is False and "evidence and change_kind only" in bad["errors"][0]["error"]
 
 
 _WORDS = {"removed", "added", "gone", "new", "bounded", "safe", "fix", "patch", "regression"}
@@ -1914,11 +1923,13 @@ def test_a_write_failing_mid_batch_leaves_nothing_written(
     real = overlay.write_prepared
     calls = {"n": 0}
 
-    def flaky(atlas: sqlite3.Connection, p: overlay.PreparedDiffWrite) -> overlay.UpsertResult:
+    def flaky(
+        atlas: sqlite3.Connection, p: overlay.PreparedDiffWrite, *a: Any, **kw: Any
+    ) -> overlay.UpsertResult:
         calls["n"] += 1
         if calls["n"] == fail_at + 1:
             raise sqlite3.OperationalError("disk I/O error (injected)")
-        return real(atlas, p)
+        return real(atlas, p, *a, **kw)
 
     monkeypatch.setattr(overlay, "write_prepared", flaky)
     items = [
@@ -1933,3 +1944,32 @@ def test_a_write_failing_mid_batch_leaves_nothing_written(
         "SELECT anchor_ref, verdict, rationale FROM overlay WHERE anchor_kind = 'diff_subject'"
     ).fetchall()
     assert [tuple(r) for r in rows] == [(anchors[0], "changed_real", "before the batch")]
+
+
+@pytest.mark.parametrize(
+    "elsewhere",
+    [f"{PAIR}#non_binary#etc/rc", f"{PAIR}#binary_presence#a_only:usr/sbin/old"],
+    ids=["non_binary", "binary_presence"],
+)
+def test_a_pair_subject_anchor_on_a_function_entry_is_refused_by_name(
+    world: World, elsewhere: str
+) -> None:
+    """★ R4: a file's or a one-sided binary's anchor, cited in a function entry's ``checked``
+    beside an anchor that resolves, is refused by name and pointed at its own judgement — never
+    kept as plain text; the four anchors of the view still resolve as before.
+
+    MUTATION (verified RED): leave both out of _anchor_marker's closed set -> kept as a note, the
+    write succeeds -> RED."""
+    world.pair(DX, "00001000", "00001000")
+    world.rows[DX] = [a_row("00001000")]
+    anchor = _pair_anchor(DX, "00001000", "00001000")
+    with pytest.raises(ConfigError, match=r"anchor: it names .* run_pair"):
+        world.judge(
+            DX,
+            anchor,
+            "no_real_change",
+            verdict_basis=_nrc(anchor) | {"checked": [anchor, elsewhere]},
+        )
+    world.judge(DX, anchor, "no_real_change", verdict_basis=_nrc(anchor))
+    assert dann._anchor_marker(anchor) == "anchor_ref"
+    assert dann._anchor_marker("pair:00001000:00001000") == "entry_id"

@@ -16,6 +16,7 @@ from treasure_map.lib.atlas import (
     add_instance,
     add_instances,
     open_atlas,
+    overlay_schema,
     upsert_pattern,
 )
 from treasure_map.lib.atlas import connection as atlas_connection
@@ -828,10 +829,10 @@ def test_open_atlas_reopens_old_shape_missing_migrated_column(
 #
 # M1. widen the exemption: in `_droptable_line_forbidden` return False whenever a name is found.
 #     -> `test_droptable_guard_permits_only_overlay` fails on the instance / overlay_backup cases.
-# M2. loosen the rebuild trigger: in `connection._migrate` test `"CHECK" in ov_sql[0]` instead of
+# M2. loosen the rebuild trigger: in `overlay_schema.needs_rebuild` test `"CHECK" in sql` instead of
 #     the verdict-anchored pattern. -> `test_verdict_check_removal_is_idempotent` fails — the other
 #     two CHECKs keep it true, so every open rebuilds again.
-# M3. drop atomicity: in `_rebuild_overlay_without_verdict_check` remove the BEGIN IMMEDIATE, OR
+# M3. drop atomicity: in `overlay_schema._rebuild` remove the BEGIN IMMEDIATE, OR
 #     run the CREATE through executescript. Both were tried; both fail
 #     `test_rebuild_leaves_nothing_behind_on_crash` — the CREATE self-commits, overlay_new survives
 #     the rollback, and the retry can never clean it up.
@@ -924,11 +925,7 @@ def test_verdict_check_removal_is_idempotent(tmp_path: Path, monkeypatch) -> Non
     assert "UNIQUE (anchor_kind, anchor_ref)" in ddl_after
 
     rebuilds: list[int] = []
-    monkeypatch.setattr(
-        atlas_connection,
-        "_rebuild_overlay_without_verdict_check",
-        lambda conn: rebuilds.append(1),
-    )
+    monkeypatch.setattr(overlay_schema, "_rebuild", lambda conn: rebuilds.append(1) or 0)
     conn = open_atlas(db)  # second open: must NOT rebuild
     assert rebuilds == [], "the migration re-ran on an already-migrated atlas"
     monkeypatch.undo()
@@ -1011,7 +1008,8 @@ def test_rebuilt_overlay_keeps_every_other_constraint(tmp_path: Path) -> None:
     # hand, so a dropped CHECK or UNIQUE would carry every row across intact and look perfectly
     # healthy — nothing in a row-by-row comparison can see it. The existing constraint tests all
     # build a FRESH atlas, which never goes through the rebuild, so this asserts them against a
-    # rebuilt table specifically. Mutation: delete any constraint from _OVERLAY_REBUILT_DDL -> red.
+    # rebuilt table specifically. Mutation: delete any constraint from the overlay statement of
+    # overlay_schema.sql -> red.
     db = tmp_path / "atlas.db"
     _old_shape_overlay(db)
     conn = open_atlas(db)  # triggers the rebuild
