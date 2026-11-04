@@ -18,14 +18,27 @@ import click
 from treasure_map.cli.interrupts import InterruptGroup
 
 
+class _ReviewGroup(InterruptGroup):
+    """``tmap review <run_pair> --agent ...`` is the batch driver (``run``); every other first
+    word names a subcommand."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if args and not args[0].startswith("-") and args[0] not in self.commands:
+            args = ["run", *args]
+        return super().parse_args(ctx, args)
+
+
 @click.group(
     name="review",
-    cls=InterruptGroup,
+    cls=_ReviewGroup,
     short_help="A run pair's diff review cut into work units: what is read, what is not",
 )
 def review() -> None:
     """A run pair's diff review: the must-read set, the units it is handed out in, and how far
-    the judgements have come (the same reading as start_diff_review(run_pair=...))."""
+    the judgements have come (the same reading as start_diff_review(run_pair=...)).
+
+    tmap review <run_pair> --agent <preset | template> runs the batch driver: one launch of your
+    agent per unit, until none is left."""
 
 
 @review.command(name="report")
@@ -474,3 +487,117 @@ def worksheet(conn: sqlite3.Connection, reading: Any, run_pair: str) -> dict[str
         ),
         "items": items,
     }
+
+
+@review.command(name="run")
+@click.argument("run_pair")
+@click.option(
+    "--agent",
+    "agent",
+    required=True,
+    help=(
+        "A preset (claude-code; experimental: codex, cursor) or a command template holding "
+        "{prompt} (also {mcp_config}, {workdir}, {atlas}, {unit_id}, {run_pair}). A template or "
+        "an experimental preset runs only after its probe passes."
+    ),
+)
+@click.option("--probe", "probe_only", is_flag=True, help="Only check the agent's tool set.")
+@click.option("--max-units", default=None, type=click.IntRange(1, None), help="Stop after N units.")
+@click.option("--max-minutes", default=None, type=float, help="Stop after M minutes.")
+@click.option(
+    "--timeout",
+    default=None,
+    type=click.IntRange(30, None),
+    help="Seconds one launch may take (default 900).",
+)
+@click.option(
+    "--retries",
+    default=None,
+    type=click.IntRange(0, 5),
+    help="Retries of a unit that did not judge every member (default 2).",
+)
+@click.option("--worker", default=None, type=click.IntRange(0, None), help="This shard's index.")
+@click.option("--workers", default=None, type=click.IntRange(1, None), help="How many shards.")
+@click.option(
+    "--k",
+    "k",
+    default=None,
+    type=click.IntRange(0, None),
+    help="How many first entries of each diff are must-read (default 4).",
+)
+@click.option("--atlas", "atlas_db", default=None, help="Atlas DB path.")
+def run(
+    run_pair: str,
+    agent: str,
+    probe_only: bool,
+    max_units: int | None,
+    max_minutes: float | None,
+    timeout: int | None,
+    retries: int | None,
+    worker: int | None,
+    workers: int | None,
+    k: int | None,
+    atlas_db: str | None,
+) -> None:
+    """Review RUN_PAIR unit by unit, one launch of your agent per unit: tmap runs the loop and
+    calls no model itself. A unit counts only when the overlay's history holds a judgement naming
+    it for every member. Ends when no unit is left, or at a limit."""
+    import tempfile
+
+    from treasure_map.lib import review_driver as rd
+    from treasure_map.lib.query import review_units as ru
+
+    if (worker is None) != (workers is None):
+        raise click.UsageError("--worker and --workers go together")
+    if worker is not None and workers is not None and worker >= workers:
+        raise click.UsageError(f"--worker must be below --workers ({workers})")
+    try:
+        preset = rd.preset_or_template(agent)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    conn, run_a, run_b, atlas = _open(atlas_db, run_pair)
+    staleness = ru.pair_staleness(conn, run_a, run_b)
+    conn.close()
+    if staleness.get("source_stale"):
+        raise click.ClickException(
+            f"{staleness['source_stale_reason']}: a run of the pair was produced by other code "
+            "than is installed — the MCP server refuses it; re-scan it first (tmap rescan)"
+        )
+    workdir = Path(tempfile.mkdtemp(prefix="tmap-review-"))
+    deadline = timeout or rd.DEFAULT_TIMEOUT
+    click.echo(f"probing {preset.name} ({preset.note or 'preset'}) …")
+    pr = rd.probe(preset, atlas_path=Path(atlas), workdir=workdir, timeout=min(deadline, 300))
+    click.echo(
+        f"probe: tmap reached {pr.tmap_reached}, built-in tools blocked {pr.builtin_blocked} — "
+        f"{pr.why}"
+    )
+    if not pr.ok:
+        raise click.ClickException("the probe failed: no unit is handed to this agent")
+    if probe_only:
+        return
+    result = rd.drive(
+        Path(atlas),
+        run_a,
+        run_b,
+        preset,
+        workdir=workdir,
+        k=ru.DEFAULT_K if k is None else k,
+        worker=worker,
+        workers=workers,
+        max_units=max_units,
+        max_minutes=max_minutes,
+        timeout=deadline,
+        retries=rd.DEFAULT_RETRIES if retries is None else retries,
+        pair_staleness=staleness,
+        echo=click.echo,
+    )
+    click.echo(
+        f"units tried {result.units_tried}, done {result.units_done}, failed "
+        f"{len(result.failed)} — {result.stopped}"
+    )
+    for f in result.failed:
+        click.echo(f"  failed {f['unit_id']} ({f['kind']}): {f['written']}/{f['members']} written")
+    if result.statement:
+        click.echo(result.statement)
+    if result.failed:
+        raise SystemExit(3)

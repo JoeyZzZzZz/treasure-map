@@ -1,0 +1,259 @@
+# Copyright (C) 2026 JoeyZzZzZz
+# SPDX-License-Identifier: Apache-2.0
+"""The batch driver (lib/review_driver, tmap review <run_pair> --agent): one launch per unit,
+success read from overlay_history only, retries, the first unit as a probe, the tool-set probe,
+the deadline, and the blind launch of an audit unit.
+
+Zero real data: the callee-group World of test_callee_groups; the agent is simulated in-process
+(an injected runner), except where a real process is the point (the deadline, the command line)."""
+
+from __future__ import annotations
+
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests.unit.lib.test_callee_groups import _fresh, _world  # noqa: F401 — autouse fixture
+from treasure_map.lib import overlay
+from treasure_map.lib import review_driver as rd
+from treasure_map.lib import tool_call_log as tcl
+from treasure_map.lib.query import review_units as ru
+
+PRESET = rd.Preset("test", ("agent", "{unit_id}", "{prompt}"), blind_argv=("--deny", "list"))
+
+
+def _units(w: Any) -> dict[str, ru.Unit]:
+    r = ru.review_pair(
+        w.atlas,
+        "runA",
+        "runB",
+        k=50,
+        pair_staleness={"source_stale": False, "source_stale_reason": None},
+        server_commit=None,
+    )
+    return {u.unit_id: u for u in r.units}
+
+
+def _group_ref(u: ru.Unit | None, m: ru.Member) -> str | None:
+    """The group_ref a member is judged with: its group unit's, or the one a reduce names."""
+    if u is None:
+        return None
+    if u.group is not None:
+        return str(u.group.get("ref"))
+    named = [r.split(":", 1)[1] for r in m.reasons if r.startswith("group_ref:")]
+    return named[0] if named else None
+
+
+def _agent(w: Any, judge: str = "all", calls: list[list[str]] | None = None) -> Any:
+    """A simulated agent: judges the members of the unit its prompt names — all, the first only,
+    or none — through annotate_diff with the unit's id, as a launched agent would."""
+
+    def run(argv: list[str], *, cwd: Path, timeout: float) -> rd.Launch:
+        if calls is not None:
+            calls.append(list(argv))
+        uid = re.search(r'unit="([0-9a-f]{16})"', argv[-1])
+        assert uid is not None
+        u = _units(w).get(uid.group(1))
+        members = [] if u is None or judge == "none" else list(u.members)
+        if judge == "first":
+            members = members[:1]
+        for m in members:
+            if m.kind != "entry":
+                continue
+            overlay.annotate_diff(
+                w.atlas,
+                anchor_ref=m.anchor_ref,
+                verdict="changed_real",
+                rationale="r",
+                diff_id=m.stream,
+                group_ref=_group_ref(u, m),
+                ctx=overlay.WriteContext(channel="mcp", unit_id=uid.group(1), session="agent"),
+                shadow=u is not None and u.kind == ru.AUDIT,
+            )
+        return rd.Launch(0, 0.01, False)
+
+    return run
+
+
+def _drive(w: Any, tmp: Path, runner: Any, **kw: Any) -> rd.DriveResult:
+    return rd.drive(
+        w.path,
+        "runA",
+        "runB",
+        PRESET,
+        workdir=tmp,
+        k=50,
+        runner=runner,
+        echo=lambda s: None,
+        **kw,
+    )
+
+
+def test_the_driver_reviews_every_unit_and_reads_success_from_the_history(tmp_path: Path) -> None:
+    """★ One launch per unit, each judging every member under the unit's id: every unit succeeds,
+    the loop ends with no unit left, and each launch is logged beside the tool-call log.
+
+    MUTATION (verified RED): count a unit done on the agent's exit code -> the 'none' agent below
+    passes -> RED (the next test)."""
+    w = _world(tmp_path)
+    result = _drive(w, tmp_path, _agent(w), max_units=50)
+    assert result.failed == [] and result.stopped == "no unit left"
+    assert result.units_done == result.units_tried > 0
+    log = tcl.read_lines(tcl.log_path_for(w.path).with_name(rd.DRIVER_LOG))
+    assert log is not None and all(ln.get("success") for ln in log)
+
+
+def test_a_launch_that_writes_nothing_fails_and_the_first_stops_the_loop(tmp_path: Path) -> None:
+    """★ Exit 0 and no write is a failure, retried, then the loop stops on the first unit with
+    the reason; nothing is counted done.
+
+    MUTATION (verified RED): believe the exit code -> units_done > 0 -> RED; retry nothing -> one
+    launch -> RED."""
+    w = _world(tmp_path)
+    calls: list[list[str]] = []
+    result = _drive(w, tmp_path, _agent(w, "none", calls), retries=2)
+    assert result.units_done == 0 and len(calls) == 3
+    assert result.stopped is not None and "wrote nothing" in result.stopped
+
+
+def test_a_unit_judged_in_part_is_not_done(tmp_path: Path) -> None:
+    """★ A launch that judges some members only does not complete the unit: it is retried, then
+    left as failed (named), and the loop goes on to the next.
+
+    MUTATION (verified RED): count a unit done on any write naming it -> RED."""
+    w = _world(tmp_path)
+    group = next(u for u in _units(w).values() if len(u.members) > 1)
+    calls: list[list[str]] = []
+
+    def partial(argv: list[str], *, cwd: Path, timeout: float) -> rd.Launch:
+        if group.unit_id in argv[-1]:
+            return _agent(w, "first", calls)(argv, cwd=cwd, timeout=timeout)
+        return _agent(w, "all", calls)(argv, cwd=cwd, timeout=timeout)
+
+    result = _drive(w, tmp_path, partial, retries=1, max_units=50)
+    assert [f["unit_id"] for f in result.failed] == [group.unit_id]
+    assert result.failed[0]["written"] == 1
+    assert result.units_done == result.units_tried - 1
+
+
+def test_an_audit_unit_is_launched_blind(tmp_path: Path) -> None:
+    """★ An audit unit's launch carries the preset's blind arguments (list_overlays denied) and
+    its prompt says it is an audit.
+
+    MUTATION (verified RED): render every launch alike -> RED."""
+    w = _world(tmp_path)
+    _drive(w, tmp_path, _agent(w), max_units=50)  # everything judged first
+    anchor = next(m.anchor_ref for u in _units(w).values() for m in u.members if m.kind == "entry")
+    overlay.annotate_diff(
+        w.atlas,
+        anchor_ref=anchor,
+        verdict="change_inconclusive",
+        rationale="r",
+        diff_id="runA::runB::libx",
+        ctx=overlay.WriteContext(channel="mcp", session="writer"),
+    )
+    calls: list[list[str]] = []
+    _drive(w, tmp_path, _agent(w, "all", calls), max_units=50)
+    blind = [c for c in calls if "AUDIT" in c[-1]]
+    assert blind and all("--deny" in c for c in blind)
+    assert all("--deny" not in c for c in calls if "AUDIT" not in c[-1])
+
+
+@pytest.mark.parametrize(
+    ("reach", "write_file", "ok"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+    ids=["ok", "no_tmap", "builtin_open"],
+)
+def test_the_probe_needs_tmap_reached_and_builtin_tools_off(
+    tmp_path: Path, reach: bool, write_file: bool, ok: bool
+) -> None:
+    """★ The probe passes only when the agent reached a tmap tool (in the tool-call log) and could
+    not create the marker file with a built-in tool.
+
+    MUTATION (verified RED): skip the marker check -> builtin_open passes -> RED; skip the log
+    check -> no_tmap passes -> RED."""
+    atlas = tmp_path / "atlas.db"
+
+    def agent(argv: list[str], *, cwd: Path, timeout: float) -> rd.Launch:
+        if reach:
+            log = tcl.ToolCallLog(tcl.log_path_for(atlas))
+            log.record("list_runs", {}, {"runs": []})
+        if write_file:
+            (cwd / "probe_marker.txt").write_text("probe")
+        return rd.Launch(0, 0.0, False)
+
+    got = rd.probe(PRESET, atlas_path=atlas, workdir=tmp_path, timeout=5, runner=agent)
+    assert got.ok is ok
+    assert (got.tmap_reached, got.builtin_blocked) == (reach, not write_file)
+
+
+def test_a_launch_past_its_deadline_is_killed_whole(tmp_path: Path) -> None:
+    """A launch past its deadline is killed with its process group: it reads timed out, and a
+    child it started does not outlive it.
+
+    MUTATION (verified RED): kill only the launched process -> the child survives -> RED."""
+    marker = tmp_path / "child_alive"
+    script = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', \"import time; time.sleep(3); "
+        f"open({str(marker)!r}, 'w').write('x')\"])\n"
+        "time.sleep(60)\n"
+    )
+    t0 = time.monotonic()
+    got = rd.run_agent([sys.executable, "-c", script], cwd=tmp_path, timeout=1)
+    assert got.timed_out and got.exit is None and time.monotonic() - t0 < 10
+    time.sleep(4)
+    assert not marker.exists()
+
+
+def test_the_claude_preset_switches_builtin_tools_off_and_loads_only_tmap() -> None:
+    """The claude-code preset: tmap's MCP server alone (--strict-mcp-config), every built-in tool
+    off (--tools ""), tmap's tools pre-allowed, no prompt, no user settings; the audit launch
+    denies list_overlays.
+
+    MUTATION (verified RED): drop --tools "" from the preset -> RED."""
+    argv = rd.render(
+        rd.PRESETS["claude-code"],
+        {
+            "prompt": "P",
+            "mcp_config": "/m.json",
+            "workdir": "/w",
+            "atlas": "/a",
+            "unit_id": "u",
+            "run_pair": "r",
+            "tmap": "tmap",
+        },
+        blind=True,
+    )
+    assert "--tools" in argv and argv[argv.index("--tools") + 1] == ""
+    assert "--strict-mcp-config" in argv and argv[argv.index("--mcp-config") + 1] == "/m.json"
+    assert argv[argv.index("--allowedTools") + 1] == "mcp__treasure-map__*"
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert argv[argv.index("--disallowedTools") + 1] == "mcp__treasure-map__list_overlays"
+    assert argv[-1] == "P"
+    assert not rd.PRESETS["claude-code"].experimental and rd.PRESETS["codex"].experimental
+
+
+def test_the_command_line_routes_a_run_pair_and_refuses_on_a_failed_probe(
+    tmp_path: Path,
+) -> None:
+    """tmap review <run_pair> --agent <template> is the driver; an agent that reaches nothing fails
+    the probe and no unit is handed out.
+
+    MUTATION (verified RED): hand units out after a failed probe -> RED."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli.review_cli import review
+
+    w = _world(tmp_path)
+    template = f"{sys.executable} -c pass {{prompt}}"
+    res = CliRunner().invoke(
+        review, ["runA::runB", "--agent", template, "--atlas", str(w.path), "--timeout", "30"]
+    )
+    assert res.exit_code != 0
+    assert "tmap reached False" in res.output and "probe failed" in res.output
+    assert w.atlas.execute("SELECT COUNT(*) FROM overlay").fetchone()[0] == 0

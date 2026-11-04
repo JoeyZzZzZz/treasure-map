@@ -45,3 +45,5 @@ produces no payload: every judgment is yours.
 - With several workers, give each its own `worker` / `workers` pair so no two judge the same unit.
 - The full unit list is not sent over MCP: `tmap review report <run_pair> --md -o review.md`
   writes it for a person to read.
+- To have tmap drive the review instead (one fresh agent run per unit, coverage guaranteed):
+  `tmap review <run_pair> --agent claude-code` — it probes the agent's tool set first.
