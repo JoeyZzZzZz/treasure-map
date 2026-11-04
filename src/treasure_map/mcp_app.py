@@ -91,6 +91,7 @@ from treasure_map.lib.query import malformed_filter_refusal as _malformed_filter
 from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
 from treasure_map.lib.query import refs_in_ledger as _refs_in_ledger
+from treasure_map.lib.query import review_units as _ru
 from treasure_map.lib.query import run_staleness as _run_staleness
 from treasure_map.lib.query import runs_where_function_exists as _runs_where_function_exists
 from treasure_map.lib.query import state_value_label as _state_value_label
@@ -413,6 +414,15 @@ _START_META_KEYS = (
     "source_stale_reason",
     "toolchain_checked",
 )
+# A binary_presence unit's material: its binary's first candidates in the triage order.
+_PRESENCE_TOP = 20
+_PAIR_WORKFLOW = (
+    "Read next_unit.material (start_diff_review(run_pair, unit=<unit_id>) reads one unit alone), "
+    "judge each member with annotate_diff(anchor_ref, verdict, ..., diff_id=<its diff>) — or "
+    "annotate_diff_batch for a batch, run_pair=... for a binary_presence binary or a file — then "
+    "call start_diff_review(run_pair) again: the next unit follows. The report counts what is "
+    "disposed; an unjudged member is UNREAD, which is not 'nothing found'."
+)
 _HEADLINE_WITHHELD = "diff_undetermined (meta.banners)"
 _HEADLINE_NONE = "no listed entry"
 
@@ -597,7 +607,18 @@ _AGENT_GUIDE = (
     "The non-binary files (scripts, configs, credentials, web assets) are compared by "
     "get_file_diff(run_pair='<run_a>::<run_b>') — any two runs from list_runs, with or without a "
     "binary diff — and one file is judged with annotate_diff(anchor_ref, verdict, rationale, "
-    "run_pair=...)."
+    "run_pair=...). "
+    "THE WHOLE PAIR: start_diff_review(run_pair='<run_a>::<run_b>') cuts the pair's review into "
+    "work units computed by the server — the must-read set (that rule made checkable, plus the "
+    "first k entries of each diff, default 4, the R entries with one side outside its scan's "
+    "inventory and the other naming a sink candidate, the aligned pairs calling a command sink "
+    "fewer times on B, and each changed non-binary file) and the second tier (every other listed "
+    "entry, in batches). Its report carries coverage_statement — quote it as it is, it is the "
+    "server's count, not yours — and must_read_complete beside complete; next_unit is the first "
+    "unit, round robin across the diffs, with a member not yet disposed (judged concluded or "
+    "change_inconclusive), with its material. Judge every member, then call again; "
+    "unit=<unit_id> reads one unit, worker/workers keep one shard. On the command line, tmap "
+    "review report <run_pair> prints the same summary and --md / --html write every unit."
 )
 
 # What the server sends as its standing instructions: the loop and both entry points, within the
@@ -2230,9 +2251,255 @@ def make_tools(
         finally:
             conn.close()
 
-    def start_diff_review(diff_id: str, limit: int = 20) -> dict[str, Any]:
+    # ── the pair review (start_diff_review(run_pair=...)) ──
+
+    def _is_int(v: Any) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    def _pair_review_args(limit: Any, worker: Any, workers: Any, unit: Any, k: Any) -> str | None:
+        if limit != 20:
+            return "limit pages one diff's view (diff_id); with run_pair it does not apply"
+        if (worker is None) != (workers is None):
+            return "worker and workers go together: pass both or neither"
+        if workers is not None:
+            if not _is_int(workers) or workers < 1:
+                return f"workers must be an integer >= 1, got {workers!r}"
+            if not _is_int(worker) or not 0 <= worker < workers:
+                return f"worker must be an integer in 0..{workers - 1}, got {worker!r}"
+        if k is not None and (not _is_int(k) or not 0 <= k <= _ru.MAX_K):
+            return f"k must be an integer in 0..{_ru.MAX_K}, got {k!r}"
+        if unit is not None and (not isinstance(unit, str) or not unit.strip()):
+            return f"unit must be a unit_id (from next_unit), got {unit!r}"
+        return None
+
+    def _unit_head(u: _ru.Unit, states: dict[str, str] | None = None) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "unit_id": u.unit_id,
+            "kind": u.kind,
+            "must_read": u.must_read,
+            "stream": u.stream,
+            "position": u.position,
+            "members": len(u.members),
+        }
+        if states is not None:
+            out["members_disposed"] = sum(
+                1 for m in u.members if _ru.disposed(states.get(m.anchor_ref))
+            )
+        return out
+
+    def _member_json(m: _ru.Member, state: str | None) -> dict[str, Any]:
+        out: dict[str, Any] = {"anchor_ref": m.anchor_ref, "kind": m.kind}
+        if m.entry_id is not None:
+            out["entry_id"] = m.entry_id
+        for key in ("bucket", "subclass", "attention", "lift_basis"):
+            value = getattr(m, key)
+            if value is not None:
+                out[key] = value
+        if m.rows:
+            out["candidate_rows"] = m.rows
+        out["reasons"] = list(m.reasons)
+        out["review_state"] = state
+        return out
+
+    def _presence_top(
+        atlas: sqlite3.Connection, facts: _ru.PairFacts, anchor: str
+    ) -> dict[str, Any]:
+        """The binary's first ``PRESENCE_TOP`` candidates in its run, in the triage order."""
+        b = next((b for b in facts.presence.items if facts.presence.anchor(b) == anchor), None)
+        if b is None:
+            return {"error": "the binary is no longer held by one run alone"}
+        ranked = [c for c in _triage(atlas, run_id=b.run) if c.binary_path == b.path]
+        ranked = _apply_view(ranked, view=None, sort_by=None, dim_filters=[], only_filters=[])
+        rows = [_candidate_row(c, i) for i, c in enumerate(ranked[:_PRESENCE_TOP])]
+        return {
+            "binary": b.name,
+            "rel_path": b.rel_path,
+            "run": b.run,
+            "side": b.tag,
+            "candidates_total": len(ranked),
+            "top": rows,
+            "top_rule": (
+                f"the binary's first {_PRESENCE_TOP} candidates in its run, in the triage order; "
+                "explain_candidate(evidence_ref) reads one's sink / source / flow"
+            ),
+        }
+
+    def _unit_material(
+        atlas: sqlite3.Connection, review: _ru.PairReview, u: _ru.Unit, budget: int
+    ) -> dict[str, Any]:
+        """What a reviewer reads to judge the unit: one entry in full, a batch's entries as a
+        scan (summary and inline_hunk), a binary_presence binary's first candidates, a file's
+        line difference — fitted to ``budget`` bytes, with the call that reads more."""
+        facts = review.facts
+        first = u.members[0]
+        if u.kind == _ru.ENTRY:
+            page = _get_diff_patch_view(atlas, u.stream, entry_id=first.entry_id)
+            if "error" in page or not page.get("entries"):
+                return {"error": page.get("error", "the entry is no longer listed")}
+            entry = _entry_within_budget(page["entries"][0], 0, budget)
+            return {
+                "diff_id": u.stream,
+                "entry": entry,
+                "read_more": (
+                    f"get_diff_patch_view(diff_id={json.dumps(u.stream)}, "
+                    f"entry_id={json.dumps(first.entry_id)}, rows_offset=<rows_next_offset>)"
+                ),
+            }
+        if u.kind in (_ru.S_BATCH, _ru.SECOND_TIER):
+            wanted = {m.entry_id for m in u.members}
+            page = _get_diff_patch_view(
+                atlas, u.stream, bucket=first.bucket or None, rows_limit=0, limit=2000
+            )
+            if "error" in page:
+                return {"error": page["error"]}
+            entries = [e for e in page.get("entries") or [] if e.get("entry_id") in wanted]
+            kept: list[dict[str, Any]] = []
+            used = 0
+            for e in entries:
+                size = len(json.dumps(e))
+                if used + size > budget:
+                    break
+                kept.append(e)
+                used += size
+            return {
+                "diff_id": u.stream,
+                "entries": kept,
+                "entries_total": len(entries),
+                "entries_truncated": len(kept) < len(entries),
+                "read_one": (
+                    f"get_diff_patch_view(diff_id={json.dumps(u.stream)}, entry_id=<entry_id>)"
+                ),
+                "judge_with": f"annotate_diff_batch(diff_id={json.dumps(u.stream)}, ...)",
+            }
+        if u.kind == _ru.PRESENCE:
+            top = _presence_top(atlas, facts, first.anchor_ref)
+            rows = top.get("top") or []
+            while rows and len(json.dumps(top)) > budget:
+                rows.pop()
+                top["top_truncated"] = True
+            return top
+        if u.kind == _ru.FILE:
+            path = first.anchor_ref.split("#non_binary#", 1)[-1]
+            try:
+                one = _fd.file_diff(atlas, facts.run_a, facts.run_b, path=path, pf=facts.pair_files)
+            except _fd.FileDiffError as exc:
+                return {"error": str(exc)}
+            one = {k: v for k, v in one.items() if k in ("run_pair", "entry", "next_hunk_offset")}
+            if len(json.dumps(one)) > budget:
+                one = {k: v for k, v in one.items() if k not in ("structured",)}
+                one["structured_withheld"] = "page_budget"
+            return {
+                **one,
+                "read_more": (
+                    f"get_file_diff(run_pair={json.dumps(facts.run_a + '::' + facts.run_b)}"
+                    f", path={json.dumps(path)}, hunk_offset=<next_hunk_offset>)"
+                ),
+            }
+        return {"error": f"no material for unit kind {u.kind!r}"}
+
+    def _start_pair_review(
+        run_pair: str, limit: Any, worker: Any, workers: Any, unit: Any, k: Any
+    ) -> dict[str, Any]:
+        bad = _pair_review_args(limit, worker, workers, unit, k)
+        if bad is not None:
+            return {"run_pair": run_pair, "error": bad}
+        kk = _ru.DEFAULT_K if k is None else int(k)
+        server, _moved = _server_block()
+        atlas = open_atlas(atlas_path)
+        try:
+            refusal, runs = _file_pair_gate(atlas, run_pair)
+            if refusal is not None:
+                refusal["server"] = server
+                return refusal
+            assert runs is not None
+            run_a, run_b = runs
+            review = _ru.review_pair(
+                atlas,
+                run_a,
+                run_b,
+                k=kk,
+                pair_staleness={"source_stale": False, "source_stale_reason": None},
+                server_commit=server.get("commit"),
+            )
+            states = review.progress.states
+            out: dict[str, Any] = {"run_pair": run_pair, "server": server}
+            if unit is not None:
+                u = review.unit(unit)
+                if u is None:
+                    out["error"] = (
+                        f"no unit {unit!r} in this pair for predicate "
+                        f"{_ru.PREDICATE_VERSION} and k={kk} (the facts may have moved, or the "
+                        "unit came with another k): call again without unit for the next one"
+                    )
+                    return out
+                out["unit"] = _unit_head(u, states)
+                out["members"] = [_member_json(m, states.get(m.anchor_ref)) for m in u.members]
+                room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
+                out["material"] = _unit_material(atlas, review, u, max(room, 0))
+                return out
+            rep = review.report
+            out["report"] = {
+                key: rep[key]
+                for key in (
+                    "predicate_version",
+                    "k",
+                    "coverage_statement",
+                    "must_read",
+                    "units_by_kind",
+                    "all_listed",
+                    "must_read_complete",
+                    "complete",
+                    "not_seen",
+                )
+            }
+            nr = rep["not_reachable"]
+            out["report"]["not_reachable"] = {
+                "failed_diffs": len(nr["failed_diffs"]),
+                "withheld_diffs": len(nr["withheld_diffs"]),
+                "not_diffed_binaries": bool(nr["not_diffed_binaries"]),
+                "non_binary_files_unavailable": nr["non_binary_files_unavailable"],
+                "see": "list_diff_blindspots(run_a, run_b); tmap review report for the lists",
+            }
+            out["shard"] = {"worker": worker, "workers": workers} if workers is not None else None
+            nxt = review.next_unit(worker, workers)
+            out["workflow"] = _PAIR_WORKFLOW
+            out["full_list"] = f"tmap review report {run_pair} --md -o <file>.md"
+            if nxt is None:
+                out["next_unit"] = None
+                return out
+            out["next_unit"] = {
+                **_unit_head(nxt, states),
+                "members": [_member_json(m, states.get(m.anchor_ref)) for m in nxt.members],
+            }
+            room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
+            if room < 2_000:
+                # A batch's member list alone fills the page: the material is read by unit=.
+                out["next_unit"]["members"] = out["next_unit"]["members"][:20]
+                out["next_unit"]["members_truncated"] = True
+                room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
+            out["next_unit"]["material"] = _unit_material(atlas, review, nxt, max(room, 0))
+            out["next_unit"]["read_alone"] = (
+                f"start_diff_review(run_pair={json.dumps(run_pair)}, unit={json.dumps(nxt.unit_id)}"
+                + (f", k={kk}" if kk != _ru.DEFAULT_K else "")
+                + ")"
+            )
+            return out
+        finally:
+            atlas.close()
+
+    def start_diff_review(
+        diff_id: str | None = None,
+        limit: int = 20,
+        run_pair: str | None = None,
+        worker: int | None = None,
+        workers: int | None = None,
+        unit: str | None = None,
+        k: int | None = None,
+    ) -> dict[str, Any]:
         """START HERE for one diff: the entries to read first and the calls to read and judge them —
-        composed from get_diff_patch_view and get_diff_meta, nothing computed of its own.
+        composed from get_diff_patch_view and get_diff_meta, nothing computed of its own. Or, with
+        ``run_pair`` (exactly one of diff_id / run_pair), START HERE for the whole pair: its review
+        cut into work units (below).
 
         ``diff_id`` = ``{run_a}::{run_b}::{binary}`` (list_diffs gives the ids). ``workflow``: how a
         diff is read, in one sentence. ``meta``: get_diff_meta's ``functions``, ``banners``,
@@ -2262,7 +2529,40 @@ def make_tools(
         entry). Only when even the view's first entry does not fit beside the headline is the
         headline's inline_hunk withheld (``page_budget``); a response still over the budget then
         carries ``over_budget: true``. A diff whose A or B side is a proven-stale scan is
-        refused, as on every diff tool."""
+        refused, as on every diff tool.
+
+        ``run_pair`` = ``{run_a}::{run_b}``: the pair's review cut into work units, computed by the
+        server from the facts and the judgements. The must-read set (``predicate_version``) is the
+        rule above made checkable, plus the first ``k`` entries of each diff (default 4), the R
+        entries with one side outside its scan's inventory and the other naming a sink candidate,
+        the aligned pairs calling a command sink fewer times on the B side, and each changed
+        non-binary file. Returns a bounded ``report`` (``coverage_statement`` — quote it as it is —
+        the must-read units by kind and by reason, how many are disposed, ``must_read_complete``
+        beside ``complete``, what no unit can reach, what this view cannot see) and ``next_unit``:
+        the first unit, in the hand-out order, with a member not yet disposed (judged
+        change_inconclusive or concluded), with its ``unit_id`` and its ``material``. Units are
+        handed out round robin by position: round r takes the r-th entry of every diff (each in
+        its own default order), of the binary_presence binaries and of the changed files.
+        ``worker`` / ``workers`` (both or neither) keep one shard: the units whose id's first 8 hex
+        digits, as an integer, are worker modulo workers. ``unit=<unit_id>`` returns that one unit:
+        its members with their review state and verdict, and its material. Judge each member with
+        annotate_diff (or annotate_diff_batch) and call again for the next unit. The full unit list
+        is not sent here: ``tmap review report <run_pair> --md -o <file>`` writes it. A pair with a
+        proven-stale run is refused."""
+        if (diff_id is None) == (run_pair is None):
+            return {
+                "error": "pass exactly one of diff_id (one diff) or run_pair (the whole pair)",
+                "diff_id": diff_id,
+                "run_pair": run_pair,
+            }
+        if run_pair is not None:
+            return _start_pair_review(run_pair, limit, worker, workers, unit, k)
+        assert diff_id is not None
+        if any(v is not None for v in (worker, workers, unit, k)):
+            return {
+                "diff_id": diff_id,
+                "error": "worker, workers, unit and k apply to run_pair only",
+            }
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
             return {
                 "diff_id": diff_id,

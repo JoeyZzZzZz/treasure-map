@@ -22,6 +22,7 @@ from treasure_map.cli.hunt_cli import (
 from treasure_map.cli.init_cli import init
 from treasure_map.cli.interrupts import install_termination_handlers
 from treasure_map.cli.mcp_cli import fact, mcp_serve
+from treasure_map.cli.review_cli import review
 from treasure_map.cli.uninstall_cli import uninstall
 from treasure_map.cli.update_cli import update
 from treasure_map.lib.errors import ConfigError
@@ -148,6 +149,7 @@ main.add_command(atlas_view)
 main.add_command(fact)
 main.add_command(mcp_serve)
 main.add_command(exploit)
+main.add_command(review)
 main.add_command(doctor)
 main.add_command(uninstall)
 main.add_command(update)

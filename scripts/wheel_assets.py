@@ -25,6 +25,7 @@ ASSETS: tuple[tuple[str, str], ...] = (
     ("treasure_map.lib.storage", "atlas_schema.sql"),
     ("treasure_map.lib.storage", "schema.sql"),
     ("treasure_map.lib.setup", "toolchain_lock.json"),
+    ("treasure_map.skills", "diff-review.md"),
 )
 
 

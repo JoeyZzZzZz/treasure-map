@@ -199,7 +199,7 @@ EXPECTED_FIRST_LINES = {
     "get_nvram_key_flow": "Required: key.",
     "get_string_keyed_edges": "Required: none.",
     "launched_by": "Required: target.",
-    "start_diff_review": "Required: diff_id.",
+    "start_diff_review": "Required: exactly one of diff_id / run_pair.",
     "get_diff_patch_view": "Required: diff_id.",
     "get_diff_deltas": "Required: diff_id.",
     "get_diff_sink_overlay": "Required: exactly one of diff_id / run_a + run_b.",
@@ -639,7 +639,11 @@ APPENDIX_A: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     ("function_name", ("from_function", "callee"), ("get_string_keyed_edges",)),
     ("function_name", ("function",), _FN_TOOLS),
     ("name", ("function",), _FN_TOOLS),
-    ("pair", ("run_pair",), ("get_file_diff", "annotate_diff", "annotate_diff_batch")),
+    (
+        "pair",
+        ("run_pair",),
+        ("get_file_diff", "annotate_diff", "annotate_diff_batch", "start_diff_review"),
+    ),
     ("query", ("text",), _TEXT_TOOLS),
     ("query", ("value",), ("get_strings",)),
     ("ref", ("anchor_ref",), ("annotate_diff",)),
@@ -661,7 +665,11 @@ APPENDIX_A: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     ("run_name", ("run_id",), _ONE_RUN),
     ("run_pair", ("diff_id", "run_a", "run_b"), ("get_diff_sink_overlay",)),
     ("run_pair", ("run_a_id", "run_b_id"), ("list_diffs", "list_diff_blindspots")),
-    ("runs", ("run_pair",), ("get_file_diff", "annotate_diff", "annotate_diff_batch")),
+    (
+        "runs",
+        ("run_pair",),
+        ("get_file_diff", "annotate_diff", "annotate_diff_batch", "start_diff_review"),
+    ),
     ("str", ("text",), _TEXT_TOOLS),
     ("str", ("value",), ("get_strings",)),
     ("string", ("text",), _TEXT_TOOLS),
@@ -696,7 +704,7 @@ def test_appendix_a_is_what_the_refusal_offers_and_nothing_outside_it_offers_any
     MUTATION (verified RED, 1 failed): drop the (stride, side) veto -> RED."""
     accepted = _accepted()
     want = {(w, t): offer for w, offer, ts in APPENDIX_A for t in ts}
-    assert len(want) == 253
+    assert len(want) == 255
     inputs = {p for ps in accepted.values() for p in ps} | set(cards._PARAM_SYNONYMS) | set(_TYPOS)
     seen = 0
     for wrong in sorted(inputs):

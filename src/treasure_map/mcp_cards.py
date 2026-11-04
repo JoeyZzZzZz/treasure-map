@@ -389,7 +389,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
         ),
     ),
     "start_diff_review": ToolCard(
-        required=("diff_id",),
+        any_of=(("diff_id",), ("run_pair",)),
+        exactly_one=True,
         example='start_diff_review(diff_id="<run_a>::<run_b>::<binary>")',
         boundary=(
             "START HERE for one diff",
@@ -405,7 +406,10 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "beside the rest), read_next and non_binary. An entry nobody judged is UNREAD, which "
             'is not "nothing found": read the P entries, the entries with a '
             "lift_basis, bucket S and each binary_presence binary too. A diff with a proven-stale "
-            "side is refused."
+            "side is refused. run_pair instead: the whole pair cut into work units by the server "
+            "— report (coverage_statement, must-read units, must_read_complete) and next_unit "
+            "with its material; unit=<unit_id> reads one, worker/workers a shard, k the first "
+            "entries per diff that are must-read (default 4)."
         ),
     ),
     "get_diff_patch_view": ToolCard(
@@ -1117,7 +1121,7 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
     _param(
         "run_pair",
         "two runs, {run_a}::{run_b}",
-        ("get_file_diff", "annotate_diff", "annotate_diff_batch"),
+        ("get_file_diff", "annotate_diff", "annotate_diff_batch", "start_diff_review"),
         _CONSISTENT,
     ),
     _param(
@@ -1324,6 +1328,10 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             ("body", "a body class of the text-unverified entries", "get_diff_patch_view"),
             ("anchored_differs", "only the anchored_differs pairs", "get_diff_patch_view"),
             ("anchored_micro_side", "only the anchored micro-side pairs", "get_diff_patch_view"),
+            ("worker", "this shard's index (with workers)", "start_diff_review"),
+            ("workers", "how many shards (with worker)", "start_diff_review"),
+            ("unit", "one work unit's unit_id", "start_diff_review"),
+            ("k", "how many first entries per diff are must-read", "start_diff_review"),
             ("rows_limit", "how many rows an entry carries inline", "get_diff_patch_view"),
             ("dimension", "a delta dimension", "get_diff_deltas"),
             ("delta_kind", "a delta kind", "get_diff_deltas"),

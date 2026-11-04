@@ -5076,6 +5076,187 @@ def _resolve_entry(built: BuiltDiff, entry_id: str, entries: list[_Entry]) -> _E
     return f"{entry_id!r} is not an entry get_diff_patch_view lists for this diff now"
 
 
+@dataclass
+class _OrderInputs:
+    """What a sink_patch page's order reads besides the entries' own rank (see :func:`_sort`):
+    each entry's proposed reading, and — for the significance order — its attention and basis
+    (``lens``), ``settled``, ``swap_lift``, ``supported_last`` and ``lift_basis``; ``read_first``
+    and ``mention`` for every order. One computation for every reader of the order (the page and
+    the review units), so the two never part."""
+
+    proposed: dict[str, tuple[str, _Read]]
+    lens: dict[str, tuple[int, str]]
+    settled: dict[str, int]
+    swap_lift: dict[str, int]
+    supported_last: dict[str, int]
+    lift_basis: dict[str, str]
+    read_first: dict[str, int]
+    mention: dict[str, int]
+
+
+def _order_inputs(
+    chosen: list[_Entry], readings: _Readings, review: ViewReview, *, significant: bool
+) -> _OrderInputs:
+    proposed = {e.entry_id: r for e in chosen if (r := _proposed_of(e, readings)) is not None}
+    lens: dict[str, tuple[int, str]] = {}
+    settled: dict[str, int] = {}
+    swap_lift: dict[str, int] = {}
+    supported_last: dict[str, int] = {}
+    lift_basis: dict[str, str] = {}
+    if significant:
+        lens = {
+            e.entry_id: significance(
+                e,
+                _sameness_of(e, readings),
+                review.items.get(e.entry_id),
+                proposed[e.entry_id][0] if e.entry_id in proposed else None,
+            )
+            for e in chosen
+        }
+        # An R entry whose proposed reading is identical_unique closes its tier — unless the
+        # caller-set edge is its basis (significance): that edge is what it is listed for.
+        settled = {
+            k: 1
+            for k, (state, _read) in proposed.items()
+            if state == sameness.U_IDENTICAL_UNIQUE and lens[k][1] != LOST_CALLERS_NEVER_SUNK
+        }
+        # After the attention is known. Every attention-1 entry carrying a sink name in its
+        # callee-set difference, or a changed sink candidate count, leads its tier whatever its
+        # basis — a judgement changes the basis it reads, never its place. On an aligned pair either
+        # has floated it to 0 already, so what is lifted here is an R entry's proposed pairing. An
+        # R entry the pair evidence floated to 0 (basis supported_pair_*) keeps its lift_basis but
+        # no swap_lift, and is read after every other attention-0 entry (supported_last): ahead
+        # of the read signals there it would bury them, its read-first order and low similarity
+        # notwithstanding.
+        swap_lift = {
+            e.entry_id: 1
+            for e in chosen
+            if lens[e.entry_id][0] == ATTENTION_MIDDLE and _lift_basis(e) is not None
+        }
+        supported_last = {k: 1 for k, (_a, basis) in lens.items() if basis in SUPPORTED_PAIR_BASES}
+        lift_basis = {
+            e.entry_id: basis
+            for e in chosen
+            if (e.entry_id in swap_lift or lens[e.entry_id][1] in SUPPORTED_PAIR_BASES)
+            and (basis := _lift_basis(e)) is not None
+        }
+    read_first: dict[str, int] = {}
+    for e in chosen:
+        if e.entry_id in proposed and (order := _read_first_order(e, proposed[e.entry_id][0])):
+            read_first[e.entry_id] = order
+    # The caller-set edge's no-mention key: 0 when no OTHER B function names this E entry's function
+    # (read first inside its lane), 1 when one does. E entries only; it reaches the order through
+    # _default_key under significance alone, so it never touches the candidate_tier order or the
+    # rank_key.
+    mention = {
+        e.entry_id: (0 if e.pair is not None and e.pair.addr_b not in readings.b_mentions else 1)
+        for e in chosen
+        if e.bucket == "E"
+    }
+    return _OrderInputs(
+        proposed, lens, settled, swap_lift, supported_last, lift_basis, read_first, mention
+    )
+
+
+def _sort_with(
+    chosen: list[_Entry], sort_by: str | None, bands: dict[str, int] | None, inputs: _OrderInputs
+) -> list[_Entry]:
+    return _sort(
+        chosen,
+        sort_by,
+        bands,
+        {k: v[0] for k, v in inputs.lens.items()},
+        inputs.settled,
+        inputs.read_first,
+        inputs.swap_lift,
+        inputs.mention,
+        inputs.supported_last,
+    )
+
+
+@dataclass(frozen=True)
+class OrderedEntry:
+    """One listed entry of a diff in the default (significance) order: its place, attention,
+    basis and lift_basis as a summary page gives them, and its review item."""
+
+    entry: _Entry
+    position: int
+    attention: int
+    basis: str
+    lift_basis: str | None
+    item: diff_review.Item
+
+
+@dataclass(frozen=True)
+class SignificanceListing:
+    """Every listed entry of one diff in the default order, or the build withheld (``withheld``
+    True: the whole diff is undetermined and lists nothing)."""
+
+    built: BuiltDiff
+    withheld: bool
+    entries: list[OrderedEntry]
+
+
+def view_staleness(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
+    """The source staleness a diff's view reads its judgements with (the same call
+    build_diff_view makes), for a reader that holds the diff's facts without building it."""
+    return diff_source_staleness(atlas, diff_id)
+
+
+def diff_fact_key(atlas: sqlite3.Connection, diff_id: str) -> tuple[str, ...] | None:
+    """What one diff's listing is read from, as a cache key: the overlay's inputs
+    (:func:`_overlay_key` — the atlas, both runs' build hash / hunt commit / update, their instance
+    rows, the diff's input columns, the diff and overlay code) plus the diff code that wrote its
+    pairs and when (a re-run of the diff pairs anew) and both content hashes. None when there is no
+    such diff."""
+    row = atlas.execute(
+        "SELECT run_a_id, run_b_id, sha256_a, sha256_b, diff_code_version, created_at "
+        "FROM diff_meta WHERE diff_id = ?",
+        (diff_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    run_a, run_b = str(row[0] or ""), str(row[1] or "")
+    return (
+        *_overlay_key(atlas, diff_id, run_a, run_b),
+        *(str(v or "") for v in row[2:]),
+    )
+
+
+def significance_listing(atlas: sqlite3.Connection, diff_id: str) -> SignificanceListing | None:
+    """Every listed entry of ``diff_id`` in the order get_diff_patch_view lists them by default
+    (sort_by unset, no filter, no band), with the same attention, basis and lift_basis — computed
+    by the same code (:func:`_order_inputs`). None when there is no such diff."""
+    built = build_diff_view(atlas, diff_id)
+    if built is None:
+        return None
+    if built.withheld is not None:
+        return SignificanceListing(built, True, [])
+    readings = _pseudo_readings(atlas, built)
+    _annotate_entries(built, readings)
+    _attach_pair_evidence(atlas, built)
+    shown = listed_view(atlas, built, readings)
+    review = ViewReview(atlas, built, shown)
+    chosen = list(shown.entries)
+    inputs = _order_inputs(chosen, readings, review, significant=True)
+    ordered = _sort_with(chosen, "significance", None, inputs)
+    return SignificanceListing(
+        built,
+        False,
+        [
+            OrderedEntry(
+                e,
+                i,
+                inputs.lens[e.entry_id][0],
+                inputs.lens[e.entry_id][1],
+                inputs.lift_basis.get(e.entry_id),
+                review.items[e.entry_id],
+            )
+            for i, e in enumerate(ordered)
+        ],
+    )
+
+
 def get_diff_patch_view(
     atlas: sqlite3.Connection,
     diff_id: str,
@@ -5431,49 +5612,10 @@ def get_diff_patch_view(
         )
         return envelope
     envelope["guards_read_with"] = _guards_read_with(built.diff)
-    proposed = {e.entry_id: r for e in chosen if (r := _proposed_of(e, readings)) is not None}
-    lens: dict[str, tuple[int, str]] = {}
-    settled: dict[str, int] = {}
-    swap_lift: dict[str, int] = {}
-    supported_last: dict[str, int] = {}
-    lift_basis: dict[str, str] = {}
+    inputs = _order_inputs(chosen, readings, review, significant=effective == "significance")
+    proposed, lens = inputs.proposed, inputs.lens
+    swap_lift, lift_basis = inputs.swap_lift, inputs.lift_basis
     if effective == "significance":
-        lens = {
-            e.entry_id: significance(
-                e,
-                _sameness_of(e, readings),
-                review.items.get(e.entry_id),
-                proposed[e.entry_id][0] if e.entry_id in proposed else None,
-            )
-            for e in chosen
-        }
-        # An R entry whose proposed reading is identical_unique closes its tier — unless the
-        # caller-set edge is its basis (significance): that edge is what it is listed for.
-        settled = {
-            k: 1
-            for k, (state, _read) in proposed.items()
-            if state == sameness.U_IDENTICAL_UNIQUE and lens[k][1] != LOST_CALLERS_NEVER_SUNK
-        }
-        # After the attention is known. Every attention-1 entry carrying a sink name in its
-        # callee-set difference, or a changed sink candidate count, leads its tier whatever its
-        # basis — a judgement changes the basis it reads, never its place. On an aligned pair either
-        # has floated it to 0 already, so what is lifted here is an R entry's proposed pairing. An
-        # R entry the pair evidence floated to 0 (basis supported_pair_*) keeps its lift_basis but
-        # no swap_lift, and is read after every other attention-0 entry (supported_last): ahead
-        # of the read signals there it would bury them, its read-first order and low similarity
-        # notwithstanding.
-        swap_lift = {
-            e.entry_id: 1
-            for e in chosen
-            if lens[e.entry_id][0] == ATTENTION_MIDDLE and _lift_basis(e) is not None
-        }
-        supported_last = {k: 1 for k, (_a, basis) in lens.items() if basis in SUPPORTED_PAIR_BASES}
-        lift_basis = {
-            e.entry_id: basis
-            for e in chosen
-            if (e.entry_id in swap_lift or lens[e.entry_id][1] in SUPPORTED_PAIR_BASES)
-            and (basis := _lift_basis(e)) is not None
-        }
         envelope["lens"]["significance"] = _SIGNIFICANCE_LENS_SHORT
         envelope["lens"]["sunk_with_body_size_differs"] = {
             "count": sum(
@@ -5484,34 +5626,12 @@ def get_diff_patch_view(
             ),
             "filter": {"body": sameness.BODY_STRUCTURE_DIFFERS},
         }
-    read_first: dict[str, int] = {}
-    for e in chosen:
-        if e.entry_id in proposed and (order := _read_first_order(e, proposed[e.entry_id][0])):
-            read_first[e.entry_id] = order
-    # The caller-set edge's no-mention key: 0 when no OTHER B function names this E entry's function
-    # (read first inside its lane), 1 when one does. E entries only; it reaches the order through
-    # _default_key under significance alone, so it never touches the candidate_tier order or the
-    # rank_key.
-    mention = {
-        e.entry_id: (0 if e.pair is not None and e.pair.addr_b not in readings.b_mentions else 1)
-        for e in chosen
-        if e.bucket == "E"
-    }
+    read_first = inputs.read_first
     bands = review.bands() if band else None
     if anchored_default:
         ordered = _anchored_order(chosen, read_first, bands)
     else:
-        ordered = _sort(
-            chosen,
-            resolved,
-            bands,
-            {k: v[0] for k, v in lens.items()},
-            settled,
-            read_first,
-            swap_lift,
-            mention,
-            supported_last,
-        )
+        ordered = _sort_with(chosen, resolved, bands, inputs)
     # The next unjudged entries are named in the order this page is read in.
     _progress({e.entry_id: i for i, e in enumerate(ordered)})
     end = offset + limit
