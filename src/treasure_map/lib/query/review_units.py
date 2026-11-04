@@ -75,15 +75,20 @@ REASONS = (
 )
 
 # Unit kinds.
-ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT = (
+ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE = (
     "entry",
     "s_batch",
     "binary_presence",
     "non_binary_file",
     "second_tier_batch",
     "audit",
+    "callee_group",
+    "reduce",
 )
-UNIT_KINDS = (ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT)
+UNIT_KINDS = (ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE)
+# Where a unit of a kind sorts among the units at the same place: a group first (its members read
+# together), an audit after the unit its member came from.
+_KIND_RANK = {GROUP: -1, AUDIT: 1}
 # How many of a binary_presence binary's candidates (its first, in the triage order) its judgement
 # must cite before the binary counts as disposed.
 PRESENCE_TOP = 20
@@ -94,7 +99,9 @@ AUDIT_SOURCES = ("change_inconclusive", "no_real_change", "unread_before_verdict
 # The writes a person makes: never audited, and what settles a disagreement.
 HUMAN = "human"
 DISPOSED_STATES = frozenset({OPEN, CONCLUDED})
-PRESENCE_STREAM, FILE_STREAM = "binary_presence", "non_binary_file"
+PRESENCE_STREAM, FILE_STREAM, REDUCE_STREAM = "binary_presence", "non_binary_file", "reduce"
+# The reduce unit is handed out after every other unit.
+_REDUCE_POSITION = 1 << 30
 
 # What this view cannot see, stated with every report; a gap is closed only by a judgement.
 NOT_SEEN = (
@@ -138,11 +145,11 @@ class Unit:
     stream: str
     position: int  # its first member's place in its stream (the round it is handed out in)
     stream_index: int  # its stream's place among the streams
+    group: dict[str, Any] | None = None  # a callee group unit's group (DiffFacts.groups)
 
     @property
     def order(self) -> tuple[int, int, int, str]:
-        # An audit follows the unit its member came from: same place, after it.
-        return (self.position, self.stream_index, int(self.kind == AUDIT), self.unit_id)
+        return (self.position, self.stream_index, _KIND_RANK.get(self.kind, 0), self.unit_id)
 
 
 def unit_id(kind: str, anchors: Iterable[str], predicate_version: str = PREDICATE_VERSION) -> str:
@@ -225,6 +232,9 @@ class DiffFacts:
     subjects: dict[str, dr.Subject]
     run_a: str
     run_b: str
+    # The diff's callee groups (lib/query/callee_groups): ``{callee_b, callee_a, name, ref,
+    # members (entry ids), members_possibly_incomplete}``, every member a listed paired entry.
+    groups: list[dict[str, Any]] = field(default_factory=list)
 
 
 def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) -> DiffFacts | None:
@@ -264,6 +274,23 @@ def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) ->
         full = dr.subjects_of(listing.built.placed, d.run_a, d.run_b, d.binary)
         # Facts only: a judgement is read against its subject's facts (diff_review.judge).
         subjects = {a: dr.Subject(s.kind, s.facts) for a, s in full.items()}
+    groups: list[dict[str, Any]] = []
+    if not listing.withheld:
+        from treasure_map.lib.query.callee_groups import callee_groups
+
+        listed = [o.entry for o in listing.entries]
+        for g in callee_groups(atlas, listing.built, listed).values():
+            groups.append(
+                {
+                    "callee_b": g.callee_b,
+                    "callee_a": g.callee_a,
+                    "name": g.callee_name,
+                    "ref": g.ref,
+                    "members": list(g.members),
+                    "members_possibly_incomplete": g.members_possibly_incomplete,
+                    "members_a_side_unread": g.members_a_side_unread,
+                }
+            )
     return DiffFacts(
         diff_id=diff_id,
         binary=d.binary,
@@ -274,6 +301,7 @@ def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) ->
         subjects=subjects,
         run_a=d.run_a,
         run_b=d.run_b,
+        groups=groups,
     )
 
 
@@ -390,6 +418,28 @@ def _chunks(members: list[Member]) -> list[list[Member]]:
     return [members[i : i + BATCH_MAX] for i in range(0, len(members), BATCH_MAX)]
 
 
+def _assign_groups(d: DiffFacts, k: int) -> dict[str, tuple[dict[str, Any], list[Member]]]:
+    """The callee groups of one diff that hold at least two must-read members, each with the
+    must-read members it hands out: a member in several groups goes with the one whose first
+    member comes first (it is read once; the others only name it). A group whose members all went
+    to earlier groups hands out nothing."""
+    by_id = {m.entry_id: _with_top_k(m, k) for m in d.entries}
+    eligible = []
+    for g in d.groups:
+        must = [by_id[e] for e in g["members"] if e in by_id and by_id[e].must_read]
+        if len(must) >= 2:
+            eligible.append((min(m.position for m in must), g["callee_b"], g, must))
+    out: dict[str, tuple[dict[str, Any], list[Member]]] = {}
+    taken: set[str | None] = set()
+    for _pos, _x, g, must in sorted(eligible, key=lambda t: (t[0], t[1])):
+        mine = [m for m in must if m.entry_id not in taken]
+        if not mine:
+            continue
+        taken |= {m.entry_id for m in mine}
+        out[g["ref"]] = (g, mine)
+    return out
+
+
 def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
     """Every unit of the pair, in the order they are handed out (``Unit.order``)."""
     units: list[Unit] = []
@@ -397,17 +447,23 @@ def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
     streams += [PRESENCE_STREAM, FILE_STREAM]
     index = {s: i for i, s in enumerate(streams)}
 
-    def add(kind: str, members: list[Member], must_read: bool) -> None:
+    def add(
+        kind: str, members: list[Member], must_read: bool, group: dict[str, Any] | None = None
+    ) -> None:
         first = min(members, key=lambda m: m.position)
+        anchors = [m.anchor_ref for m in members]
+        if group is not None:
+            anchors.append(group["ref"])
         units.append(
             Unit(
-                unit_id=unit_id(kind, (m.anchor_ref for m in members)),
+                unit_id=unit_id(kind, anchors),
                 kind=kind,
                 must_read=must_read,
                 members=tuple(sorted(members, key=lambda m: m.position)),
                 stream=first.stream,
                 position=first.position,
                 stream_index=index[first.stream],
+                group=group,
             )
         )
 
@@ -416,8 +472,14 @@ def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
             continue
         s_members: list[Member] = []
         second: dict[str, list[Member]] = {}
+        grouped = _assign_groups(d, k)
+        for g, members in grouped.values():
+            add(GROUP, members, True, g)
+        taken = {m.entry_id for _g, members in grouped.values() for m in members}
         for raw in d.entries:
             m = _with_top_k(raw, k)
+            if m.entry_id in taken:
+                continue
             if m.bucket == "S":
                 s_members.append(m)
             elif m.must_read:
@@ -589,6 +651,50 @@ def presence_citations_short(
     return out
 
 
+# ── reduce: every callee group's members read as one group ──────────────────────────────────
+
+
+def read_reduce(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) -> list[Member]:
+    """The judgements a reduce still owes, as members: every member a callee group unit handed out
+    must be judged leaning on that group (its ``group_ref``), and so must the group's own callee
+    entry when the view lists it and no group took it as a member. Read from the judgements' stored
+    group blocks; empty when the reduce is done (or there is no group)."""
+    pair = dr.run_pair(facts.run_a, facts.run_b)
+    leaned: dict[str, str | None] = {}
+    for anchor, basis in atlas.execute(
+        "SELECT anchor_ref, basis_state FROM overlay WHERE anchor_kind = 'diff_subject' "
+        "AND run_id = ?",
+        (pair,),
+    ):
+        group = _json(basis).get("group")
+        leaned[anchor] = group.get("group_ref") if isinstance(group, dict) else None
+    groups = [u for u in units if u.kind == GROUP and u.group is not None]
+    in_a_group = {m.entry_id for u in groups for m in u.members}
+    entries = {(d.diff_id, m.entry_id): m for d in facts.diffs for m in d.entries}
+    owed: list[Member] = []
+    for u in groups:
+        assert u.group is not None
+        ref = u.group["ref"]
+        x = u.group["callee_b"]
+        need = list(u.members)
+        key = next(
+            (
+                m
+                for (diff_id, eid), m in entries.items()
+                if diff_id == u.stream
+                and eid is not None
+                and (eid == f"b:{x}" or (eid.startswith("pair:") and eid.endswith(f":{x}")))
+            ),
+            None,
+        )
+        if key is not None and key.entry_id not in in_a_group:
+            need.append(key)
+        for m in need:
+            if leaned.get(m.anchor_ref) != ref:
+                owed.append(replace(m, reasons=(f"group_ref:{ref}",)))
+    return owed
+
+
 # ── audits and disagreements, read from the overlay and its history ────────────────────────
 
 
@@ -731,8 +837,9 @@ def disposed(state: str | None) -> bool:
 
 
 def unit_disposed(u: Unit, states: dict[str, str]) -> bool:
-    """Every member disposed. An audit unit exists only while its audit is open, so it never is."""
-    if u.kind == AUDIT:
+    """Every member disposed. An audit or a reduce unit exists only while it is owed, so it never
+    is."""
+    if u.kind in (AUDIT, REDUCE):
         return False
     return all(disposed(states.get(m.anchor_ref)) for m in u.members)
 
@@ -767,6 +874,7 @@ def report(
     server_commit: str | None,
     audits: Audits | None = None,
     presence_short: dict[str, dict[str, Any]] | None = None,
+    reduce_owed: list[Member] | None = None,
 ) -> dict[str, Any]:
     """The pair's report: the must-read set by unit kind and by reason, how much of it and of every
     listed subject is disposed, ``must_read_complete`` beside the existing ``complete``, what no
@@ -774,7 +882,9 @@ def report(
     states = progress.states
     audits = audits or Audits()
     presence_short = presence_short or {}
-    subjects = [u for u in units if u.kind != AUDIT]  # an audit re-reads a subject, it is none
+    reduce_owed = reduce_owed or []
+    # An audit re-reads a subject and a reduce re-judges one: neither is a subject of its own.
+    subjects = [u for u in units if u.kind not in (AUDIT, REDUCE)]
     must = [u for u in subjects if u.must_read]
     must_members = [m for u in must for m in u.members]
     all_members = [m for u in subjects for m in u.members]
@@ -802,6 +912,7 @@ def report(
         and not facts.failed_diffs
         and not audits.open
         and not audits.disagreements
+        and not reduce_owed
     )
     complete = (
         unseen == 0
@@ -815,8 +926,10 @@ def report(
         f"must-read {len(must_members)} / disposed {must_done}; "
         f"all subjects {len(all_members)} / disposed {all_done}; "
         f"open audits {len(audits.open)}; disagreements {len(audits.disagreements)}; "
-        f"reduce not run; predicate {PREDICATE_VERSION} (k={k}); server {server}"
+        f"{'reduce done' if not reduce_owed else f'reduce owed {len(reduce_owed)}'}; "
+        f"predicate {PREDICATE_VERSION} (k={k}); server {server}"
     )
+    group_units = [u for u in units if u.kind == GROUP]
     by_source: dict[str, int] = dict.fromkeys(AUDIT_SOURCES, 0)
     for au in audits.open:
         for src in au.sources:
@@ -851,6 +964,21 @@ def report(
             "settled_by": "a judgement written by a person (tmap review judge / audit --apply)",
         },
         "presence_citations_short": presence_short,
+        "groups": {
+            "units": len(group_units),
+            "members": sum(len(u.members) for u in group_units),
+            "members_possibly_incomplete": sum(
+                1 for u in group_units if (u.group or {}).get("members_possibly_incomplete")
+            ),
+            "groups_in_diffs": sum(len(d.groups) for d in facts.diffs),
+        },
+        "reduce": {
+            "owed": len(reduce_owed),
+            "rule": (
+                "each member a callee group handed out is judged leaning on the group (its "
+                "group_ref), and so is the group's own callee entry when listed"
+            ),
+        },
         "not_seen": list(NOT_SEEN),
         "dangling_judgements": sorted(progress.dangling),
     }
@@ -904,7 +1032,11 @@ def _group_reader(
     """Re-read a same-shape group a judgement leaned on, building its diff on first use (rare: only
     a judgement that recorded a group needs it)."""
     from treasure_map.lib.query.diff_group_freshness import group_moved
-    from treasure_map.lib.query.patch_view import build_diff_view, listed_view
+    from treasure_map.lib.query.patch_view import (
+        _attach_pair_evidence,
+        build_diff_view,
+        listed_view,
+    )
 
     built_by: dict[str, Any] = {}
     caches: dict[str, dict[tuple[str, str], Any]] = {}
@@ -913,6 +1045,8 @@ def _group_reader(
         if diff_id not in built_by:
             built = build_diff_view(atlas, diff_id)
             if built is not None:
+                # read as every judgement path reads it: the pair evidence attached, S decided
+                _attach_pair_evidence(atlas, built)
                 listed_view(atlas, built)
             built_by[diff_id] = built
         built = built_by[diff_id]
@@ -989,7 +1123,24 @@ def review_pair(
         # Judged without citing the binary's first candidates: read again, not disposed.
         progress.states[anchor] = NEEDS_RECHECK
     audits = read_audits(atlas, facts, units)
-    units = sorted([*units, *(a.unit for a in audits.open)], key=lambda u: u.order)
+    owed = read_reduce(atlas, facts, units)
+    extra = [a.unit for a in audits.open]
+    if owed and all(
+        unit_disposed(u, progress.states) for u in units if u.kind not in (AUDIT, REDUCE)
+    ):
+        # Handed out once every other unit is disposed (the must-read set and the second tier).
+        extra.append(
+            Unit(
+                unit_id=unit_id(REDUCE, [m.anchor_ref + "|" + m.reasons[0] for m in owed]),
+                kind=REDUCE,
+                must_read=True,
+                members=tuple(owed),
+                stream=REDUCE_STREAM,
+                position=_REDUCE_POSITION,
+                stream_index=len(facts.diffs) + 2,
+            )
+        )
+    units = sorted([*units, *extra], key=lambda u: u.order)
     rep = report(
         facts,
         units,
@@ -998,6 +1149,7 @@ def review_pair(
         server_commit=server_commit,
         audits=audits,
         presence_short=short,
+        reduce_owed=owed,
     )
     return PairReview(facts, units, progress, rep, k, audits)
 

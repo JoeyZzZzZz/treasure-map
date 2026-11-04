@@ -309,7 +309,16 @@ def _diff_group_echo(atlas: sqlite3.Connection, row_id: int) -> dict[str, Any] |
         return None
     return {
         k: group[k]
-        for k in ("group_ref", "side", "relation", "member_count", "counts", "summary")
+        for k in (
+            "group_ref",
+            "kind",
+            "callee",
+            "side",
+            "relation",
+            "member_count",
+            "counts",
+            "summary",
+        )
         if k in group
     }
 
@@ -636,7 +645,10 @@ _AGENT_GUIDE = (
     "was read opens an audit unit: another session reads it blind (its write is a shadow, the "
     "current judgment unchanged) — a different reading is a disagreement, settled by a person "
     "(tmap review judge / tmap review audit). Open audits and disagreements hold "
-    "must_read_complete false."
+    "must_read_complete false. A callee_group unit holds the entries that newly call one "
+    "function (its code on both sides given once): judge each with group_ref=<its group_ref>, "
+    "and the callee's own entry too; the reduce unit, handed out last, names what still lacks "
+    "it. A reduce owed holds must_read_complete false."
 )
 
 # What the server sends as its standing instructions: the loop and both entry points, within the
@@ -2304,6 +2316,9 @@ def make_tools(
             out["members_disposed"] = sum(
                 1 for m in u.members if _ru.disposed(states.get(m.anchor_ref))
             )
+        if u.group is not None:
+            out["group_ref"] = u.group.get("ref")
+            out["callee"] = u.group.get("name")
         return out
 
     def _members_json(u: _ru.Unit, states: dict[str, str]) -> list[dict[str, Any]]:
@@ -2372,6 +2387,10 @@ def make_tools(
                     f"entry_id={json.dumps(first.entry_id)}, rows_offset=<rows_next_offset>)"
                 ),
             }
+        if u.kind == _ru.GROUP and u.group is not None:
+            return _group_material(atlas, review, u, budget)
+        if u.kind == _ru.REDUCE:
+            return _reduce_material(review, u, budget)
         if u.kind in (_ru.S_BATCH, _ru.SECOND_TIER):
             wanted = {m.entry_id for m in u.members}
             page = _get_diff_patch_view(
@@ -2423,6 +2442,94 @@ def make_tools(
                 ),
             }
         return {"error": f"no material for unit kind {u.kind!r}"}
+
+    def _side_code(run: str, function: str, binary: str | None, cap: int) -> dict[str, Any]:
+        """One side's pseudocode of a function, cut at ``cap`` characters (with the call that reads
+        the rest)."""
+        got = get_pseudocode(function=function, binary=binary, run_id=run)
+        text = got.get("pseudocode") if isinstance(got, dict) else None
+        if not isinstance(text, str):
+            return {"unavailable": (got or {}).get("error") or (got or {}).get("pseudocode_status")}
+        out: dict[str, Any] = {"pseudocode": text[:cap]}
+        if len(text) > cap:
+            out["cut_at"] = cap
+            out["read_with"] = (
+                f"get_pseudocode(run_id={json.dumps(run)}, function={json.dumps(function)}"
+                + (f", binary={json.dumps(binary)}" if binary else "")
+                + ")"
+            )
+        return out
+
+    def _group_material(
+        atlas: sqlite3.Connection, review: _ru.PairReview, u: _ru.Unit, budget: int
+    ) -> dict[str, Any]:
+        """A callee group: the callee X on both sides once, then the members as a scan — and how to
+        record the group (group_ref on every member; the group's conclusion on X's own entry)."""
+        g = u.group or {}
+        facts = review.facts
+        d = next((d for d in facts.diffs if d.diff_id == u.stream), None)
+        binary = d.binary if d is not None else None
+        cap = max(budget // 6, 1_000)
+        out: dict[str, Any] = {
+            "diff_id": u.stream,
+            "group_ref": g.get("ref"),
+            "callee": {
+                "name": g.get("name"),
+                "b": g.get("callee_b"),
+                "a": g.get("callee_a"),
+                "b_side": _side_code(facts.run_b, str(g.get("callee_b")), binary, cap),
+                "a_side": (
+                    _side_code(facts.run_a, str(g.get("callee_a")), binary, cap)
+                    if g.get("callee_a")
+                    else {"unavailable": "no A-side counterpart: a new function"}
+                ),
+            },
+            "members_possibly_incomplete": bool(g.get("members_possibly_incomplete")),
+            "how": (
+                "these entries newly call the same function: read it once (callee), then each "
+                "member, and judge every member with group_ref=<group_ref>; write the group's own "
+                "conclusion on the callee's entry when the view lists it, else in each member's "
+                "rationale"
+            ),
+        }
+        wanted = {m.entry_id for m in u.members}
+        page = _get_diff_patch_view(atlas, u.stream, rows_limit=0, limit=2000)
+        entries = [e for e in page.get("entries") or [] if e.get("entry_id") in wanted]
+        room = budget - len(json.dumps(out))
+        kept: list[dict[str, Any]] = []
+        for e in entries:
+            size = len(json.dumps(e))
+            if size > room:
+                break
+            kept.append(e)
+            room -= size
+        out["entries"] = kept
+        out["entries_total"] = len(entries)
+        out["entries_truncated"] = len(kept) < len(entries)
+        return out
+
+    def _reduce_material(review: _ru.PairReview, u: _ru.Unit, budget: int) -> dict[str, Any]:
+        """The reduce: the judgements still owed a group_ref, the groups, and where to look for
+        the same change left undone elsewhere (computed when read, never stored)."""
+        owed = [
+            {"anchor_ref": m.anchor_ref, "group_ref": m.reasons[0].split(":", 1)[1]}
+            for m in u.members
+        ]
+        out: dict[str, Any] = {
+            "owed": owed,
+            "owed_total": len(owed),
+            "how": (
+                "re-judge each owed anchor leaning on its group (annotate_diff(..., group_ref=)); "
+                "then look for the same change left undone: same_shape_siblings(diff_id, "
+                "evidence_ref=<a changed candidate>) in the binary, get_functions_referencing_"
+                "string(<a changed literal>) across binaries (get_diff_string_delta lists them); "
+                "a remainder is judged on the subject that calls it"
+            ),
+        }
+        while out["owed"] and len(json.dumps(out)) > budget:
+            out["owed"] = out["owed"][: len(out["owed"]) // 2]
+            out["owed_truncated"] = True
+        return out
 
     def _session_id() -> str | None:
         return call_log.session.id if call_log is not None else None

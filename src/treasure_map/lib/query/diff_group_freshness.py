@@ -43,6 +43,7 @@ import sqlite3
 from typing import Any
 
 from treasure_map.lib.errors import ConfigError
+from treasure_map.lib.query import callee_groups as cg
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import same_shape_siblings as sss
 from treasure_map.lib.query.patch_view import (
@@ -235,6 +236,8 @@ def group_moved(
     (``group_unreadable``), never silently "unchanged"."""
     try:
         stored_ref = stored.get("group_ref")
+        if cg.is_callee_ref(stored_ref):
+            return _callee_moved(atlas, built, stored)
         side = stored.get("side")
         f2_key = _f2_from_ref(stored_ref)
         if f2_key is None or side not in ("a", "b"):
@@ -334,7 +337,13 @@ def annotate_group_on(
     ``cache`` (a batch passes one dict for the whole batch) keeps, per ``group_ref``, everything
     that depends on the group alone — the ref checks, the grouping and the snapshot — so several
     entries leaning on one group snapshot it once. Only the "about this entry" relation is worked
-    out per entry. A failed ref is not cached; it fails again, the same way, for each entry."""
+    out per entry. A failed ref is not cached; it fails again, the same way, for each entry.
+
+    A callee group_ref (``{diff_id}#callee:{X}@callee-v1``, lib/query/callee_groups) is checked
+    against the diff's callee groups now: the judged entry must be a member (``is_member``) or X's
+    own entry (``is_callee``)."""
+    if cg.is_callee_ref(group_ref):
+        return _annotate_callee(atlas, built, diff_id, anchor_ref, group_ref)
     hit = cache.get(group_ref) if cache is not None else None
     if hit is None:
         hit = _checked_group(atlas, built, side_meta, diff_id, group_ref)
@@ -410,6 +419,11 @@ def group_in_diff(
     ``annotate_group_on`` up to (not including) the ``_relation`` "about this entry" check: a
     group_ref used as a ``checked`` anchor proves a group was read, it need not be this entry's
     group. Never raises — any mismatch is False (it answers ``is_diff_anchor``, not a write)."""
+    if cg.is_callee_ref(item):
+        try:
+            return _callee_now(atlas, built, item, diff_id_of(side_meta))[0] is not None
+        except Exception:  # noqa: BLE001 — an anchor test never raises
+            return False
     parsed = _parse_ref(item)
     if parsed is None:
         return False
@@ -459,3 +473,70 @@ def _subject_shapes_listing(
     subject_refs, _is_candidate = _subject_side_refs(built, anchor_ref, side)
     mine = [c for c in calls if c.ref in subject_refs and c.unkeyed is None]
     return sss._shape_keys(meta, side, mine, groups)
+
+
+# ── callee groups (lib/query/callee_groups) ──────────────────────────────────────────────────
+
+
+def _callee_now(
+    atlas: sqlite3.Connection, built: BuiltDiff, group_ref: str, diff_id: str
+) -> tuple[cg.CalleeGroup | None, list[Any]]:
+    """The callee group ``group_ref`` names as it stands in this build now (None when it does not:
+    another diff, another version, no group of that callee), and the listed entries."""
+    parsed = cg.parse_ref(group_ref)
+    entries = listed_view(atlas, built).entries
+    if parsed is None:
+        return None, entries
+    g_diff, callee, version = parsed
+    if g_diff != diff_id or version != cg.CALLEE_GROUP_VERSION:
+        return None, entries
+    return cg.callee_groups(atlas, built, entries).get(callee), entries
+
+
+def _callee_moved(
+    atlas: sqlite3.Connection, built: BuiltDiff, stored: dict[str, Any]
+) -> dict[str, Any] | None:
+    group, entries = _callee_now(atlas, built, str(stored.get("group_ref")), built.diff.diff_id)
+    return cg.moved(stored, cg.snapshot(group, entries) if group is not None else None)
+
+
+def _callee_relation(group: cg.CalleeGroup, built: BuiltDiff, anchor_ref: str) -> str | None:
+    """``is_member`` when the judged entry is one of the group's members, ``is_callee`` when it is
+    the callee's own entry (a pair whose B side is X, or X in no pair), else None."""
+    diff = built.diff
+    for e in built.placed:
+        if dr.entry_anchor(e, diff.run_a, diff.run_b, diff.binary or "") != anchor_ref:
+            continue
+        if e.entry_id in group.members:
+            return "is_member"
+        if (e.pair is not None and e.pair.addr_b == group.callee_b) or (
+            e.unpaired is not None and e.unpaired.side == "b" and e.unpaired.addr == group.callee_b
+        ):
+            return "is_callee"
+        return None
+    return None
+
+
+def _annotate_callee(
+    atlas: sqlite3.Connection, built: BuiltDiff, diff_id: str, anchor_ref: str, group_ref: str
+) -> dict[str, Any]:
+    parsed = cg.parse_ref(group_ref)
+    if parsed is None or parsed[0] != diff_id:
+        raise ConfigError(f"group_ref {group_ref!r} is not a callee group of diff {diff_id!r}")
+    if parsed[2] != cg.CALLEE_GROUP_VERSION:
+        raise ConfigError(
+            f"group_ref is of version {parsed[2]!r}, but this build groups callees by "
+            f"{cg.CALLEE_GROUP_VERSION!r} — read the unit again and annotate against it"
+        )
+    group, entries = _callee_now(atlas, built, group_ref, diff_id)
+    if group is None:
+        raise ConfigError(
+            f"no callee group of {parsed[1]} in diff {diff_id!r} now — read the unit again"
+        )
+    relation = _callee_relation(group, built, anchor_ref)
+    if relation is None:
+        raise ConfigError(
+            f"group {group_ref!r} is not about this entry: it is neither one of its members "
+            f"({len(group.members)}) nor the callee's own entry"
+        )
+    return {**cg.snapshot(group, entries), "relation": relation}

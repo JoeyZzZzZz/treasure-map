@@ -12,6 +12,7 @@ paths, entry ids) is escaped in the HTML, which carries no script.
 from __future__ import annotations
 
 import html
+import re
 from typing import Any
 
 from treasure_map.lib.query import review_units as ru
@@ -85,6 +86,33 @@ def _md_cell(text: Any) -> str:
     return str(text).replace("|", "\\|").replace("\n", " ")
 
 
+# Above this many members a callee group is listed, not drawn (a diagram that size reads worse
+# than the table under it; the HTML page lists it the same way).
+MERMAID_MAX_MEMBERS = 15
+_MERMAID_SAFE = re.compile(r"[^0-9A-Za-z_:.]")
+
+
+def _mermaid_group(u: ru.Unit) -> list[str]:
+    """A callee group as a mermaid graph: each member -> the callee it newly calls."""
+    g = u.group or {}
+    if len(u.members) > MERMAID_MAX_MEMBERS:
+        return [
+            f"_Callee group `{_md_cell(g.get('ref'))}`: {len(u.members)} members newly call "
+            f"`{_md_cell(g.get('name'))}` — too many to draw; listed below._",
+            "",
+        ]
+
+    def label(text: Any) -> str:
+        return _MERMAID_SAFE.sub("_", str(text))
+
+    out = ["```mermaid", "graph LR"]
+    callee = f'X["{label(g.get("name"))} {label(g.get("callee_b"))}"]'
+    for i, m in enumerate(u.members):
+        out.append(f'  M{i}["{label(m.entry_id)}"] --> {callee if i == 0 else "X"}')
+    out += ["```", ""]
+    return out
+
+
 def markdown(review: ru.PairReview, *, header: dict[str, Any] | None = None) -> str:
     """The whole report as markdown: the summary, then every unit in the hand-out order."""
     rep = review.report
@@ -144,6 +172,8 @@ def markdown(review: ru.PairReview, *, header: dict[str, Any] | None = None) -> 
             '--rationale "<why>"`'
         )
         out.append("")
+        if u.kind == ru.GROUP and u.group is not None:
+            out += _mermaid_group(u)
         out.append("| member | bucket | state | reasons |")
         out.append("|---|---|---|---|")
         for m in u.members:
