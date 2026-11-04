@@ -374,12 +374,22 @@ def test_a_few_link_changes_stay_on_the_first_page(fw: FW) -> None:
 
 @pytest.mark.parametrize(
     "kw",
-    [{"offset": 1}, {"hunk_offset": 1}, {"path": "etc/rc"}, {"ko_offset": -1}],
+    [
+        {"offset": 1},
+        {"hunk_offset": 1},
+        {"path": "etc/rc"},
+        {"ko_offset": -1},
+        {"change": "content_differs"},
+        {"kind": "shell_script"},
+        {"detail": "summary"},
+    ],
 )
 def test_ko_offset_is_passed_alone(fw: FW, kw: dict[str, Any]) -> None:
-    """ko_offset pages the whole-pair lists; with offset, hunk_offset or path it is refused.
+    """ko_offset pages the whole-pair lists; with offset, hunk_offset or path it is refused, and
+    so with change, kind or detail="summary" (they would be ignored, silently, on its page).
 
-    MUTATION (verified RED): drop the exclusivity check -> no error -> RED."""
+    MUTATION (verified RED): drop the exclusivity check -> no error -> RED; drop the change / kind
+    / detail check -> those three -> RED."""
     fw.inv("a", "etc/rc", file_type="text", data="a\n")
     fw.inv("b", "etc/rc", file_type="text", data="b\n")
     args = {"ko_offset": 0, **kw}
@@ -433,7 +443,9 @@ def test_a_file_over_the_read_limit_reads_over_size_limit(
     """The line difference is read only up to a bound: a larger file reads over_size_limit, never
     a whole read into memory.
 
-    MUTATION (verified RED): drop the size check -> the hunk is read -> RED."""
+    MUTATION (verified RED): drop BOTH bounds — the size check before the read and the running
+    count during it -> the hunk is read -> RED. Either one alone holds the bound, so dropping only
+    one stays green."""
     monkeypatch.setattr(fd, "MAX_READ_BYTES", 8)
     fw.inv("a", "etc/big", file_type="text", data="a\n" * 10)
     fw.inv("b", "etc/big", file_type="text", data="b\n" * 10)
@@ -457,7 +469,27 @@ def test_every_entry_says_how_it_was_paired_and_the_legend_explains_it(fw: FW) -
 # ── E: the functions whose decompile did not finish, named ──────────────────────────────────
 
 
-def _gap_world(tmp: Path) -> tuple[Path, sqlite3.Connection]:
+def _other_side_db(tmp: Path, status: str, error: str | None = None) -> Path:
+    """The "old" run's own analysis.db: the paired function 00400a00 with ``status``."""
+    db = tmp / "old_analysis.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, sha256, ghidra_ok) VALUES (1, 'svc', ?, 1)", ("cd" * 32,)
+    )
+    conn.execute(
+        "INSERT INTO functions (binary_id, name, address, decompile_status, decompile_error, "
+        "callees) VALUES (1, 'big_fn', '00400a00', ?, ?, '[]')",
+        (status, error),
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _gap_world(
+    tmp: Path, other_status: str | None = "ok", other_error: str | None = None
+) -> tuple[Path, sqlite3.Connection]:
+    """``other_status`` None: the atlas records no analysis.db for the other run."""
     db = tmp / "analysis.db"
     conn = open_db(db)
     conn.execute(
@@ -485,7 +517,11 @@ def _gap_world(tmp: Path) -> tuple[Path, sqlite3.Connection]:
         "CREATE TABLE function_alignment (diff_id TEXT, addr_a TEXT, addr_b TEXT, "
         "alignment_state TEXT);"
         "CREATE TABLE instance (evidence_ref TEXT);"
+        "CREATE TABLE run (run_id TEXT, analysis_db_path TEXT);"
     )
+    if other_status is not None:
+        other = _other_side_db(tmp, other_status, other_error)
+        atlas.execute("INSERT INTO run VALUES ('old', ?)", (str(other),))
     atlas.execute(
         "INSERT INTO diff_meta VALUES ('d', 'old', 'new', ?, ?, 1)", ("cd" * 32, "ab" * 32)
     )
@@ -515,11 +551,66 @@ def test_unfinished_decompiles_are_named_with_what_remains(tmp_path: Path) -> No
     assert big["sink_callees"]["names"] == ["popen", "system"]
     assert big["sink_callees"]["unresolved_stub_callees"] == 1
     assert big["counterparts"] == [
-        {"diff_id": "d", "address": "00400a00", "alignment_state": "aligned", "candidates": 3}
+        {
+            "diff_id": "d",
+            "address": "00400a00",
+            "alignment_state": "aligned",
+            "counterpart_decompile": "ok",
+            "candidates": 3,
+        }
     ]
     assert by["huge_fn"]["cause"] == "payload_exceeded"
     line = gaps.describe(big)
     assert "2 sink callee(s)" in line and "1 unresolved stub" in line and "3 candidate" in line
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "cause"),
+    [("timeout", None, "timeout"), ("error", "payload_exceeded", "payload_exceeded")],
+)
+def test_a_counterpart_whose_decompile_did_not_finish_either_has_no_count(
+    tmp_path: Path, status: str, error: str | None, cause: str
+) -> None:
+    """★ The same function did not finish on the other side either: it has no pseudocode there,
+    so its 0 is not measured — no candidate count is given, the cause is named, and the line never
+    says it holds 0 (even with no instance on that side).
+
+    MUTATION (verified RED): count the candidates whatever the other side's decompile -> 0 ->
+    "holds 0" -> RED."""
+    db, atlas = _gap_world(tmp_path, other_status=status, other_error=error)
+    atlas.execute("DELETE FROM instance")
+    got = gaps.unfinished_decompiles(db, atlas=atlas, run_id="new")
+    assert got is not None
+    big = {g["name"]: g for g in got}["big_fn"]
+    (c,) = big["counterparts"]
+    assert c.get("candidates", "missing") is None
+    assert c.get("counterpart_decompile") == cause
+    line = gaps.describe(big)
+    assert "holds 0" not in line and "candidate(s)" not in line
+    assert f"did not finish either ({cause})" in line
+
+
+def test_a_counterpart_whose_decompile_cannot_be_read_keeps_its_count_and_says_so(
+    tmp_path: Path,
+) -> None:
+    """The other side's analysis.db is not recorded: its decompile is unknown, the instances are
+    still counted, and a 0 says its finish could not be read.
+
+    MUTATION (verified RED): treat unknown as unfinished -> no count -> RED; drop the unknown note
+    -> RED."""
+    db, atlas = _gap_world(tmp_path, other_status=None)
+    big = {g["name"]: g for g in gaps.unfinished_decompiles(db, atlas=atlas, run_id="new") or []}[
+        "big_fn"
+    ]
+    (c,) = big["counterparts"]
+    assert c.get("counterpart_decompile") == "unknown" and c.get("candidates") == 3
+    atlas.execute("DELETE FROM instance")
+    big = {g["name"]: g for g in gaps.unfinished_decompiles(db, atlas=atlas, run_id="new") or []}[
+        "big_fn"
+    ]
+    assert "holds 0 candidate(s) (whether its decompile finished could not be read)" in (
+        gaps.describe(big)
+    )
 
 
 def test_the_hunt_summaries_name_them(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

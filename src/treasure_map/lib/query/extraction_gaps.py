@@ -8,7 +8,10 @@ stored (and the atlas, for a counterpart), never computed during a hunt.
   candidate however many sinks it calls. Each is named with the facts that remain: the sinks its
   call list names (the call list is read from the listing, not the pseudocode, so it is there),
   how many of its callees are unresolved stubs, and — where a diff pairs it — how many candidates
-  the same function holds on the other side.
+  the same function holds on the other side. That count is given only when the other side's
+  decompile of it finished: one that did not finish either (or was never decompiled) holds no
+  candidate for the same reason, so its 0 is not measured — ``candidates`` is None and
+  ``counterpart_decompile`` names why.
 * ``analyzer_degraded_binaries`` — the binaries whose extraction finished while a Ghidra analyzer
   threw (``ghidra_status_reason`` ``analyzer_exception:*``): they hold functions, so no incomplete
   list names them, but their function set may be short.
@@ -85,13 +88,80 @@ def analyzer_degraded_binaries(conn: sqlite3.Connection) -> list[dict[str, Any]]
     return [{"binary": r[0], "reason": r[1]} for r in rows]
 
 
+# What the other side's decompile of a paired function came to (``counterpart_decompile``): "ok" (it
+# has pseudocode, so its candidate count is measured), the cause it has none, or "unknown" (the
+# other side's analysis.db, binary or function could not be read).
+COUNTERPART_FINISHED = "ok"
+COUNTERPART_UNKNOWN = "unknown"
+# The causes of a decompile that ran and did not finish (``skipped_micro`` never ran).
+_UNFINISHED_CAUSES = frozenset({"timeout", "payload_exceeded", "error"})
+
+
+def _decompile_cause(status: Any, error: Any) -> str:
+    """The stored decompile outcome as one word: "ok", "timeout", "payload_exceeded", "error",
+    "skipped_micro" (or another recorded status as it is); "unknown" when none is recorded."""
+    if not status:
+        return COUNTERPART_UNKNOWN
+    if status == "error":
+        return "payload_exceeded" if error == "payload_exceeded" else "error"
+    return str(status)
+
+
+def _other_side_decompile(
+    atlas: sqlite3.Connection,
+    run_id: str,
+    sha: str,
+    addr: str,
+    opened: dict[str, sqlite3.Connection | None],
+) -> str:
+    """The decompile outcome of the function at ``addr`` of the binary ``sha`` in ``run_id``'s
+    own analysis.db (``_decompile_cause``); "unknown" when any of it cannot be read. ``opened``
+    keeps one read-only connection per run for the caller to close."""
+    if run_id not in opened:
+        conn: sqlite3.Connection | None = None
+        try:
+            row = atlas.execute(
+                "SELECT analysis_db_path FROM run WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is not None and row[0]:
+                conn = ro_connect(Path(row[0]))
+        except sqlite3.Error:
+            conn = None
+        opened[run_id] = conn
+    conn = opened[run_id]
+    if conn is None:
+        return COUNTERPART_UNKNOWN
+    try:
+        fcols = _columns(conn, "functions")
+        if "decompile_status" not in fcols:
+            return COUNTERPART_UNKNOWN
+        err = "f.decompile_error" if "decompile_error" in fcols else "NULL"
+        found = conn.execute(
+            f"SELECT f.decompile_status, {err} FROM functions f JOIN binaries b "  # noqa: S608
+            "ON b.id = f.binary_id WHERE b.sha256 = ? AND f.address = ?",
+            (sha, addr),
+        ).fetchone()
+    except sqlite3.Error:
+        return COUNTERPART_UNKNOWN
+    if found is None:
+        return COUNTERPART_UNKNOWN
+    return _decompile_cause(found[0], found[1])
+
+
 def _counterparts(
-    atlas: sqlite3.Connection | None, run_id: str | None, sha: str, addr: str
+    atlas: sqlite3.Connection | None,
+    run_id: str | None,
+    sha: str,
+    addr: str,
+    opened: dict[str, sqlite3.Connection | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Per stored diff holding this binary of this run: the function its alignment pairs with
-    ``addr`` on the other side, and the candidates that function holds there."""
+    ``addr`` on the other side, what that side's decompile of it came to, and the candidates it
+    holds there — None when that decompile did not finish (no pseudocode: the 0 is not
+    measured)."""
     if atlas is None or run_id is None:
         return []
+    opened = {} if opened is None else opened
     out: list[dict[str, Any]] = []
     try:
         diffs = atlas.execute(
@@ -112,19 +182,26 @@ def _counterparts(
                 out.append({"diff_id": diff_id, "address": None, "candidates": None})
                 continue
             other_run, other_sha = (run_b, sha_b) if here_a else (run_a, sha_a)
+            decompile = _other_side_decompile(
+                atlas, str(other_run), str(other_sha), str(row[0]), opened
+            )
+            entry: dict[str, Any] = {
+                "diff_id": diff_id,
+                "address": row[0],
+                "alignment_state": row[1],
+                "counterpart_decompile": decompile,
+            }
+            if decompile not in (COUNTERPART_FINISHED, COUNTERPART_UNKNOWN):
+                entry["candidates"] = None  # no pseudocode there either: nothing was measured
+                out.append(entry)
+                continue
             prefix = f"{other_run}#{str(other_sha)[:8]}:{row[0]}@"
             n = atlas.execute(
                 "SELECT COUNT(*) FROM instance WHERE evidence_ref >= ? AND evidence_ref < ?",
                 (prefix, prefix[:-1] + "A"),  # '@' + 1 = 'A': every ref with this prefix
             ).fetchone()[0]
-            out.append(
-                {
-                    "diff_id": diff_id,
-                    "address": row[0],
-                    "alignment_state": row[1],
-                    "candidates": int(n),
-                }
-            )
+            entry["candidates"] = int(n)
+            out.append(entry)
     except sqlite3.OperationalError:
         return []
     return out
@@ -162,35 +239,52 @@ def unfinished_decompiles(
     finally:
         conn.close()
     out: list[dict[str, Any]] = []
-    for binary, sha, addr, name, status, error, callees_raw, truncated, stub_raw in rows:
-        table = _stub_table(stub_raw)
-        callees = _callees(callees_raw)
-        entry: dict[str, Any] = {
-            "binary": binary,
-            "address": addr,
-            "name": name,
-            "cause": "payload_exceeded" if status == "error" else "timeout",
-        }
-        if callees is None:
-            entry["sink_callees"] = None
-        else:
-            sinks: set[str] = set()
-            unresolved = 0
-            for c in callees:
-                resolved = stub_resolved_name(c, table) or c
-                if resolved in HUNT_SINKS:
-                    sinks.add(resolved)
-                elif _STUB_TOKEN.fullmatch(resolved):
-                    unresolved += 1
-            entry["sink_callees"] = {
-                "count": len(sinks),
-                "names": sorted(sinks)[:SINK_NAME_SAMPLE],
-                "unresolved_stub_callees": unresolved,
-                "callees_truncated": bool(truncated),
-            }
-        entry["counterparts"] = _counterparts(atlas, run_id, str(sha), str(addr))
-        out.append(entry)
+    opened: dict[str, sqlite3.Connection | None] = {}
+    try:
+        for row in rows:
+            out.append(_entry(row, atlas, run_id, opened))
+    finally:
+        for other in opened.values():
+            if other is not None:
+                other.close()
     return out
+
+
+def _entry(
+    row: tuple[Any, ...],
+    atlas: sqlite3.Connection | None,
+    run_id: str | None,
+    opened: dict[str, sqlite3.Connection | None],
+) -> dict[str, Any]:
+    """One unfinished function with what remains readable of it (see the module docstring)."""
+    binary, sha, addr, name, status, error, callees_raw, truncated, stub_raw = row
+    table = _stub_table(stub_raw)
+    callees = _callees(callees_raw)
+    entry: dict[str, Any] = {
+        "binary": binary,
+        "address": addr,
+        "name": name,
+        "cause": "payload_exceeded" if status == "error" else "timeout",
+    }
+    if callees is None:
+        entry["sink_callees"] = None
+    else:
+        sinks: set[str] = set()
+        unresolved = 0
+        for c in callees:
+            resolved = stub_resolved_name(c, table) or c
+            if resolved in HUNT_SINKS:
+                sinks.add(resolved)
+            elif _STUB_TOKEN.fullmatch(resolved):
+                unresolved += 1
+        entry["sink_callees"] = {
+            "count": len(sinks),
+            "names": sorted(sinks)[:SINK_NAME_SAMPLE],
+            "unresolved_stub_callees": unresolved,
+            "callees_truncated": bool(truncated),
+        }
+    entry["counterparts"] = _counterparts(atlas, run_id, str(sha), str(addr), opened)
+    return entry
 
 
 def describe(entry: dict[str, Any]) -> str:
@@ -209,9 +303,17 @@ def describe(entry: dict[str, Any]) -> str:
     for c in entry.get("counterparts") or []:
         if c.get("address") is None:
             head += f"; no counterpart in {c['diff_id']}"
-        else:
-            head += (
-                f"; the same function on the other side ({c['address']}, {c['alignment_state']}) "
-                f"holds {c['candidates']} candidate(s)"
-            )
+            continue
+        head += f"; the same function on the other side ({c['address']}, {c['alignment_state']})"
+        decompile = c.get("counterpart_decompile", COUNTERPART_FINISHED)
+        if c.get("candidates") is None:
+            if decompile in _UNFINISHED_CAUSES:
+                head += f": its decompile did not finish either ({decompile})"
+            else:
+                head += f": it has no pseudocode either ({decompile})"
+            head += " — no candidate count"
+            continue
+        head += f" holds {c['candidates']} candidate(s)"
+        if decompile == COUNTERPART_UNKNOWN and not c["candidates"]:
+            head += " (whether its decompile finished could not be read)"
     return head

@@ -1414,9 +1414,10 @@ def file_diff(
     suppressed shape paged by ``hunk_offset`` (on the page with ``offset`` 0). ``review`` maps an
     anchor to its review state (the caller's judgement read); a file with none reads the unjudged
     state, as an unjudged entry of a binary diff does. ``pf`` is the pair's files when the caller
-    has read them already. ``ko_offset`` (alone: no ``path``, ``offset`` or ``hunk_offset``) reads
-    a page of the whole-pair lists — the .ko modules and the symbolic links — that the first page
-    gives as counts. Raises FileDiffError on an argument or a side it cannot read."""
+    has read them already. ``ko_offset`` (alone: no ``path``, ``offset``, ``hunk_offset``,
+    ``change``, ``kind`` or ``detail="summary"``) reads a page of the whole-pair lists — the .ko
+    modules and the symbolic links — that the first page gives as counts. Raises FileDiffError on
+    an argument or a side it cannot read."""
     if detail not in DETAILS:
         raise FileDiffError(f"detail must be one of {list(DETAILS)}; got {detail!r}")
     if change is not None and change not in STATUSES:
@@ -1435,6 +1436,11 @@ def file_diff(
             raise FileDiffError(
                 "ko_offset pages the whole-pair lists (.ko modules, symbolic links); offset pages "
                 "the files and path / hunk_offset read one file: pass ko_offset alone"
+            )
+        if change is not None or kind is not None or detail != DETAILS[0]:
+            raise FileDiffError(
+                "ko_offset pages the whole-pair lists whole: change, kind and detail filter or "
+                "shorten the file entries, not them — pass ko_offset alone"
             )
     if pf is None:
         pf = read_pair(atlas, run_a, run_b)

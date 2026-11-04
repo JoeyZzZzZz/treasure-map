@@ -797,6 +797,25 @@ def test_the_scan_records_a_rerun_that_could_not_finish_and_the_next_scan_honour
     assert _rows(tmp_path / "ws" / "analysis.db")[a]["rerun"] is None  # the re-run finished them
 
 
+def test_a_kept_phase_one_session_still_records_the_rerun_that_could_not_finish(
+    tmp_path: Path,
+) -> None:
+    """★ Phase 1's session is the better one and stands whole (``stored_stands``); the isolated
+    re-run still left large decompiles unfinished, so the row records it all the same — the next
+    scan under the same conditions does not buy that attempt again.
+
+    MUTATION (verified RED): drop the record call on the stored_stands branch of _persist_export
+    -> no record -> RED."""
+    a = _NAMES[0]
+    plan = _Plan({a: [{"large": 1}, {"large": 3}], **{n: [{"functions": 2}] for n in _NAMES[1:]}})
+    fs = _firmware(tmp_path)
+    home = _ghidra(tmp_path)
+    _scan(fs, tmp_path / "ws", home, plan)
+    assert sum(1 for c in plan.calls if c[0] == a) == 2  # phase 1, then the isolated re-run
+    rec = _rows(tmp_path / "ws" / "analysis.db")[a].get("rerun")
+    assert rec is not None and rec.get("ghidra_version") == "11.0" and rec.get("budget", 0) > 0
+
+
 def test_the_scan_summary_names_the_binaries_that_kept_an_analyzer_exception() -> None:
     """MUTATION (verified RED): leave _warn_analyzer_degraded out of report_extraction_state ->
     RED."""

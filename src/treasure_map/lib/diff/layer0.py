@@ -887,9 +887,10 @@ def compute_side_presence(
 
     ★ HONEST COVERAGE NOTE: the presence / baseline layer has NO real-firmware CI coverage. Every
     presence test uses a synthetic analysis.db; the A-side reference numbers (1111 / 737 / 34) rest
-    on two one-off manual verifications with no live assertion, and the B-side (where the 'new
-    function' signal would live) has never been run on real data because no patched run is ingested.
-    The double-machine reproducibility that IS proven covers the .BinDiff EXPORT, not this layer."""
+    on two one-off manual verifications with no live assertion. Both sides now run on real data
+    (patched runs are ingested, so every stored diff computes A- and B-side presence), but no live
+    number of either side is asserted anywhere. The double-machine reproducibility that IS proven
+    covers the .BinDiff EXPORT, not this layer."""
     domain = baseline.addrs - stubs
     unmatched_addrs = domain - matched_addrs
     out_of_inventory_addrs = matched_addrs - baseline.addrs
