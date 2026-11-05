@@ -14,12 +14,15 @@ binary it finished: re-running the same command decompiles only the rest.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import json
 import logging
 import sqlite3
+import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +36,7 @@ from treasure_map.lib.analyze.db_ingest import (
     toolchain_changed,
 )
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, scan_filesystem
+from treasure_map.lib.analyze.extraction_share import ExtractionShare
 from treasure_map.lib.analyze.file_inventory import build_file_inventory
 from treasure_map.lib.analyze.ghidra_ingest import (
     IngestStats,
@@ -44,6 +48,7 @@ from treasure_map.lib.analyze.ghidra_runner import (
     ANALYZER_EXCEPTION_PREFIX,
     GhidraResult,
     GhidraRunner,
+    _write_owner,
     export_paths,
     unfinished_decompiles,
 )
@@ -234,12 +239,36 @@ def _archive_export(
                 ctx.archive_dir,
                 rec.sha256,
                 ctx.pass_version,
+                res.session,
             )
             archived = (a.export_name, a.report_name, a.export_bytes)
         except OSError as exc:
             logger.warning("binexport: cannot archive the export of %s: %s", rec.name, exc)
             status = "failed:archive_error"
     return status, _export_meta(ctx, res, archived), archived
+
+
+# The sessions shared by the runs of one rescan (lib/analyze/extraction_share); None outside one.
+_SHARE: contextvars.ContextVar[ExtractionShare | None] = contextvars.ContextVar(
+    "extraction_share", default=None
+)
+
+
+@contextlib.contextmanager
+def sharing_extractions() -> Iterator[ExtractionShare]:
+    """Every scan run inside this block hands a Ghidra session it ran to the later runs that need
+    the same one (same binary, same key), instead of each running it again. The kept files live in
+    a temporary directory removed when the block ends (owner-marked, so a scan that dies leaves
+    one the next scan sweeps)."""
+    with tempfile.TemporaryDirectory(prefix="tm_share_") as d:
+        root = Path(d)
+        _write_owner(root)
+        share = ExtractionShare(root)
+        token = _SHARE.set(share)
+        try:
+            yield share
+        finally:
+            _SHARE.reset(token)
 
 
 def run_analyze(
@@ -288,6 +317,9 @@ def run_analyze(
     # extension_missing, and a diff of them is a declared blind spot.
     extension = scan_extension(runner.get_headless().resolve().parent.parent)
     runner.set_extension(extension)
+    # Within a rescan that shares sessions across its runs (sharing_extractions), a binary another
+    # run already extracted under the same key is handed over instead of extracted again.
+    runner.set_share(_SHARE.get())
     if extension.note:
         logger.warning("binexport: %s", extension.note)
     script_hash = export_code_hash(SCAN_BUILDER)

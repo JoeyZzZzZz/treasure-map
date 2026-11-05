@@ -3007,7 +3007,31 @@ def _rescan_each(
     resolved_atlas: Path,
     force: bool,
 ) -> list[tuple[str, str]]:
-    """Scan each runnable run in place, in order; returns the runs that failed, with why."""
+    """Scan each runnable run in place, in order; returns the runs that failed, with why.
+
+    The runs share their Ghidra sessions (lib/analyze/extraction_share): a binary several runs hold
+    byte for byte is decompiled once, and every one of them stores that one session's output."""
+    from treasure_map.lib.analyze.pipeline import sharing_extractions
+
+    with sharing_extractions() as share:
+        failed = _rescan_each_sharing(ctx, runnable, axis_of, cfg, config, resolved_atlas, force)
+    if share.handed:
+        click.echo(
+            f"\nshared extraction: {share.handed} binary session(s) handed to another run "
+            f"instead of decompiled again ({share.sessions} session(s) run)"
+        )
+    return failed
+
+
+def _rescan_each_sharing(
+    ctx: click.Context,
+    runnable: list[tuple[RunRow, str]],
+    axis_of: dict[str, str],
+    cfg: Config,
+    config: Path | None,
+    resolved_atlas: Path,
+    force: bool,
+) -> list[tuple[str, str]]:
     failed: list[tuple[str, str]] = []
     for i, (r, _why) in enumerate(runnable, start=1):
         click.echo(f"\n=== [{i}/{len(runnable)}] rescanning {r.run_id} ===")

@@ -388,6 +388,19 @@ def test_the_guide_explains_string_delta_and_callsite_counts() -> None:
     )
 
 
+def test_the_guide_names_the_undisassembled_bytes_probe_and_its_reason() -> None:
+    """★ W11: the guide's P-entry sentence names the counterpart_probe value for bytes the other
+    side never disassembled AND the presence_reason a reader filters on, and says it is
+    incomplete — so a P entry over such bytes is not read as a determined add or delete.
+
+    MUTATION (verified RED): the sentence reduced to "are gaps" (both names dropped) -> RED."""
+    guide = " ".join(mcp_app._AGENT_GUIDE.split())
+    assert (
+        "bytes the other side's analysis never disassembled are undisassembled_bytes (reason "
+        "other_side_bytes_not_disassembled, incomplete)" in guide
+    )
+
+
 def test_the_descriptions_name_skipped_micro_and_pseudocode_status() -> None:
     """get_diff_patch_view lists skipped_micro as a pseudocode_sameness value of its own, apart
     from unavailable; get_pseudocode says what an empty text carries.

@@ -9,15 +9,19 @@ analysis.db, one pair per (sha256, pass_version):
     binexport/<sha256>_<pass_version>_<session>.BinExport.gz
     binexport/<sha256>_<pass_version>_<session>.export_report.json.gz
 
-``<session>`` is new for every archive written, so an archive is never overwritten in place: the
-row names its own files, the new files are written beside the old ones, and the old ones are removed
-only after the row naming the new ones is committed (an interrupt in between leaves the row and its
-own, intact files — never a row whose name now holds another session's export).
+``<session>`` names the Ghidra session that made the export, new for every session, so an archive
+is never overwritten in place: the row names its own files, the new files are written beside the
+old ones, and the old ones are removed only after the row naming the new ones is committed (an
+interrupt in between leaves the row and its own, intact files — never a row whose name now holds
+another session's export).
 
-Never shared across workspaces by content: two sessions export one binary differently, and a diff
-must compare two exports each made in the session that made its side's functions. Within one
-workspace a sha256 is one binary row, so one pair is current per binary; any other pair of that
-sha256 is removed once a new outcome is stored.
+An export always comes from the session that made the functions stored beside it. Within one
+rescan, a binary held by several workspaces may be extracted once and that one session's output —
+its functions and its export together — stored in each (lib/analyze/extraction_share): each
+workspace then archives a copy under the same session name. Never is one workspace's archive read
+by another, and never is an export paired with functions of another session. Within one workspace a
+sha256 is one binary row, so one pair is current per binary; any other pair of that sha256 is
+removed once a new outcome is stored.
 
 The binary row records the outcome (``binaries.binexport_status``: ok / degraded / failed:<why> /
 scan_failed:<why> / extension_missing) and what the export was made by
@@ -90,12 +94,18 @@ class Archived:
 
 
 def write_archive(
-    export_file: Path, report_file: Path, dest_dir: Path, sha256: str, pass_version: str
+    export_file: Path,
+    report_file: Path,
+    dest_dir: Path,
+    sha256: str,
+    pass_version: str,
+    session: str | None = None,
 ) -> Archived:
-    """Compress one binary's export and report into ``dest_dir``. Raises OSError when either cannot
-    be written (the caller records the export as failed)."""
+    """Compress one binary's export and report into ``dest_dir``, named by the Ghidra ``session``
+    that made them (a fresh id when not given). Raises OSError when either cannot be written (the
+    caller records the export as failed)."""
     dest_dir.mkdir(parents=True, exist_ok=True)
-    export_name, report_name = archive_names(sha256, pass_version, uuid.uuid4().hex[:12])
+    export_name, report_name = archive_names(sha256, pass_version, session or uuid.uuid4().hex[:12])
     _gzip_into(report_file, dest_dir / report_name)
     size = _gzip_into(export_file, dest_dir / export_name)
     return Archived(export_name, report_name, size)

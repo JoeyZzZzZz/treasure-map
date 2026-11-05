@@ -376,3 +376,45 @@ def test_the_load_shift_follows_the_class_and_the_lowest_load(tmp_path: Path) ->
     for name, (elf, want) in cases.items():
         assert ghidra_load_shift(_write(tmp_path, name, elf.build())) == want, name
     assert ghidra_load_shift(_write(tmp_path, "text", b"not an elf")) is None
+
+
+# ── complete: the named table covers every stub of the binary ──────────────────────────────────
+
+
+def test_a_plt_whose_every_entry_is_named_and_no_mips_stubs_is_complete(tmp_path: Path) -> None:
+    """★ The one shape that is a full account: no ``.MIPS.stubs`` and every ``.plt`` entry named.
+    The positive control for the two refusals below (a mutation there must not merely turn every
+    table incomplete)."""
+    from tests.unit.lib.elf_builder import mips_plt_binary
+
+    r = resolve_stubs(_write(tmp_path, "lib.so", mips_plt_binary(mips_stubs=False)))
+    assert r is not None
+    assert r.names == {0x10420: "system"}
+    assert r.complete is True
+
+
+def test_a_non_empty_mips_stubs_table_makes_the_named_table_incomplete(tmp_path: Path) -> None:
+    """★ Every ``.plt`` entry is named, but a non-empty ``.MIPS.stubs`` holds stubs this path never
+    names: the table is NOT complete, so a one-sided import name on a diff is not read as
+    determined.
+
+    MUTATION (verified RED): ``complete`` ignores ``.MIPS.stubs`` (entry count alone) -> RED."""
+    from tests.unit.lib.elf_builder import mips_plt_binary
+
+    r = resolve_stubs(_write(tmp_path, "lib.so", mips_plt_binary(mips_stubs=True)))
+    assert r is not None
+    assert r.names == {0x10420: "system"}
+    assert r.complete is False
+
+
+def test_a_plt_entry_left_unnamed_makes_the_named_table_incomplete(tmp_path: Path) -> None:
+    """★ No ``.MIPS.stubs``, but the ``.plt`` holds two entries and only the first one's GOT slot
+    has a relocation: one name for two stubs is NOT complete.
+
+    MUTATION (verified RED): ``complete`` ignores the entry count (``.MIPS.stubs`` alone) -> RED."""
+    from tests.unit.lib.elf_builder import mips_plt_binary
+
+    r = resolve_stubs(_write(tmp_path, "lib.so", mips_plt_binary(plt_entries=2, mips_stubs=False)))
+    assert r is not None
+    assert r.names == {0x10420: "system"}
+    assert r.complete is False

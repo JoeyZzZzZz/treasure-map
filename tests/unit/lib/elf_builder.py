@@ -127,9 +127,14 @@ def mips_plt_binary(
     got_plt_addr: int = 0x800,
     stubs_addr: int = 0x600,
     import_name: str = "system",
+    plt_entries: int = 1,
+    mips_stubs: bool = True,
 ) -> bytes:
-    """A 32-bit MIPS ELF whose one ``.plt`` stub resolves, through ``.rel.plt``, to
-    ``import_name``; plus a ``.MIPS.stubs`` region. Addresses are link-time (sh_addr)."""
+    """A 32-bit MIPS ELF whose first ``.plt`` stub resolves, through ``.rel.plt``, to
+    ``import_name``; plus a ``.MIPS.stubs`` region. Addresses are link-time (sh_addr).
+
+    ``plt_entries``: how many per-import stubs the ``.plt`` holds; only the first has a relocation,
+    so every further one is left unnamed. ``mips_stubs=False`` leaves the ``.MIPS.stubs`` out."""
     dynstr = b"\0" + import_name.encode() + b"\0"
     # Elf32_Sym: name, value, size, info, other, shndx — a null symbol, then the import.
     dynsym = struct.pack("<IIIBBH", 0, 0, 0, 0, 0, 0) + struct.pack("<IIIBBH", 1, 0, 0, 0x12, 0, 0)
@@ -139,10 +144,14 @@ def mips_plt_binary(
         Section(".dynstr", SHT_STRTAB, data=dynstr),
         Section(".dynsym", SHT_DYNSYM, data=dynsym, link=".dynstr", info=1, entsize=16),
         Section(".rel.plt", SHT_REL, data=rel, link=".dynsym", entsize=8),
-        Section(".plt", SHT_PROGBITS, addr=plt_addr, data=b"\0" * 0x30, flags=6),
+        Section(
+            ".plt", SHT_PROGBITS, addr=plt_addr, data=b"\0" * (0x20 + 0x10 * plt_entries), flags=6
+        ),
         Section(".MIPS.stubs", SHT_PROGBITS, addr=stubs_addr, data=b"\0" * 0x20, flags=6),
         Section(".got.plt", SHT_PROGBITS, addr=got_plt_addr, data=b"\0" * 12, flags=3),
     ]
+    if not mips_stubs:
+        secs = [s for s in secs if s.name != ".MIPS.stubs"]
     return Elf(e_type=e_type, machine=EM_MIPS, load_vaddr=load_vaddr, sections=secs).build()
 
 

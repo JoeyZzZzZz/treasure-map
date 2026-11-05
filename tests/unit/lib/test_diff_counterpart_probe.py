@@ -331,6 +331,32 @@ def test_probe_counterparts_directly() -> None:
     assert got["00002000"].overlap == ((0x2120, 0x2123),)
 
 
+def test_a_stub_region_is_half_open_its_end_address_is_not_a_slot() -> None:
+    """★ A stub region is half-open [lo, hi), as an ELF section is: its first and last byte are
+    stub slots (occupied), the address equal to its end is the next thing past the table and is
+    probed like any other spot (here: nothing there, uncovered).
+
+    MUTATION (verified RED): the region read closed (``lo <= y <= hi``) -> the end address reads
+    occupied -> RED."""
+    own = BaselineDomain(
+        functions={a: ("f", "ok") for a in ("00002000", "000020ff", "00002100")},
+        sizes={"00002000": 1, "000020ff": 1, "00002100": 1},
+    )
+    other = BaselineDomain(
+        functions={}, residual_ranges=(), undefined_ranges=(), stub_regions=((0x2100, 0x2200),)
+    )
+    got = probe_counterparts(
+        frozenset({"00002000", "000020ff", "00002100"}),
+        own,
+        other,
+        [("00001000", "00001100")],
+        frozenset(),
+    )
+    assert got["00002000"].probe == "occupied"  # maps to lo
+    assert got["000020ff"].probe == "occupied"  # maps to hi - 1
+    assert got["00002100"].probe == "uncovered"  # maps to hi: past the table
+
+
 # ── W4: import stubs ────────────────────────────────────────────────────────────────────────
 
 _STUB_A = {0x400: "strcpy", 0x410: "system", 0x420: "only_a"}
@@ -661,3 +687,94 @@ def test_two_complete_tables_are_not_flagged_unconfirmed(tmp_path: Path) -> None
     assert st["complete"] == {"a": 1, "b": 1}
     assert st["a_only"] == ["system"] and st["b_only"] == ["printf"]
     assert "one_sided_unconfirmed" not in st
+
+
+def test_a_one_sided_name_is_unconfirmed_when_a_tables_completeness_is_not_recorded(
+    tmp_path: Path,
+) -> None:
+    """★ W13: B's table is named but its completeness was never recorded (NULL). Not known to be
+    complete is not complete: a name present only on A is still flagged one_sided_unconfirmed.
+
+    MUTATION (verified RED): flag only a recorded 0 (``complete_a == 0 or complete_b == 0``) ->
+    the NULL side reads as confirmed -> RED."""
+    con, did = _diff(
+        tmp_path,
+        _W13_A,
+        _W13_B,
+        _W13_PAIRS,
+        a_stubs={0x3000: "system", 0x3010: "printf"},
+        a_stub_complete=1,
+        b_stubs={0x3100: "printf"},
+        b_stub_complete=None,
+    )
+    st = get_diff_meta(con, did)["import_stubs"]
+    con.close()
+    assert (st["table_a"], st["table_b"]) == ("resolved", "resolved")
+    assert st["complete"] == {"a": 1, "b": None}
+    assert st["a_only"] == ["system"]
+    assert st.get("one_sided_unconfirmed") is True
+
+
+def test_an_atlas_without_the_stub_complete_columns_gains_them_on_open(tmp_path: Path) -> None:
+    """★ W13: an atlas whose diff_meta predates stub_complete_a / stub_complete_b gains both on
+    open (the migration, not only a fresh CREATE TABLE), so a diff written into it records each
+    side's completeness and the import_stubs read finds the columns.
+
+    MUTATION (verified RED): drop stub_complete_a from the diff_meta migration list -> RED."""
+    from treasure_map.lib.atlas.connection import _column_names
+
+    db = tmp_path / "atlas.db"
+    con = open_atlas(db)
+    con.execute("ALTER TABLE diff_meta DROP COLUMN stub_complete_a")
+    con.execute("ALTER TABLE diff_meta DROP COLUMN stub_complete_b")
+    con.commit()
+    assert not {"stub_complete_a", "stub_complete_b"} & set(_column_names(con, "diff_meta"))
+    con.close()
+    con = open_atlas(db)
+    try:
+        cols = set(_column_names(con, "diff_meta"))
+    finally:
+        con.close()
+    assert {"stub_complete_a", "stub_complete_b"} <= cols
+
+
+# ── a ledger stub is a taken spot for the other side's probe ──────────────────────────────────
+
+# keep@0x1000 <-> 0x1100 (+0x100) is the only pair. A's g@0x2000 maps onto B's stub at 0x2100; B's
+# h@0x3100 maps back onto A's stub at 0x3000. Both stub tables are named, so the ledger takes the
+# stubs out of the pairing — and a stub it took out is still a TAKEN spot, not an unpaired function.
+_LS_A = [(0x1000, "keep", 0x40, None), (0x2000, "g", 0x20, None), (0x3000, "puts", 0x10, None)]
+_LS_B = [(0x1100, "keep", 0x40, None), (0x2100, "strcpy", 0x10, None), (0x3100, "h", 0x20, None)]
+_LS_PAIRS = [(0x1000, "keep", 0x1100, "keep")]
+
+
+def test_a_stub_the_ledger_accounts_reads_occupied_for_the_other_sides_probe(
+    tmp_path: Path,
+) -> None:
+    """★ An unmatched function that maps onto an other-side import stub the ledger accounts by name
+    lands on a taken spot: occupied, unmatched_analysis_complete — never counterpart_suspected (a
+    stub is not a function the diff tool failed to pair). Checked on both sides.
+
+    MUTATION (verified RED): the other side's ledger stubs left out of ``occupied`` (B side:
+    ``parsed.matched_addrs_b`` alone) -> g reads counterpart_suspected -> RED; the same on the A
+    side -> h reads counterpart_suspected -> RED."""
+    con, did = _diff(
+        tmp_path,
+        _LS_A,
+        _LS_B,
+        _LS_PAIRS,
+        a_stubs={0x3000: "puts"},
+        b_stubs={0x2100: "strcpy"},
+    )
+    pres = _presence(con, did)
+    meta = get_diff_meta(con, did)["import_stubs"]
+    con.close()
+    assert (meta["table_a"], meta["table_b"]) == ("resolved", "resolved")  # the ledger is on
+    assert ("a", "00003000") not in pres and ("b", "00002100") not in pres  # stubs taken out
+    g, h = pres[("a", "00002000")], pres[("b", "00003100")]
+    for row, stub in ((g, "00002100"), (h, "00003000")):
+        assert (row["presence_state"], row["counterpart_probe"], row["counterpart_addr"]) == (
+            "unmatched_analysis_complete",
+            "occupied",
+            stub,
+        )

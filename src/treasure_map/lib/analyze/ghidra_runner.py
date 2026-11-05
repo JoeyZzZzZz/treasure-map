@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
@@ -27,7 +28,9 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, has_substantial_text
+from treasure_map.lib.analyze.extraction_share import ExtractionShare
 from treasure_map.lib.analyze.ghidra_launch import (
+    JVM_INHERITED_KEYS,
     _patch_elf_for_ghidra,
     build_cmd,
     build_env,
@@ -284,6 +287,10 @@ class GhidraResult:
     # unfinished: the budget it ran under. Recorded so a later scan under the same pass, Ghidra and
     # budget does not spend another isolated re-run on them (see db_ingest.decompile_rerun_skips).
     decompile_rerun_budget: int | None = None
+    # The Ghidra session that produced this result (a fresh id per attempt). Its export is archived
+    # under it, so every workspace holding one session's export names it alike (see
+    # lib/analyze/extraction_share). None for a result no session produced.
+    session: str | None = None
     # The wall-clock budget (seconds) the attempt behind THIS result actually ran under — recorded,
     # not re-derived, because "re-scan may finish it" is only true if the next scan hands it MORE
     # time. Measured rather than computed so a run that never reached the isolated retry (its phase
@@ -750,7 +757,7 @@ def _read_export(export_file: Path, report_file: Path) -> tuple[str, dict[str, A
 # owner is alive, or that carries no marker, or whose owner cannot be told (no /proc), is left.
 
 _OWNER_FILE = ".tmap_owner"
-_SESSION_PREFIXES = ("tm_ghidra_proj_", "tm_ghidra_home_", "tm_elfpatch_")
+_SESSION_PREFIXES = ("tm_ghidra_proj_", "tm_ghidra_home_", "tm_elfpatch_", "tm_share_")
 
 
 def _process_start(pid: int) -> str | None:
@@ -906,6 +913,13 @@ def _compare_extractions(first: GhidraResult, rerun: GhidraResult) -> int:
     return 0
 
 
+def phase_one_order(records: list[ElfRecord]) -> list[tuple[int, ElfRecord]]:
+    """(index, record) in the order phase 1 hands them to the pool: the largest file first, so the
+    longest sessions start while the pool is full instead of trailing alone at its end; records of
+    one size keep their order."""
+    return sorted(enumerate(records), key=lambda ir: (-(ir[1].size or 0), ir[0]))
+
+
 class GhidraRunner:
     """Manages Ghidra headless analysis for one or many ELF binaries."""
 
@@ -924,9 +938,16 @@ class GhidraRunner:
         # None, or one with no ext_dir, = no export: binaries are recorded extension_missing.
         self._extension = extension
 
+    def set_share(self, share: ExtractionShare | None) -> None:
+        """The rescan's shared sessions (lib/analyze/extraction_share): a session another run of
+        the same rescan already ran under the same key is handed over instead of run again. None
+        (the default) runs every session."""
+        self._share = share
+
     def set_extension(self, extension: ScanExtension | None) -> None:
         """The BinExport copy the scan's JVMs load (None = none: no export is attempted)."""
         self._extension = extension
+        self._share: ExtractionShare | None = None
 
     def _exporting(self) -> bool:
         return self._extension is not None and self._extension.ext_dir is not None
@@ -948,6 +969,40 @@ class GhidraRunner:
         return detect_ghidra_version(self.get_headless())
 
     def run_ghidra(
+        self,
+        binary: Path,
+        output_dir: Path,
+        timeout: int,
+        arch: str,
+        sha8: str = "",
+        retry: bool = True,
+        large_payload: bool = False,
+    ) -> GhidraResult:
+        """``_run_session``, or — within a rescan that shares sessions (``set_share``) — the outcome
+        of the session another run already ran under the same key, copied into ``output_dir``."""
+        share = getattr(self, "_share", None)
+        if share is None:
+            return self._run_session(binary, output_dir, timeout, arch, sha8, retry, large_payload)
+        key = share.key(
+            binary,
+            arch=arch,
+            timeout=timeout,
+            retry=retry,
+            large_payload=large_payload,
+            pass_version=self.pass_version(),
+            ghidra_version=self.ghidra_version(),
+            extension=self._extension.stamp if self._exporting() and self._extension else None,
+            environment={k: v for k, v in os.environ.items() if k in JVM_INHERITED_KEYS},
+        )
+        handed = share.get(key, binary, output_dir)
+        if handed is not None:
+            return handed  # type: ignore[no-any-return]
+        result = self._run_session(binary, output_dir, timeout, arch, sha8, retry, large_payload)
+        if result.reason not in (_INTERRUPTED, "launch_failed"):
+            share.put(key, result)
+        return result
+
+    def _run_session(
         self,
         binary: Path,
         output_dir: Path,
@@ -1271,6 +1326,7 @@ class GhidraRunner:
             export_report_file=exp[1] if usable and exp is not None else None,
             export_report=export_report if usable else None,
             export_budget=export_budget,
+            session=uuid.uuid4().hex[:12],
         )
 
     def run_all(
@@ -1352,7 +1408,7 @@ class GhidraRunner:
                     rec.sha256[:8],
                     False,  # phase 1: defer the timeout retry to the serial phase 2
                 ): i
-                for i, rec in enumerate(records)
+                for i, rec in phase_one_order(records)
             }
             try:
                 for done, fut in enumerate(as_completed(future_to_idx), 1):

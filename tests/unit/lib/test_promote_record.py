@@ -581,6 +581,74 @@ def test_the_scan_prints_the_promotion_line_and_names_unowned_binaries(tmp_path:
     assert re.search(r"tripped a promotion guard.*: b$", out.stderr, re.M)
 
 
+def test_either_guard_count_alone_names_the_binary(tmp_path: Path) -> None:
+    """★ The W14 guard trips on lost instruction bytes OR on no-return flips — each alone names
+    the binary; two zeros or an unrecorded (NULL) guard do not.
+
+    MUTATION (verified RED): the guard reads the flips only -> 'lost' is not named -> RED; the guard
+    reads the lost bytes only -> 'flip' is not named -> RED."""
+    conn = open_db(tmp_path / "analysis.db")
+    try:
+        # name, lost_bytes, nr_flips
+        for i, (name, lost, flips) in enumerate(
+            [("flip", 0, 1), ("lost", 8, 0), ("quiet", 0, 0), ("unknown", None, None)], start=1
+        ):
+            conn.execute(
+                "INSERT INTO binaries (id, name, sha256, ghidra_ok, promote_created, "
+                "promote_residual_insns, promote_residual_unowned, promote_recovered, "
+                "promote_recover_lost_bytes, promote_recover_noreturn_flips) "
+                "VALUES (?, ?, ?, 1, 1, 0, 0, 0, ?, ?)",
+                (i, name, f"{i:064x}", lost, flips),
+            )
+        conn.commit()
+        assert promote_summary(conn)["guard_binaries"] == ["flip", "lost"]
+    finally:
+        conn.close()
+
+
+def test_a_scan_where_no_binary_recorded_the_promotion_says_so_not_zero(tmp_path: Path) -> None:
+    """★ Every extracted binary recorded nothing: the line says "not recorded for N binaries", and
+    never "0 created ... 0 instructions left", which would read as a determined zero.
+
+    MUTATION (verified RED): drop the all-unrecorded branch (``if total - unrecorded <= 0``) -> the
+    line prints "0 created" -> RED."""
+    import click
+
+    from treasure_map.cli.analyze_cli import report_extraction_state
+
+    conn = open_db(tmp_path / "analysis.db")
+    try:
+        for i, name in enumerate(("svc_a", "svc_b"), start=1):
+            conn.execute(
+                "INSERT INTO binaries (id, name, sha256, ghidra_ok) VALUES (?, ?, ?, 1)",
+                (i, name, f"{i:064x}"),
+            )
+        conn.commit()
+        promote = promote_summary(conn)
+    finally:
+        conn.close()
+    assert (promote["binaries"], promote["unrecorded"]) == (2, 2)
+
+    class _R:
+        incomplete_binaries: list[str] = []
+        no_functions_binaries: list[str] = []
+        kept_earlier_binaries: list[dict[str, Any]] = []
+        reanalyze_pending = 0
+
+    result = _R()
+    result.promote = promote  # type: ignore[attr-defined]
+
+    @click.command()
+    def cmd() -> None:
+        report_extraction_state(result, None)
+
+    out = CliRunner().invoke(cmd, [])
+    assert out.exit_code == 0, out.output
+    assert "promoted functions: not recorded for 2 binaries" in out.stdout
+    assert "created" not in out.stdout
+    assert "instructions left" not in out.stdout
+
+
 # ── the two Ghidra scripts, read as text ────────────────────────────────────────────────────
 
 
