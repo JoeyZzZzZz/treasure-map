@@ -1792,3 +1792,30 @@ def test_the_literal_spans_of_a_text_are_read_once_for_every_reader() -> None:
     assert taint._literal_spans(text) is first
     info = classes._literal_spans.cache_info()
     assert (info.hits, info.misses) == (1, 1)
+
+
+def test_the_cached_taint_readings_cannot_be_changed_in_place() -> None:
+    """★ The taint readings are cached per text and the SAME object goes to every caller, so none
+    of them can be updated in place: the call names and the seeds are frozensets, the derivation map
+    a read-only mapping of frozensets. A caller that changed one would change every later reading
+    of that text.
+
+    MUTATION (verified RED): hand out a plain set / dict again -> the update goes through -> RED."""
+    import pytest
+
+    from treasure_map.lib.reachability import taint
+
+    text = 'n = recv(s, buf, 64, 0);\nsnprintf(cmd, 64, "%s", buf);\nsystem(cmd);\n'
+    names = taint._call_names(text)
+    deps = taint._derives_map(text)
+    strong, weak, par = taint._seed_sets(text)
+    assert "system" in names and "cmd" in deps and strong
+    with pytest.raises(AttributeError):
+        names.add("x")  # type: ignore[attr-defined]
+    with pytest.raises(TypeError):
+        deps["x"] = frozenset()  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        deps["cmd"].add("x")  # type: ignore[attr-defined]
+    for seeds in (strong, weak, par):
+        with pytest.raises(AttributeError):
+            seeds.add("x")  # type: ignore[attr-defined]

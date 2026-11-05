@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any, Literal
 
@@ -116,7 +117,7 @@ def _source_kind(pseudocode: str, sink_arg: str | None, *, conservative_free: bo
     return "unknown"
 
 
-def _real_vars(pseudocode: str, deps: dict[str, set[str]]) -> set[str]:
+def _real_vars(pseudocode: str, deps: Mapping[str, AbstractSet[str]]) -> set[str]:
     """The function's real variables — values that are written, depended on, caller-supplied, or
     source-seeded. Used to filter format-literal noise (e.g. the `echo`/`s` of `"echo %s"`) out of
     the reported flow so the evidence lists actual flow variables, not parsed string fragments."""
@@ -128,7 +129,9 @@ def _real_vars(pseudocode: str, deps: dict[str, set[str]]) -> set[str]:
     return real
 
 
-def _flow_path(pseudocode: str, sink_arg: str | None, deps: dict[str, set[str]]) -> dict[str, Any]:
+def _flow_path(
+    pseudocode: str, sink_arg: str | None, deps: Mapping[str, AbstractSet[str]]
+) -> dict[str, Any]:
     """The sink argument and its ONE-HOP backward dependencies (the intermediate values feeding
     it directly), filtered to real variables. Reliable range only — direct args + one intermediate
     variable; deeper links are summarized by ``trace_boundary``, not invented here."""
@@ -166,7 +169,7 @@ def _trace_boundary(
     pseudocode: str,
     sink_arg: str | None,
     source_kind: str,
-    deps: dict[str, set[str]],
+    deps: Mapping[str, AbstractSet[str]],
     ref: ArgRef | None = None,
     located: bool = True,
 ) -> str:
@@ -227,7 +230,7 @@ def _trace_boundary(
     return "two_hop_untraced"
 
 
-def _chain_depth(deps: dict[str, set[str]], start: str) -> int:
+def _chain_depth(deps: Mapping[str, AbstractSet[str]], start: str) -> int:
     """Longest backward chain length from ``start`` over the dependency edges (cycle-safe)."""
     best = {start: 0}
     stack = [start]
@@ -310,7 +313,7 @@ def _size_trace_boundary(
     pseudocode: str,
     kind: str,
     size_var: str | None,
-    deps: dict[str, set[str]],
+    deps: Mapping[str, AbstractSet[str]],
     form: str | None = None,
     lead: str | None = None,
 ) -> str:

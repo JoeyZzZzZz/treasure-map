@@ -20,7 +20,9 @@ from __future__ import annotations
 import bisect
 import re
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from functools import lru_cache
+from types import MappingProxyType
 
 from treasure_map.lib.pattern.classes import (
     _HEX_FRAGMENT_RE as _HEX_FRAGMENT_RE,
@@ -225,8 +227,13 @@ def _calls_in(stmt: str, names: frozenset[str]) -> list[tuple[str, list[str]]]:
 _CACHE_SIZE = 256
 
 
+# The three readings below are cached per pseudocode text and handed to every caller as the SAME
+# object, so each is read-only: a frozenset, or a mapping proxy over frozensets. A caller that
+# needs to grow one builds a new set (``|``), never updates the cached one in place.
+
+
 @lru_cache(maxsize=_CACHE_SIZE)
-def _call_names(pseudocode: str) -> set[str]:
+def _call_names(pseudocode: str) -> frozenset[str]:
     """Every name written as a callee (``name(``) outside string literals."""
     spans = _literal_spans(pseudocode)
     # `spans` are sorted by open-quote index and non-overlapping, so a binary search replaces the
@@ -237,9 +244,9 @@ def _call_names(pseudocode: str) -> set[str]:
         i = bisect.bisect_left(los, x) - 1  # the last span with lo < x
         return i >= 0 and x <= spans[i][1]
 
-    return {
+    return frozenset(
         m.group(1) for m in _CALL_HEAD_RE.finditer(pseudocode) if not _inside_a_literal(m.end() - 1)
-    }
+    )
 
 
 def _seed_source(
@@ -267,7 +274,7 @@ def _seed_source(
     # is the safe direction (it biases toward "unknown", never toward over-claiming).
 
 
-def _dep_idents(text: str, call_names: set[str]) -> set[str]:
+def _dep_idents(text: str, call_names: AbstractSet[str]) -> set[str]:
     """Plausible variable identifiers in ``text`` — pollution (callee names, type words,
     hex fragments) removed so the flow set stays trustworthy."""
     cleaned = _HEX_LITERAL_RE.sub(" ", text)
@@ -282,7 +289,7 @@ def _dep_idents(text: str, call_names: set[str]) -> set[str]:
 
 
 @lru_cache(maxsize=_CACHE_SIZE)
-def _derives_map(pseudocode: str) -> dict[str, set[str]]:
+def _derives_map(pseudocode: str) -> Mapping[str, frozenset[str]]:
     """Map each variable to the variables it is directly assigned/built from.
 
     Edges come from the same real assignment/builder forms the forward taint uses:
@@ -302,11 +309,11 @@ def _derives_map(pseudocode: str) -> dict[str, set[str]]:
             if dst is not None:
                 rest = _dep_idents(",".join(parts[1:]), call_names) - {dst}
                 deps.setdefault(dst, set()).update(rest)
-    return deps
+    return MappingProxyType({k: frozenset(v) for k, v in deps.items()})
 
 
 @lru_cache(maxsize=_CACHE_SIZE)
-def _seed_sets(pseudocode: str) -> tuple[set[str], set[str], set[str]]:
+def _seed_sets(pseudocode: str) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
     """Return the directly-seeded (strong, weak, parameter) inputs — pre-propagation.
 
     These are the ORIGINATING tainted values (a source's buffer/return, or a parameter),
@@ -323,7 +330,7 @@ def _seed_sets(pseudocode: str) -> tuple[set[str], set[str], set[str]]:
         rhs = assign.group(2) if assign else ""
         for name, args in _calls_in(stmt, _SOURCE_NAMES):
             _seed_source(name, args, lhs, rhs, strong, weak)
-    return strong, weak, par
+    return frozenset(strong), frozenset(weak), frozenset(par)
 
 
 def flows_into(pseudocode: str, sink_var: str) -> set[str]:
