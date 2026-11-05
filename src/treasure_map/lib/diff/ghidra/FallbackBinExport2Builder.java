@@ -96,6 +96,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.function.ToIntFunction;
@@ -898,6 +899,14 @@ public class FallbackBinExport2Builder {
         continue; // Skip empty flow graphs, they only exist as call graph nodes
       }
       var flowGraph = builder.addFlowGraphBuilder();
+      // The blocks of this function's graph: an edge is written only when its target is one of
+      // them. An edge leaving the graph (a call, a tail branch into another function) has no
+      // target block here, and written without one it reads as an edge to block 0.
+      Set<Long> graphBlocks = new HashSet<>();
+      for (var gIter = bbModel.getCodeBlocksContaining(func.getBody(), monitor);
+          gIter.hasNext(); ) {
+        graphBlocks.add(getMappedAddress(gIter.next().getFirstStartAddress()));
+      }
       while (bbIter.hasNext()) {
         CodeBlock bb = bbIter.next();
         long bbAddress = getMappedAddress(bb.getFirstStartAddress());
@@ -919,19 +928,38 @@ public class FallbackBinExport2Builder {
 
         long bbLastInstrAddress =
             getMappedAddress(listing.getInstructionBefore(bb.getMaxAddress()));
+        // A block that ends in a delay slot carries its flow on the branch just before the slot:
+        // that branch is the block's flow instruction too. No delay slot, no change.
+        long bbBranchAddress = bbLastInstrAddress;
+        Instruction lastIns = listing.getInstructionBefore(bb.getMaxAddress());
+        if (lastIns != null && lastIns.isInDelaySlot()) {
+          Instruction branch = listing.getInstructionBefore(lastIns.getMinAddress());
+          if (branch != null) {
+            bbBranchAddress = getMappedAddress(branch.getMinAddress());
+          }
+        }
         var edges = new ArrayList<BinExport2.FlowGraph.Edge>();
         var lastFlow = RefType.INVALID;
         for (var bbDestIter = bb.getDestinations(monitor); bbDestIter.hasNext(); ) {
           CodeBlockReference bbRef = bbDestIter.next();
           // BinExport2 only stores flow from the very last instruction of a
-          // basic block.
-          if (getMappedAddress(bbRef.getReferent()) != bbLastInstrAddress) {
+          // basic block (or the branch whose delay slot ends it).
+          long referent = getMappedAddress(bbRef.getReferent());
+          if (referent != bbLastInstrAddress && referent != bbBranchAddress) {
+            continue;
+          }
+          FlowType flow = bbRef.getFlowType();
+          long destination = getMappedAddress(bbRef.getDestinationAddress());
+          if (flow.isCall() || !graphBlocks.contains(destination)) {
+            // Not an edge of this graph, so not written — but it is still the flow the next
+            // destination follows: the fall-through after a conditional branch out of the
+            // function stays its false edge.
+            lastFlow = flow;
             continue;
           }
 
           var edge = BinExport2.FlowGraph.Edge.newBuilder();
-          var targetId = basicBlockIndices.get(getMappedAddress(bbRef.getDestinationAddress()));
-          FlowType flow = bbRef.getFlowType();
+          var targetId = basicBlockIndices.get(destination);
           if (flow.isConditional() || lastFlow.isConditional()) {
             edge.setType(
                     flow.isConditional()
