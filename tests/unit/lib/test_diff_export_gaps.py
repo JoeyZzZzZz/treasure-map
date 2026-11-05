@@ -79,7 +79,9 @@ def headless(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         driver,
         "_run_killable",
-        lambda cmd, env, timeout: subprocess.run(cmd, env=env, timeout=timeout),  # noqa: S603
+        lambda cmd, env, timeout, cwd=None: subprocess.run(  # noqa: S603
+            cmd, env=env, timeout=timeout
+        ),
     )
 
 
