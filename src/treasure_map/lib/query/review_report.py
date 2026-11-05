@@ -95,11 +95,26 @@ _MERMAID_SAFE = re.compile(r"[^0-9A-Za-z_:.]")
 def _mermaid_group(u: ru.Unit) -> list[str]:
     """A callee group as a mermaid graph: each member -> the callee it newly calls."""
     g = u.group or {}
+    # Members kept though their A-side call list was unreadable: "newly calls" is UNCONFIRMED for
+    # them, so the report names them rather than letting "N members newly call X" read as settled.
+    unread = list(g.get("members_a_side_unread") or [])
+    caveat = (
+        [
+            f"_{len(unread)} member(s) kept with the A-side call list unreadable, so "
+            "'newly calls' is UNCONFIRMED for: "
+            + ", ".join(f"`{_md_cell(x)}`" for x in unread)
+            + "._",
+            "",
+        ]
+        if unread
+        else []
+    )
     if len(u.members) > MERMAID_MAX_MEMBERS:
         return [
             f"_Callee group `{_md_cell(g.get('ref'))}`: {len(u.members)} members newly call "
             f"`{_md_cell(g.get('name'))}` — too many to draw; listed below._",
             "",
+            *caveat,
         ]
 
     def label(text: Any) -> str:
@@ -110,7 +125,7 @@ def _mermaid_group(u: ru.Unit) -> list[str]:
     for i, m in enumerate(u.members):
         out.append(f'  M{i}["{label(m.entry_id)}"] --> {callee if i == 0 else "X"}')
     out += ["```", ""]
-    return out
+    return out + caveat
 
 
 def markdown(review: ru.PairReview, *, header: dict[str, Any] | None = None) -> str:

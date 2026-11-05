@@ -81,7 +81,9 @@ def test_the_members_are_the_pairs_that_newly_call_a_defined_function(tmp_path: 
     assert set(groups) == {X_B}
     g = groups[X_B]
     assert set(g.members) == {_pair_id(*P1), _pair_id(*P2), _pair_id(*P4)}
-    assert (g.callee_a, g.callee_name, g.members_a_side_unread) == (X_A, "new_helper", 1)
+    assert (g.callee_a, g.callee_name) == (X_A, "new_helper")
+    # the unread-A member (P4) is recorded by its entry id, not merely counted
+    assert g.members_a_side_unread == [_pair_id(*P4)]
     assert g.ref == f"{DIFF}#callee:{X_B}@{cg.CALLEE_GROUP_VERSION}"
 
 
@@ -234,3 +236,35 @@ def test_the_markdown_draws_a_small_group_and_lists_a_large_one(tmp_path: Path) 
     unit = next(u for u in r.units if u.kind == ru.GROUP)
     many = ru.Unit(**{**unit.__dict__, "members": unit.members * (rr.MERMAID_MAX_MEMBERS + 1)})
     assert "too many to draw" in "\n".join(rr._mermaid_group(many))
+
+
+def test_the_report_names_a_members_unreadable_a_side(tmp_path: Path) -> None:
+    """★ The group kept P4, whose A-side call list was unreadable, so "newly calls X" is
+    UNCONFIRMED for it: the report NAMES P4 rather than letting "N members newly call X" read as
+    settled for every member (the reader surfacing of members_a_side_unread).
+
+    MUTATION (verified RED): drop the unread caveat in _mermaid_group -> P4's id is absent -> RED.
+    """
+    from treasure_map.lib.query import review_report as rr
+
+    text = rr.markdown(_review(_world(tmp_path)))
+    assert "UNCONFIRMED" in text
+    assert _pair_id(*P4) in text
+
+
+def test_the_material_pack_names_the_unreadable_a_side_member(tmp_path: Path) -> None:
+    """★ The MCP material pack an agent reads lists members_a_side_unread (P4's id) and warns in
+    `how` that "newly calls" is unconfirmed for it; premise_relies_on_unread is False here because
+    P1 and P2 are confirmed (two readable A sides).
+
+    MUTATION (verified RED): drop members_a_side_unread from _group_material -> P4 absent -> RED.
+    """
+    from treasure_map import mcp_app
+
+    w = _world(tmp_path)
+    group = next(u for u in _review(w).units if u.kind == ru.GROUP)
+    out = mcp_app.make_tools(w.path)["start_diff_review"](run_pair="runA::runB", unit=group.unit_id)
+    mat = out["material"]
+    assert _pair_id(*P4) in mat["members_a_side_unread"]
+    assert "CAVEAT" in mat["how"]
+    assert mat["premise_relies_on_unread"] is False

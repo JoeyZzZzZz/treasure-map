@@ -2470,6 +2470,19 @@ def make_tools(
         d = next((d for d in facts.diffs if d.diff_id == u.stream), None)
         binary = d.binary if d is not None else None
         cap = max(budget // 6, 1_000)
+        unread = list(g.get("members_a_side_unread") or [])
+        how = (
+            "these entries newly call the same function: read it once (callee), then each "
+            "member, and judge every member with group_ref=<group_ref>; write the group's own "
+            "conclusion on the callee's entry when the view lists it, else in each member's "
+            "rationale"
+        )
+        if unread:
+            how += (
+                f"; CAVEAT: for {len(unread)} member(s) the A-side call list could not be read, so "
+                "'newly calls' is UNCONFIRMED for them (kept, not dropped) — their entry ids are "
+                "in members_a_side_unread"
+            )
         out: dict[str, Any] = {
             "diff_id": u.stream,
             "group_ref": g.get("ref"),
@@ -2485,12 +2498,16 @@ def make_tools(
                 ),
             },
             "members_possibly_incomplete": bool(g.get("members_possibly_incomplete")),
-            "how": (
-                "these entries newly call the same function: read it once (callee), then each "
-                "member, and judge every member with group_ref=<group_ref>; write the group's own "
-                "conclusion on the callee's entry when the view lists it, else in each member's "
-                "rationale"
+            # Entry ids of members whose A-side call list could not be read: "newly calls X" is
+            # UNCONFIRMED for them (kept, not dropped). Surfaced so the reader does not take the
+            # group's premise as established for every member.
+            "members_a_side_unread": unread,
+            # True when fewer than two members have a readable A side, i.e. the ">= 2 members newly
+            # call X" premise only holds by counting the unconfirmed members above.
+            "premise_relies_on_unread": (
+                len(g.get("members") or []) - len(unread) < 2 and bool(unread)
             ),
+            "how": how,
         }
         wanted = {m.entry_id for m in u.members}
         page = _get_diff_patch_view(atlas, u.stream, rows_limit=0, limit=2000)

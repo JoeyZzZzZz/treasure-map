@@ -6,7 +6,8 @@ A group is keyed by one B-side function X. Its members are the listed PAIRED ent
 in no pair has no A side to compare, so it is never a member) whose B function calls X while
 their A function does not call X's counterpart — the A function the diff pairs X with (an
 undetermined pairing too); an X in no pair has none, so every caller of it is a member. A member
-whose A call list cannot be read is kept (``members_a_side_unread`` counts it): it cannot rule X
+whose A call list cannot be read is kept (its entry id is recorded in ``members_a_side_unread``,
+and surfaced to the reader so "newly calls X" is not claimed for it): it cannot rule X
 out, and a group is never dropped for it. X must be defined in the binary — one function of that
 name on the B side, not a thunk — and is no key when its own entry is a function in no pair whose
 counterpart may exist (``counterpart_suspected``): what looks new may be only unpaired.
@@ -59,7 +60,10 @@ class CalleeGroup:
     callee_a: str | None  # X's aligned A-side function, when it has one
     members: list[str] = field(default_factory=list)  # entry ids, in listing order
     members_possibly_incomplete: bool = False
-    members_a_side_unread: int = 0  # members whose A call list could not be read
+    # entry ids of members whose A call list could not be read, so "newly calls X" is UNCONFIRMED
+    # for them (kept as members, never dropped). A list, not a count, so the reader can be shown
+    # WHICH members carry the caveat — not merely how many.
+    members_a_side_unread: list[str] = field(default_factory=list)
 
     @property
     def ref(self) -> str:
@@ -121,7 +125,7 @@ def callee_groups(
         if fb is None or fb.callees is None:
             continue  # no B call list: nothing names X
         # An A side whose call list cannot be read cannot rule X out: the entry is a member, and
-        # the group counts it apart (members_a_side_unread) — never a drop, never a claim.
+        # the group records it apart (members_a_side_unread) — never a drop, never a claim.
         a_unread = fa is None or fa.callees is None
         a_calls = set() if a_unread else set(fa.callees or ())
         for name in dict.fromkeys(fb.callees):
@@ -140,7 +144,7 @@ def callee_groups(
             if e.entry_id not in g.members:
                 g.members.append(e.entry_id)
                 if a_unread:
-                    g.members_a_side_unread += 1
+                    g.members_a_side_unread.append(e.entry_id)
     return {x: g for x, g in groups.items() if len(g.members) >= 2}
 
 
