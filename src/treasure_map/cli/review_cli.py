@@ -17,6 +17,8 @@ from typing import Any
 import click
 
 from treasure_map.cli.interrupts import InterruptGroup
+from treasure_map.lib.query import diff_skill
+from treasure_map.lib.query.diff_skill import SKILL_DIRNAME
 
 
 class _ReviewGroup(InterruptGroup):
@@ -152,28 +154,6 @@ def report(
     click.echo(rr.terminal(reading, header=header))
 
 
-SKILL_DIRNAME = "tmap-diff-review"
-
-
-SKILL_LOOP_MARKER = "{loop}"
-
-
-def skill_text() -> str:
-    """The diff-review skill shipped with tmap (markdown with its frontmatter): the template's
-    frontmatter and rules around ``## The loop``, which is the server's own two workflow sentences
-    (``DIFF_WORKFLOW`` and ``PAIR_WORKFLOW``) — quoted, never retyped, so the skill cannot drift
-    from what the server says."""
-    from importlib.resources import files
-
-    from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW, PAIR_WORKFLOW
-
-    template = files("treasure_map.skills").joinpath("diff-review.md").read_text(encoding="utf-8")
-    if template.count(SKILL_LOOP_MARKER) != 1:
-        raise RuntimeError(f"the skill template must hold {SKILL_LOOP_MARKER} exactly once")
-    loop = f"## The loop\n\n{DIFF_WORKFLOW}\n\n{PAIR_WORKFLOW}"
-    return template.replace(SKILL_LOOP_MARKER, loop)
-
-
 @review.command(name="skill")
 @click.option(
     "--install",
@@ -191,7 +171,7 @@ def skill_text() -> str:
 def skill(install_dir: str | None, force: bool) -> None:
     """Print the agent skill for reviewing a run pair unit by unit, or write it into a skills
     directory."""
-    text = skill_text()
+    text = diff_skill.skill_text()
     if install_dir is None:
         click.echo(text, nl=False)
         return
@@ -208,14 +188,15 @@ def skill(install_dir: str | None, force: bool) -> None:
         click.echo(line)
     root = Path(install_dir)
     data = text.encode("utf-8")
-    st = sk.classify(root, ledger, data)
+    known = sk.known_roots(home, os.environ)
+    st = sk.classify(root, ledger, data, known=known)
     if st.state == "aligned":
         click.echo(f"{st.path} is already current")
         return
     if st.state in ("foreign", "invalid") and not force:
         raise click.ClickException(f"{st.path}: {st.detail}; not replaced (--force replaces it)")
     # Recorded only where tmap uninstall may take it away again.
-    recorded = os.path.realpath(root) in {os.path.realpath(r) for r in sk.known_roots(home)}
+    recorded = sk.is_known(root, known)
     try:
         if recorded:
             sk.install(st.path, data, ledger)

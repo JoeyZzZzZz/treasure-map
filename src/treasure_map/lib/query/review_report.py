@@ -18,10 +18,13 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from treasure_map.lib import handoff_boundary as _handoff_boundary
 from treasure_map.lib.query import review_units as ru
+
+if TYPE_CHECKING:
+    from treasure_map.lib.query.same_shape_siblings import SameShapeReads
 
 # How many next units the terminal summary names.
 TERMINAL_NEXT = 10
@@ -408,6 +411,42 @@ def _short_error(text: Any, limit: int = 300) -> str:
     return s if len(s) <= limit else f"{s[:limit]}… ({len(s)} chars)"
 
 
+_BACKTICKS = re.compile(r"`+")
+
+
+def _fenced(lines: list[str]) -> list[str]:
+    """``lines`` inside a code fence longer than any backtick run they hold (three at least), so no
+    line of embedded text — a rationale, an agent's text, firmware text — can close it and be read
+    as one of the block's own lines (a status, a basis, a heading)."""
+    longest = max((len(m) for x in lines for m in _BACKTICKS.findall(x)), default=0)
+    fence = "`" * max(len(_FENCE), longest + 1)
+    return [fence, *lines, fence]
+
+
+def _is_fence(line: str) -> bool:
+    return len(line) >= len(_FENCE) and line == "`" * len(line)
+
+
+def _open_fence(lines: list[str]) -> str | None:
+    """The fence ``lines`` leave open (as _fenced writes them: a line of backticks only, closed by
+    one at least as long), or None."""
+    open_: str | None = None
+    for x in lines:
+        if not _is_fence(x):
+            continue
+        if open_ is None:
+            open_ = x
+        elif len(x) >= len(open_):
+            open_ = None
+    return open_
+
+
+def _embedded(label: str, text: str) -> list[str]:
+    """A cell whose value is text tmap did not write (a recorded rationale): the label, then the
+    text fenced, line by line as it was written."""
+    return [f"- {label}:", *_fenced(text.splitlines() or [""])]
+
+
 # ── the function shapes ─────────────────────────────────────────────────────────────────────────
 
 
@@ -451,12 +490,12 @@ def _hunk_lines(label: str, delta: dict[str, Any]) -> list[str]:
     out = [f"- {label}:"]
     runs = [r for r in hunk.get("structural") or [] if r]
     if runs:
-        out.append(_FENCE)
+        shown: list[str] = []
         for k, run in enumerate(runs):
             if k:
-                out.append("…")
-            out += [str(x) for x in run]
-        out.append(_FENCE)
+                shown.append("…")
+            shown += [str(x) for x in run]
+        out += _fenced(shown)
     for g in hunk.get("substitution_groups") or []:
         step = f" step {g['step']}" if "step" in g else ""
         first = "; ".join(
@@ -571,10 +610,13 @@ def _diff_side(atlas: Any, diff_id: str, side: str) -> tuple[str, str] | None:
 
 
 def _callers_cell(atlas: Any, diff_id: str, side: str, addr: Any) -> str:
-    """One-level callers of the finding's function on ``side``, as get_xrefs(direction="callers")
-    reads them from that side's run's analysis.db: a count, the first names and its note. A
-    function the run cannot resolve is stated, never read as 'no caller'."""
+    """One-level callers of the finding's function on ``side``, as the get_xrefs tool
+    (direction="callers") reads them from that side's run's analysis.db — through the same lib call,
+    entry_words.xrefs_with_entry_words, so a function with no caller carries the tool's note on the
+    data words holding its entry value: a count, the first names and that note, verbatim. A function
+    the run cannot resolve is stated, never read as 'no caller'."""
     from treasure_map.lib import facts as _facts
+    from treasure_map.lib.query import entry_words as _entry_words
     from treasure_map.lib.query.runs import get_run
 
     if not addr:
@@ -591,7 +633,9 @@ def _callers_cell(atlas: Any, diff_id: str, side: str, addr: Any) -> str:
     try:
         conn = _facts.open_analysis_ro(run.analysis_db_path)
         try:
-            xr = _facts.get_xrefs(conn, func=str(addr), direction="callers", binary=binary or None)
+            xr = _entry_words.xrefs_with_entry_words(
+                conn, func=str(addr), direction="callers", binary=binary or None
+            )
         finally:
             conn.close()
     except Exception as exc:  # noqa: BLE001
@@ -615,12 +659,19 @@ def _callers_cell(atlas: Any, diff_id: str, side: str, addr: Any) -> str:
 
 
 def _siblings_lines(
-    atlas: Any, diff_id: str, rows: list[dict[str, Any]], stamp: HandoffStamp | None
+    atlas: Any,
+    diff_id: str,
+    rows: list[dict[str, Any]],
+    stamp: HandoffStamp | None,
+    reads: SameShapeReads | None = None,
 ) -> list[str]:
     """The same-shape groups of the rows shown, one line per group (its size and by-landing counts,
     and which rows fall in it); the member lists stay in same_shape_siblings' own pages (B-1). A row
-    whose group cannot be read states why."""
+    whose group cannot be read states why. ``reads`` (same_shape_siblings.SameShapeReads) is the
+    hand-off pass's holder: each diff's view is built once for all its rows, not once per row."""
     from treasure_map.lib.query import same_shape_siblings as _sss
+
+    reads = _sss.SameShapeReads() if reads is None else reads
 
     if stamp is None:
         return [_cell(_SIBLINGS, _unavailable("staleness context not provided"))]
@@ -643,6 +694,7 @@ def _siblings_lines(
                     build_hash=stamp.build_hash,
                     current=stamp.current,
                     commit=stamp.commit,
+                    reads=reads,
                 )
             except Exception as exc:  # noqa: BLE001
                 read[ref] = {"error": f"siblings error: {type(exc).__name__}"}
@@ -666,7 +718,13 @@ def _siblings_lines(
 
 
 def _handoff_function_facts(
-    atlas: Any, diff_id: str, anchor_ref: str, stamp: HandoffStamp | None, *, paired: bool
+    atlas: Any,
+    diff_id: str,
+    anchor_ref: str,
+    stamp: HandoffStamp | None,
+    *,
+    paired: bool,
+    reads: SameShapeReads | None = None,
 ) -> list[str]:
     """A function's facts — a pair's or a single side's: the change, the reachable shape (the
     candidate rows, their sink classes, size / source kind), the one-level callers and the
@@ -694,7 +752,7 @@ def _handoff_function_facts(
         ]
     out += _shape_lines(diff_id, entry)
     out.append(_cell("one-level callers", _callers_cell(atlas, diff_id, side, addr)))
-    out += _siblings_lines(atlas, diff_id, entry.get("rows") or [], stamp)
+    out += _siblings_lines(atlas, diff_id, entry.get("rows") or [], stamp, reads)
     return out
 
 
@@ -763,7 +821,7 @@ def _handoff_file_facts(atlas: Any, run_a: str, run_b: str, path: str) -> list[s
                 break
             kept.append(x)
             size += cost
-        out += [f"- {_FILE_HUNK}:", _FENCE, *kept, _FENCE]
+        out += [f"- {_FILE_HUNK}:", *_fenced(kept)]
         total = hunk.get("total_pieces")
         total = len(lines) if not isinstance(total, int) else total
         if len(kept) < total:
@@ -834,20 +892,24 @@ def _cap_lines(lines: list[str], room: int, more: str) -> list[str]:
             break
         kept.append(x)
         size += cost
-    if sum(1 for x in kept if x == _FENCE) % 2:
-        kept.append(_FENCE)
+    left_open = _open_fence(kept)
+    if left_open is not None:
+        kept.append(left_open)
     left = total - sum(_json_len(x + "\n") for x in kept)
     kept.append(f"- [block cut to fit a page: {left} more bytes of facts; read them with {more}]")
     return kept
 
 
 def _analysis_lines(text: str | None) -> list[str]:
-    """A filled analysis section's body (the driver's document): the agent's text, or the line
-    saying it wrote nothing; the skeleton (None) has no body."""
+    """A filled analysis section's body (the driver's document): the agent's text, fenced so none
+    of its lines reads as one of the block's own (a status, a heading), or the line saying it wrote
+    nothing; the skeleton (None) has no body."""
     if text is None:
         return []
     body = text.strip()
-    return [body or HANDOFF_NOTHING_WRITTEN, ""]
+    if not body:
+        return [HANDOFF_NOTHING_WRITTEN, ""]
+    return [*_fenced(body.splitlines()), ""]
 
 
 def handoff_chunk(
@@ -858,6 +920,7 @@ def handoff_chunk(
     stamp: HandoffStamp | None = None,
     analysis: dict[str, str] | None = None,
     cap: int | None = None,
+    reads: SameShapeReads | None = None,
 ) -> str:
     """One finding's hand-off block (Design B): the recorded judgment, the tmap facts for its
     subject shape, the two analysis placeholders a person fills, and the standing status. The block
@@ -866,10 +929,14 @@ def handoff_chunk(
     tool and the CLI pass the same one so the block reads identically either side.
 
     ``cap`` (default HANDOFF_BLOCK_CAP, JSON-string bytes) cuts the judgment and facts part, with a
-    note naming the call that reads the rest; the placeholders and the status are never cut.
+    note naming the call that reads the rest; the placeholders and the status are never cut, and
+    the basis line comes before the recorded rationale, so a long rationale never cuts it.
     ``analysis`` (the driver's document) fills the two placeholders with an agent's
     ``hypotheses`` / ``device_checks`` — a missing or blank one says the agent wrote nothing; the
-    skeleton (None) leaves them for a person."""
+    skeleton (None) leaves them for a person. Text tmap did not write (the rationale, the agent's
+    texts) is fenced, so none of its lines can read as the block's own basis or status line.
+    ``reads`` (same_shape_siblings.SameShapeReads) is the caller's holder for one pass over many
+    blocks; handoff_blocks passes one."""
     from treasure_map.lib.query import file_diff as _fd
 
     anchor = str(finding["anchor_ref"])
@@ -881,13 +948,17 @@ def handoff_chunk(
         _cell("subject", kind or "unknown"),
         _cell("recorded verdict", str(finding.get("verdict") or "")),
         _cell("recorded change kind", _finding_change_kind(finding)),
-        _cell("recorded rationale", str(finding.get("rationale") or "(none recorded)")),
         _cell("basis", _finding_basis_line(finding)),
-        "",
     ]
+    rationale = str(finding.get("rationale") or "")
+    if rationale:
+        lines += _embedded("recorded rationale", rationale)
+    else:
+        lines.append(_cell("recorded rationale", "(none recorded)"))
+    lines.append("")
     if kind in ("function_pair", "function_presence") and isinstance(diff_id, str):
         lines += _handoff_function_facts(
-            atlas, diff_id, anchor, stamp, paired=kind == "function_pair"
+            atlas, diff_id, anchor, stamp, paired=kind == "function_pair", reads=reads
         )
     elif kind == "non_binary":
         runs = _fd.split_run_pair(atlas, run_pair)
@@ -970,7 +1041,11 @@ def handoff_blocks(
 ) -> list[str]:
     """One block per finding, in the findings' order. ``analysis`` maps an anchor_ref to the agent's
     two texts (the driver's document); with it, a finding the map does not name says the agent
-    wrote nothing for it."""
+    wrote nothing for it. The blocks are one pass: each diff's view (and each side's calls) that
+    the same-shape cells read is built once for all of them, and dropped when the pass ends."""
+    from treasure_map.lib.query import same_shape_siblings as _sss
+
+    reads = _sss.SameShapeReads()
     return [
         handoff_chunk(
             atlas,
@@ -978,6 +1053,7 @@ def handoff_blocks(
             f,
             stamp=stamp,
             analysis=None if analysis is None else analysis.get(str(f["anchor_ref"]), {}),
+            reads=reads,
         )
         for f in findings
     ]

@@ -971,19 +971,29 @@ def test_a_final_failure_clears_its_mark_and_a_skipped_store_keeps_it(tmp_path: 
     assert res.reanalyze_pending == 1
 
 
-def test_a_binary_the_ingest_refuses_is_counted_failed_not_ok(tmp_path: Path) -> None:
+def test_a_binary_the_ingest_refuses_is_counted_failed_not_ok(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """★ The session succeeded but the ingest refused its output (the image base disagrees with
     the stub table's shift) and recorded the binary failed: the scan's summary counts it with the
-    failed, not with "Ghidra OK".
+    failed, not with "Ghidra OK" — and, its failure committed, with the stored: the summary line
+    adds up (6 of 6 stored = 5 ok + 1 failed).
 
     MUTATION (verified RED, 1 failed): count every successful session as ok again (increment
-    before the ingest's answer) -> 6 ok."""
+    before the ingest's answer) -> 6 ok.
+    MUTATION (S-1, verified RED, 1 failed): drop the refused branch's ``kept += 1`` -> the summary
+    reads "5 of 6 dirty binaries stored (5 ok, 1 failed)"."""
+    import logging
+
     fs = _firmware(tmp_path)
     cfg = _e2e_cfg(_ghidra(tmp_path))
-    res = _scan_e2e(fs, tmp_path / "ws", cfg, _Decompiler({_NAMES[2]: "moved_base"}))
+    with caplog.at_level(logging.INFO):
+        res = _scan_e2e(fs, tmp_path / "ws", cfg, _Decompiler({_NAMES[2]: "moved_base"}))
     st = _state(tmp_path / "ws" / "analysis.db")
     assert (st[_NAMES[2]]["ghidra_ok"], st[_NAMES[2]]["reason"]) == (0, "image_base_mismatch")
     assert (res.ghidra_ok, res.ghidra_failed) == (5, 1)
+    summary = [m for r in caplog.records if "dirty binaries stored" in (m := r.getMessage())]
+    assert summary == ["pipeline: 6 of 6 dirty binaries stored (5 ok, 1 failed)"], summary
 
 
 def test_an_interrupt_in_phase_one_counts_what_is_left(

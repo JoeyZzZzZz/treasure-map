@@ -10,7 +10,9 @@ user's own JDK, Ghidra or BinDiff, even when config.yaml points at them. Before 
 deleted it must still be what tmap put there: under ``~/.treasure-map/toolchain``, or (BinExport
 in a user's Ghidra) a ``BinExport`` directory whose jars still hash to what tmap installed, or (the
 skill) a ``tmap-diff-review/SKILL.md`` in one of tmap's skills directories that still hashes to
-what tmap wrote.
+what tmap wrote — read after an interrupted skill write is settled (``skills.recover``), so a
+replacement cut off half way is not taken for a user's edit. The directories that skill's write
+created go with it, each only when empty.
 
 The data stays unless ``--purge-data`` is given AND the user types the confirmation phrase;
 ``--yes`` does not stand in for it. Even then only what is provably tmap's goes (``purge_plan``):
@@ -24,7 +26,7 @@ import os
 import shutil
 import sqlite3
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -76,7 +78,9 @@ def _completion_paths(home: Path) -> set[str]:
     return out
 
 
-def safe_to_remove(entry: Entry, *, toolchain_dir: Path, home: Path) -> str | None:
+def safe_to_remove(
+    entry: Entry, *, toolchain_dir: Path, home: Path, environ: Mapping[str, str]
+) -> str | None:
     """None when ``entry``'s path may be removed; else why not."""
     path = Path(entry.path)
     if entry.id == "completion":
@@ -84,7 +88,7 @@ def safe_to_remove(entry: Entry, *, toolchain_dir: Path, home: Path) -> str | No
             return None
         return f"{path} is not where tmap installs completion"
     if entry.id.startswith(sk.ID_PREFIX):
-        return sk.removable(path, entry.extra.get("sha256"), home)
+        return sk.removable(path, entry.extra.get("sha256"), home, environ)
     if entry.kind == "edit":
         return None  # restored, never deleted; checked in _restore_edit
     if strictly_under(path, toolchain_dir):
@@ -162,8 +166,26 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def plan_lines(ledger: Ledger, survey: cl.Survey, *, toolchain_dir: Path, home: Path) -> list[str]:
+class _Unsaved(Ledger):
+    """A copy of a ledger that is never written back (what the plan shows before any change)."""
+
+    def save(self) -> None:
+        pass
+
+
+def plan_lines(
+    ledger: Ledger,
+    survey: cl.Survey,
+    *,
+    toolchain_dir: Path,
+    home: Path,
+    environ: Mapping[str, str],
+) -> list[str]:
     lines: list[str] = []
+    # as uninstall will see it: with an interrupted skill write settled (on a copy — the plan
+    # changes nothing)
+    ledger = _Unsaved(ledger.path, [Entry.from_json(e.to_json()) for e in ledger.entries])
+    sk.recover(ledger)
     for cid in cl.CLIENT_IDS:
         st = survey.states[cid]
         if st.state in ("aligned", "stale", "shadowed", "unknown") and st.editable:
@@ -173,7 +195,7 @@ def plan_lines(ledger: Ledger, survey: cl.Survey, *, toolchain_dir: Path, home: 
         for r in st.reported:
             lines.append(f"leave alone: {r}")
     for e in reversed(ledger.entries):
-        why = safe_to_remove(e, toolchain_dir=toolchain_dir, home=home)
+        why = safe_to_remove(e, toolchain_dir=toolchain_dir, home=home, environ=environ)
         verb = "restore" if e.kind == "edit" else "remove"
         if why is None:
             lines.append(f"{verb} {e.path} ({e.id})")
@@ -202,9 +224,11 @@ def uninstall(
     # 2. ledger, newest first
     ledger_path = toolchain_dir / LEDGER_NAME
     ledger = Ledger.load(ledger_path)
+    for line in sk.recover(ledger):  # an interrupted skill write, settled before it is judged
+        echo(f"  {line}")
     removed_paths: list[Path] = []
     for e in list(reversed(ledger.entries)):
-        why = safe_to_remove(e, toolchain_dir=toolchain_dir, home=home)
+        why = safe_to_remove(e, toolchain_dir=toolchain_dir, home=home, environ=client_host.environ)
         if why is not None:
             report.refused.append(why)
             continue
@@ -218,12 +242,9 @@ def uninstall(
                 _remove_path(path)
                 report.removed.append(f"removed {path}")
                 removed_paths.append(path)
-            if e.id.startswith(sk.ID_PREFIX) and path.parent.is_dir():
-                try:
-                    path.parent.rmdir()  # only when nothing else is left in it
-                    report.removed.append(f"removed {path.parent}")
-                except OSError:
-                    pass
+            if e.id.startswith(sk.ID_PREFIX):
+                for d in sk.prune_dirs(path, e.extra.get("created_dirs")):
+                    report.removed.append(f"removed {d}")
         except OSError as exc:  # this entry only: it stays in the ledger for a later run
             verb = "restore" if e.kind == "edit" else "remove"
             report.manual.append(f"could not {verb} {path}: {exc}; run tmap uninstall again")

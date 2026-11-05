@@ -7,9 +7,13 @@ of the writing server's session — recorded with the write in overlay_history a
 
 * ``unit_delivered`` — this session was handed the unit's material before the write (by
   start_diff_review, or a write's answer naming the next unit with it; a unit named without its
-  material is not handed out); when that material was cut, something of the unit was also fetched
-  after it. The unit is the one the write names; a write that names none is read against the
-  units this session was handed that hold its subject, and then carries ``unit_inferred``.
+  material is not handed out) and that material showed the written subject whole: a material that
+  lists members (a batch, a callee group, a reduce) shows only the members it kept, a one-subject
+  material (an entry, a binary's first candidates, a file) shows its subject unless it was cut.
+  Otherwise the delivery counts only once the subject ITSELF was fetched after it (then
+  ``material_cut``); fetching another member does not read this one. The unit is the one the write
+  names; a write that names none is read against the units this session was handed that hold its
+  subject, and then carries ``unit_inferred``.
 * ``fetched`` — this session read the subject itself before the write: the entry in full
   (get_diff_patch_view with its entry_id), a side's pseudocode, disassembly or callees, a file's
   difference (get_file_diff with its path).
@@ -28,7 +32,6 @@ the log at all (``basis`` ``human``).
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
 from typing import Any
 
 from treasure_map.lib import tool_call_log as tcl
@@ -129,31 +132,33 @@ def _fetched(line: dict[str, Any], anchor_ref: str, entry_id: str | None) -> boo
     return False
 
 
+def _shown_whole(line: dict[str, Any], anchor_ref: str, entry_id: str | None) -> bool:
+    """Whether one delivery of a unit showed this subject whole: listed among the members its
+    material kept, or — a one-subject material, which logs no member list — not cut."""
+    whole = line.get("unit_whole")
+    if isinstance(whole, list):
+        return anchor_ref in whole or (entry_id is not None and entry_id in whole)
+    return not line.get("unit_material_cut")
+
+
 def infer(
     lines: list[dict[str, Any]] | None,
     *,
     anchor_ref: str,
     entry_id: str | None = None,
     unit_id: str | None = None,
-    unit_anchors: Iterable[tuple[str, str | None]] = (),
 ) -> dict[str, Any]:
-    """The read basis of one write (see the module docstring). ``unit_anchors`` are the unit's
-    members (anchor, entry_id): after a cut delivery, a fetch of any of them counts as reading
-    on."""
+    """The read basis of one write of ``anchor_ref`` (see the module docstring)."""
     if lines is None:
         return {"basis": "unknown", "why": "no tool-call log for this session"}
-    members = list(unit_anchors) or [(anchor_ref, entry_id)]
     if unit_id is not None:
         delivered = [i for i, ln in enumerate(lines) if ln.get("unit") == unit_id]
         if delivered:
-            # Every delivery cut (none whole): it counts once something of the unit was fetched
+            whole = any(_shown_whole(lines[i], anchor_ref, entry_id) for i in delivered)
+            # Not shown whole by any delivery: it counts once the subject itself was fetched
             # after the first of them.
-            always_cut = all(lines[i].get("unit_material_cut") for i in delivered)
-            read_on = any(
-                _fetched(ln, a, e) for ln in lines[delivered[0] + 1 :] for a, e in members
-            )
-            if not always_cut or read_on:
-                return {"basis": "unit_delivered", "material_cut": always_cut}
+            if whole or any(_fetched(ln, anchor_ref, entry_id) for ln in lines[delivered[0] + 1 :]):
+                return {"basis": "unit_delivered", "material_cut": not whole}
     if any(_fetched(ln, anchor_ref, entry_id) for ln in lines):
         return {"basis": "fetched"}
     return {"basis": "none"}

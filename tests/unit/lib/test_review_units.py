@@ -1139,10 +1139,13 @@ def test_the_pair_loop_as_the_workflow_says_it_completes(world: World, name_unit
     MUTATION (verified RED, 1 failed): drop the server's inference (``handed`` always empty) ->
     without_unit_id: every write basis none, disposed 0 -> RED. MUTATION (verified RED, 1
     failed): drop ``unit_id=...`` from PAIR_WORKFLOW -> the text test in test_diff_workflow RED
-    (this loop passes it explicitly)."""
+    (this loop passes it explicitly). R-9 — MUTATION (verified RED, 1 failed): record the inferred
+    unit's id with the write -> without_unit_id RED; MUTATION (verified RED, 1 failed): hand the
+    next unit on after an inferred write -> without_unit_id RED."""
     server = mcp_app.build_server(world.path)
     out = _server_call(server, "start_diff_review", {"run_pair": PAIR})
     bases: list[dict[str, Any]] = []
+    judged: list[str] = []
     for _ in range(30):
         nu = out.get("next_unit")
         if not nu:
@@ -1153,6 +1156,10 @@ def test_the_pair_loop_as_the_workflow_says_it_completes(world: World, name_unit
             )
             assert r.get("written") is True, r
             bases.append(r["read_basis"])
+            if not name_unit:
+                # R-9: an inferred unit is for the read basis only — no next unit handed on
+                assert "next_unit" not in r and "coverage_statement" not in r, sorted(r)
+            judged.append(m["anchor_ref"])
         out = _server_call(server, "start_diff_review", {"run_pair": PAIR})
     assert bases, "the loop judged nothing"
     assert out.get("next_unit") is None, out.get("next_unit")
@@ -1161,6 +1168,15 @@ def test_the_pair_loop_as_the_workflow_says_it_completes(world: World, name_unit
     if not name_unit:
         want["unit_inferred"] = True
     assert bases == [want] * len(bases)
+    units = {
+        a: world.atlas.execute(
+            "SELECT unit_id FROM overlay_history WHERE anchor_ref = ? ORDER BY id DESC LIMIT 1",
+            (a,),
+        ).fetchone()[0]
+        for a in judged
+    }
+    # R-9: and none is recorded as the unit the write judged
+    assert all((u is None) is (not name_unit) for u in units.values()), units
 
 
 def test_a_batch_naming_no_unit_is_read_against_the_unit_it_was_handed(world: World) -> None:
@@ -1304,8 +1320,9 @@ def test_a_newer_unread_write_without_the_flag_does_not_clear_it(world: World) -
     """★ C-3 (X1): only a newer write whose read basis is not ``none`` clears needs_recheck; a
     basis-none write carrying no flag (not must-read at its writer's k) changes nothing.
 
-    MUTATION (verified RED, 1 failed): read the flag off the latest write only (the old rule) ->
-    RED."""
+    NOTE: A1 is must-read at k=0, so the report-k layer flags it whatever the walk of its history
+    says — reading the flag off the latest write only stays GREEN here. The walk itself is pinned
+    by test_the_walk_of_the_history_holds_off_the_report_k."""
     world.judge(DX, A1, "changed_real", ctx=UNREAD)
     assert A1 in _review(world, k=0).audits.needs_recheck
     world.judge(DX, A1, "changed_real", ctx=NONE_NOFLAG)
@@ -1735,3 +1752,229 @@ def test_list_candidates_before_a_shadow_makes_it_not_blind(
     lines = tcl.read_lines(tcl.log_path_for(world.path)) or []
     logged = [ln["params"] for ln in lines if ln.get("tool") == "list_candidates"]
     assert logged and logged[0].get("overlay") is bool(overlay_arg)
+
+
+# ── what a cut material reads, and the answer's byte budget ─────────────────────────────────
+
+
+def _hex_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int) -> World:
+    """``n`` aligned pairs in DX at addresses 1, 2, …, n (eight hex digits each): at k=0 or k=1
+    the rest of them is ONE second-tier batch, whose material is cut once n is large."""
+    w = World(tmp_path, monkeypatch)
+    for i in range(1, n + 1):
+        w.pair(DX, f"{i:08x}", f"{i:08x}")
+    return w
+
+
+def test_a_cut_batch_reads_only_the_members_its_material_showed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ FC01: a second-tier batch of 60 whose material showed some of its members. A member it
+    showed reads ``unit_delivered`` at once, named or not; one that NO delivery listed reads
+    ``none`` even after another member's entry was fetched — and ``unit_delivered``
+    (``material_cut``) once its own entry was. (A named write's answer hands the unit out again,
+    possibly listing other members: what counts is what some delivery listed.)
+
+    MUTATION (verified RED, 1 failed): the former rule — after a cut delivery a fetch of ANY member
+    counts for the whole unit (``infer`` over every member of the unit) -> an unlisted member reads
+    unit_delivered -> RED."""
+    w = _hex_world(tmp_path, monkeypatch, 60)
+    server = mcp_app.build_server(w.path)
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    listed = {e["entry_id"] for e in nu["material"]["entries"]}
+    members = list(nu["members"])
+    # the preconditions: one cut batch that lists some members and not others
+    assert nu["kind"] == "second_tier_batch" and nu["material_cut"] is True
+    assert 3 <= len(listed) <= len(members) - 4, (len(listed), len(members))
+
+    def write(m: dict[str, Any], named: bool) -> dict[str, Any]:
+        got = _server_call(
+            server, "annotate_diff", _judge_args(m, nu["unit_id"] if named else None)
+        )
+        assert got.get("written") is True, got
+        again = got.get("next_unit") or {}
+        if again.get("unit_id") == nu["unit_id"]:  # handed out again: what it listed counts too
+            listed.update(e["entry_id"] for e in again["material"].get("entries") or [])
+        return got
+
+    def unlisted() -> dict[str, Any]:
+        return next(m for m in members if m["entry_id"] not in listed and m not in used)
+
+    shown = [m for m in members if m["entry_id"] in listed]
+    used: list[dict[str, Any]] = []
+    assert write(shown[1], False)["read_basis"] == {
+        "basis": "unit_delivered",
+        "material_cut": False,
+        "unit_inferred": True,
+    }
+    seen = _server_call(
+        server, "get_diff_patch_view", {"diff_id": DX, "entry_id": shown[2]["entry_id"]}
+    )
+    assert "error" not in seen, seen
+    not_read = {"basis": "none", "unread_before_verdict": False}  # second tier: not must-read
+    used.append(unlisted())
+    assert write(used[-1], False)["read_basis"] == not_read
+    used.append(unlisted())
+    assert write(used[-1], True)["read_basis"] == not_read
+    used.append(unlisted())
+    own = _server_call(
+        server, "get_diff_patch_view", {"diff_id": DX, "entry_id": used[-1]["entry_id"]}
+    )
+    assert "error" not in own, own
+    assert write(used[-1], True)["read_basis"] == {"basis": "unit_delivered", "material_cut": True}
+    assert write(shown[0], True)["read_basis"] == {"basis": "unit_delivered", "material_cut": False}
+
+
+# Fixture sizes whose answer the former fit sent over the byte budget (each kind of answer at its
+# own n): a first write, an overwrite (its answer carries ``overwrote``), a batch write, and
+# start_diff_review(run_pair) itself.
+_OVER_AT = (43, 47, 51, 53, 61, 65, 69, 71)
+
+
+@pytest.mark.parametrize("n", _OVER_AT)
+def test_every_answer_carrying_a_units_material_keeps_to_the_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int
+) -> None:
+    """★ FC02: the material's own budget counts its entries but not its wrapping, so the answer
+    is measured as it is sent and the material cut again by what it is over. At each of these
+    sizes the former fit sent one kind of answer over 48,000 bytes; every answer keeps to it now,
+    and the write answers' next unit says its material was cut.
+
+    MUTATION (verified RED, 8 failed): drop the measure-and-cut-again pass (one fit to the
+    entries' budget, as before) -> RED at every n. MUTATION (verified RED): ``material_cut`` always
+    False -> RED."""
+    w = _hex_world(tmp_path, monkeypatch, n)
+    server = mcp_app.build_server(w.path)
+    budget = mcp_app._RESPONSE_BYTE_BUDGET
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 1})["next_unit"]
+    args = {**_judge_args(nu["members"][0], nu["unit_id"])}
+    sizes: dict[str, int] = {}
+    for kind in ("write", "overwrite"):
+        out = _server_call(server, "annotate_diff", args)
+        assert out.get("written") is True, out
+        assert out["next_unit"]["material_cut"] is True
+        sizes[kind] = len(json.dumps(out))
+    item = {k: args[k] for k in ("anchor_ref", "verdict", "rationale")}
+    batch = _server_call(
+        server,
+        "annotate_diff_batch",
+        {"annotations": [item], "diff_id": DX, "unit_id": nu["unit_id"]},
+    )
+    assert batch.get("written") is True, batch
+    assert batch["next_unit"]["material_cut"] is True
+    sizes["batch"] = len(json.dumps(batch))
+    sizes["start"] = len(
+        json.dumps(_server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 1}))
+    )
+    assert all(size <= budget for size in sizes.values()), sizes
+
+
+def test_the_walk_of_the_history_holds_off_the_report_k(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ FC04 (X1, the walk itself): the subject is must-read at k=8 only, so the k=4 report's own
+    layer cannot flag it — only the walk of its history can. A k=8 session judged it unread
+    (flagged); a k=4 session rewrote it, still unread, unflagged: the k=4 report keeps it
+    needs_recheck.
+
+    MUTATION (verified RED, 1 failed): read the flag off the latest write only -> RED. MUTATION
+    (verified RED, 1 failed): let any unflagged write clear it (basis none included) -> RED."""
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    target = sorted(_must_at(w, 8) - _must_at(w, 4))[0]
+    w.judge(DX, target, "changed_real", ctx=UNREAD)
+    w.judge(DX, target, "changed_real", ctx=NONE_NOFLAG)
+    assert target not in _must_at(w, 4)  # the precondition: the report-k layer is out of play
+    assert target in _review(w, k=4).audits.needs_recheck
+
+
+def test_a_one_diff_start_call_is_not_a_pair_call_at_the_default_k(world: World) -> None:
+    """★ R-7: the session's k is read off its whole-pair start_diff_review calls only; a k=0
+    session that also opened one diff (start_diff_review(diff_id), which has no k) keeps k=0.
+
+    MUTATION (verified RED, 1 failed): count every start_diff_review line (the diff form as the
+    default k) -> the next unit's read_with loses its ``k=0`` -> RED."""
+    server = mcp_app.build_server(world.path)
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    one = _server_call(server, "start_diff_review", {"diff_id": DX})
+    assert "error" not in one, one
+    out = _server_call(server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"]))
+    assert out.get("written") is True, out
+    assert out["next_unit"] is not None
+    assert out["next_unit"]["read_with"].endswith(", k=0)"), out["next_unit"]["read_with"]
+
+
+def test_a_refused_call_asking_an_in_range_k_sets_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ R-8 (the error filter alone): a start_diff_review refused for its unit but asking k=8 —
+    in range — sets nothing: the session works at the default k, so after its four must-read
+    entries the next unit is the second tier.
+
+    MUTATION (verified RED, 1 failed): take k from refused calls too (the range check kept) ->
+    read at k=8 -> the fifth unit is still an entry -> RED."""
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    server = mcp_app.build_server(w.path)
+    bad = _server_call(server, "start_diff_review", {"run_pair": PAIR, "unit": "nope", "k": 8})
+    assert "error" in bad, bad
+    nxt = _server_call(server, "start_diff_review", {"run_pair": PAIR})["next_unit"]
+    for _ in range(4):
+        assert nxt is not None and nxt["kind"] == "entry"
+        _read_unit(server, nxt["unit_id"], None)
+        out = _server_call(server, "annotate_diff", _judge_args(nxt["members"][0], nxt["unit_id"]))
+        assert out.get("written") is True, out
+        nxt = out["next_unit"]
+    assert nxt is not None and nxt["kind"] == "second_tier_batch"
+
+
+def test_a_call_without_k_counts_as_the_default_k(world: World) -> None:
+    """★ R-8 (a call without k): a session that asked k=0 and then called without k works at the
+    larger, the default — its last write's coverage reads (k=4).
+
+    MUTATION (verified RED, 1 failed): skip calls without k -> the session reads k=0 -> RED."""
+    server = mcp_app.build_server(world.path)
+    _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
+    out = _walk_pair(server, None)
+    assert "(k=4)" in out["coverage_statement"], out["coverage_statement"]
+
+
+def test_a_range_check_alone_keeps_an_out_of_range_k_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ R-8 (the range check alone): a logged start_diff_review line asking an out-of-range k
+    with NO error recorded (a log line the error filter does not catch) still sets nothing.
+
+    MUTATION (verified RED, 1 failed): drop the 0..MAX_K check (the error filter kept) -> the
+    session reads k=201 -> refused write -> RED."""
+    from treasure_map.lib import tool_call_log as tcl
+
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    server = mcp_app.build_server(w.path)
+    nxt = _server_call(server, "start_diff_review", {"run_pair": PAIR})["next_unit"]
+    log = tcl.log_path_for(w.path)
+    session = next(iter(tcl.read_lines(log) or []))["session"]
+    forged = tcl.build_line(
+        tcl.Session(id=session), "start_diff_review", {"run_pair": PAIR, "k": 201}
+    )
+    tcl.append(log, forged)
+    out = _server_call(server, "annotate_diff", _judge_args(nxt["members"][0], nxt["unit_id"]))
+    assert out.get("written") is True, out
+    assert out["next_unit"] is not None and ", k=" not in out["next_unit"]["read_with"]
+
+
+def test_the_reports_judged_unread_is_the_coverage_statements_number(world: World) -> None:
+    """★ R-13: the structured report's ``judged_unread`` is the coverage statement's "judged
+    unread N" — one count, one name; the former key ``needs_recheck`` carries the same value,
+    marked deprecated.
+
+    MUTATION (verified RED, 1 failed): count the open audits under ``judged_unread`` -> RED."""
+    import re
+
+    world.judge(DX, A1, "changed_real", ctx=UNREAD)
+    rep = _review(world, k=0).report
+    said = re.search(r"judged unread (\d+);", rep["coverage_statement"])
+    assert said is not None, rep["coverage_statement"]
+    assert rep["judged_unread"]["count"] == int(said.group(1)) == 1
+    assert A1 in rep["judged_unread"]["subjects"]
+    old = dict(rep["needs_recheck"])
+    assert old.pop("deprecated") == "renamed judged_unread"
+    assert old == rep["judged_unread"]

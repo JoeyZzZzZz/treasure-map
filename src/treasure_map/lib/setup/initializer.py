@@ -1021,8 +1021,10 @@ def run_init(
                 plan.needs_you.append(f"{label}: {r}")
     # the diff-review skill: each skills directory the chosen agents read, once
     skill_bytes = sk.shipped_bytes()
-    for root in sk.target_roots(selected, chost.home):
-        sst = sk.classify(root, ledger, skill_bytes)
+    skill_known = sk.known_roots(chost.home, chost.environ)
+    skill_targets = sk.target_roots(selected, chost.home, chost.environ)
+    for root in skill_targets:
+        sst = sk.classify(root, ledger, skill_bytes, known=skill_known)
         if sst.state in ("missing", "stale", "legacy"):
             plan.add(
                 Action(
@@ -1034,11 +1036,26 @@ def run_init(
             )
         elif sst.state == "foreign":
             plan.needs_you.append(
-                f"skill {sst.path}: {sst.detail}; not modified — to replace it: "
-                + sk.replace_command(root)
+                f"skill {sst.path}: {sst.detail}; not modified — {sk.next_step(sst)}"
             )
         elif sst.state == "invalid":
             plan.needs_you.append(f"skill {sst.path}: {sst.detail}; not modified")
+    # A copy tmap wrote, still byte for byte, in a directory no agent chosen in this run reads is
+    # brought up to date too (an agent reading two directories would otherwise see two versions);
+    # nothing is created there.
+    for root in skill_known:
+        if root in skill_targets:
+            continue
+        sst = sk.classify(root, ledger, skill_bytes, known=skill_known)
+        if sst.state == "stale":
+            plan.add(
+                Action(
+                    "install_skill",
+                    f"update the diff-review skill tmap installed in {root}",
+                    target=sst.path,
+                    lines=[f"replaces: {sst.detail}"],
+                )
+            )
     for cid in selected:
         if cid in sk.MANUAL:  # a note, not a to-do: it would repeat on every run
             echo(f"  Skill: {sk.MANUAL[cid]}")
@@ -1169,6 +1186,16 @@ def run_init(
             if not out.ok and out.manual:
                 needs_you.append(f"{out.message}; run: {out.manual}")
         elif a.kind == "install_skill" and a.target is not None:
+            # looked at again: the file may have been edited since the plan was shown
+            now = sk.classify(a.target.parent.parent, ledger, skill_bytes, known=skill_known)
+            if now.state not in ("missing", "stale", "legacy"):
+                if now.state != "aligned":
+                    why = f"skill {now.path}: {now.detail}; not modified"
+                    if now.state == "foreign":
+                        why += f" — {sk.next_step(now)}"
+                    echo(f"  ✗ {why}")
+                    needs_you.append(why)
+                continue
             try:
                 sk.install(a.target, skill_bytes, ledger)
             except OSError as exc:  # this directory only, reported

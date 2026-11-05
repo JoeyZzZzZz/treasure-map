@@ -175,9 +175,16 @@ def manual_text(client: str, tmap: Path | None) -> str:
 # ── where each client keeps its configuration ───────────────────────────────────────────────
 
 
+def claude_config_override(environ: Mapping[str, str]) -> Path | None:
+    """``CLAUDE_CONFIG_DIR`` when it is set: the directory Claude Code keeps its configuration in
+    instead of its defaults (``~/.claude.json``, ``~/.claude/``)."""
+    base = environ.get("CLAUDE_CONFIG_DIR")
+    return Path(base) if base else None
+
+
 def claude_json(host: ClientHost) -> Path:
-    base = host.environ.get("CLAUDE_CONFIG_DIR")
-    return (Path(base) if base else host.home) / ".claude.json"
+    base = claude_config_override(host.environ)
+    return (base if base is not None else host.home) / ".claude.json"
 
 
 def codex_config(host: ClientHost) -> Path:

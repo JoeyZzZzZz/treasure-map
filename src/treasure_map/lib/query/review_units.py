@@ -99,12 +99,21 @@ DISAGREEMENTS_SHOWN = 20
 # blind audit unit (see ``read_audits`` and ``BLIND_AUDIT_ENABLED``).
 AUDIT_SOURCES = ("change_inconclusive", "no_real_change")
 # Blind auditing (the blind second reading of a no_real_change / change_inconclusive, and the shadow
-# write it records) is SEALED off by default. Before flipping this back to True the sealed section
-# of the spec must be satisfied: A-4 (the --disallowedTools fix, so the agent keeps its prompt) AND
-# a server-side audit mode (an audit session's replies carry no verdict / review_state). Until then
-# a blind reading shares its parent's MCP connection and verdict context, so its record is not
-# trustworthy. The "judged unread -> NEEDS_RECHECK" and "overwritten by another session" signals do
-# NOT depend on this flag; they stay on so must_read_complete never goes green on an unread verdict.
+# write it records) is SEALED off by default. Before flipping this back to True, all three must
+# hold:
+#   1. the blind launch keeps its prompt (A-4: the single-token --disallowedTools form);
+#   2. a server-side audit mode: an audit session's replies carry no verdict / review_state;
+#   3. an interactive session can close an audit unit (R-5). Today it cannot: the pair overview
+#      start_diff_review(run_pair) is itself off the blind-read whitelist, so a session walking the
+#      loop is handed the same audit unit round after round and every shadow it writes is
+#      non-blind (``open audits`` never reaches 0). The fix then: the overview and a write's
+#      next_unit skip AUDIT units; an audit unit is handed out only through ``unit=`` as a
+#      session's FIRST call (the batch driver's); the report counts "audits pending (fresh
+#      session)" apart.
+# Until then a blind reading shares its parent's MCP connection and verdict context, so its record
+# is not trustworthy. The "judged unread -> NEEDS_RECHECK" and "overwritten by another session"
+# signals do NOT depend on this flag; they stay on so must_read_complete never goes green on an
+# unread verdict.
 BLIND_AUDIT_ENABLED = False
 # The writes a person makes: never audited, and what settles a disagreement.
 HUMAN = "human"
@@ -981,10 +990,16 @@ def report(
     # disagreement counts are always real.
     audits_off = not BLIND_AUDIT_ENABLED
     open_text = "off" if audits_off else str(len(audits.open))
+    judged_unread = {
+        "count": len(audits.needs_recheck),
+        "subjects": sorted(audits.needs_recheck)[:DISAGREEMENTS_SHOWN],
+        "why": "judged before anything of the subject was read",
+        "cleared_by": "a later judgement written after reading the subject",
+    }
     statement = (
         f"must-read {len(must_members)} / disposed {must_done}; "
         f"all subjects {len(all_members)} / disposed {all_done}; "
-        f"open audits {open_text}; judged unread {len(audits.needs_recheck)}; "
+        f"open audits {open_text}; judged unread {judged_unread['count']}; "
         f"disagreements {len(audits.disagreements)}; "
         f"{'reduce done' if not reduce_owed else f'reduce owed {len(reduce_owed)}'}; "
         f"predicate {PREDICATE_VERSION} (k={k}); server {server}"
@@ -1022,12 +1037,11 @@ def report(
             "status": "audits off" if audits_off else "on",
             "by_source": by_source,
         },
-        "needs_recheck": {
-            "count": len(audits.needs_recheck),
-            "subjects": sorted(audits.needs_recheck)[:DISAGREEMENTS_SHOWN],
-            "why": "judged before anything of the subject was read",
-            "cleared_by": "a later judgement written after reading the subject",
-        },
+        # The coverage statement's "judged unread N": the same count, under the same name.
+        "judged_unread": judged_unread,
+        # Deprecated: the former name of ``judged_unread``, kept (same value) for readers of
+        # older reports; it is dropped in a later release.
+        "needs_recheck": {**judged_unread, "deprecated": "renamed judged_unread"},
         "disagreements": {
             "count": len(audits.disagreements),
             "items": audits.disagreements[:DISAGREEMENTS_SHOWN],

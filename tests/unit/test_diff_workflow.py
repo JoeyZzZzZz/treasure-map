@@ -138,7 +138,7 @@ def test_every_text_that_teaches_the_pair_loop_names_the_unit() -> None:
 
     MUTATION (verified RED, 1 failed each): drop "unit_id" from DIFF_WORKFLOW / PAIR_WORKFLOW ->
     RED; write the skill's loop by hand without it -> RED."""
-    from treasure_map.cli.review_cli import skill_text
+    from treasure_map.lib.query.diff_skill import skill_text
     from treasure_map.lib.query.diff_workflow import PAIR_WORKFLOW
 
     assert "unit_id=" in DIFF_WORKFLOW
@@ -155,7 +155,7 @@ def test_the_skill_quotes_the_servers_own_loop() -> None:
 
     MUTATION (verified RED, 1 failed): build the loop from a hand-written sentence instead of the
     two constants -> RED. (A template without the marker fails louder: skill_text raises.)"""
-    from treasure_map.cli.review_cli import skill_text
+    from treasure_map.lib.query.diff_skill import skill_text
     from treasure_map.lib.query.diff_workflow import PAIR_WORKFLOW
 
     skill = skill_text()
@@ -189,6 +189,30 @@ def test_the_guide_says_what_the_blind_audit_gate_says() -> None:
     off, on = mcp_app._blind_audit_sentence(False), mcp_app._blind_audit_sentence(True)
     assert "sealed off" in off and "sealed" not in on and on != off
     assert mcp_app._blind_audit_sentence(ru.BLIND_AUDIT_ENABLED) in mcp_app._AGENT_GUIDE
+
+
+def test_the_guide_is_built_from_the_gate_it_is_imported_under() -> None:
+    """★ R-6: the wiring, not only the helper — import mcp_app in a fresh interpreter with the gate
+    switched ON before the import, and the guide it builds carries the "on" sentence, not the
+    sealed one.
+
+    MUTATION (verified RED, 1 failed): build the guide from ``_blind_audit_sentence(False)`` -> the
+    fresh import still says sealed -> RED."""
+    import subprocess
+    import sys
+
+    probe = (
+        "from treasure_map.lib.query import review_units as ru\n"
+        "ru.BLIND_AUDIT_ENABLED = True\n"
+        "from treasure_map import mcp_app\n"
+        "print(mcp_app._blind_audit_sentence(True) in mcp_app._AGENT_GUIDE)\n"
+        "print(mcp_app._blind_audit_sentence(False) in mcp_app._AGENT_GUIDE)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["True", "False"], done.stdout
 
 
 def test_the_start_card_leads_with_the_whole_pair() -> None:

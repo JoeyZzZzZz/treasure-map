@@ -82,6 +82,52 @@ def test_the_read_basis_of_a_write(
     assert rb.infer(lines, anchor_ref=ANCHOR, entry_id=ENTRY, **kw)["basis"] == basis
 
 
+def _batch(*whole: str, cut: bool = True) -> dict[str, Any]:
+    """A batch's delivery line: the members its material kept (``unit_whole``)."""
+    return {
+        **_line("start_diff_review", unit="u1", unit_material_cut=cut),
+        "unit_whole": list(whole),
+    }
+
+
+@pytest.mark.parametrize(
+    ("lines", "want"),
+    [
+        # listed in the cut batch's material: read with the unit, at once
+        ([_batch(ENTRY)], {"basis": "unit_delivered", "material_cut": False}),
+        # not listed: the batch did not show it
+        ([_batch("pair:1:2")], {"basis": "none"}),
+        # a member left out of an UNCUT material (not in the view) is not shown either
+        ([_batch("pair:1:2", cut=False)], {"basis": "none"}),
+        # fetching ANOTHER member after the cut delivery does not read this one
+        (
+            [_batch("pair:1:2"), _line("get_diff_patch_view", entry_id="pair:1:2")],
+            {"basis": "none"},
+        ),
+        # fetching this one after it does
+        (
+            [_batch("pair:1:2"), _line("get_diff_patch_view", entry_id=ENTRY)],
+            {"basis": "unit_delivered", "material_cut": True},
+        ),
+        # a later delivery that lists it counts (any delivery before the write)
+        ([_batch("pair:1:2"), _batch(ENTRY)], {"basis": "unit_delivered", "material_cut": False}),
+    ],
+    ids=["listed", "unlisted", "unlisted_uncut", "other_fetched", "self_fetched", "listed_later"],
+)
+def test_a_cut_batch_counts_only_the_members_it_showed(
+    lines: list[dict[str, Any]], want: dict[str, Any]
+) -> None:
+    """★ FC01: a delivery reads a member only when its material showed that member whole (listed
+    in ``unit_whole``), or the member itself was fetched after it — never because another member
+    was.
+
+    MUTATION (verified RED, 3 failed): read a listing delivery by its cut flag alone (ignore
+    ``unit_whole``) -> listed, unlisted_uncut and listed_later RED. MUTATION (verified RED, 1
+    failed): count a fetch of any delivered member (``_fetched`` of ``unit_whole[0]``) ->
+    other_fetched RED."""
+    assert rb.infer(lines, anchor_ref=ANCHOR, entry_id=ENTRY, unit_id="u1") == want
+
+
 def test_a_file_is_fetched_by_its_path() -> None:
     lines = [_line("get_file_diff", run_pair="a::b", path="etc/rc")]
     assert rb.infer(lines, anchor_ref=FILE)["basis"] == "fetched"

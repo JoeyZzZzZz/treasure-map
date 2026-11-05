@@ -8,16 +8,21 @@ the chosen agents read it. A file there is in one of these states:
 
   * ``missing``  — no ``SKILL.md``.
   * ``aligned``  — exactly the skill this tmap ships.
-  * ``stale``    — tmap's (the ledger records it, its frontmatter name is the skill's), an
-    earlier text; it is replaced.
+  * ``stale``    — tmap's (the ledger records it, and it still holds exactly the bytes tmap
+    wrote), an earlier text; it is replaced — in every directory tmap manages, not only the ones
+    the agents chosen in a run read.
   * ``legacy``   — byte for byte a version an earlier tmap shipped before the ledger recorded
     skills (installed by hand); it is replaced, and recorded from then on.
-  * ``foreign``  — anything else (a file the ledger never recorded, an edited copy of an old
-    version, a symbolic link); it is NEVER modified.
+  * ``foreign``  — anything else (a file the ledger never recorded, a recorded file changed since
+    tmap wrote it, an edited copy of an old version, a symbolic link); it is NEVER modified. Even
+    ``--force`` replaces only the file itself (a link at ``SKILL.md`` included), never what a
+    linked ``tmap-diff-review`` directory points at.
   * ``invalid``  — not a readable regular file; nothing is written.
 
-A write is recorded ``pending`` (target path and sha256) before the file moves into place, read
-back, and only then ``committed``.
+A write is recorded ``pending`` (target path, sha256 and the directories it creates) before the
+file moves into place, read back, and only then ``committed``. ``tmap uninstall`` removes a file
+only while it still holds the recorded bytes, and then the directories that write created, each
+only when empty.
 """
 
 from __future__ import annotations
@@ -25,16 +30,16 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-import yaml
-
+from treasure_map.lib.query import diff_skill
+from treasure_map.lib.query.diff_skill import SKILL_DIRNAME
+from treasure_map.lib.setup.clients import claude_config_override
 from treasure_map.lib.setup.ledger import Ledger
 
-SKILL_DIRNAME = "tmap-diff-review"
 SKILL_FILE = "SKILL.md"
 ID_PREFIX = "skill:"
 
@@ -51,32 +56,43 @@ LEGACY_SHA256 = frozenset(
 
 
 # Where each agent reads personal skills (<root>/<skill name>/SKILL.md):
-#   Claude Code: ~/.claude/skills — https://code.claude.com/docs/en/skills
+#   Claude Code: ~/.claude/skills ($CLAUDE_CONFIG_DIR/skills when that is set, the same override
+#     its MCP registration follows) — https://code.claude.com/docs/en/skills
 #   Codex: $HOME/.agents/skills (not ~/.codex/skills) — https://learn.chatgpt.com/docs/build-skills
 #   Cursor: ~/.agents/skills and ~/.cursor/skills, and also ~/.claude/skills and ~/.codex/skills
 #     — https://cursor.com/docs/context/skills
-def claude_root(home: Path) -> Path:
-    return home / ".claude" / "skills"
+def claude_root(home: Path, environ: Mapping[str, str]) -> Path:
+    base = claude_config_override(environ)
+    return (base if base is not None else home / ".claude") / "skills"
 
 
 def agents_root(home: Path) -> Path:
     return home / ".agents" / "skills"
 
 
-def known_roots(home: Path) -> tuple[Path, ...]:
+def named_roots(home: Path, environ: Mapping[str, str]) -> tuple[tuple[str, Path], ...]:
     """Every directory tmap may write the skill into (and so ``tmap uninstall`` may remove it
-    from)."""
-    return (claude_root(home), agents_root(home))
+    from), each with the short name the doctor reports it under."""
+    return (("claude", claude_root(home, environ)), ("agents", agents_root(home)))
 
 
-def target_roots(selected: Iterable[str], home: Path) -> list[Path]:
+def known_roots(home: Path, environ: Mapping[str, str]) -> tuple[Path, ...]:
+    return tuple(root for _name, root in named_roots(home, environ))
+
+
+def is_known(root: Path, known: Iterable[Path]) -> bool:
+    """Whether ``root`` is one of the ``known`` directories (compared with links resolved)."""
+    return os.path.realpath(root) in {os.path.realpath(r) for r in known}
+
+
+def target_roots(selected: Iterable[str], home: Path, environ: Mapping[str, str]) -> list[Path]:
     """The skills directories to write for the agents chosen in THIS run, each once. Cursor reads
     the Claude Code and Codex directories too, so it adds one only when neither of those agents was
     chosen."""
     chosen = set(selected)
     out: list[Path] = []
     if "claude-code" in chosen:
-        out.append(claude_root(home))
+        out.append(claude_root(home, environ))
     if "codex" in chosen:
         out.append(agents_root(home))
     if "cursor" in chosen and not chosen & {"claude-code", "codex"}:
@@ -111,9 +127,7 @@ def entry_id(path: Path) -> str:
 
 def shipped_bytes() -> bytes:
     """The skill this tmap ships, as it is written to disk."""
-    from treasure_map.cli.review_cli import skill_text
-
-    return skill_text().encode("utf-8")
+    return diff_skill.skill_text().encode("utf-8")
 
 
 def sha256_of(data: bytes) -> str:
@@ -127,25 +141,6 @@ def file_sha256(path: Path) -> str | None:
         return None
 
 
-def frontmatter_name(data: bytes) -> str | None:
-    """The ``name`` in the file's leading ``---`` block, or None."""
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    if not text.startswith("---\n"):
-        return None
-    end = text.find("\n---", 4)
-    if end < 0:
-        return None
-    try:
-        meta = yaml.safe_load(text[4:end])
-    except yaml.YAMLError:
-        return None
-    name = meta.get("name") if isinstance(meta, dict) else None
-    return name if isinstance(name, str) else None
-
-
 @dataclass(frozen=True)
 class SkillStatus:
     root: Path
@@ -154,8 +149,10 @@ class SkillStatus:
     detail: str = ""
 
 
-def classify(root: Path, ledger: Ledger, want: bytes) -> SkillStatus:
-    """What is at ``root``'s skill path, against ``want`` and the ledger's committed record."""
+def classify(root: Path, ledger: Ledger, want: bytes, *, known: Iterable[Path]) -> SkillStatus:
+    """What is at ``root``'s skill path, against ``want`` and the ledger's committed record.
+    ``known`` is the directories tmap manages (``known_roots``): a file elsewhere is never in the
+    ledger, and is said so rather than called someone else's."""
     path = skill_path(root)
 
     def status(state: SkillState, detail: str = "") -> SkillStatus:
@@ -179,15 +176,53 @@ def classify(root: Path, ledger: Ledger, want: bytes) -> SkillStatus:
         return status("legacy", "an earlier tmap's version, installed by hand")
     rec = ledger.committed(entry_id(path))
     if rec is not None and rec.path == str(path):
-        if frontmatter_name(data) == SKILL_DIRNAME:
+        # Only the very bytes tmap wrote are tmap's to replace: the same test uninstall applies
+        # before it deletes the file (``removable``).
+        if sha256_of(data) == rec.extra.get("sha256"):
             return status("stale", "tmap's, from an earlier version")
-        return status("foreign", f"its name is no longer {SKILL_DIRNAME}")
+        return status("foreign", "changed since tmap installed it")
+    if not is_known(root, known):
+        return status("foreign", "not in tmap's install ledger (a directory tmap does not manage)")
     return status("foreign", "tmap did not install it")
 
 
 def replace_command(root: Path) -> str:
     """What a person runs to replace a file tmap will not touch."""
     return f"tmap review skill --install {root} --force"
+
+
+def next_step(st: SkillStatus) -> str:
+    """What a person does about a file tmap will not touch: the command that replaces it — or,
+    for a ``tmap-diff-review`` directory that is a link (which not even ``--force`` writes
+    through), to change the link first."""
+    if st.path.parent.is_symlink():
+        return f"{st.path.parent} is a link; remove or replace it first"
+    return "to replace it: " + replace_command(st.root)
+
+
+class SkillWriteError(OSError):
+    """The file read back differs from what was written, or the write would go through a link."""
+
+
+def _refuse_linked_dir(path: Path) -> None:
+    """A ``tmap-diff-review`` directory that is a symbolic link is someone else's: not even
+    ``--force`` writes into what it points at (a link at ``SKILL.md`` itself is replaced as a
+    link, its target untouched)."""
+    if path.parent.is_symlink():
+        raise SkillWriteError(
+            f"{path.parent} is a symbolic link to {os.readlink(path.parent)}; tmap does not write "
+            "through it — remove or replace the link first"
+        )
+
+
+def _missing_dirs(directory: Path) -> list[Path]:
+    """``directory`` and each of its parents that does not exist yet, outermost first."""
+    out: list[Path] = []
+    for d in (directory, *directory.parents):
+        if d.exists() or d.is_symlink():
+            break
+        out.append(d)
+    return out[::-1]
 
 
 def _write(path: Path, data: bytes) -> None:
@@ -211,26 +246,30 @@ def _read_back(path: Path) -> bytes:
     return path.read_bytes()
 
 
-class SkillWriteError(OSError):
-    """The file read back differs from what was written."""
-
-
 def write_plain(path: Path, data: bytes) -> None:
     """Write without recording (a directory tmap does not manage), then read it back."""
+    _refuse_linked_dir(path)
     _write(path, data)
     if _read_back(path) != data:
         raise SkillWriteError(f"{path}: the file read back differs from what was written")
 
 
 def install(path: Path, data: bytes, ledger: Ledger) -> None:
-    """Write ``data`` at ``path`` through the ledger: pending (path, sha256) -> write -> read back
-    equal -> committed. A failed read-back leaves the entry pending for the next run to settle."""
+    """Write ``data`` at ``path`` through the ledger: pending (path, sha256, the directories this
+    write creates — kept from the earlier record on a replacement) -> write -> read back equal ->
+    committed. A failed read-back leaves the entry pending for the next run to settle."""
+    _refuse_linked_dir(path)
     eid = entry_id(path)
     prior = ledger.committed(eid)
     prior_sha = prior.extra.get("sha256") if prior is not None else None
-    extra: dict[str, str] = {"sha256": sha256_of(data)}
+    prior_dirs = prior.extra.get("created_dirs") if prior is not None else None
+    extra: dict[str, object] = {"sha256": sha256_of(data)}
     if isinstance(prior_sha, str):
         extra["prior_sha256"] = prior_sha
+    created = [d for d in prior_dirs if isinstance(d, str)] if isinstance(prior_dirs, list) else []
+    created += [str(d) for d in _missing_dirs(path.parent) if str(d) not in created]
+    if created:
+        extra["created_dirs"] = created
     ledger.add_pending(eid, "file", path, **extra)
     _write(path, data)
     if sha256_of(_read_back(path)) != extra["sha256"]:
@@ -265,13 +304,13 @@ def recover(ledger: Ledger) -> list[str]:
     return lines
 
 
-def removable(path: Path, recorded_sha: object, home: Path) -> str | None:
+def removable(
+    path: Path, recorded_sha: object, home: Path, environ: Mapping[str, str]
+) -> str | None:
     """None when the recorded skill at ``path`` may be removed; else why not: only a
     ``tmap-diff-review/SKILL.md`` directly in one of tmap's skills directories, still holding what
     tmap wrote."""
-    in_known = os.path.realpath(path.parent.parent) in {
-        os.path.realpath(r) for r in known_roots(home)
-    }
+    in_known = is_known(path.parent.parent, known_roots(home, environ))
     if path.name != SKILL_FILE or path.parent.name != SKILL_DIRNAME or not in_known:
         return f"{path} is not where tmap installs its skill; not removed"
     if path.is_symlink() or path.parent.is_symlink():
@@ -281,3 +320,24 @@ def removable(path: Path, recorded_sha: object, home: Path) -> str | None:
     if not isinstance(recorded_sha, str) or file_sha256(path) != recorded_sha:
         return f"{path} changed since tmap installed it; not removed"
     return None
+
+
+def prune_dirs(path: Path, created: object) -> list[Path]:
+    """After the skill at ``path`` is removed: its ``tmap-diff-review`` directory and the
+    directories above it that tmap's write created (the ledger's ``created_dirs``), deepest first,
+    each only when nothing is left in it. A recorded directory that is not one of ``path``'s
+    parents, or is a symbolic link, is left alone."""
+    parents = set(path.parents)
+    dirs = {path.parent}
+    if isinstance(created, list):
+        dirs |= {Path(d) for d in created if isinstance(d, str) and Path(d) in parents}
+    removed: list[Path] = []
+    for d in sorted(dirs, key=lambda p: len(p.parts), reverse=True):
+        if d.is_symlink() or not d.is_dir():
+            continue
+        try:
+            d.rmdir()  # only when nothing else is left in it
+        except OSError:
+            continue
+        removed.append(d)
+    return removed

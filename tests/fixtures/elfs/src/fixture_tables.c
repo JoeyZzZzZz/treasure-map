@@ -18,6 +18,8 @@
  *   unterminated  {name, internal function}           a table (4 records) one of whose keys is a
  *                                                     printable run ended by a control byte, not by
  *                                                     a NUL, and no string Ghidra defines
+ *   short_run     {name, internal function}           not a table: 3 records, one fewer than the
+ *                                                     detector's minimum run
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,6 +86,10 @@ const struct command bounded[] = {
 
 const struct command unterminated[] = {
     {"red", fx_alpha}, {"green\x01", fx_beta}, {"blue", fx_gamma}, {"cyan", fx_delta}, {NULL, NULL},
+};
+
+const struct command short_run[] = {
+    {"low", fx_alpha}, {"mid", fx_beta}, {"high", fx_gamma}, {NULL, NULL},
 };
 
 int fx_imported(int x) {

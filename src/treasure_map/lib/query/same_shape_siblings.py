@@ -209,6 +209,35 @@ def _calls(atlas: sqlite3.Connection, run_id: str, sha: str) -> list[_Call]:
     return [_call(tuple(r)) for r in rows]
 
 
+@dataclass
+class SameShapeReads:
+    """What one call of same_shape_siblings reads that does not depend on its input: the diff's
+    built view, a side's instance rows and a side's analysis.db functions. A caller asking for many
+    calls of the same diffs in ONE pass (the findings hand-off) holds one of these for that pass, so
+    each diff's view is built once and each side read once; the answers are the ones separate calls
+    give. It is never kept past that pass — a view goes stale when a judgement or a hunt moves it —
+    so there is no process-wide cache here. Without one, each call reads afresh."""
+
+    views: dict[str, BuiltDiff | None] = field(default_factory=dict)
+    calls: dict[tuple[str, str], list[_Call]] = field(default_factory=dict)
+    sides: dict[tuple[str, str | None], _Side] = field(default_factory=dict)
+
+    def view(self, atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None:
+        if diff_id not in self.views:
+            self.views[diff_id] = build_diff_view(atlas, diff_id)
+        return self.views[diff_id]
+
+    def side_calls(self, atlas: sqlite3.Connection, run_id: str, sha: str) -> list[_Call]:
+        if (run_id, sha) not in self.calls:
+            self.calls[(run_id, sha)] = _calls(atlas, run_id, sha)
+        return self.calls[(run_id, sha)]
+
+    def side_db(self, atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side:
+        if (run_id, sha) not in self.sides:
+            self.sides[(run_id, sha)] = _read_side(atlas, run_id, sha)
+        return self.sides[(run_id, sha)]
+
+
 # ── the diff, its sides, and the refusals ───────────────────────────────────────────────────
 
 
@@ -663,6 +692,7 @@ def same_shape_siblings(
     build_hash: str | None,
     current: rescan_version.CodeStamp,
     commit: str,
+    reads: SameShapeReads | None = None,
 ) -> dict[str, Any]:
     """The same-shape group of one sink call of a diff (see the module docstring).
 
@@ -674,7 +704,12 @@ def same_shape_siblings(
     Without ``members_offset``: the group object — counts only, no member list. With it: one page
     of the members (``members_limit`` of them, in ``MEMBERS_ORDER``) and ``members_next_offset``
     (null on the last page). A function-level input returns ``not_a_member`` with the shapes it has
-    instead."""
+    instead.
+
+    ``reads`` (SameShapeReads) is the caller's holder for one pass over many calls of the same
+    diffs: the view and the side reads are taken from it, read once each. The answer is the same
+    with it or without it."""
+    reads = SameShapeReads() if reads is None else reads
     meta = _meta(atlas, diff_id)
     if meta is None:
         return {"diff_id": diff_id, "error": f"no diff {diff_id!r} in this atlas (see list_diffs)"}
@@ -703,7 +738,7 @@ def same_shape_siblings(
                     "binary cannot be read"
                 ),
             }
-        side_calls = _calls(atlas, meta.run[s], sha)
+        side_calls = reads.side_calls(atlas, meta.run[s], sha)
         found = [c for c in side_calls if c.ref == inp.ref]
         if found:
             side, calls, rows = s, side_calls, found
@@ -773,11 +808,11 @@ def same_shape_siblings(
         }
     (key,) = keys
     members = groups[key]
-    built = build_diff_view(atlas, diff_id)
+    built = reads.view(atlas, diff_id)
     assert built is not None  # the diff_meta row was just read
     listed_view(atlas, built)  # which members' entries are listed: bucket S counts as listed
     states = _states(built, side, members)
-    side_db = _read_side(atlas, meta.run[side], meta.sha[side])
+    side_db = reads.side_db(atlas, meta.run[side], meta.sha[side])
     if members_offset is None:
         page_ref: dict[str, Any] = {"diff_id": diff_id}
         page_ref["candidate_anchor" if candidate_anchor is not None else "evidence_ref"] = (

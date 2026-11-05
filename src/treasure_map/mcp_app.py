@@ -2557,6 +2557,9 @@ def make_tools(
         }
         wanted = {m.entry_id for m in u.members}
         page = _get_diff_patch_view(atlas, u.stream, rows_limit=0, limit=2000)
+        if "error" in page:
+            # No members to show is not an empty group: the material is the error (not handed out).
+            return {"error": page["error"]}
         entries = [e for e in page.get("entries") or [] if e.get("entry_id") in wanted]
         room = budget - len(json.dumps(out))
         kept: list[dict[str, Any]] = []
@@ -2598,17 +2601,48 @@ def make_tools(
         return call_log.session.id if call_log is not None else None
 
     def _material_cut(material: Any) -> bool:
-        """Whether a unit's material was cut to fit: a part withheld for the page budget, or a
-        list cut short (the read_more / read_one calls reach the rest)."""
+        """Whether a unit's material was cut to fit: a part withheld for the page budget, a list
+        cut short, an entry's rows or a file's hunks that continue on another page (the read_more /
+        read_one calls reach the rest)."""
         if not isinstance(material, dict):
             return False
         if '"page_budget"' in json.dumps(material):
             return True
         entry = material.get("entry")
-        return any(
-            bool(material.get(k))
-            for k in ("entries_truncated", "top_truncated", "structured_withheld")
-        ) or (isinstance(entry, dict) and entry.get("rows_next_offset") is not None)
+        return (
+            any(
+                bool(material.get(k))
+                for k in (
+                    "entries_truncated",
+                    "owed_truncated",
+                    "top_truncated",
+                    "structured_withheld",
+                )
+            )
+            or material.get("next_hunk_offset") is not None
+            or (isinstance(entry, dict) and entry.get("rows_next_offset") is not None)
+        )
+
+    def _fit_unit_material(
+        atlas: sqlite3.Connection,
+        review: _ru.PairReview,
+        u: _ru.Unit,
+        holder: dict[str, Any],
+        sent_size: Callable[[], int],
+        room: int,
+    ) -> None:
+        """Put ``u``'s material (and ``material_cut``) into ``holder``, fitted to ``room`` bytes
+        and then measured in the answer as it is sent (``sent_size``): the material's own budget
+        counts its entries, not its wrapping, so an answer still over the byte budget has its
+        material cut again by the bytes it is over."""
+        members_cut = bool(holder.get("members_truncated"))
+        while True:
+            holder["material"] = _unit_material(atlas, review, u, max(room, 0))
+            holder["material_cut"] = members_cut or _material_cut(holder["material"])
+            over = sent_size() - _RESPONSE_BYTE_BUDGET
+            if over <= 0 or room <= 0:
+                return
+            room -= over
 
     def _start_pair_review(
         run_pair: str, limit: Any, worker: Any, workers: Any, unit: Any, k: Any
@@ -2648,8 +2682,7 @@ def make_tools(
                 out["unit"] = _unit_head(u, states)
                 out["members"] = _members_json(u, states)
                 room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
-                out["material"] = _unit_material(atlas, review, u, max(room, 0))
-                out["material_cut"] = _material_cut(out["material"])
+                _fit_unit_material(atlas, review, u, out, lambda: len(json.dumps(out)), room)
                 return out
             rep = review.report
             out["report"] = {
@@ -2688,14 +2721,13 @@ def make_tools(
                 out["next_unit"]["members"] = out["next_unit"]["members"][:20]
                 out["next_unit"]["members_truncated"] = True
                 room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
-            out["next_unit"]["material"] = _unit_material(atlas, review, nxt, max(room, 0))
-            out["next_unit"]["material_cut"] = bool(
-                out["next_unit"].get("members_truncated")
-            ) or _material_cut(out["next_unit"]["material"])
             out["next_unit"]["read_alone"] = (
                 f"start_diff_review(run_pair={json.dumps(run_pair)}, unit={json.dumps(nxt.unit_id)}"
                 + (f", k={kk}" if kk != _ru.DEFAULT_K else "")
                 + ")"
+            )
+            _fit_unit_material(
+                atlas, review, nxt, out["next_unit"], lambda: len(json.dumps(out)), room
             )
             return out
         finally:
@@ -3799,7 +3831,9 @@ def make_tools(
             out: dict[str, Any] = {
                 "run_pair": run_pair,
                 "offset": offset,
-                "next_offset": total,  # the widest value it can take, while the page is measured
+                # While the page is measured: the widest value it can take — null (the last page)
+                # or a block index, at most ``total`` — whichever is longer as JSON.
+                "next_offset": max((None, total), key=lambda v: len(json.dumps(v))),
                 "total_blocks": total,
                 "findings": total - 1,  # blocks[0] is the header
                 "findings_digest": digest,
@@ -4843,10 +4877,13 @@ def make_tools(
         # — fail-closed (the must-read set, which decides unread_before_verdict, only grows with
         # k, so the largest k flags the most writes unread, and the next unit / coverage come back
         # at the k the session is working at, e.g. k=8 or k=0, not the default). With no unit
-        # named, the largest k.
+        # named, the largest k. Only the whole-pair form counts: start_diff_review(diff_id) has no
+        # k and cuts no units.
         ks: list[int] = []
         for ln in lines or []:
             if ln.get("tool") != "start_diff_review" or ln.get("error"):
+                continue
+            if not (ln.get("params") or {}).get("run_pair"):
                 continue
             kk = (ln.get("params") or {}).get("k")
             kk = _ru.DEFAULT_K if kk is None else kk
@@ -4875,7 +4912,6 @@ def make_tools(
             if stray:
                 return {}, False, f"unit {unit_id} does not hold {stray[:3]}", k
             audit = review(k).audit_of(unit_id)
-        unit_anchors = [(m.anchor_ref, m.entry_id) for m in unit.members] if unit else []
         # The units this session was handed WITH their material (the log records only those): a
         # write that names no unit is read against them — for its read basis only, never as the
         # unit it judges (no unit_id is recorded, no audit, no next unit).
@@ -4890,7 +4926,6 @@ def make_tools(
                     anchor_ref=anchor,
                     entry_id=_entry_id_of(anchor),
                     unit_id=unit_id,
-                    unit_anchors=unit_anchors,
                 )
                 if handed and rb["basis"] != "unit_delivered":
                     rb = _inferred_unit_basis(lines, anchor, handed, ks, review) or rb
@@ -4936,7 +4971,6 @@ def make_tools(
                     anchor_ref=anchor,
                     entry_id=_entry_id_of(anchor),
                     unit_id=u.unit_id,
-                    unit_anchors=[(m.anchor_ref, m.entry_id) for m in u.members],
                 )
                 if got["basis"] == "unit_delivered":
                     return {**got, "unit_inferred": True}
@@ -4978,9 +5012,10 @@ def make_tools(
             head["members"] = head["members"][:20]
             head["members_truncated"] = True
             room = _RESPONSE_BYTE_BUDGET - used - len(json.dumps({"next_unit": head})) - 200
-        head["material"] = _unit_material(atlas, review, nxt, max(room, 0))
-        head["material_cut"] = bool(head.get("members_truncated")) or _material_cut(
-            head["material"]
+        # The caller merges this into its answer of ``used`` bytes: the answer as sent is that
+        # plus this block's own JSON (the braces it drops pay for the ", " joining it).
+        _fit_unit_material(
+            atlas, review, nxt, head, lambda: used + len(json.dumps({"next_unit": head})), room
         )
         return {"next_unit": head}
 

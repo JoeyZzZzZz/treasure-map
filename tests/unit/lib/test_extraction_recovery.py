@@ -730,11 +730,12 @@ def test_a_rerun_that_could_not_finish_is_not_bought_again_under_the_same_condit
     recs = _recs(tmp_path, names)
     now = retry_budget_seconds(recs[0].path, 300)
     assert now is not None
+    arch = recs[0].arch
     rows = [
-        ("same", decompile_rerun_record("P", "11.4.3", now)),
-        ("other_pass", decompile_rerun_record("Q", "11.4.3", now)),
-        ("other_ghidra", decompile_rerun_record("P", "12.0", now)),
-        ("bigger", decompile_rerun_record("P", "11.4.3", now - 1)),
+        ("same", decompile_rerun_record("P", "11.4.3", now, arch=arch)),
+        ("other_pass", decompile_rerun_record("Q", "11.4.3", now, arch=arch)),
+        ("other_ghidra", decompile_rerun_record("P", "12.0", now, arch=arch)),
+        ("bigger", decompile_rerun_record("P", "11.4.3", now - 1, arch=arch)),
         ("junk", "{not json"),
         ("none", None),
     ]
@@ -752,6 +753,38 @@ def test_a_rerun_that_could_not_finish_is_not_bought_again_under_the_same_condit
         )
     finally:
         conn.close()
+
+
+def test_a_rerun_under_another_architecture_does_not_settle_this_one(tmp_path: Path) -> None:
+    """S-2. The decompiler is started with the architecture, so an isolated re-run that could not
+    finish under one says nothing about another (the rule step 1e of the ingest applies to a
+    timeout): a record made under the architecture detected now is skipped, one made under
+    another is re-run, and a record that names none (written before the architecture was
+    recorded) is re-run too — the safe side.
+
+    MUTATION (verified RED, 1 failed): drop the architecture comparison from
+    ``decompile_rerun_skips`` -> the "moved" and "unrecorded" binaries are skipped."""
+    names = ("same", "moved", "unrecorded")
+    recs = _recs(tmp_path, names)
+    now = retry_budget_seconds(recs[0].path, 300)
+    assert now is not None
+    old_arch, new_arch = "ARM:LE:32:v8", "ARM:BE:32:v8"
+    recs = [replace(r, arch=new_arch) for r in recs]  # what is detected now
+    unrecorded = json.loads(decompile_rerun_record("P", "11.4.3", now, arch=new_arch))
+    del unrecorded["arch"]
+    rows: list[tuple[str, str | None]] = [
+        ("same", decompile_rerun_record("P", "11.4.3", now, arch=new_arch)),
+        ("moved", decompile_rerun_record("P", "11.4.3", now, arch=old_arch)),
+        ("unrecorded", json.dumps(unrecorded, sort_keys=True)),
+    ]
+    conn = _rerun_db(tmp_path, rows)
+    try:
+        skips = decompile_rerun_skips(
+            conn, recs, pass_version="P", timeout_base=300, ghidra_version="11.4.3"
+        )
+    finally:
+        conn.close()
+    assert skips == {recs[0].sha256}
 
 
 # ── the pipeline: what is stored, recorded and said ─────────────────────────────────────────
@@ -808,6 +841,16 @@ def test_the_scan_stores_the_better_extraction_and_names_what_kept_its_blind_spo
     assert result.analyzer_degraded_binaries == [{"binary": b, "reason": _THREW}]
 
 
+def _arch_of(db: Path, name: str) -> str | None:
+    conn = open_db(db)
+    try:
+        row = conn.execute("SELECT arch FROM binaries WHERE name = ?", (name,)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None and row[0], name
+    return str(row[0])
+
+
 def test_the_scan_records_a_rerun_that_could_not_finish_and_the_next_scan_honours_it(
     tmp_path: Path,
 ) -> None:
@@ -816,7 +859,9 @@ def test_the_scan_records_a_rerun_that_could_not_finish_and_the_next_scan_honour
     again; --force-retry does. A stored extraction with none left clears the record.
 
     MUTATION (verified RED): skip the record write -> RED; leave decompile_settled out of run_all
-    -> the second scan calls it twice -> RED."""
+    -> the second scan calls it twice -> RED.
+    MUTATION (S-2, verified RED, 1 failed): record the re-run with no architecture (``arch=None``)
+    -> the record does not name what it ran under."""
     a = _NAMES[0]
     others = {n: [{"functions": 2}] * 4 for n in _NAMES[1:]}
     plan = _Plan(
@@ -827,6 +872,7 @@ def test_the_scan_records_a_rerun_that_could_not_finish_and_the_next_scan_honour
     _scan(fs, tmp_path / "ws", home, plan)
     rec = _rows(tmp_path / "ws" / "analysis.db")[a]["rerun"]
     assert rec is not None and rec["ghidra_version"] == "11.0" and rec["budget"] > 0
+    assert rec["arch"] == _arch_of(tmp_path / "ws" / "analysis.db", a)  # what it ran under
     assert sum(1 for c in plan.calls if c[0] == a) == 2
 
     before = len(plan.calls)

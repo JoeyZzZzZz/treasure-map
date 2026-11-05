@@ -137,7 +137,6 @@ class ExtractionShare:
                         ", ".join(differs),
                     )
                 return None
-            self.handed += 1
         result, files = kept
         output_dir.mkdir(parents=True, exist_ok=True)
         moved: dict[str, Path | None] = {}
@@ -149,6 +148,10 @@ class ExtractionShare:
             dest = output_dir / src.name
             shutil.copyfile(src, dest)
             moved[attr] = dest
+        # Counted once the copies are made: a copy that fails raises above, and that holder runs a
+        # session of its own instead (it was never handed this one).
+        with self._lock:
+            self.handed += 1
         return dataclasses.replace(result, binary=binary, **moved)
 
     def put(self, key: tuple[Any, ...], result: Any) -> None:

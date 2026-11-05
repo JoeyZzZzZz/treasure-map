@@ -117,11 +117,19 @@ def _timeout_skips(
     return skips
 
 
-def decompile_rerun_record(pass_version: str, ghidra_version: str, budget: int) -> str:
+def decompile_rerun_record(
+    pass_version: str, ghidra_version: str, budget: int, *, arch: str | None
+) -> str:
     """The ``binaries.decompile_rerun`` value for an isolated re-run that still left decompiles
-    unfinished (see ``decompile_rerun_skips``)."""
+    unfinished (see ``decompile_rerun_skips``). ``arch`` is the architecture the re-run was started
+    with."""
     return json.dumps(
-        {"pass_version": pass_version, "ghidra_version": ghidra_version, "budget": int(budget)},
+        {
+            "arch": arch,
+            "budget": int(budget),
+            "ghidra_version": ghidra_version,
+            "pass_version": pass_version,
+        },
         sort_keys=True,
     )
 
@@ -141,8 +149,10 @@ def decompile_rerun_skips(
     ran under (``decompile_rerun``). The same as ``_timeout_skips``: at the same budget with the
     same code and decompiler, a second isolated re-run is the same attempt, bought at up to half an
     hour. So it is skipped only when every axis is positively the same: this pass, this Ghidra
-    (both known), and a budget this scan would hand it that is no larger. Anything unrecorded or
-    unreadable re-runs.
+    (both known), the architecture detected now (the decompiler is started with it, so a re-run
+    under another one says nothing about this one — the same rule as step 1e of ``ingest_elfs``),
+    and a budget this scan would hand it that is no larger. Anything unrecorded or unreadable
+    re-runs, a record that names no architecture included.
 
     It decides only that re-run; the binary's extraction itself is never skipped on it, and its
     unfinished decompiles stay recorded on its functions (decompile_status)."""
@@ -173,7 +183,9 @@ def decompile_rerun_skips(
         if meta.get("pass_version") != pass_version or meta.get("ghidra_version") != ghidra_version:
             continue
         rec = rec_by_sha.get(row["sha256"])
-        current = retry_budget_seconds(rec.path, timeout_base) if rec is not None else None
+        if rec is None or "arch" not in meta or meta["arch"] != rec.arch:
+            continue  # re-run under another (or an unrecorded) architecture -> a different attempt
+        current = retry_budget_seconds(rec.path, timeout_base)
         if current is None or current > budget:
             continue
         skips.add(row["sha256"])

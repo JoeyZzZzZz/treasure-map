@@ -352,6 +352,58 @@ def test_phase_two_sessions_are_shared_too(tmp_path: Path) -> None:
     assert finals[0] == finals[1]
 
 
+def test_a_kept_session_that_cannot_be_handed_on_is_extracted_by_its_holder(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """S-3. Two runs of a rescan hold the same six binaries; every copy OUT of the share fails
+    (the holder's workspace full, or the share's files gone): the second run's binaries are each
+    extracted by a phase-1 session of its own and stored as a success — the share costs sharing,
+    never the extraction — and none of them is counted as handed on.
+
+    MUTATION (verified RED, 1 failed): let the OSError from ``share.get`` propagate in run_ghidra
+    -> no "not handed on" warning: each of the second run's phase-1 sessions crashes instead, and
+    only the serial re-run (another key, another kept session) extracts the binary — its stored
+    state alone would not show it.
+    MUTATION (verified RED, 1 failed): count ``handed`` before the copies are made -> 6 handed."""
+    import errno
+    import logging
+    import shutil as real_shutil
+
+    from treasure_map.lib.analyze import extraction_share
+
+    fs = _firmware(tmp_path)
+    home = _ghidra(tmp_path)
+    _with_extension(home)
+    dec = _Counted(_Sessions({n: ["ok"] * 4 for n in _NAMES}))
+    real_copy = real_shutil.copyfile
+
+    def gone(src: Any, dst: Any, *a: Any, **k: Any) -> Any:
+        if "tm_share_" in str(src) and "tm_share_" not in str(dst):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_copy(src, dst, *a, **k)
+
+    dbs = [tmp_path / f"ws{i}" / "analysis.db" for i in (1, 2)]
+    with (
+        patch.object(GhidraRunner, "_run_session", lambda self, *a, **k: dec(self, *a, **k)),
+        patch.object(extraction_share.shutil, "copyfile", gone),
+        sharing_extractions() as share,
+        caplog.at_level(logging.WARNING),
+    ):
+        for db in dbs:
+            with Workspace(db.parent) as ws:
+                run_analyze(fs, ws, _e2e_cfg(home))
+    for db in dbs:
+        state = _state(db)
+        assert set(state) == set(_NAMES)
+        assert all(v["ghidra_ok"] == 1 and v["functions"] for v in state.values()), state
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("not handed on" in m for m in messages) == len(_NAMES)
+    assert not [m for m in messages if "Ghidra crashed" in m]
+    assert share.sessions == len(_NAMES)  # the first run's sessions, kept once
+    assert dec.n == 2 * len(_NAMES)  # ...and the second run extracted each binary itself
+    assert share.handed == 0
+
+
 def test_a_share_that_cannot_keep_a_session_costs_sharing_not_the_extraction(
     tmp_path: Path,
 ) -> None:

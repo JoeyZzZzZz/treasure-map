@@ -6,8 +6,9 @@ A stored JSON cannot catch a change to the Java that writes it, so what the extr
 decide is checked here, through real Ghidra, on binaries whose construction is known:
 
 * the dispatch-table detector and the ELF slot check after it (libtables / libclasses): which
-  record arrays are tables, and which only look like one; why each table stops where it does, and
-  a key that is not a C string;
+  record arrays are tables, and which only look like one (a run one record short of the minimum
+  among them); why each table stops where it does; a key that is not a C string, and the same key
+  once a test-only script has defined it as a string;
 * the promotion / recovery pass (promote): undefined ranges, the pointer-only function it
   recovers, the undecodable bytes it refuses, the functions it promotes, the thunks it records;
 * the same pass where a block's function entry already holds a function (libtables, with one
@@ -141,6 +142,17 @@ def no_return_off(tmp_path_factory: pytest.TempPathFactory) -> str:
     )[1]
 
 
+@pytest.fixture(scope="module")
+def green_defined(tmp_path_factory: pytest.TempPathFactory) -> tuple[dict[str, Any], str]:
+    """libtables with the "green" key's five printable bytes (followed by a control byte, not a
+    NUL) defined as a fixed-length string before the promotion and extraction passes run."""
+    return _extract(
+        tmp_path_factory.mktemp("green_defined"),
+        "libtables_x86_64.so",
+        before_promote=["-postScript", "DefineString.java", b"green\x01".hex(), "5"],
+    )
+
+
 def _keys(table: Any) -> list[str]:
     return [str(e.get("key")) for e in table["entries"]]
 
@@ -157,7 +169,8 @@ def _table(tables: Any, first_key: str) -> dict[str, Any]:
 def test_the_detector_finds_the_tables_and_the_slot_check_refuses_the_lookalike(
     tables_json: dict[str, Any],
 ) -> None:
-    """★ libtables holds four tables and two arrays that look like one. The detector takes the
+    """★ libtables holds four tables and two arrays that look like one (and a run too short to be
+    one: ``test_a_run_shorter_than_the_minimum_is_no_table``). The detector takes the
     four tables and the {name -> imported data object + 8*i} array (each target lands on an
     imported function in Ghidra's external layout — the shape that produced false tables in
     firmware); it never takes {name -> data object}. The ELF slot check then refuses the look-alike
@@ -231,6 +244,59 @@ def test_a_key_that_is_no_c_string_is_kept_and_marked(tables_json: dict[str, Any
     (red,) = [t for t in kept if str(t.entries[0].get("key")) == "red"]
     assert len(red.entries) == 4
     assert red.reason == "key_not_terminated"
+
+
+def _symbol_size(path: Path, symbol: str) -> int:
+    with path.open("rb") as fh:
+        symtab = ELFFile(fh).get_section_by_name(".symtab")
+        assert isinstance(symtab, SymbolTableSection)
+        (sym,) = [s for s in symtab.iter_symbols() if s.name == symbol]
+        return int(sym["st_size"])
+
+
+def test_a_run_shorter_than_the_minimum_is_no_table(tables_json: dict[str, Any]) -> None:
+    """J-2. The detector's minimum run is four records. libtables holds {name -> internal function}
+    records in runs of three (short_run, NULL-ended) and of four (north..west, red..cyan): the run
+    of three is no table, the runs of four are tables. Together the two pin the minimum from both
+    sides.
+
+    MUTATION (verified RED, 2 failed each — this test and the table list above): lower the Java
+    detector's minimum run to 3, or to 2 -> the run of three becomes a table. Raising it to 5
+    (verified RED) drops the four-record tables."""
+    lib = _FIXTURES / "libtables_x86_64.so"
+    assert _symbol_size(lib, "short_run") == 4 * 16  # three records and the NULL one (precondition)
+    tables = tables_json["string_tables"]["tables"]
+    keyed = {tuple(_keys(t)) for t in tables}
+    assert not [k for k in keyed if set(k) & {"low", "mid", "high"}], sorted(keyed)
+    assert ("north", "south", "east", "west") in keyed
+    assert ("red", "green", "blue", "cyan") in keyed
+
+
+def test_a_key_ghidra_defines_as_a_string_is_terminated(
+    green_defined: tuple[dict[str, Any], str],
+) -> None:
+    """J-1. The other half of the rule: a data-block key Ghidra DEFINES as a string counts as
+    terminated although its bytes end in a control byte, not a NUL. The same "green" key, defined
+    as a five-byte string before the extraction, is read as "green", marked terminated, and the
+    red..cyan table it sits in is no longer given "key_not_terminated".
+
+    MUTATION (verified RED, 1 failed): count only a NUL-terminated run as terminated (drop the
+    defined-string half, ``defined ||``) -> "green" reads not terminated again."""
+    data, log = green_defined
+    assert "DefineString: defined 5 bytes at" in log  # the setup held (precondition)
+    table = _table(data["string_tables"]["tables"], "red")
+    assert {str(e["key"]): e["key_terminated"] for e in table["entries"]} == {
+        "red": True,
+        "green": True,
+        "blue": True,
+        "cyan": True,
+    }
+    kept = checked_string_tables(
+        data["string_tables"]["tables"], read_elf_slots(_FIXTURES / "libtables_x86_64.so")
+    )
+    (red,) = [t for t in kept if str(t.entries[0].get("key")) == "red"]
+    assert len(red.entries) == 4
+    assert red.reason == "scope_only"
 
 
 def _typeinfo_runs(path: Path) -> int:

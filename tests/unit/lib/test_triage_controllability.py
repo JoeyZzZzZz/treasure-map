@@ -1381,6 +1381,9 @@ def test_variadic_iron_law_is_untouched_by_the_gate(sink: str, tmp_path: Path) -
     # -> this candidate reads ('proven', 'constant').
     # MUTATION (verified RED, 1 failed — the execvpe case): set _MULTI_ARG_COMMAND_SINKS back to the
     # literal {"execl", "execle", "execlp", "execv", "execve", "execvp"}.
+    # MUTATION (H-3, verified RED, 7 failed): make the variadic downgrade return "controllable"
+    # instead of "unknown" -> each case reads ('proven', 'controllable'). Asserting only
+    # `!= ('proven', 'constant')` let that pass: the reading is pinned exactly.
     assert sink in classes.CMD  # premise: the candidate reaches the const-command exits at all
     conn = open_atlas(tmp_path / "atlas.db")
     try:
@@ -1391,7 +1394,7 @@ def test_variadic_iron_law_is_untouched_by_the_gate(sink: str, tmp_path: Path) -
             sink_anchor=sink,
             flow_evidence={"sink_arg_provenance": [_const_record(sink, "/bin/sh")]},
         )
-        assert _dim_of(conn, ref) != ("proven", "constant")
+        assert _dim_of(conn, ref) == ("unknown", "unknown")
     finally:
         conn.close()
 

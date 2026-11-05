@@ -106,6 +106,22 @@ def test_a_loose_key_counts_only_by_its_shape_or_a_mostly_strict_run() -> None:
     assert "tableKey(" in record and "strAtRodata(" not in record
 
 
+def test_the_minimum_run_is_four_records_on_both_sides() -> None:
+    """J-2. A table is a run of at least four records: the detector (Java) finds runs that long and
+    the slot check (Python, ``ghidra_ingest.STRTBL_MIN_RUN``) holds a piece it cut out to the same
+    minimum, which it calls "the detector's own". Pinned here as one value, so the unit suite (no
+    Ghidra) sees an edit to either side; the integration suite pins the Java behaviour on a fixture
+    (a run of three is no table, runs of four are).
+
+    MUTATION (verified RED, 1 failed): set the Java constant to 2, 3 or 5; set the Python constant
+    to 3."""
+    from treasure_map.lib.analyze import ghidra_ingest
+
+    found = re.findall(r"\bstatic\s+final\s+int\s+STRTBL_MIN_RUN\s*=\s*(\d+)\s*;", _code())
+    assert len(found) == 1, found  # declared once
+    assert (int(found[0]), ghidra_ingest.STRTBL_MIN_RUN) == (4, 4)
+
+
 def test_str_at_rodata_still_refuses_an_executable_block() -> None:
     """The default-value table reader shares ``strAtRodata``; the dispatch-table change must not
     widen it.

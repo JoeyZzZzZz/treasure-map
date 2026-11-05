@@ -10,8 +10,9 @@ inferred from it as unknown.
 
 Each line records: the time, the server session (an id fixed at startup, the process id and the
 start time), the tool, its key parameters (identifiers and paging only — never free text such as a
-rationale), the size of the response in bytes, whether the response is a cut page, and its error.
-The response itself is never stored.
+rationale), the size of the response in bytes, whether the response is a cut page, and its error;
+for a review work unit handed out with its material, the unit, whether that material was cut and
+which of its members it listed (identifiers only). The response itself is never stored.
 """
 
 from __future__ import annotations
@@ -158,9 +159,10 @@ def build_line(
         "error": None if error is None else _value(error),
     }
     # A work unit handed out with its material (start_diff_review(run_pair=...), or a write's
-    # answer naming the next unit): which, and whether its material was cut — what a later
-    # write's read basis is read from. A unit named WITHOUT its material (or with a material that
-    # is only an error) was not handed out, so it is not recorded.
+    # answer naming the next unit): which, whether its material was cut, and — for a material
+    # that lists several members — which of them it showed — what a later write's read basis is
+    # read from. A unit named WITHOUT its material (or with a material that is only an error) was
+    # not handed out, so it is not recorded.
     if isinstance(result, dict):
         unit = result.get("next_unit") if "next_unit" in result else result.get("unit")
         if isinstance(unit, dict) and isinstance(unit.get("unit_id"), str):
@@ -170,7 +172,30 @@ def build_line(
                 line["unit_material_cut"] = bool(
                     unit.get("material_cut") or result.get("material_cut")
                 )
+                whole = shown_members(material)
+                if whole is not None:
+                    line["unit_whole"] = whole
     return line
+
+
+# A material that lists members: the list's key and the identifier each item carries.
+_MEMBER_LISTS = (("entries", "entry_id"), ("owed", "anchor_ref"))
+
+
+def shown_members(material: dict[str, Any]) -> list[str] | None:
+    """The members a unit's material lists — a batch's or a callee group's entries (entry ids,
+    only the ones the material kept), a reduce's owed judgements (anchors, only the ones listed) —
+    or None for a one-subject material (an entry, a binary's first candidates, a file), which
+    shows its subject whole unless it was cut."""
+    for key, ident in _MEMBER_LISTS:
+        items = material.get(key)
+        if isinstance(items, list):
+            return [
+                str(x[ident])
+                for x in items
+                if isinstance(x, dict) and isinstance(x.get(ident), str)
+            ]
+    return None
 
 
 def append(path: Path, line: dict[str, Any]) -> None:

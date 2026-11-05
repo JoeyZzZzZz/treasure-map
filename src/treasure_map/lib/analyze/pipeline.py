@@ -389,7 +389,7 @@ def run_analyze(
         )
         dirty_records = [r for r in records if r.sha256 in dirty_shas]
         # The binaries an isolated re-run already left with decompiles unfinished under this pass,
-        # Ghidra and budget: not re-run for them again (--force-retry re-runs them).
+        # Ghidra, architecture and budget: not re-run for them again (--force-retry re-runs them).
         decompile_settled = (
             set()
             if force_retry
@@ -455,8 +455,10 @@ def run_analyze(
                         )
                     if one.binaries_image_base_mismatch:
                         # The ingest refused the output and recorded the binary failed: it is one
-                        # of the failed, never counted with the extracted ones.
+                        # of the failed, never counted with the extracted ones — and, its failure
+                        # committed by the ingest, one of the stored.
                         ghidra_failed += 1
+                        kept += 1
                         stored_failed += 1
                     else:
                         ghidra_ok += 1
@@ -542,12 +544,12 @@ def run_analyze(
 
             def _record_decompile_rerun(rec: ElfRecord, res: GhidraResult) -> None:
                 """Record an isolated re-run that still left decompiles unfinished (so a later
-                scan under the same pass, Ghidra and budget does not re-run it for them), and
-                clear the record once a stored extraction has none left. Left as it is when the
-                stored extraction does not say (an output without the counts)."""
+                scan under the same pass, Ghidra, architecture and budget does not re-run it for
+                them), and clear the record once a stored extraction has none left. Left as it is
+                when the stored extraction does not say (an output without the counts)."""
                 if res.decompile_rerun_budget is not None:
                     value: str | None = decompile_rerun_record(
-                        pass_version, ghidra_version, res.decompile_rerun_budget
+                        pass_version, ghidra_version, res.decompile_rerun_budget, arch=rec.arch
                     )
                 elif unfinished_decompiles(res) == 0:
                     value = None

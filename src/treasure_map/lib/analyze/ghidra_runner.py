@@ -284,8 +284,9 @@ class GhidraResult:
     decompile_large_timeouts: int | None = None
     decompile_payload_exceeded: int | None = None
     # Set by run_all on a phase-2 result when that isolated re-run still left decompiles
-    # unfinished: the budget it ran under. Recorded so a later scan under the same pass, Ghidra and
-    # budget does not spend another isolated re-run on them (see db_ingest.decompile_rerun_skips).
+    # unfinished: the budget it ran under. Recorded (with the architecture) so a later scan under
+    # the same pass, Ghidra, architecture and budget does not spend another isolated re-run on them
+    # (see db_ingest.decompile_rerun_skips).
     decompile_rerun_budget: int | None = None
     # The Ghidra session that produced this result (a fresh id per attempt). Its export is archived
     # under it, so every workspace holding one session's export names it alike (see
@@ -1387,8 +1388,8 @@ class GhidraRunner:
         isolated re-run at a doubled budget was measured to finish none (see
         ``unfinished_decompiles``). A binary in
         ``decompile_settled`` (sha256) is not re-run for the second reason: an isolated re-run
-        under this pass, Ghidra and budget already left it unfinished. Of the two sessions, the
-        better extraction is kept whole, with its own export (``_settle_rerun``).
+        under this pass, Ghidra, architecture and budget already left it unfinished. Of the two
+        sessions, the better extraction is kept whole, with its own export (``_settle_rerun``).
 
         Discovers analyzeHeadless once before spawning threads so GhidraNotFoundError is raised
         immediately rather than N times.

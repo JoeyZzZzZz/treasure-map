@@ -558,6 +558,44 @@ def extract_handoff(
     return parse_handoff_analysis(result)
 
 
+# Written above the agent's final message when the driver refuses to compose the hand-off from it.
+HANDOFF_AGENT_RESULT_HEAD = (
+    "This is not a hand-off document: it is the hand-off agent's final message, kept as it was "
+    "printed because the driver refused to compose the hand-off from it ({why})."
+)
+
+
+def agent_result_path(out_file: Path) -> Path:
+    """Where a refused hand-off keeps the agent's final message: ``<out>.agent-result.txt``."""
+    return out_file.with_name(out_file.name + ".agent-result.txt")
+
+
+def _launch_result(launch: Launch) -> str | None:
+    """The agent's final message (claude-code's ``result``) in a launch's output, or None."""
+    try:
+        data = json.loads(launch.output)
+    except (TypeError, ValueError):
+        return None
+    result = data.get("result") if isinstance(data, dict) else None
+    return result if isinstance(result, str) and result.strip() else None
+
+
+def _refused(launch: Launch, out_file: Path, error: str) -> dict[str, Any]:
+    """A refused hand-off: nothing is written to ``out_file``; the agent's final message, when the
+    launch printed one, is kept beside it (agent_result_path), headed as not a hand-off document, so
+    a long analysis is not lost to one wrong anchor."""
+    out: dict[str, Any] = {"ok": False, "error": error}
+    result = _launch_result(launch)
+    if result is not None:
+        kept = agent_result_path(out_file)
+        kept.write_text(
+            HANDOFF_AGENT_RESULT_HEAD.format(why=error) + "\n\n" + result, encoding="utf-8"
+        )
+        out["agent_result_file"] = str(kept)
+        out["error"] = f"{error}; the agent's final message is kept in {kept}"
+    return out
+
+
 def run_handoff(
     preset: Preset,
     *,
@@ -571,8 +609,10 @@ def run_handoff(
     """Launch the hand-off agent, then write the document to ``out_file``: handoff_document (the
     CLI's function) with the agent's texts under each block's placeholders — a finding it wrote
     nothing for says so. Nothing is written when the launch failed or reported an error, or when
-    its texts name an anchor the hand-off does not hold. An experimental preset is refused before
-    the launch (B-5)."""
+    its texts name an anchor the hand-off does not hold; the agent's final message, when there is
+    one, is then kept beside it (agent_result_path) — headed as not a hand-off document — and the
+    hand-off file is still not written. An experimental preset is refused before the launch
+    (B-5)."""
     from treasure_map.lib.atlas.connection import open_atlas
 
     if preset.name not in HANDOFF_PRESETS:
@@ -587,7 +627,7 @@ def run_handoff(
         }
     analysis, err = extract_handoff(preset, launch)
     if analysis is None:
-        return {"ok": False, "error": err}
+        return _refused(launch, out_file, str(err))
     atlas = open_atlas(atlas_path)
     try:
         stamp, file_staleness = _rr.local_handoff_context(atlas)
@@ -595,13 +635,12 @@ def run_handoff(
         known = {str(f["anchor_ref"]) for f in findings}
         extra = sorted(set(analysis) - known)
         if extra:
-            return {
-                "ok": False,
-                "error": (
-                    f"the agent wrote for {len(extra)} anchor(s) the hand-off does not hold "
-                    f"(first: {extra[0][:200]!r}); nothing was written"
-                ),
-            }
+            return _refused(
+                launch,
+                out_file,
+                f"the agent wrote for {len(extra)} anchor(s) the hand-off does not hold "
+                f"(first: {extra[0][:200]!r}); nothing was written",
+            )
         document = _rr.handoff_header(run_pair, len(findings)) + "".join(
             _rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=analysis)
         )

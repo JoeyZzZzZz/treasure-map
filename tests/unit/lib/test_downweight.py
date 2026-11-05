@@ -1172,14 +1172,47 @@ def test_the_numeric_write_still_has_to_enclose_the_sink() -> None:
     """The exemption is for constant content only: with a pure-literal write in a sibling block and
     the integer-format write outside the sink's block, nothing marks the candidate.
 
-    (An exempt write also never sets the format-or-converter flag. That is not separately
-    observable: a converter result is on the buffer's path only through a non-literal write, which
-    itself sets the flag or refuses the mark — so a mutation letting the exempt write set it stays
-    green, and is equivalent.)
-
     MUTATION (verified RED, 1 failed): drop the position check on a non-literal format write."""
     pure = 'sprintf(b,"pidof %s > %s","svc","/tmp/svc.pid");'
     assert _cmd_num(pure, numeric_write_wrapped=False) is None
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        'snprintf(b,n,"reboot");',  # no conversion at all
+        'snprintf(b,n,"kill %d",9);',  # a conversion fed a literal
+    ],
+)
+@pytest.mark.parametrize("enclosing", [True, False], ids=["encloses", "sibling"])
+def test_an_exempt_literal_format_write_is_never_the_numeric_write(
+    write: str, enclosing: bool
+) -> None:
+    """H-1. An exempt (pure-literal) write never counts as the format/converter write the mark
+    needs. This is observable: the dependency graph makes a builder's destination depend on every
+    other argument, the size argument included, so a converter result reaches the buffer's path
+    through the size of a pure-literal snprintf — the premise (a converter result on the path)
+    holds while the only write is a constant. Its content is constant, not numeric-constrained:
+    wherever the write sits, nothing marks the candidate (a mark on such a write would be a
+    numeric reading of a constant command).
+
+    MUTATION (verified RED, 4 failed): let the exempt pure-literal format write set the
+    format-or-converter flag before it skips the position check."""
+    body = f"  {write}\n" if enclosing else f"  if (y != 0) {{\n    {write}\n  }}\n"
+    pc = (
+        "void f(char *x,char *y)\n{\n  int n;\n  char b [64];\n  n = atoi(x);\n"
+        f"{body}  system(b);\n}}"
+    )
+    got = detect_form_signal(
+        sink_name="system",
+        pseudocode=pc,
+        callees=["atoi", "snprintf", "system"],
+        sink_arg="b",
+        sink_class="cmd",
+        sink_form="var",
+        occurrence=0,
+    )
+    assert got is None
 
 
 @pytest.mark.parametrize(
@@ -1188,6 +1221,8 @@ def test_the_numeric_write_still_has_to_enclose_the_sink() -> None:
         'sprintf(b,"pidof %s > %s",y,"/tmp/svc.pid");',  # a non-literal argument
         'sprintf(b,"pidof %d",i);',  # an integer argument: not a literal
         "strcpy(b,y);",  # a non-literal copy
+        "strcpy(b,(char *)atoi(y));",  # a converter copy
+        'sprintf(b,"pidof %d",atoi(y));',  # a literal format, one argument an inline converter
     ],
 )
 def test_a_sibling_write_with_non_literal_content_is_not_exempt(sibling: str) -> None:
@@ -1195,10 +1230,15 @@ def test_a_sibling_write_with_non_literal_content_is_not_exempt(sibling: str) ->
     and precede the sink (or, if it is not a safe write at all, fails on its own).
 
     The non-literal %s argument and the non-literal copy are refused as unsafe writes wherever they
-    sit; the integer-argument format is a safe write and so is the case the position check decides.
+    sit; the integer-argument format, the converter copy and the format with an inline converter
+    argument are safe writes and so are the cases the position check decides.
 
     MUTATION (verified RED, 1 failed — the integer-argument case): drop the position check on a
-    non-literal format write."""
+    non-literal format write.
+    MUTATION (H-2, verified RED, 1 failed — the converter-copy case): exempt a converter copy
+    from the position check too.
+    MUTATION (H-2, verified RED, 1 failed — the inline-converter case): treat a format whose
+    every argument is a literal OR an inline converter as pure literal."""
     assert _cmd_num(sibling) is None
 
 

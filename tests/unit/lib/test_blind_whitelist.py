@@ -3,13 +3,20 @@
 """The blind-read whitelist (read_basis.BLIND_SAFE_TOOLS) proven from the answers, not the names.
 
 A shadow judgement is blind only when its session made no call whose answer depends on the
-verdicts recorded. Each whitelisted tool is called (through the real server, its log on) in two
-worlds that hold the same facts and judgements on the same subjects with DIFFERENT verdicts — diff
-verdicts rotated, a scan verdict excluded vs suspicious — and its answer must be the same, byte
-for byte, once the server block and the world's own path are taken out. Whether something was
-judged at all may show (a judged-or-not count, as get_diff_meta's binary_presence gives); the
-verdict's value may not. A word scan would not do: get_tool_reference names every verdict as
-vocabulary and carries none of them.
+verdicts recorded. Each whitelisted tool is called (through the real server, its log on) in three
+worlds that hold the same facts: x and y judge the same subjects with DIFFERENT verdicts — every
+subject's value differs, and so does the distribution of values over the pair — and "none" judges
+nothing. An answer must be the same, byte for byte, in x and y once the server block and the
+world's own path are taken out; against "none" it may differ only in a judged-or-not count (as
+get_diff_meta's binary_presence gives), never in a verdict's value. A word scan would not do:
+get_tool_reference names every verdict as vocabulary and carries none of them.
+
+Three fixtures, so every call reaches the branch that could carry a verdict: the diff World of
+test_diff_review (diffs, a scan candidate, nvram flow), the same-shape World of
+test_same_shape_siblings (a group of judged entries), and the binary-presence World of
+test_binary_presence (binaries one run holds alone, judged on the run pair). Every call must
+answer without an error and with something found; the few that can only reach a not-found answer
+here are listed in NOT_FOUND_ONLY with why.
 
 The completeness guard ties the table to the whitelist: a tool added to BLIND_SAFE_TOOLS without a
 call here fails it, and once a call is added, the difference proves or refutes it."""
@@ -23,6 +30,8 @@ from typing import Any
 
 import pytest
 
+from tests.unit.lib import test_binary_presence as tbp
+from tests.unit.lib import test_same_shape_siblings as tss
 from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cache fixture
     DX,
     DY,
@@ -35,6 +44,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
 from tests.unit.lib.test_review_units import _build_world, _server_call
 from tests.unit.test_mcp_app import _mk_analysis
 from treasure_map import mcp_app
+from treasure_map.cli import mcp_cli
 from treasure_map.lib import overlay
 from treasure_map.lib.atlas.models import InstanceRow, NvramFlowRow
 from treasure_map.lib.atlas.writer import (
@@ -48,6 +58,8 @@ from treasure_map.lib.atlas.writer import (
 from treasure_map.lib.query import patch_view as pv
 from treasure_map.lib.query import read_basis as rb
 from treasure_map.lib.query import review_units as ru
+from treasure_map.lib.query import same_shape_siblings as ss
+from treasure_map.version import UNKNOWN_VERSION
 
 A1 = _pair_anchor(DX, "00001000", "00001000")
 A2 = _pair_anchor(DX, "00002000", "00002800")
@@ -55,7 +67,6 @@ A3 = _pair_anchor(DX, "00003000", "00003000")
 P4 = f"{PAIR}#function_presence#libx::b:00004000"
 Y5 = _pair_anchor(DY, "00005000", "00005000")
 REF_M = "run_m#fn1@cmd"
-REF_A = "runA#0a1b2c3d:00001000@cmd@0x10"
 
 # One call (at least) per whitelisted tool, plus the switches that change an answer's shape.
 SAFE_CALLS: list[tuple[str, dict[str, Any]]] = [
@@ -86,8 +97,6 @@ SAFE_CALLS: list[tuple[str, dict[str, Any]]] = [
     ("launched_by", {"target": "webd", "run_id": "run_m"}),
     ("pattern_density", {}),
     ("cross_firmware_patterns", {}),
-    ("same_shape_siblings", {"diff_id": DX, "evidence_ref": REF_A}),
-    ("same_shape_siblings", {"diff_id": DX, "evidence_ref": REF_A, "members_offset": 0}),
     ("get_diff_meta", {"diff_id": DX}),
     ("get_diff_meta", {"diff_id": DY}),
     ("get_diff_deltas", {"diff_id": DX}),
@@ -101,25 +110,62 @@ SAFE_CALLS: list[tuple[str, dict[str, Any]]] = [
     ("get_tool_reference", {"name": "annotate_diff"}),
 ]
 
-# The two worlds' verdicts: the same subjects judged, every value different.
-VERDICTS = {
-    "x": {
-        A1: "no_real_change",
-        A2: "change_inconclusive",
-        A3: "changed_real",
-        P4: "changed_real",
-        Y5: "change_inconclusive",
-        REF_M: "excluded",
-    },
-    "y": {
-        A1: "change_inconclusive",
-        A2: "changed_real",
-        A3: "no_real_change",
-        P4: "change_inconclusive",
-        Y5: "changed_real",
-        REF_M: "suspicious",
-    },
+# The same-shape World's calls: a group whose members' entries are judged.
+SIB_CALLS: list[tuple[str, dict[str, Any]]] = [
+    ("same_shape_siblings", {"diff_id": tss.DIFF, "evidence_ref": tss.LISTED}),
+    ("same_shape_siblings", {"diff_id": tss.DIFF, "evidence_ref": tss.LISTED, "members_offset": 0}),
+    ("same_shape_siblings", {"diff_id": tss.DIFF, "evidence_ref": tss.WRAPPED[0]}),
+]
+# The binary-presence World's calls: binaries one run holds alone, judged on the run pair.
+PRES_CALLS: list[tuple[str, dict[str, Any]]] = [
+    ("get_diff_meta", {"diff_id": tbp.DIFF}),
+]
+
+NRC, CI, CR = "no_real_change", "change_inconclusive", "changed_real"
+# World y's verdict of a subject world x judged ``v``: another value on every subject, and another
+# distribution over the pair (x: nrc 1 / ci 2 / cr 2 here; y: ci 2 / cr 3).
+_OTHER = {NRC: CR, CI: CR, CR: CI, "excluded": "suspicious"}
+X_VERDICTS = {A1: NRC, A2: CI, A3: CR, P4: CR, Y5: CI, REF_M: "excluded"}
+WORLDS = ("x", "y", "none")
+
+
+def _verdict(which: str, x: str) -> str | None:
+    """World ``which``'s verdict on a subject world x judged ``x`` (None: not judged)."""
+    return {"x": x, "y": _OTHER[x], "none": None}[which]
+
+
+# The calls that, in these fixtures, can only reach a not-found answer — kept because the
+# not-found answer must not carry a verdict either, and because there is no fixture for more.
+def _key(name: str, args: dict[str, Any]) -> tuple[str, str]:
+    return name, json.dumps(args, sort_keys=True)
+
+
+NOT_FOUND_ONLY: dict[tuple[str, str], str] = {
+    _key("get_data_bytes", {"run_id": "run_m", "binary": "webd", "address": "0x6bc0"}): (
+        "the fixture's analysis.db holds no data segment"
+    ),
+    _key("get_data_table", {"run_id": "run_m", "binary": "webd", "address": "0x6bc0"}): (
+        "the fixture's analysis.db holds no data segment"
+    ),
+    _key("get_sink_provenance", {"evidence_ref": REF_M}): (
+        "the fixture's candidate carries no sink provenance record"
+    ),
+    _key("get_sink_provenance", {"evidence_ref": REF_M, "dominating_only": True}): (
+        "the fixture's candidate carries no sink provenance record"
+    ),
+    _key("get_function_alignment", {"diff_id": DX, "function": "0x4000", "side": "b"}): (
+        "a function in no pair: not found IS the answer for it (the unmatched branch)"
+    ),
+    _key("get_string_reference_anchors", {"run_id": "run_m", "text": "x"}): (
+        "the fixture's analysis.db has no string-reference export"
+    ),
 }
+
+# Where the "none" world may differ from a judged one: a judged-or-not count, by its key — never a
+# verdict's value. Each entry is (call label, key).
+JUDGED_OR_NOT: frozenset[tuple[str, str]] = frozenset(
+    {('pres:get_diff_meta({"diff_id": "runA::runB::libx"})', "not_looked_at")}
+)
 
 
 def _world(tmp: Path, monkeypatch: pytest.MonkeyPatch, which: str) -> World:
@@ -171,7 +217,10 @@ def _world(tmp: Path, monkeypatch: pytest.MonkeyPatch, which: str) -> World:
         ],
     )
     conn.commit()
-    for anchor, verdict in VERDICTS[which].items():
+    for anchor, x in X_VERDICTS.items():
+        verdict = _verdict(which, x)
+        if verdict is None:
+            continue
         if anchor == REF_M:
             overlay.upsert_overlay(
                 conn,
@@ -204,41 +253,200 @@ def _text(got: dict[str, Any], where: Path) -> str:
     return _STAMP.sub("<t>", text)
 
 
-def _answers(tmp: Path, monkeypatch: pytest.MonkeyPatch, which: str) -> list[str]:
-    pv._clear_view_caches()
-    ru.DIFF_CACHE.clear()
-    where = tmp / which
-    w = _world(where, monkeypatch, which)
-    server = mcp_app.build_server(w.path)
-    out = []
-    for name, args in SAFE_CALLS:
-        got = _server_call(server, name, args)
-        if name == "list_runs":  # runs written in the same second sort either way
-            got["runs"] = sorted(got.get("runs") or [], key=lambda r: json.dumps(r, sort_keys=True))
-        out.append(_text(got, where))
+def _sib_world(tmp: Path, mp: pytest.MonkeyPatch, which: str) -> Path:
+    """The same-shape World, its listed pairs judged (none in world "none")."""
+
+    def fresh(atlas: Any, diff_id: str) -> dict[str, Any]:
+        return {"source_stale": False, "source_stale_reason": None, "toolchain_checked": True}
+
+    mp.setattr(pv, "diff_source_staleness", fresh)
+    mp.setattr(ss, "diff_source_staleness", fresh)
+    mp.setattr(mcp_app, "_installed_commit", lambda: UNKNOWN_VERSION)
+    mp.setattr(mcp_cli, "installed_commit", lambda: UNKNOWN_VERSION)
+    tmp.mkdir(parents=True, exist_ok=True)
+    w = tss.World(tmp)
+    tss._build(w)
+    # Every entry the view lists (pairs and one-sided functions), judged in turn NRC, CI, CR, … in
+    # world x.
+    page = pv.get_diff_patch_view(w.atlas, tss.DIFF, rows_limit=0, limit=200)
+    listed = [e["entry_id"] for e in page["entries"]]
+    assert len(listed) == 12, listed
+    for i, entry_id in enumerate(listed):
+        verdict = _verdict(which, (NRC, CI, CR)[i % 3])
+        if verdict is None:
+            continue
+        kind, rest = entry_id.split(":", 1)
+        anchor = (
+            _pair_anchor(tss.DIFF, *rest.split(":"))
+            if kind == "pair"
+            else f"runA::runB#function_presence#libx::{entry_id}"
+        )
+        overlay.annotate_diff(
+            w.atlas,
+            diff_id=tss.DIFF,
+            anchor_ref=anchor,
+            verdict=verdict,
+            rationale="r",
+            verdict_basis=(
+                {"checked": [anchor], "why_unchanged": "same"} if verdict == NRC else None
+            ),
+        )
+    w.commit()
+    return w.path
+
+
+def _pres_world(tmp: Path, mp: pytest.MonkeyPatch, which: str) -> Path:
+    """The binary-presence World, its first two A-only binaries judged on the run pair."""
+    mp.setattr(mcp_app, "_installed_commit", lambda: UNKNOWN_VERSION)
+    mp.setattr(
+        pv,
+        "diff_source_staleness",
+        lambda atlas, diff_id: {
+            "source_stale": False,
+            "source_stale_reason": None,
+            "toolchain_checked": True,
+        },
+    )
+    tmp.mkdir(parents=True, exist_ok=True)
+    w = tbp.World(tmp)
+    tbp._build(w)
+    presence = tbp.bp.find_presence(w.atlas, "runA", "runB")
+    a_only = [b for b in presence.items if b.tag == "a_only"][:2]
+    assert len(a_only) == 2, presence.items
+    for b, x in zip(a_only, (NRC, CI), strict=True):
+        verdict = _verdict(which, x)
+        if verdict is None:
+            continue
+        anchor = presence.anchor(b)
+        overlay.annotate_diff(
+            w.atlas,
+            run_pair=tbp.PAIR,
+            anchor_ref=anchor,
+            verdict=verdict,
+            rationale="r",
+            verdict_basis=(
+                {"checked": [anchor], "why_unchanged": "same"} if verdict == NRC else None
+            ),
+        )
+    w.commit()
+    return w.path
+
+
+def _label(part: str, name: str, args: dict[str, Any]) -> str:
+    return f"{part}:{name}({json.dumps(args, sort_keys=True)})"
+
+
+def _answers(tmp: Path, which: str) -> dict[str, dict[str, Any]]:
+    """Every call of the three tables in world ``which``: its answer with the server block, the
+    world's own path and the build times taken out, by call label."""
+    out: dict[str, dict[str, Any]] = {}
+    for part, calls in (("diff", SAFE_CALLS), ("sib", SIB_CALLS), ("pres", PRES_CALLS)):
+        pv._clear_view_caches()
+        ru.DIFF_CACHE.clear()
+        where = tmp / which / part
+        with pytest.MonkeyPatch.context() as mp:
+            if part == "diff":
+                path = _world(where, mp, which).path
+            elif part == "sib":
+                path = _sib_world(where, mp, which)
+            else:
+                path = _pres_world(where, mp, which)
+            server = mcp_app.build_server(path)
+            for name, args in calls:
+                got = _server_call(server, name, args)
+                if name == "list_runs":  # runs written in the same second sort either way
+                    got["runs"] = sorted(
+                        got.get("runs") or [], key=lambda r: json.dumps(r, sort_keys=True)
+                    )
+                out[_label(part, name, args)] = json.loads(_text(got, where))
+        pv._clear_view_caches()
+        ru.DIFF_CACHE.clear()
     return out
 
 
+def _all_calls() -> list[tuple[str, str, dict[str, Any]]]:
+    return [
+        (part, name, args)
+        for part, calls in (("diff", SAFE_CALLS), ("sib", SIB_CALLS), ("pres", PRES_CALLS))
+        for name, args in calls
+    ]
+
+
+def _masked(label: str, got: Any) -> Any:
+    """``got`` without the judged-or-not counts JUDGED_OR_NOT allows for this call."""
+    keys = {key for call, key in JUDGED_OR_NOT if call == label}
+    if isinstance(got, dict):
+        return {k: _masked(label, v) for k, v in got.items() if k not in keys}
+    if isinstance(got, list):
+        return [_masked(label, v) for v in got]
+    return got
+
+
 def test_every_whitelisted_tool_has_a_call_here() -> None:
-    """★ C-9 completeness: the table names exactly the whitelist.
+    """★ C-9 completeness: the tables name exactly the whitelist.
 
     MUTATION (verified RED, 1 failed): add list_overlays to BLIND_SAFE_TOOLS -> RED."""
-    assert {name for name, _ in SAFE_CALLS} == rb.BLIND_SAFE_TOOLS
+    assert {name for _, name, _ in _all_calls()} == rb.BLIND_SAFE_TOOLS
+
+
+@pytest.fixture(scope="module")
+def answers(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, dict[str, Any]]]:
+    """The three worlds' answers, built once for the tests below."""
+    tmp = tmp_path_factory.mktemp("worlds")
+    return {which: _answers(tmp, which) for which in WORLDS}
+
+
+def test_every_call_reaches_an_answer_that_could_carry_a_verdict(
+    answers: dict[str, dict[str, dict[str, Any]]],
+) -> None:
+    """★ FC03: a call that only reaches an error, or a not-found answer, compares two answers
+    that cannot differ — so every call answers without an error and finds something, except the
+    ones NOT_FOUND_ONLY names (with why); that list is exactly the calls that do not find.
+
+    MUTATION (verified RED, 1 failed): put back the siblings call on a ref that is no candidate
+    of the diff World (it answers an error) -> RED."""
+    x = answers["x"]
+    assert len(x) == len(_all_calls())
+    not_found = set()
+    for part, name, args in _all_calls():
+        got = x[_label(part, name, args)]
+        assert "error" not in got, (part, name, args, got.get("error"))
+        if got.get("found") is False:
+            not_found.add(_key(name, args))
+    assert not_found == set(NOT_FOUND_ONLY), not_found
 
 
 def test_no_whitelisted_answer_changes_with_the_verdicts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    answers: dict[str, dict[str, dict[str, Any]]],
 ) -> None:
-    """★ C-9: every call in SAFE_CALLS answers the same, byte for byte, in world x and world y.
+    """★ C-9 / FC03: every call answers the same, byte for byte, in world x and world y — whose
+    verdicts differ on every subject and in their distribution over the pair.
 
-    MUTATION (verified RED, 1 failed): have get_diff_meta carry a judged subject's verdict ->
-    RED; MUTATION (verified RED, 1 failed): add get_diff_patch_view (which carries review_state)
-    to the whitelist and a call of it here -> RED."""
-    x = _answers(tmp_path, monkeypatch, "x")
-    y = _answers(tmp_path, monkeypatch, "y")
-    assert len(x) == len(SAFE_CALLS)
-    differ = [SAFE_CALLS[i] for i, (a, b) in enumerate(zip(x, y, strict=True)) if a != b]
+    MUTATION (verified RED, 1 failed): have get_diff_meta carry a judged subject's verdict -> RED;
+    MUTATION (verified RED, 1 failed): add get_diff_patch_view (which carries review_state) to the
+    whitelist and a call of it here -> RED. FC03 — MUTATION (verified RED, 1 failed): give
+    same_shape_siblings' members their entry's verdict (its found path) -> RED; MUTATION (verified
+    RED, 1 failed): give get_diff_meta the pair's verdict counts -> RED; MUTATION (verified RED, 1
+    failed): give get_diff_meta's binary_presence the A-only binaries' verdicts -> RED."""
+    x, y = answers["x"], answers["y"]
+    differ = [label for label in x if json.dumps(x[label]) != json.dumps(y[label])]
     assert differ == []
+
+
+def test_against_no_judgement_only_a_judged_or_not_count_moves(
+    answers: dict[str, dict[str, dict[str, Any]]],
+) -> None:
+    """★ FC03: world "none" (nothing judged) against world x: an answer may differ only in the
+    judged-or-not counts JUDGED_OR_NOT names — and each one named does move (the table is exactly
+    what differs, never wider).
+
+    MUTATION (verified RED, 1 failed): carry the judged subjects' anchors (not their verdicts) in
+    get_diff_meta's binary_presence -> RED."""
+    x, none = answers["x"], answers["none"]
+    differ = {label for label in x if json.dumps(x[label]) != json.dumps(none[label])}
+    assert differ == {call for call, _ in JUDGED_OR_NOT}, differ
+    for label in differ:
+        assert json.dumps(_masked(label, x[label])) == json.dumps(_masked(label, none[label]))
 
 
 def test_the_worlds_really_differ_where_a_verdict_shows(
@@ -260,3 +468,29 @@ def test_the_worlds_really_differ_where_a_verdict_shows(
         seen[which] = (_text(view, where), _text(cands, where))
     assert seen["x"][0] != seen["y"][0]
     assert seen["x"][1] != seen["y"][1]
+
+
+def test_the_other_two_fixtures_really_hold_different_verdicts(tmp_path: Path) -> None:
+    """The same precondition for the same-shape and binary-presence fixtures: their judgements
+    show where a tool carries them (list_overlays on the diff / on the run pair) — three ways
+    apart, and with a different distribution of verdicts in x and y."""
+    from collections import Counter
+
+    for part, build, run_id in (
+        ("sib", _sib_world, tbp.PAIR),
+        ("pres", _pres_world, tbp.PAIR),
+    ):
+        got = {}
+        for which in WORLDS:
+            pv._clear_view_caches()
+            ru.DIFF_CACHE.clear()
+            with pytest.MonkeyPatch.context() as mp:
+                path = build(tmp_path / which / part, mp, which)
+                server = mcp_app.build_server(path)
+                rows = _server_call(
+                    server, "list_overlays", {"anchor_kind": "diff_subject", "run_id": run_id}
+                )
+            got[which] = Counter(r["verdict"] for r in rows.get("overlays") or [])
+        assert got["none"] == Counter(), (part, got)
+        assert got["x"] and got["y"] and got["x"] != got["y"], (part, got)
+        assert sum(got["x"].values()) == sum(got["y"].values()), (part, got)

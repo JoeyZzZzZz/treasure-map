@@ -416,8 +416,9 @@ def test_run_handoff_composes_the_document_from_the_agents_texts(
     stamp, file_staleness = rr.local_handoff_context(w.atlas)
     skeleton = rr.handoff_document(w.atlas, PAIR, stamp=stamp, file_staleness=file_staleness)
     stripped = written
-    for text in ("HYP-ONE", "CHECK-ONE", rr.HANDOFF_NOTHING_WRITTEN):
-        stripped = stripped.replace(f"{text}\n\n", "")
+    for text in ("HYP-ONE", "CHECK-ONE"):  # the agent's texts, fenced
+        stripped = stripped.replace(f"```\n{text}\n```\n\n", "")
+    stripped = stripped.replace(f"{rr.HANDOFF_NOTHING_WRITTEN}\n\n", "")
     assert stripped == skeleton
 
 
@@ -723,6 +724,67 @@ def test_the_candidate_rows_are_written_out_and_their_cut_is_named(full: sst.Wor
     assert "(of the 20 rows shown)" in _cell_value(block, "sink class")
 
 
+def _presence_finding(full: sst.World) -> str:
+    """A B-only function of the same diff with one candidate row; its anchor, judged."""
+    full.atlas.execute(
+        "INSERT INTO function_presence (diff_id, side, addr, presence_state) "
+        "VALUES (?, 'b', '00006000', 'unmatched_analysis_complete')",
+        (sst.DIFF,),
+    )
+    full.inst("runB", sst._ref("runB", "00006000", "copy", "0x10"), "copy", "strcpy", sst.SRC)
+    full.fn("b", "00006000", ["strcpy"], name="fnew")
+    full.commit()
+    anchor = dr.presence_anchor("runA", "runB", "libx", "b", "00006000")
+    _judge(full.atlas, sst.DIFF, anchor)
+    return anchor
+
+
+def test_the_handoff_builds_each_diffs_view_once_for_its_sibling_cells(
+    full: sst.World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ FC10: one hand-off pass builds each diff's view once for all its same-shape cells (and
+    reads each side's calls once) — not once per row ref — and the blocks are byte for byte the
+    ones a separate same_shape_siblings call per ref gives.
+
+    MUTATION (verified RED, ``1 failed``): let handoff_blocks hand no shared reads to its blocks
+    (``reads = None``) -> the view is built once per block -> RED; let the siblings cell call
+    same_shape_siblings without the reads (``reads=None``) -> once per row ref -> RED."""
+    _wide_rows(full)
+    _judge(full.atlas, sst.DIFF, _pair_ref())
+    _presence_finding(full)
+    stamp, file_staleness = rr.local_handoff_context(full.atlas)
+    findings = rr.handoff_findings(full.atlas, PAIR, file_staleness=file_staleness)
+    assert len(findings) == 2 and {f["diff_id"] for f in findings} == {sst.DIFF}
+    real_view, real_calls, real_sss = sss.build_diff_view, sss._calls, sss.same_shape_siblings
+    built: list[str] = []
+    read: list[tuple[str, str]] = []
+
+    def counting_view(atlas: Any, diff_id: str) -> Any:
+        built.append(diff_id)
+        return real_view(atlas, diff_id)
+
+    def counting_calls(atlas: Any, run_id: str, sha: str) -> Any:
+        read.append((run_id, sha))
+        return real_calls(atlas, run_id, sha)
+
+    monkeypatch.setattr(sss, "build_diff_view", counting_view)
+    monkeypatch.setattr(sss, "_calls", counting_calls)
+    shared = rr.handoff_blocks(full.atlas, PAIR, findings, stamp=stamp)
+    assert built == [sst.DIFF], built  # one diff involved, one build
+    assert len(read) == len(set(read)), read  # each side's calls read once
+    # the per-call path: every same_shape_siblings call reads afresh, once per distinct row ref
+    built.clear()
+
+    def fresh(*a: Any, **k: Any) -> Any:
+        k.pop("reads", None)
+        return real_sss(*a, **k)
+
+    monkeypatch.setattr(sss, "same_shape_siblings", fresh)
+    separate = rr.handoff_blocks(full.atlas, PAIR, findings, stamp=stamp)
+    assert len(built) == 21  # 20 rows shown of the pair, 1 of the single-side function
+    assert shared == separate
+
+
 def test_a_single_side_function_states_its_sink_class_and_callers(full: sst.World) -> None:
     """★ A function on one side only has no counterpart to compare, but its own candidate rows,
     sink class and callers are read as a pair's are — not written off as 'single side'.
@@ -745,30 +807,197 @@ def test_a_single_side_function_states_its_sink_class_and_callers(full: sst.Worl
     assert "function on side b only" in _cell_value(block, "change (tmap facts)")
 
 
-def test_each_fact_is_what_its_own_tool_answers(full: sst.World) -> None:
-    """★ The block's facts are the values the MCP tools answer for the same subject: the callers of
-    get_xrefs, the rows of get_diff_patch_view, the group of same_shape_siblings. A tool whose
-    answer changes shape turns this red.
+def _callers_expected(xr: dict[str, Any], side: str = "b") -> str:
+    """The callers cell a get_xrefs answer gives: the count, the names, the tool's note verbatim."""
+    names = [e["anchor"]["function"] for e in xr["edges"]]
+    body = f"{len(names)} caller(s) on side {side}" + (f": {', '.join(names)}" if names else "")
+    return f"{body} — {xr['note']}" if xr.get("note") else body
 
-    MUTATION (verified RED): read the caller name from a key the edge does not have -> RED; key
-    the siblings on the A ref -> another group_ref -> RED."""
+
+def _null(value: Any) -> str:
+    return "null" if value is None else str(value)
+
+
+def _side_values(axes: dict[str, Any], axis: str, fields: tuple[str, ...]) -> list[str]:
+    """``<side> <v1>,<v2>`` for each side of a row's sink_axes that gives ``axis``."""
+    out = []
+    for side in ("a", "b"):
+        value = (axes.get(side) or {}).get(axis)
+        if isinstance(value, dict):
+            vals = ",".join(_null(value.get(f)) for f in fields)
+            out.append(f"{side} {vals}")
+    return out
+
+
+def _cross_check_world(full: sst.World) -> None:
+    """Rows of three shapes in the changed function (copy / source_len, copy / const, a command
+    call with a recorded source kind), a constant changed in its body, and an undetermined pair
+    whose B function nobody calls."""
+    for k, (cls, sink, flow) in enumerate(
+        [
+            ("copy", "strcpy", sst.SRC),
+            ("copy", "strcpy", sst.CONST),
+            ("cmd", "system", json.dumps({"source_kind": "free_string"})),
+            ("copy", "strcpy", sst.CONST),
+        ]
+    ):
+        full.inst("runB", sst._ref("runB", FB, cls, f"0x{512 + 8 * k:x}"), cls, sink, flow)
+    _body(full, "a", FA, "void f(void)\n{\n  strcpy(d, s);\n  n = 4;\n  return;\n}", "fa")
+    _body(full, "b", FB, "void f(void)\n{\n  strcpy(d, s);\n  n = 8;\n  return;\n}", "fb")
+    full.pair("00007000", "00008000", 0.5, 0.6)
+    full.fn("a", "00007000", ["strcpy"], name="ua")
+    full.fn("b", "00008000", ["strcpy"], name="ub")
+    full.commit()
+
+
+def test_each_fact_is_what_its_own_tool_answers(full: sst.World) -> None:
+    """★ FC08: the block's facts are the values the MCP tools answer for the same subject, cell by
+    cell — the callers cell (count, names and the note) of get_xrefs, for a function with a caller
+    and one with none; each row's a_ref / b_ref / sink_class / landing / size kind and argument /
+    source kind of get_diff_patch_view; the change's structural lines and substitution groups of
+    its inline_hunk; and every distinct row ref's group (group_ref, member_count, by_landing, the
+    rows in it) of same_shape_siblings. A tool whose answer changes shape turns this red.
+
+    MUTATION (verified RED each, ``1 failed``): read the caller name from a key the edge does not
+    have; key the siblings on the A ref; drop the get_xrefs note (``return body``); read source_kind
+    from ``kind``; render the row's sink_class as null; render no substitution group; leave
+    by_landing out of the group line (``json.dumps({})``)."""
+    _cross_check_world(full)
+    undetermined = _pair_ref("00007000", "00008000")
     _judge(full.atlas, sst.DIFF, _pair_ref())
+    _judge(full.atlas, sst.DIFF, undetermined)
     block = _block(full.atlas, _pair_ref())
     tools = mcp_app.make_tools(full.path)
+    # the callers: one caller here, none for the undetermined pair's B function
     xr = tools["get_xrefs"](function=FB, direction="callers", run_id="runB", binary=sst.SHA_B)
-    names = [e["anchor"]["function"] for e in xr["edges"]]
-    assert _cell_value(block, "one-level callers").startswith(
-        f"{len(names)} caller(s) on side b: {', '.join(names)}"
+    assert xr["edges"] and _cell_value(block, "one-level callers") == _callers_expected(xr)
+    xr0 = tools["get_xrefs"](function="00008000", direction="callers", run_id="runB")
+    assert not xr0["edges"] and xr0["note"]
+    assert _cell_value(_block(full.atlas, undetermined), "one-level callers") == (
+        _callers_expected(xr0)
     )
     view = tools["get_diff_patch_view"](sst.DIFF, entry_id=_pair_ref())
     (entry,) = view["entries"]
+    assert len(entry["rows"]) == entry["rows_total"] == 5  # all shown: every row is checked
+    assert {r["sink_class"] for r in entry["rows"]} == {"copy", "cmd"}
     for i, row in enumerate(entry["rows"], 1):
         line = next(x for x in block.splitlines() if x.startswith(f"  - row {i}: "))
-        assert f"a_ref {row['a_ref']} · b_ref {row['b_ref']}" in line
-        assert f"landing {row['landing']}" in line
-    ref = entry["rows"][0]["b_ref"]
-    group = tools["same_shape_siblings"](sst.DIFF, evidence_ref=ref)
-    assert f"  - group `{group['group_ref']}`: {group['member_count']} member(s)" in block
+        refs = f"a_ref {_null(row['a_ref'])} · b_ref {_null(row['b_ref'])}"
+        assert f"{refs} · sink_class {_null(row['sink_class'])} · landing {row['landing']}" in line
+        size_part = line.split("· size_kind,size_arg ", 1)[1].split(" · source_kind ", 1)
+        for v in _side_values(row["sink_axes"], "bound", ("size_kind", "size_arg")):
+            assert v in size_part[0], (v, line)
+        for v in _side_values(row["sink_axes"], "source", ("source_kind",)):
+            assert v in size_part[1], (v, line)
+    assert any(_side_values(r["sink_axes"], "source", ("source_kind",)) for r in entry["rows"])
+    # the change: every structural line and every substitution group of the tool's inline hunk
+    hunk = entry["pseudocode_delta"]["inline_hunk"]
+    lines = block.splitlines()
+    for run in hunk["structural"]:
+        for x in run:
+            assert x in lines, x
+    subs = [x for x in lines if x.startswith("  - substitution group: ")]
+    assert hunk["substitution_groups"] and len(subs) == len(hunk["substitution_groups"])
+    for g, line in zip(hunk["substitution_groups"], subs, strict=True):
+        assert f"{g['kind']}" in line and f", {g['total']} time(s): " in line, (g, line)
+    # the groups: each distinct row ref's group as same_shape_siblings answers it
+    by_group: dict[str, tuple[dict[str, Any], list[int]]] = {}
+    for i, row in enumerate(entry["rows"], 1):
+        g = tools["same_shape_siblings"](sst.DIFF, evidence_ref=row["b_ref"] or row["a_ref"])
+        by_group.setdefault(g["group_ref"], (g, []))[1].append(i)
+    assert len(by_group) == 3
+    group_lines = [x for x in lines if x.startswith("  - group `")]
+    assert group_lines == [
+        f"  - group `{ref}`: {g['member_count']} member(s), by landing "
+        f"{json.dumps(g['by_landing'], sort_keys=True)} — row(s) {', '.join(map(str, idx))}"
+        for ref, (g, idx) in by_group.items()
+    ]
+
+
+def test_the_file_facts_are_what_get_file_diff_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ FC08: a file block's facts are get_file_diff's for the path — the change, the kind, the
+    hunk stats and the structured counts of its summary, and the first page of its hunk lines.
+
+    MUTATION (verified RED, ``1 failed``): leave the structured counts out of the file cell -> RED;
+    leave the hunk stats out -> RED."""
+    _servable(monkeypatch)
+    fw = FW(tmp_path)
+    fa = fw.file("a", "etc/app.conf", "config_file", "port=80\nmode=a\n")
+    fb = fw.file("b", "etc/app.conf", "config_file", "port=8080\nmode=a\n")
+    fw.row("a", "config_entries", fa, section=None, key="port", value="80", is_sensitive=0)
+    fw.row("b", "config_entries", fb, section=None, key="port", value="8080", is_sensitive=0)
+    anchor = f"{PAIR}#non_binary#etc/app.conf"
+    tools = fw.tools()
+    conn = fw.atlas()
+    try:
+        _judge(conn, None, anchor)
+        block = _block(conn, anchor)
+    finally:
+        conn.close()
+    summary = tools["get_file_diff"](PAIR, path="etc/app.conf", detail="summary")["entry"]
+    page = tools["get_file_diff"](PAIR, path="etc/app.conf")["entry"]
+    assert summary["structured_counts"], summary  # the fixture really has structured rows
+    assert _cell_value(block, "file difference (tmap facts)") == ", ".join(
+        [
+            f"change {page['change']}",
+            f"kind {page['kind']}",
+            f"hunk stats {json.dumps(summary['hunk_stats'], sort_keys=True)}",
+            f"structured counts {json.dumps(summary['structured_counts'], sort_keys=True)}",
+        ]
+    )
+    lines = block.splitlines()
+    start = lines.index("- file hunk (tmap facts):") + 2
+    assert lines[start : start + len(page["hunk"]["lines"])] == page["hunk"]["lines"]
+
+
+def test_the_callers_cell_reads_this_diffs_binary_of_two_at_one_address(
+    full: sst.World,
+) -> None:
+    """★ FC07: the side's analysis.db holds two binaries with a function at the finding's address;
+    the callers cell reads the diff's own binary (by its content hash), so the caller of THAT
+    function is named — never "ambiguous".
+
+    MUTATION (verified RED, ``1 failed``): drop the binary qualifier (``binary=None``) -> the
+    address names two functions -> "function not resolved … ambiguous" -> RED."""
+    full.adb["b"].execute("INSERT INTO binaries (name, sha256) VALUES ('liby', ?)", ("e" * 64,))
+    full.adb["b"].execute(
+        "INSERT INTO functions (binary_id, name, address, callees, callees_truncated, "
+        "unresolved_external_calls) VALUES (2, 'other', ?, '[]', 0, '[]')",
+        (FB,),
+    )
+    full.adb["b"].execute(
+        "INSERT INTO functions (binary_id, name, address, callees, callees_truncated, "
+        "unresolved_external_calls) VALUES (2, 'caller_y', '00005800', '[\"other\"]', 0, '[]')"
+    )
+    full.commit()
+    _judge(full.atlas, sst.DIFF, _pair_ref())
+    cell = _cell_value(_block(full.atlas, _pair_ref()), "one-level callers")
+    assert cell.startswith("1 caller(s) on side b: caller_b"), cell
+    assert "caller_y" not in cell
+
+
+def test_a_function_with_no_caller_carries_the_get_xrefs_note(full: sst.World) -> None:
+    """★ FC09: the callers cell reads through the get_xrefs tool's own lib call
+    (entry_words.xrefs_with_entry_words): a function nobody calls carries the tool's note verbatim,
+    the sentence on the data words holding its entry value included.
+
+    MUTATION (verified RED, ``1 failed``): call facts.get_xrefs again -> the note lacks the
+    entry-words sentence -> RED; drop the note -> RED."""
+    full.pair("00007000", "00008000", 0.5, 0.6)
+    full.fn("a", "00007000", ["strcpy"], name="ua")
+    full.fn("b", "00008000", ["strcpy"], name="ub")
+    full.commit()
+    anchor = _pair_ref("00007000", "00008000")
+    _judge(full.atlas, sst.DIFF, anchor)
+    cell = _cell_value(_block(full.atlas, anchor), "one-level callers")
+    tools = mcp_app.make_tools(full.path)
+    xr = tools["get_xrefs"](function="00008000", direction="callers", run_id="runB")
+    assert xr["edges"] == [] and "entry_words" in xr, xr
+    assert cell.startswith("0 caller(s) on side b — ")
+    assert cell.endswith(xr["note"]), (cell, xr["note"])
+    assert " | " in xr["note"]  # the entry-words sentence after get_xrefs' own note
 
 
 def test_a_fully_read_finding_states_no_cell_unavailable(full: sst.World) -> None:
@@ -1153,12 +1382,15 @@ def _template_text(doc: str) -> str:
     """``doc`` with what tmap embeds rather than writes taken out: code blocks (firmware text), the
     boundary, the recorded judgment's values, backticked anchors and refs."""
     out: list[str] = []
-    fenced = False
+    fence: str | None = None
     for line in doc.replace(rr.HANDOFF_BOUNDARY, "").splitlines():
-        if line == "```":
-            fenced = not fenced
+        if re.fullmatch(r"`{3,}", line):
+            if fence is None:
+                fence = line
+            elif len(line) >= len(fence):
+                fence = None
             continue
-        if fenced:
+        if fence is not None:
             continue
         for label in ("recorded verdict", "recorded change kind", "recorded rationale"):
             if line.startswith(f"- {label}: "):
@@ -1172,10 +1404,14 @@ def _template_text(doc: str) -> str:
 def test_the_rendered_blocks_carry_no_verdict_word(full: sst.World) -> None:
     """★ Acceptance 7 with teeth: each subject shape rendered for real (a function pair, a single-
     side function, a file, a whole binary), its embedded values taken out, says no verdict word —
-    and the whole document passes the public-surface scan.
+    and the whole document passes the public-surface scan. B2-m5: the branches a plain fixture does
+    not reach are rendered too — a finding whose basis MOVED, a file whose hunk is held back
+    (sensitive), and a block cut to its cap.
 
     MUTATION (verified RED): write "single side — safe, no exploitable delta" into the single-side
-    change cell -> RED; render the sink class label as "vulnerable sink class" -> RED."""
+    change cell -> RED; render the sink class label as "vulnerable sink class" -> RED; write
+    "possibly exploitable" into the MOVED line, "safe to skip" into the held-back file line, or
+    "(safe to skip)" into the cut note -> RED (``1 failed``) each."""
     from tests.unit.test_public_surface_wording import _flag
 
     full.atlas.execute(
@@ -1197,12 +1433,32 @@ def test_the_rendered_blocks_carry_no_verdict_word(full: sst.World) -> None:
         "review_state": "concluded",
     }
     docs.append(rr.handoff_chunk(full.atlas, PAIR, binary, stamp=stamp))
+    # B2-m5: a moved basis, and a block cut to its cap
+    (pair,) = [
+        f
+        for f in rr.handoff_findings(full.atlas, PAIR, file_staleness=staleness)
+        if f["anchor_ref"] == _pair_ref()
+    ]
+    moved = {
+        **pair,
+        "review_state": "needs_recheck",
+        "basis_state": "unchanged",
+        "source_stale_reason": "diff_logic_changed",
+    }
+    docs.append(rr.handoff_chunk(full.atlas, PAIR, moved, stamp=stamp))
+    docs.append(rr.handoff_chunk(full.atlas, PAIR, pair, stamp=stamp, cap=1_000))
     fw = _files_world(full)
     fw.file("a", "etc/rc", "shell_script", "echo old\n")
     fw.file("b", "etc/rc", "shell_script", "echo new\n")
+    fw.file("a", "etc/app.conf", "config_file", "pass=old-synthetic\n")
+    conf = fw.file("b", "etc/app.conf", "config_file", f"pass={SECRET_VALUE}\n")
+    fw.row(
+        "b", "config_entries", conf, section=None, key="pass", value=SECRET_VALUE, is_sensitive=1
+    )
     conn = fw.atlas()
     try:
         _judge(conn, None, f"{PAIR}#non_binary#etc/rc")
+        _judge(conn, None, f"{PAIR}#non_binary#etc/app.conf")
         stamp, staleness = rr.local_handoff_context(conn)
         docs.append(rr.handoff_document(conn, PAIR, stamp=stamp, file_staleness=staleness))
     finally:
@@ -1211,17 +1467,73 @@ def test_the_rendered_blocks_carry_no_verdict_word(full: sst.World) -> None:
     assert all(
         s in doc for s in ("function_pair", "function_presence", "non_binary", "binary_presence")
     )
+    for branch in (
+        "- basis: MOVED since the judgment",
+        "hunk held back (sensitive: ",
+        "- [block cut",
+    ):
+        assert branch in doc, branch  # each branch really rendered
     # a stored value (an identifier with an underscore) is a value, not prose
     words = {w.lower() for w in re.findall(r"[A-Za-z_]+", _template_text(doc)) if "_" not in w}
     assert not (words & _JUDGEMENT_WORDS), words & _JUDGEMENT_WORDS
     assert _flag(doc) == []
 
 
+def _template_strings() -> list[tuple[int, str]]:
+    """Every string literal the hand-off part of review_report renders from — each constant and
+    each constant part of an f-string, docstrings left out — with its line number."""
+    import ast
+    import inspect
+
+    source = inspect.getsource(rr)
+    start = source.index("# ── the findings handoff (Design B)")
+    first_line = source[:start].count("\n") + 1
+    tree = ast.parse(source)
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.ClassDef | ast.Module)
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+    return [
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.lineno >= first_line
+        and id(node) not in docstrings
+    ]
+
+
+def test_every_handoff_template_string_carries_no_verdict_word() -> None:
+    """★ B2-m5: every string the hand-off renders from — every branch of the four entry forms,
+    each unavailable reason, the MOVED line, the held-back and cut notes — carries no verdict word,
+    whether or not a fixture reaches its branch. (The boundary is imported; values such as a
+    sink class or a stored state are not template text.)
+
+    MUTATION (verified RED, ``1 failed``): write "possibly exploitable" into the MOVED line, "safe
+    to skip" into the held-back file line, or "(safe to skip)" into the cut note -> RED each."""
+    strings = _template_strings()
+    assert any("MOVED since the judgment" in x for _n, x in strings)  # the scan reaches them
+    assert any("function not resolved" in x for _n, x in strings)
+    hits = []
+    for lineno, text in strings:
+        words = {w.lower() for w in re.findall(r"[A-Za-z_]+", text) if "_" not in w}
+        if words & _JUDGEMENT_WORDS:
+            hits.append((lineno, text, sorted(words & _JUDGEMENT_WORDS)))
+    assert hits == []
+
+
 # ── the driver's command line: when the hand-off runs, and with which preset ────────────────────
 
 
-def _patch_run(monkeypatch: pytest.MonkeyPatch, stopped: str) -> dict[str, list[Any]]:
-    """review run with every launch faked: the probe passes, the drive ends ``stopped``."""
+def _patch_run(
+    monkeypatch: pytest.MonkeyPatch, stopped: str, failed: list[dict[str, Any]] | None = None
+) -> dict[str, list[Any]]:
+    """review run with every launch faked: the probe passes, the drive ends ``stopped`` with the
+    ``failed`` units."""
     from treasure_map.cli import review_cli
     from treasure_map.lib import review_driver as rd
     from treasure_map.lib.query import review_units as ru
@@ -1241,7 +1553,9 @@ def _patch_run(monkeypatch: pytest.MonkeyPatch, stopped: str) -> dict[str, list[
 
     def drive(*a: Any, **k: Any) -> rd.DriveResult:
         calls["drive"].append(a)
-        return rd.DriveResult(units_tried=1, units_done=1, stopped=stopped)
+        return rd.DriveResult(
+            units_tried=1, units_done=1, stopped=stopped, failed=list(failed or [])
+        )
 
     def run_handoff(*a: Any, **k: Any) -> dict[str, Any]:
         calls["handoff"].append(a)
@@ -1295,3 +1609,249 @@ def test_handoff_with_an_experimental_preset_is_refused_before_driving(
     )
     assert res.exit_code == 2 and "claude-code preset" in res.output, res.output
     assert calls == {"drive": [], "handoff": [], "probe": []}
+
+
+# ── the block's own lines: the basis kept, fences closed, embedded text contained ──────────────
+
+
+def _outside_fences(text: str) -> tuple[list[str], bool]:
+    """The lines of ``text`` a markdown reader takes as outside any code fence (a fence opens with
+    up to three spaces and three or more backticks, and closes with as many or more), and whether
+    the text ends inside one."""
+    out: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines():
+        m = re.fullmatch(r" {0,3}(`{3,})([^`]*)", line)
+        if fence is None:
+            if m:
+                fence = m.group(1)
+                continue
+            out.append(line)
+        elif m and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+            fence = None
+    return out, fence is not None
+
+
+def test_a_long_rationale_never_cuts_the_basis_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ B2-m1: the basis line comes before the recorded rationale, so a rationale long enough to
+    cut the block — one long line, or many — never cuts the MOVED line with it.
+
+    MUTATION (verified RED, ``1 failed``): put the basis line back after the rationale -> the cut
+    takes it -> RED."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 2)
+    a1, a2 = sorted(f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR))
+    _judge(w.atlas, DX, a1, "z" * 31_000)
+    _judge(w.atlas, DX, a2, "a line of the rationale\n" * 2_000)
+    w.stale[DX] = {"source_stale": True, "source_stale_reason": "diff_logic_changed"}
+    for finding in rr.handoff_findings(w.atlas, PAIR):
+        block = rr.handoff_chunk(w.atlas, PAIR, finding, stamp=_stamp())
+        lines, _open = _outside_fences(block)
+        assert any(x.startswith("- [block cut to fit a page: ") for x in lines)  # really cut
+        assert any(
+            x.startswith("- basis: MOVED since the judgment (diff_logic_changed)") for x in lines
+        ), lines
+
+
+def test_a_cut_inside_a_fence_closes_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """★ B2-m6: a block cut where a fence is open (here inside a long rationale) closes the fence
+    before the cut note, so the note, the placeholders and the status read as the block's own
+    lines, not as code.
+
+    MUTATION (verified RED, ``1 failed``): drop the closing of the open fence -> the cut note and
+    the status sit inside the code block -> RED."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 1)
+    (anchor,) = [f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR)]
+    _judge(w.atlas, DX, anchor, "a line of the rationale\n" * 400)
+    (finding,) = rr.handoff_findings(w.atlas, PAIR)
+    block = rr.handoff_chunk(w.atlas, PAIR, finding, stamp=_stamp(), cap=3_000)
+    lines, ends_open = _outside_fences(block)
+    assert not ends_open
+    all_lines = block.splitlines()
+    cut = next(i for i, x in enumerate(all_lines) if x.startswith("- [block cut"))
+    assert all_lines[cut - 1] == "```" and "a line of the rationale" in all_lines[cut - 2]
+    assert all_lines[cut] in lines and f"- status: {rr.HANDOFF_STATUS}" in lines
+
+
+def test_embedded_text_cannot_forge_the_blocks_own_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ B2-m8: a rationale or an agent's text holding a "- status: …" or "- basis: …" line, a
+    heading, or an unpaired code fence stays inside its own fence: every block's only status line
+    outside a fence is tmap's, its basis line is tmap's, and the document never ends inside a code
+    block — in the skeleton and in the driver's document alike.
+
+    MUTATION (verified RED, ``1 failed`` each): render the rationale as a plain cell again; put the
+    agent's text under the placeholder unfenced again."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 2)
+    a1, a2 = sorted(f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR))
+    forged = "line one\n- basis: MOVED by hand\n- status: confirmed by a person\n````\n## `x`"
+    _judge(w.atlas, DX, a1, forged)
+    stamp, staleness = rr.local_handoff_context(w.atlas)
+
+    def check(doc: str, n_findings: int) -> None:
+        lines, ends_open = _outside_fences(doc)
+        assert not ends_open
+        assert [x for x in lines if x.startswith("- status:")] == [
+            f"- status: {rr.HANDOFF_STATUS}"
+        ] * n_findings, lines
+        assert [x for x in lines if x.startswith("- basis:")] == ["- basis: current"] * n_findings
+        assert [x for x in lines if x.startswith("## ")] == [f"## `{a1}`", f"## `{a2}`"]
+
+    skeleton = rr.handoff_document(w.atlas, PAIR, stamp=stamp, file_staleness=staleness)
+    assert "- status: confirmed by a person" in skeleton  # the text is there, contained
+    check(skeleton, 2)
+    texts = {a1: {"hypotheses": "H\n```", "device_checks": "D\n- status: verified\n## `y`"}}
+    out_file = tmp_path / "handoff.md"
+    res = _run_handoff(w, out_file, _claude_result(json.dumps(texts)))
+    assert res["ok"] is True, res
+    written = out_file.read_text(encoding="utf-8")
+    assert "- status: verified" in written
+    check(written, 2)
+
+
+def test_a_refused_handoff_keeps_the_agents_message_beside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ B2-m9: when the driver refuses to compose the hand-off from the agent's final message (it
+    names an anchor the hand-off does not hold, or is not the JSON asked for), the hand-off file is
+    still not written, and the message is kept as it was printed in ``<out>.agent-result.txt``,
+    headed as not a hand-off document — a long analysis is not lost to one wrong anchor.
+
+    MUTATION (verified RED, ``1 failed``): keep nothing (skip the write in ``_refused``) -> RED."""
+    from treasure_map.lib import review_driver as rd
+
+    w = _wide_findings_world(tmp_path, monkeypatch, 1)
+    wrong = json.dumps({f"{PAIR}#function_pair#libx::0badc0de::0badc0de": {"hypotheses": "h"}})
+    for name, result in (("anchor", wrong), ("prose", "here is my analysis, not JSON")):
+        out_file = tmp_path / f"{name}.md"
+        res = _run_handoff(w, out_file, _claude_result(result))
+        assert res["ok"] is False and not out_file.exists(), res
+        kept = rd.agent_result_path(out_file)
+        assert kept == tmp_path / f"{name}.md.agent-result.txt"
+        assert kept.is_file(), res
+        assert res.get("agent_result_file") == str(kept) and str(kept) in res["error"]
+        text = kept.read_text(encoding="utf-8")
+        assert text.startswith("This is not a hand-off document")
+        assert text.endswith("\n\n" + result)
+
+
+def test_the_last_page_keeps_within_the_budget_at_its_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ B2-m2: a page is measured with next_offset at its widest — null (four bytes) is wider than
+    a block count under 1000 — so the last page, whose next_offset becomes null, never goes over
+    the budget, at any budget around the one that just fits; the pages still concatenate to the
+    document.
+
+    MUTATION (verified RED, ``1 failed``): measure with ``"next_offset": total`` again -> the last
+    page is 3 bytes over -> RED."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 5)
+    for i, f in enumerate(rr.handoff_findings(w.atlas, PAIR), 1):
+        _judge(w.atlas, DX, f["anchor_ref"], "r" * (100 * i))
+    tools = mcp_app.make_tools(w.path)
+    whole = tools["get_diff_handoff"](PAIR, 0)
+    assert whole["next_offset"] is None and whole["total_blocks"] < 10
+    fits = len(json.dumps(dict(whole, next_offset=whole["total_blocks"])))
+    document = rr.handoff_document(
+        w.atlas, PAIR, stamp=_stamp(), file_staleness=_local_staleness(w)
+    )
+    for budget in range(fits - 4, fits + 5):
+        monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", budget)
+        out, off = [], 0
+        while off is not None:
+            r = tools["get_diff_handoff"](PAIR, off)
+            assert len(json.dumps(r)) <= budget, (budget, off, len(json.dumps(r)))
+            out.append(r["text"])
+            off = r["next_offset"]
+        assert "".join(out) == document
+
+
+def test_a_long_file_hunk_is_cut_at_its_cap_and_names_the_page_that_follows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ B2-m3: a file whose line difference is over the block's file-hunk cap shows the pieces
+    that fit (whole pieces, the next one would pass the cap) and names the get_file_diff call that
+    reads on from the first piece not shown — whose first piece is that piece.
+
+    MUTATION (verified RED, ``1 failed`` each): name hunk_offset one past the pieces shown; lift
+    the cap -> no continuation line -> RED."""
+    _servable(monkeypatch)
+    fw = FW(tmp_path)
+    fw.file("a", "etc/big", "shell_script", "echo old\n")
+    body = "".join(f"echo line-{i:04d} {'p' * 30}\n" for i in range(400))
+    fw.file("b", "etc/big", "shell_script", body)
+    anchor = f"{PAIR}#non_binary#etc/big"
+    tools = fw.tools()
+    conn = fw.atlas()
+    try:
+        _judge(conn, None, anchor)
+        block = _block(conn, anchor)
+    finally:
+        conn.close()
+    hunk = tools["get_file_diff"](PAIR, path="etc/big")["entry"]["hunk"]
+    pieces = hunk["lines"]
+    assert hunk["next_hunk_offset"] is None  # the tool's first page holds every piece
+    lines = block.splitlines()
+    start = lines.index("- file hunk (tmap facts):") + 2
+    end = lines.index("```", start)
+    shown = lines[start:end]
+    n = len(shown)
+    assert 0 < n < len(pieces) and shown == pieces[:n]
+    size = sum(len(json.dumps(x + "\n")) - 2 for x in shown)
+    assert size <= rr.HANDOFF_FILE_HUNK_BYTES < size + len(json.dumps(pieces[n] + "\n")) - 2
+    more = (
+        f"  - hunk shown {n} of {hunk['total_pieces']} piece(s) — rest: "
+        f'get_file_diff(run_pair="{PAIR}", path="etc/big", hunk_offset={n})'
+    )
+    assert more in lines, [x for x in lines if "hunk shown" in x]
+    rest = tools["get_file_diff"](PAIR, path="etc/big", hunk_offset=n)["entry"]["hunk"]
+    assert rest["lines"][0] == pieces[n]
+
+
+def test_an_undetermined_pair_with_no_proposed_hunk_states_the_proposed_reading(
+    full: sst.World,
+) -> None:
+    """★ B2-m4: an undetermined pair whose proposed pairing gives no pseudocode delta says so with
+    the state the view's proposed_pair_reading gives, under the proposed-pairing label.
+
+    MUTATION (verified RED, ``1 failed``): leave the proposed state out -> RED."""
+    full.pair("00007000", "00008000", 0.5, 0.6)
+    full.fn("a", "00007000", ["strcpy"], name="ua")
+    full.fn("b", "00008000", ["strcpy"], name="ub")
+    full.commit()
+    anchor = _pair_ref("00007000", "00008000")
+    _judge(full.atlas, sst.DIFF, anchor)
+    block = _block(full.atlas, anchor)
+    view = mcp_app.make_tools(full.path)["get_diff_patch_view"](sst.DIFF, entry_id=anchor)
+    (entry,) = view["entries"]
+    proposed = entry["proposed_pair_reading"]
+    assert "pseudocode_delta" not in proposed and proposed["state"]
+    label = "change (tmap facts, proposed pairing — alignment undetermined)"
+    assert _cell_value(block, label) == (
+        f"unavailable (no pseudocode delta; the proposed pairing reads {proposed['state']})"
+    )
+
+
+def test_the_handoff_is_skipped_when_a_unit_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ B2-m7: a drive that ran out of units but had a unit fail is not a finished review — the
+    hand-off is skipped and nothing launched for it.
+
+    MUTATION (verified RED, ``1 failed``): decide on ``stopped`` alone -> the hand-off launches ->
+    RED."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli import review_cli
+
+    failed = [{"unit_id": "u-1", "kind": "function_pair", "written": 0, "members": 1}]
+    calls = _patch_run(monkeypatch, "no unit left", failed)
+    res = CliRunner().invoke(
+        review_cli.review,
+        ["run", PAIR, "--agent", "claude-code", "--handoff", str(tmp_path / "h.md")],
+    )
+    assert "hand-off skipped" in res.output, res.output
+    assert calls["handoff"] == [] and len(calls["drive"]) == 1
+    assert res.exit_code == 3  # a failed unit still fails the run

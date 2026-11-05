@@ -66,7 +66,9 @@ def _uninstall(purge_data: bool, assume_yes: bool, dry_run: bool) -> None:
     survey = cl.survey(chost, tmap)
     self_argv = un.uv_self_uninstall(Path(sys.prefix), home, host.which, host.run)
     click.echo("Uninstall plan:")
-    for line in un.plan_lines(ledger, survey, toolchain_dir=tm_home / "toolchain", home=home):
+    for line in un.plan_lines(
+        ledger, survey, toolchain_dir=tm_home / "toolchain", home=home, environ=chost.environ
+    ):
         click.echo(f"  • {line}")
     if self_argv is not None:
         click.echo(f"  • last: remove the tmap program itself ({' '.join(self_argv[1:])})")

@@ -398,26 +398,35 @@ def _skill_checks(inp: DoctorInputs) -> list[Check]:
     except ConfigError as exc:
         return [check("skill", "unknown", f"cannot read the install ledger: {exc}")]
     want = sk.shipped_bytes()
-    home = inp.client_host.home
-    requested = sk.target_roots(inp.requested_clients, home)
+    home, environ = inp.client_host.home, inp.client_host.environ
+    requested = sk.target_roots(inp.requested_clients, home, environ)
+    known = sk.known_roots(home, environ)
     out = []
-    for root in sk.known_roots(home):
-        st = sk.classify(root, ledger, want)
-        name = f"skill.{root.relative_to(home).parts[0].lstrip('.')}"
+    for short, root in sk.named_roots(home, environ):
+        st = sk.classify(root, ledger, want, known=known)
+        name = f"skill.{short}"
         if st.state == "aligned":
             out.append(check(name, "ok", str(st.path)))
         elif st.state == "missing":
             state: State = "missing" if root in requested else "info"
             out.append(check(name, state, f"{st.path}: not installed"))
-        elif st.state in ("stale", "legacy"):
+        elif st.state == "stale":  # every run of init updates tmap's own unchanged copy
             out.append(check(name, "warn", f"{st.path}: {st.detail}; `tmap init` replaces it"))
+        elif st.state == "legacy":  # only where an agent chosen in that run reads
+            out.append(
+                check(
+                    name,
+                    "warn",
+                    f"{st.path}: {st.detail}; `tmap init` replaces it when it sets up an agent "
+                    f"that reads {root}",
+                )
+            )
         elif st.state == "foreign":
             out.append(
                 check(
                     name,
                     "warn",
-                    f"{st.path}: {st.detail} — not modified; to replace it: "
-                    + sk.replace_command(root),
+                    f"{st.path}: {st.detail} — not modified; {sk.next_step(st)}",
                 )
             )
         else:

@@ -21,7 +21,7 @@ SHELL (``system`` / ``popen`` / ``doSystem``)
     always ``/bin/sh`` and is deliberately not listed as a second edge (it would swamp the table
     with a constant). The command text stays visible, so pipes and a wrapping ``sh -c`` are read
     out of it.
-EXEC (``execl`` / ``execlp`` / ``execle`` / ``execv`` / ``execvp`` / ``execve``)
+EXEC (``execl`` / ``execlp`` / ``execle`` / ``execv`` / ``execvp`` / ``execve`` / ``execvpe``)
     The argument is the image path itself. ★ VARIADIC IRON LAW: argv is structurally invisible
     here — a variadic argument list, or an array the caller built elsewhere. arg0 is recorded and
     argv is NEVER reconstructed or guessed. When arg0 is a shell, that is recorded as shell_wrapped

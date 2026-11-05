@@ -166,8 +166,18 @@ def test_a_long_log_is_moved_aside_before_a_write(
         # start_diff_review(run_pair, unit=...): the unit's head, its material beside it
         ({"unit": {"unit_id": "u1"}, "material": {"entry": {}}}, True),
         ({"unit": {"unit_id": "u1"}}, False),
+        # R-10: an "error" INSIDE the material (a side whose decompile failed) is part of what was
+        # read, not a failed material
+        ({"next_unit": {"unit_id": "u1", "material": {"entry": {"error": "x"}}}}, True),
     ],
-    ids=["with_material", "head_only", "error_material", "unit_read", "unit_head_only"],
+    ids=[
+        "with_material",
+        "head_only",
+        "error_material",
+        "unit_read",
+        "unit_head_only",
+        "nested_error",
+    ],
 )
 def test_a_unit_counts_as_handed_out_only_with_its_material(
     result: dict[str, Any], recorded: bool
@@ -176,10 +186,47 @@ def test_a_unit_counts_as_handed_out_only_with_its_material(
     read from) only when the answer carried its material — a unit named without it was not read.
 
     MUTATION (verified RED, 3 failed): record any answer naming a unit (the old rule) -> head_only,
-    error_material and unit_head_only RED."""
+    error_material and unit_head_only RED. MUTATION (R-10, verified RED, 1 failed): look for
+    "error" anywhere in the material (``"error" not in json.dumps(material)``) -> nested_error
+    RED."""
     from treasure_map.lib.query import read_basis as rb
 
     line = tcl.build_line(tcl.Session(), "annotate_diff", {}, result)
     assert ("unit" in line) is recorded
     basis = rb.infer([line], anchor_ref="x", unit_id="u1")["basis"]
     assert (basis == "unit_delivered") is recorded
+
+
+@pytest.mark.parametrize(
+    ("material", "whole"),
+    [
+        # a batch / callee group: the entries the material KEPT, by entry id
+        (
+            {"entries": [{"entry_id": "e1"}, {"entry_id": "e2"}], "entries_truncated": True},
+            ["e1", "e2"],
+        ),
+        ({"entries": [], "entries_truncated": True}, []),
+        # a reduce: the owed judgements listed, by anchor
+        ({"owed": [{"anchor_ref": "a1", "group_ref": "g"}], "owed_truncated": True}, ["a1"]),
+        # one-subject materials list no members: whole unless cut
+        ({"entry": {"entry_id": "e1"}}, None),
+        ({"top": [{"evidence_ref": "r"}]}, None),
+    ],
+    ids=["batch", "batch_empty", "reduce", "entry", "presence"],
+)
+def test_a_handed_out_unit_records_which_members_its_material_showed(
+    material: dict[str, Any], whole: list[str] | None
+) -> None:
+    """★ FC01: a delivery line records the members a list-form material showed (``unit_whole``)
+    — what a later write of one member is read against — and none for a one-subject material.
+
+    MUTATION (verified RED, 3 failed): leave ``unit_whole`` out of the line -> batch,
+    batch_empty and reduce RED."""
+    line = tcl.build_line(
+        tcl.Session(),
+        "start_diff_review",
+        {},
+        {"next_unit": {"unit_id": "u1", "material": material, "material_cut": True}},
+    )
+    assert line.get("unit") == "u1"
+    assert line.get("unit_whole") == whole

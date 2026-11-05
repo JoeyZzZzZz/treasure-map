@@ -7,6 +7,7 @@ Zero real data: the World of test_patch_view (one diff of libx)."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -310,3 +311,63 @@ def test_the_material_pack_never_hands_an_empty_pseudocode_as_a_reading(tmp_path
     assert "pseudocode" not in b_side
     assert b_side.get("unavailable") == "decompile_failed"
     assert b_side.get("decompile_status") == "timeout"
+
+
+def test_a_group_whose_view_fails_hands_out_no_material(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ R-11: when the diff's view cannot be read, the group's material is that error — not a
+    group with no entries, which the log would record as handed out whole.
+
+    MUTATION (verified RED, 1 failed): swallow the view's error into ``entries: []`` -> the log
+    records the unit as handed out -> RED."""
+    from treasure_map import mcp_app
+    from treasure_map.lib import tool_call_log as tcl
+
+    w = _world(tmp_path)
+    group = next(u for u in _review(w, k=ru.DEFAULT_K).units if u.kind == ru.GROUP)
+    real = mcp_app._get_diff_patch_view
+
+    def failing(atlas: Any, diff_id: str, **kw: Any) -> dict[str, Any]:
+        if kw.get("entry_id") is None:
+            return {"error": "the view could not be built"}
+        return dict(real(atlas, diff_id, **kw))
+
+    monkeypatch.setattr(mcp_app, "_get_diff_patch_view", failing)
+    out = mcp_app.make_tools(w.path)["start_diff_review"](run_pair="runA::runB", unit=group.unit_id)
+    assert out["material"] == {"error": "the view could not be built"}, out["material"]
+    assert "unit" not in tcl.build_line(tcl.Session(), "start_diff_review", {}, out)
+
+
+def test_a_reduce_whose_owed_list_was_cut_says_its_material_was_cut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ R-11: the reduce's owed list cut to fit (``owed_truncated``) is a cut material, so a
+    write of an owed judgement it did not list is not read as handed out whole.
+
+    MUTATION (verified RED, 1 failed): leave ``owed_truncated`` out of _material_cut -> RED."""
+    from treasure_map import mcp_app
+
+    w = _world(tmp_path)
+    for u in _review(w, k=ru.DEFAULT_K).units:
+        for m in u.members:
+            if m.kind == "entry":
+                overlay.annotate_diff(
+                    w.atlas,
+                    anchor_ref=m.anchor_ref,
+                    verdict="changed_real",
+                    rationale="r",
+                    diff_id=DIFF,
+                )
+    red = next(u for u in _review(w, k=ru.DEFAULT_K).units if u.kind == ru.REDUCE)
+    tools = mcp_app.make_tools(w.path)
+    whole = tools["start_diff_review"](run_pair="runA::runB", unit=red.unit_id)
+    assert whole["material_cut"] is False and "owed_truncated" not in whole["material"]
+    # a budget that leaves the owed list less room than it takes
+    rest = len(json.dumps(whole)) - len(json.dumps(whole["material"]))
+    monkeypatch.setattr(
+        mcp_app, "_RESPONSE_BYTE_BUDGET", rest + len(json.dumps(whole["material"])) - 40
+    )
+    cut = mcp_app.make_tools(w.path)["start_diff_review"](run_pair="runA::runB", unit=red.unit_id)
+    assert cut["material"].get("owed_truncated") is True, cut["material"]
+    assert cut["material_cut"] is True
