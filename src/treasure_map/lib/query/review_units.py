@@ -94,8 +94,18 @@ _KIND_RANK = {GROUP: -1, AUDIT: 1}
 PRESENCE_TOP = 20
 # How many disagreements the report lists (the count is always exact).
 DISAGREEMENTS_SHOWN = 20
-# The judgements an audit reads blind: why one is opened.
-AUDIT_SOURCES = ("change_inconclusive", "no_real_change", "unread_before_verdict")
+# The judgements an audit reads blind: why one is opened. ``unread_before_verdict`` is NOT here any
+# more — a subject judged before it was read is now a non-blind NEEDS_RECHECK (always on), not a
+# blind audit unit (see ``read_audits`` and ``BLIND_AUDIT_ENABLED``).
+AUDIT_SOURCES = ("change_inconclusive", "no_real_change")
+# Blind auditing (the blind second reading of a no_real_change / change_inconclusive, and the shadow
+# write it records) is SEALED off by default. Before flipping this back to True the sealed section
+# of the spec must be satisfied: A-4 (the --disallowedTools fix, so the agent keeps its prompt) AND
+# a server-side audit mode (an audit session's replies carry no verdict / review_state). Until then
+# a blind reading shares its parent's MCP connection and verdict context, so its record is not
+# trustworthy. The "judged unread -> NEEDS_RECHECK" and "overwritten by another session" signals do
+# NOT depend on this flag; they stay on so must_read_complete never goes green on an unread verdict.
+BLIND_AUDIT_ENABLED = False
 # The writes a person makes: never audited, and what settles a disagreement.
 HUMAN = "human"
 DISPOSED_STATES = frozenset({OPEN, CONCLUDED})
@@ -714,6 +724,11 @@ class Audit:
 class Audits:
     open: list[Audit] = field(default_factory=list)
     disagreements: list[dict[str, Any]] = field(default_factory=list)
+    # Subjects whose LATEST write was made before anything of the subject was read
+    # (``unread_before_verdict``). Always computed, independent of ``BLIND_AUDIT_ENABLED``; the
+    # caller sets each to NEEDS_RECHECK (not disposed). Cleared only by a newer write that read
+    # first (then the latest write no longer carries the flag).
+    needs_recheck: list[str] = field(default_factory=list)
 
 
 def _json(raw: Any) -> dict[str, Any]:
@@ -725,14 +740,19 @@ def _json(raw: Any) -> dict[str, Any]:
 
 
 def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) -> Audits:
-    """The open audits and the disagreements of the pair, from its judgements and their history.
+    """The open audits, disagreements, and needs-recheck subjects of the pair, from its judgements
+    and their history. Three products, split by whether they depend on blind auditing:
 
-    An audit opens on a judgement that is change_inconclusive or no_real_change, or that was
-    written before anything of its subject was read (``unread_before_verdict``) — never on a
-    person's (``human``). It closes when a blind shadow judgement follows the write (one whose
-    session neither wrote it nor read the overlay's verdicts first: ``non_blind`` is not counted).
-    A disagreement is a blind shadow that reads otherwise than the current judgement, or a
-    judgement overwritten by another session with another verdict; a person's write settles it."""
+    * ``open`` (blind audit units) — a judgement that is change_inconclusive or no_real_change,
+      never a person's (``human``). GATED by ``BLIND_AUDIT_ENABLED``: none are produced while blind
+      auditing is sealed. An audit closes when a blind shadow judgement follows the write (one whose
+      session neither wrote it nor read the overlay's verdicts first: ``non_blind`` is not counted).
+    * ``needs_recheck`` (ALWAYS on) — a subject whose latest write was made before anything of it
+      was read (``unread_before_verdict``). The caller marks it NEEDS_RECHECK; it does not open a
+      blind audit. Cleared only by a newer write that read first.
+    * ``disagreements`` (ALWAYS on) — a blind shadow that reads otherwise than the current judgement
+      (from history, even once the gate is off), or a judgement overwritten by another session with
+      another verdict; a person's write settles it."""
     pair = dr.run_pair(facts.run_a, facts.run_b)
     current = {
         r[0]: {"verdict": r[1], "attributed_to": r[2]}
@@ -808,16 +828,24 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
                             "before": was,
                         }
                     )
+            # Always on, independent of the gate: a subject whose LATEST write was made unread is
+            # re-read (NEEDS_RECHECK), not audited blind. unread_before_verdict rides only the
+            # latest write (set per must-read anchor when the basis is ``none``), so its presence
+            # here means the newest verdict was written unread; a newer read-first write clears it.
+            if last is not None and last["read_basis"].get("unread_before_verdict"):
+                out.needs_recheck.append(m.anchor_ref)
+            # Below: the blind audit unit. Sealed off by default (A-1); produced only when the
+            # sealed section is satisfied and the flag is flipped back on.
+            if not BLIND_AUDIT_ENABLED:
+                continue
             sources = []
             if row["verdict"] in ("change_inconclusive", "no_real_change"):
                 sources.append(row["verdict"])
-            if last is not None and last["read_basis"].get("unread_before_verdict"):
-                sources.append("unread_before_verdict")
             if not sources or blind:
                 continue
-            # The member an auditor reads names no source: a source is the verdict under audit
-            # (or that it was written unread), and an audit is read blind (spec six.7). The
-            # sources stay on the Audit, counted only in the report's ``audits.by_source``.
+            # The member an auditor reads names no source: a source is the verdict under audit, and
+            # an audit is read blind (spec six.7). The sources stay on the Audit, counted only in
+            # the report's ``audits.by_source``.
             audited = replace(m, reasons=(AUDIT,))
             wid = last["id"] if last is not None else None
             unit = Unit(
@@ -915,6 +943,7 @@ def report(
         and not facts.failed_diffs
         and not audits.open
         and not audits.disagreements
+        and not audits.needs_recheck
         and not reduce_owed
     )
     complete = (
@@ -925,10 +954,16 @@ def report(
         and facts.files_unavailable is None
     )
     server = server_commit or "unknown"
+    # Blind auditing is sealed off by default: the report says ``audits off`` (not 0) so a reader
+    # does not mistake the gate being closed for "audited, nothing open". The needs-recheck and
+    # disagreement counts are always real.
+    audits_off = not BLIND_AUDIT_ENABLED
+    open_text = "off" if audits_off else str(len(audits.open))
     statement = (
         f"must-read {len(must_members)} / disposed {must_done}; "
         f"all subjects {len(all_members)} / disposed {all_done}; "
-        f"open audits {len(audits.open)}; disagreements {len(audits.disagreements)}; "
+        f"open audits {open_text}; needs recheck {len(audits.needs_recheck)}; "
+        f"disagreements {len(audits.disagreements)}; "
         f"{'reduce done' if not reduce_owed else f'reduce owed {len(reduce_owed)}'}; "
         f"predicate {PREDICATE_VERSION} (k={k}); server {server}"
     )
@@ -960,7 +995,17 @@ def report(
             "not_diffed_binaries": facts.not_diffed_binaries,
             "non_binary_files_unavailable": facts.files_unavailable,
         },
-        "audits": {"open": len(audits.open), "by_source": by_source},
+        "audits": {
+            "open": None if audits_off else len(audits.open),
+            "status": "audits off" if audits_off else "on",
+            "by_source": by_source,
+        },
+        "needs_recheck": {
+            "count": len(audits.needs_recheck),
+            "subjects": sorted(audits.needs_recheck)[:DISAGREEMENTS_SHOWN],
+            "why": "judged before anything of the subject was read",
+            "cleared_by": "a later judgement written after reading the subject",
+        },
         "disagreements": {
             "count": len(audits.disagreements),
             "items": audits.disagreements[:DISAGREEMENTS_SHOWN],
@@ -1126,6 +1171,11 @@ def review_pair(
         # Judged without citing the binary's first candidates: read again, not disposed.
         progress.states[anchor] = NEEDS_RECHECK
     audits = read_audits(atlas, facts, units)
+    for anchor in audits.needs_recheck:
+        # Judged before anything of the subject was read (A-2(2)): re-read, not disposed. Always
+        # on, independent of BLIND_AUDIT_ENABLED. Set like the presence citations above so the
+        # reduce gate and must_read_complete below see it undisposed.
+        progress.states[anchor] = NEEDS_RECHECK
     owed = read_reduce(atlas, facts, units)
     extra = [a.unit for a in audits.open]
     if owed and all(

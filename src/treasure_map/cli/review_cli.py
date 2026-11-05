@@ -53,11 +53,17 @@ def review() -> None:
 @click.option("--md", "as_md", is_flag=True, help="Write the whole report as markdown.")
 @click.option("--html", "as_html", is_flag=True, help="Write the whole report as one HTML page.")
 @click.option(
+    "--handoff",
+    "as_handoff",
+    is_flag=True,
+    help="Write the standardized findings hand-off (one block per changed_real finding).",
+)
+@click.option(
     "-o",
     "--output",
     default=None,
     type=click.Path(dir_okay=False, writable=True),
-    help="The file --md / --html writes (required with either).",
+    help="The file --md / --html / --handoff writes (required with any).",
 )
 @click.option(
     "--atlas",
@@ -70,6 +76,7 @@ def report(
     k: int | None,
     as_md: bool,
     as_html: bool,
+    as_handoff: bool,
     output: str | None,
     atlas_db: str | None,
 ) -> None:
@@ -81,12 +88,15 @@ def report(
     from treasure_map.lib.query import review_units as ru
     from treasure_map.version import installed_commit
 
-    if as_md and as_html:
-        raise click.UsageError("pass one of --md / --html")
-    if (as_md or as_html) and output is None:
-        raise click.UsageError("--md / --html write a file: pass -o <file>")
-    if output is not None and not (as_md or as_html):
-        raise click.UsageError("-o names the file --md / --html writes: pass one of them")
+    file_flags = sum((as_md, as_html, as_handoff))
+    if file_flags > 1:
+        raise click.UsageError("pass one of --md / --html / --handoff")
+    if file_flags and output is None:
+        raise click.UsageError("--md / --html / --handoff write a file: pass -o <file>")
+    if output is not None and not file_flags:
+        raise click.UsageError(
+            "-o names the file a format writes: pass one of --md / --html / --handoff"
+        )
     atlas, _ = _resolve_mcp_target(atlas_db, None)
     if not Path(atlas).is_file():
         raise click.ClickException(f"no atlas at {atlas}: pass --atlas <path to atlas.db>")
@@ -99,6 +109,23 @@ def report(
                 ", see tmap runs)"
             )
         run_a, run_b = runs
+        if as_handoff:
+            assert output is not None
+            from treasure_map.lib import rescan_version
+            from treasure_map.lib.analyze.ghidra_runner import current_pass_version
+            from treasure_map.lib.config.config import load_config
+
+            # The same staleness context the MCP get_diff_handoff builds (installed_commit for the
+            # same commit), so the file and the tool's pages are the same text (B-4(d)).
+            stamp = rr.HandoffStamp(
+                build_hash=current_pass_version(),
+                current=rescan_version.current_code_stamp(load_config()),
+                commit=installed_commit(),
+            )
+            text = rr.handoff_document(conn, run_pair, stamp=stamp)
+            Path(output).write_text(text, encoding="utf-8")
+            click.echo(f"wrote {output} ({len(rr.handoff_findings(conn, run_pair))} findings)")
+            return
         staleness = ru.pair_staleness(conn, run_a, run_b)
         commit = installed_commit()
         reading = ru.review_pair(
@@ -343,7 +370,8 @@ def judge(
     "emit_to",
     default=None,
     type=click.Path(dir_okay=False),
-    help="Write the audit worksheet (the open audits and the disagreements) here.",
+    help="Write the audit worksheet (the disagreements to settle, and open audits when blind "
+    "auditing is enabled) here.",
 )
 @click.option(
     "--apply",
@@ -357,10 +385,11 @@ def judge(
 def audit(
     run_pair: str, emit_to: str | None, apply_from: str | None, by: str, atlas_db: str | None
 ) -> None:
-    """The pair's audit worksheet: --emit writes the judgements owed a second reading and the
-    disagreements a person settles; fill in verdict / rationale / checked / why_unchanged /
-    evidence / change_kind for the ones you judge, then --apply it. Each filled item goes through
-    the same checks as any judgement: one that fails is reported and not written."""
+    """The pair's audit worksheet: --emit writes the disagreements a person settles (and, when
+    blind auditing is enabled, the judgements owed a second reading); fill in verdict / rationale /
+    checked / why_unchanged / evidence / change_kind for the ones you judge, then --apply it. Each
+    filled item goes through the same checks as any judgement: one that fails is reported and not
+    written."""
     import json
 
     from treasure_map.lib import overlay
@@ -529,6 +558,14 @@ def worksheet(conn: sqlite3.Connection, reading: Any, run_pair: str) -> dict[str
     type=click.IntRange(0, None),
     help="How many first entries of each diff are must-read (default 4).",
 )
+@click.option(
+    "--handoff",
+    "handoff_out",
+    default=None,
+    type=click.Path(dir_okay=False, writable=True),
+    help="After the review is done, launch one agent to write the findings hand-off here "
+    "(claude-code only this version).",
+)
 @click.option("--atlas", "atlas_db", default=None, help="Atlas DB path.")
 def run(
     run_pair: str,
@@ -541,6 +578,7 @@ def run(
     worker: int | None,
     workers: int | None,
     k: int | None,
+    handoff_out: str | None,
     atlas_db: str | None,
 ) -> None:
     """Review RUN_PAIR unit by unit, one launch of your agent per unit: tmap runs the loop and
@@ -559,6 +597,13 @@ def run(
         preset = rd.preset_or_template(agent)
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
+    if handoff_out is not None and preset.name not in rd.HANDOFF_PRESETS:
+        # Fail before driving — B-5: an experimental preset's result is read differently and is not
+        # supported this version, so the hand-off is refused, never attempted and silently empty.
+        raise click.UsageError(
+            f"--handoff can only write from the claude-code preset this version; {preset.name!r} "
+            "is experimental and prints its result another way"
+        )
     conn, run_a, run_b, atlas = _open(atlas_db, run_pair)
     staleness = ru.pair_staleness(conn, run_a, run_b)
     conn.close()
@@ -603,5 +648,25 @@ def run(
         click.echo(f"  failed {f['unit_id']} ({f['kind']}): {f['written']}/{f['members']} written")
     if result.statement:
         click.echo(result.statement)
+    if handoff_out is not None:
+        if result.stopped != "no unit left" or result.failed:
+            click.echo(
+                f"hand-off skipped: the review is not done ({result.stopped}); re-run without a "
+                "limit, then write the hand-off"
+            )
+        else:
+            click.echo(f"writing the findings hand-off with {preset.name} …")
+            ho = rd.run_handoff(
+                preset,
+                atlas_path=Path(atlas),
+                run_pair=run_pair,
+                workdir=workdir,
+                out_file=Path(handoff_out),
+                timeout=deadline,
+            )
+            if ho["ok"]:
+                click.echo(f"wrote {ho['out_file']} ({ho['bytes']} bytes)")
+            else:
+                click.echo(f"hand-off failed: {ho['error']}")
     if result.failed:
         raise SystemExit(3)

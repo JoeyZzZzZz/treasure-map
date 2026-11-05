@@ -30,9 +30,60 @@ from typing import Any
 
 from treasure_map.lib import tool_call_log as tcl
 
-# Tools whose answer carries the judgements themselves: having called one makes a shadow
-# judgement not blind.
+# Blind-read whitelist (G): the ONLY tools whose answer is proven free of any judgement — no
+# verdict, review_state, verdict_shape or annotation block — so having called one keeps a shadow
+# judgement blind. FAIL-CLOSED: every other tool, including list_overlays, the verdict-carrying
+# views (get_diff_patch_view, get_diff_sink_overlay, list_diffs), start_diff_review's pair overview,
+# and any tool not listed here (new ones included), makes a shadow NOT blind. A blocklist could not
+# say this and could not tell apart the two calls below, which turn on a parameter. The members are
+# proven leak-free by tests/unit/lib/test_read_basis.py; adding one without that proof is a bug.
+BLIND_SAFE_TOOLS = frozenset(
+    {
+        "get_pseudocode",
+        "get_disassembly",
+        "get_callees",
+        "get_xrefs",
+        "get_strings",
+        "get_data_bytes",
+        "get_data_table",
+        "get_sink_provenance",
+        "get_imports_exports",
+        "get_function_alignment",
+        "get_functions_referencing_string",
+        "get_string_reference_anchors",
+        "get_string_keyed_edges",
+        "get_nvram_key_flow",
+        "get_script_callsites",
+        "launched_by",
+        "pattern_density",
+        "cross_firmware_patterns",
+        "same_shape_siblings",
+        "get_diff_meta",
+        "get_diff_deltas",
+        "get_diff_string_delta",
+        "list_runs",
+        "legal_notice",
+        "get_tool_reference",
+    }
+)
+# Kept for callers that still name it (the blocklist is now the whitelist's complement).
 VERDICT_READERS = frozenset({"list_overlays"})
+
+
+def _blind_safe(line: dict[str, Any]) -> bool:
+    """Whether one logged call keeps a shadow blind. Two tools turn on a parameter:
+    start_diff_review is safe only when it names a ``unit`` (that unit's material, the verdict
+    hidden) and not for the pair overview (which carries review_state and the annotation block);
+    list_candidates is never safe with ``overlay`` true (it then shows the scan's own verdicts)."""
+    tool = line.get("tool")
+    params = line.get("params") or {}
+    if tool == "start_diff_review":
+        return params.get("unit") is not None
+    if tool == "list_candidates":
+        return not params.get("overlay")
+    return tool in BLIND_SAFE_TOOLS
+
+
 _FETCH_BY_FUNCTION = frozenset({"get_pseudocode", "get_disassembly", "get_callees"})
 _HEX = re.compile(r"(?<![0-9A-Za-z])(?:0x)?([0-9a-fA-F]{4,})(?![0-9A-Za-z])")
 
@@ -107,9 +158,12 @@ def blind(
     lines: list[dict[str, Any]] | None, write_session: str | None, session: str | None
 ) -> bool:
     """Whether a shadow judgement written now is blind: its session wrote neither the judgement it
-    audits nor read the overlay's verdicts before. Without a log it cannot be shown blind."""
+    audits nor read anything that carries a verdict before. Without a log it cannot be shown blind.
+    FAIL-CLOSED: blind only when EVERY call the session made is on the blind-read whitelist
+    (:func:`_blind_safe`); one call to anything else — list_overlays, a verdict-carrying view, or
+    any unlisted tool — makes it not blind."""
     if lines is None or session is None:
         return False
     if write_session is not None and write_session == session:
         return False
-    return not any(ln.get("tool") in VERDICT_READERS for ln in lines)
+    return all(_blind_safe(ln) for ln in lines)

@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib import tool_call_log as tcl
+from treasure_map.lib.query import review_report as _rr
 from treasure_map.lib.query import review_units as ru
 
 DEFAULT_TIMEOUT = 15 * 60
@@ -82,7 +83,10 @@ PRESETS: dict[str, Preset] = {
             "--no-session-persistence",
             "{prompt}",
         ),
-        blind_argv=("--disallowedTools", f"mcp__{SERVER_NAME}__list_overlays"),
+        # One token with ``=`` — ``--disallowedTools mcp__…`` as two tokens is parsed greedily and
+        # swallows the prompt that follows it (A-4); ``--disallowedTools=mcp__…`` binds just the one
+        # value and leaves the prompt a clean positional.
+        blind_argv=(f"--disallowedTools=mcp__{SERVER_NAME}__list_overlays",),
         note=(
             '--allowedTools only skips confirmation; --tools "" switches every built-in tool '
             'off and --setting-sources "" loads no user or project settings'
@@ -193,8 +197,11 @@ class Launch:
     output: str = ""
 
 
-def run_agent(argv: Sequence[str], *, cwd: Path, timeout: float) -> Launch:
-    """Run one agent launch in its own process group, killed whole at ``timeout``."""
+def run_agent(argv: Sequence[str], *, cwd: Path, timeout: float, keep_full: bool = False) -> Launch:
+    """Run one agent launch in its own process group, killed whole at ``timeout``. A per-unit
+    launch keeps only the tail of the output (the judgement is read from the overlay history, not
+    the text); the hand-off launch (``keep_full``) keeps all of it, because the driver reads the
+    finished document out of it — the agent, with every built-in tool off, cannot write a file."""
     env = {k: v for k, v in os.environ.items() if k not in _PARENT_AGENT_ENV}
     t0 = time.monotonic()
     proc = subprocess.Popen(  # noqa: S603 — the user's own agent command line
@@ -208,7 +215,9 @@ def run_agent(argv: Sequence[str], *, cwd: Path, timeout: float) -> Launch:
     )
     try:
         out, _ = proc.communicate(timeout=timeout)
-        return Launch(proc.returncode, time.monotonic() - t0, False, out[-4000:])
+        return Launch(
+            proc.returncode, time.monotonic() - t0, False, out if keep_full else out[-4000:]
+        )
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -252,30 +261,41 @@ def probe(
     timeout: float,
     runner: Callable[..., Launch] = run_agent,
 ) -> ProbeResult:
-    """One launch that must reach a tmap tool (list_runs, seen in the tool-call log) and must fail
-    to create a file with a built-in tool (the marker file must not exist after it)."""
+    """Each launch must reach a tmap tool (list_runs, seen in the tool-call log) and must fail to
+    create a file with a built-in tool (the marker file must not exist after it). A preset with
+    ``blind_argv`` is probed twice — once plain, once blind — so the blind argv is proven not to
+    swallow the prompt (A-4: the blind launch still reaches a tmap tool). The result combines both:
+    reached / blocked hold only when every launch did."""
     marker = workdir / "probe_marker.txt"
-    marker.unlink(missing_ok=True)
-    started = time.time()
     prompt = (
         "This is a check of your tool set, nothing else. Step 1: call the tmap tool list_runs. "
         f"Step 2: if you have any tool that writes files or runs commands, use it to create the "
         f"file {marker} containing the word probe; if you have none, say so. Then stop."
     )
     values = _values(preset, atlas_path, workdir, prompt, "probe", "probe")
-    launch = runner(render(preset, values), cwd=workdir, timeout=timeout)
-    lines = tcl.read_lines(tcl.log_path_for(atlas_path)) or iter(())
-    reached = any(
-        ln.get("tool") == "list_runs" and float(ln.get("ts") or 0) >= started for ln in lines
-    )
-    blocked = not marker.exists()
-    why = []
-    if not reached:
-        why.append("the agent never reached a tmap tool (is the MCP server loaded and allowed?)")
-    if not blocked:
-        why.append("the agent created a file with a built-in tool: built-in tools are not off")
-    if launch.timed_out:
-        why.append("the probe launch hit its deadline")
+    blinds = [False, True] if preset.blind_argv else [False]
+    reached = blocked = True
+    why: list[str] = []
+    launch: Launch | None = None
+    for blind in blinds:
+        marker.unlink(missing_ok=True)
+        started = time.time()
+        launch = runner(render(preset, values, blind=blind), cwd=workdir, timeout=timeout)
+        lines = tcl.read_lines(tcl.log_path_for(atlas_path)) or iter(())
+        r = any(
+            ln.get("tool") == "list_runs" and float(ln.get("ts") or 0) >= started for ln in lines
+        )
+        b = not marker.exists()
+        tag = " (blind)" if blind else ""
+        if not r:
+            why.append(
+                f"the agent never reached a tmap tool{tag} (is the MCP server loaded and allowed?)"
+            )
+        if not b:
+            why.append(f"the agent created a file with a built-in tool{tag}: built-in tools are on")
+        if launch.timed_out:
+            why.append(f"the probe launch{tag} hit its deadline")
+        reached, blocked = reached and r, blocked and b
     return ProbeResult(reached and blocked, reached, blocked, "; ".join(why) or "ok", launch)
 
 
@@ -436,3 +456,78 @@ def drive(
             )
             break
     return out
+
+
+# ── the findings hand-off launch (B-5) ──────────────────────────────────────────────────────────
+# A FINAL launch, run once the review is done (no unit left): one agent reads the whole findings
+# skeleton through the MCP tool get_diff_handoff, fills the analysis placeholders and prints the
+# finished document. Its full output is kept and the driver reads the document out of it — the
+# agent, with every built-in tool off, cannot write a file. Only claude-code's result is extracted
+# this version; an experimental preset is refused, never served a silent miss.
+HANDOFF_PRESETS = frozenset({"claude-code"})
+
+
+def handoff_prompt(run_pair: str) -> str:
+    """The hand-off agent's prompt (B-7): read the skeleton, fill hypotheses and device checks,
+    print the whole document — and the boundary, never a working attack."""
+    return (
+        f"You are writing the findings hand-off for the firmware version diff {run_pair} with the "
+        "tmap tools. tmap draws no conclusion: the analysis is yours, and it is unverified. "
+        f'1. Page the whole skeleton: get_diff_handoff(run_pair="{run_pair}", offset=0), then '
+        "follow next_offset until it is null (re-start from offset 0 if findings_digest changes). "
+        "2. It has one block per finding, each with tmap's facts and two analysis placeholders. "
+        "Under 'agent analysis — unverified hypotheses' write your unverified hypotheses; under "
+        "'to check on a device' write concrete things a person could verify on a device. Keep "
+        "every other line as it is. 3. Print the COMPLETE document — every block, in order — as "
+        "your final message, and nothing else. " + _rr.HANDOFF_BOUNDARY
+    )
+
+
+def extract_handoff(preset: Preset, launch: Launch) -> tuple[str | None, str | None]:
+    """The finished document from a hand-off launch's output, or ``(None, error)``. claude-code
+    prints ``--output-format json`` whose ``result`` is the agent's final message; other presets
+    print it differently and are not supported this version (B-5) — refused, never a silent miss."""
+    if preset.name not in HANDOFF_PRESETS:
+        return None, (
+            f"the hand-off reads the finished document from the launch output, which only the "
+            f"claude-code preset is supported for this version; {preset.name!r} is experimental "
+            "and prints its result another way"
+        )
+    try:
+        data = json.loads(launch.output)
+    except (TypeError, ValueError) as exc:
+        return None, f"the launch did not print the expected JSON result ({exc})"
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(result, str) or not result.strip():
+        return None, "the launch's JSON carried no 'result' text"
+    return result, None
+
+
+def run_handoff(
+    preset: Preset,
+    *,
+    atlas_path: Path,
+    run_pair: str,
+    workdir: Path,
+    out_file: Path,
+    timeout: float = DEFAULT_TIMEOUT,
+    runner: Callable[..., Launch] = run_agent,
+) -> dict[str, Any]:
+    """Launch the hand-off agent and write the document it prints to ``out_file``. The agent reads
+    only through get_diff_handoff; its full output is kept (``keep_full``) and the document read out
+    of it. An experimental preset is refused before the launch (B-5)."""
+    if preset.name not in HANDOFF_PRESETS:
+        return {"ok": False, "error": extract_handoff(preset, Launch(0, 0.0, False))[1]}
+    values = _values(preset, atlas_path, workdir, handoff_prompt(run_pair), "handoff", run_pair)
+    launch = runner(render(preset, values), cwd=workdir, timeout=timeout, keep_full=True)
+    if launch.timed_out:
+        return {
+            "ok": False,
+            "error": "the hand-off launch hit its deadline",
+            "seconds": launch.seconds,
+        }
+    document, err = extract_handoff(preset, launch)
+    if document is None:
+        return {"ok": False, "error": err}
+    out_file.write_text(document, encoding="utf-8")
+    return {"ok": True, "out_file": str(out_file), "bytes": len(document)}

@@ -51,6 +51,7 @@ _EXPECTED_TOOLS = {
     "same_shape_siblings",
     "get_diff_meta",
     "get_diff_string_delta",
+    "get_diff_handoff",
     "get_function_alignment",
     "get_diff_capabilities",
     "list_diffs",

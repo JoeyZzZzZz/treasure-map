@@ -140,11 +140,13 @@ def test_a_unit_judged_in_part_is_not_done(tmp_path: Path) -> None:
     assert result.units_done == result.units_tried - 1
 
 
-def test_an_audit_unit_is_launched_blind(tmp_path: Path) -> None:
+def test_an_audit_unit_is_launched_blind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """★ An audit unit's launch carries the preset's blind arguments (list_overlays denied) and
-    its prompt says it is an audit.
+    its prompt says it is an audit. (Blind auditing is sealed by default; this test turns it on so
+    an audit unit is produced to launch.)
 
     MUTATION (verified RED): render every launch alike -> RED."""
+    monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
     w = _world(tmp_path)
     _drive(w, tmp_path, _agent(w), max_units=50)  # everything judged first
     anchor = next(m.anchor_ref for u in _units(w).values() for m in u.members if m.kind == "entry")
@@ -191,6 +193,31 @@ def test_the_probe_needs_tmap_reached_and_builtin_tools_off(
     assert (got.tmap_reached, got.builtin_blocked) == (reach, not write_file)
 
 
+def test_a_preset_with_blind_argv_is_probed_blind_too(tmp_path: Path) -> None:
+    """★ A-4 / acceptance 12: a preset carrying blind_argv is probed twice — once plain, once with
+    the blind argv — so the blind launch is proven to still reach a tmap tool (the blind argv did
+    not swallow the prompt). A preset with no blind_argv is probed once.
+
+    MUTATION (verified RED): probe only once -> the blind launch never runs -> RED."""
+    atlas = tmp_path / "atlas.db"
+    launches: list[list[str]] = []
+
+    def agent(argv: list[str], *, cwd: Path, timeout: float) -> rd.Launch:
+        launches.append(list(argv))
+        tcl.ToolCallLog(tcl.log_path_for(atlas)).record("list_runs", {}, {"runs": []})
+        return rd.Launch(0, 0.0, False)
+
+    got = rd.probe(PRESET, atlas_path=atlas, workdir=tmp_path, timeout=5, runner=agent)
+    assert got.ok is True
+    assert len(launches) == 2
+    assert sum("--deny" in argv for argv in launches) == 1  # exactly one blind launch
+
+    launches.clear()
+    plain = rd.Preset("plain", ("agent", "{prompt}"))  # no blind_argv
+    rd.probe(plain, atlas_path=atlas, workdir=tmp_path, timeout=5, runner=agent)
+    assert len(launches) == 1
+
+
 def test_a_launch_past_its_deadline_is_killed_whole(tmp_path: Path) -> None:
     """A launch past its deadline is killed with its process group: it reads timed out, and a
     child it started does not outlive it.
@@ -233,7 +260,9 @@ def test_the_claude_preset_switches_builtin_tools_off_and_loads_only_tmap() -> N
     assert "--strict-mcp-config" in argv and argv[argv.index("--mcp-config") + 1] == "/m.json"
     assert argv[argv.index("--allowedTools") + 1] == "mcp__treasure-map__*"
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
-    assert argv[argv.index("--disallowedTools") + 1] == "mcp__treasure-map__list_overlays"
+    # One token with '=' (A-4): the two-token form is parsed greedily and swallows the prompt.
+    assert "--disallowedTools=mcp__treasure-map__list_overlays" in argv
+    assert "--disallowedTools" not in argv
     assert argv[-1] == "P"
     assert not rd.PRESETS["claude-code"].experimental and rd.PRESETS["codex"].experimental
 

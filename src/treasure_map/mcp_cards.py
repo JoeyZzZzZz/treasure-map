@@ -535,6 +535,26 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "next_offset); get_diff_meta carries the counts."
         ),
     ),
+    "get_diff_handoff": ToolCard(
+        required=("run_pair",),
+        example='get_diff_handoff(run_pair="<run_a>::<run_b>")',
+        boundary=(
+            "tmap draws no conclusion here",
+            "a cell it cannot read states its reason",
+            "the status stays awaiting human verification",
+        ),
+        summary=(
+            "A standardized hand-off of a run pair's changed_real findings, one block per finding, "
+            "paged by offset. Each block carries the recorded judgment, tmap's facts for the "
+            "finding's subject shape (the change, the reachable shape, the same-shape siblings) "
+            "and two analysis placeholders a person fills. tmap draws no conclusion here: a cell "
+            "it cannot read states its reason, never blank. Blocks are in a fixed order "
+            "(anchor_ref); "
+            "follow next_offset. The pages concatenated are the file tmap review report --handoff "
+            "writes; re-fetch from offset 0 if findings_digest changes. the status stays awaiting "
+            "human verification."
+        ),
+    ),
     "get_function_alignment": ToolCard(
         required=("diff_id", "function"),
         aliases={"addr": "function"},
@@ -863,7 +883,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "rationale is required except for no_real_change (it defaults to why_unchanged). "
             "group_ref records a same-shape group the judgment leaned on; change_kind what a "
             "changed_real does. unit_id (a work unit from start_diff_review(run_pair)) returns "
-            "the next one; on an audit unit the judgment is a shadow. One judgment per "
+            "the next one, read at the session's k. One judgment per "
             "anchor: re-annotating OVERWRITES. Many entries at once: annotate_diff_batch."
         ),
     ),
@@ -1124,7 +1144,13 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
     _param(
         "run_pair",
         "two runs, {run_a}::{run_b}",
-        ("get_file_diff", "annotate_diff", "annotate_diff_batch", "start_diff_review"),
+        (
+            "get_file_diff",
+            "get_diff_handoff",
+            "annotate_diff",
+            "annotate_diff_batch",
+            "start_diff_review",
+        ),
         _CONSISTENT,
     ),
     _param(
@@ -1300,6 +1326,7 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             "get_diff_deltas",
             "get_diff_sink_overlay",
             "get_diff_string_delta",
+            "get_diff_handoff",
             "get_file_diff",
             "cross_firmware_patterns",
             "pattern_density",

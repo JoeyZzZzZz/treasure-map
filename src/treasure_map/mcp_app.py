@@ -91,6 +91,7 @@ from treasure_map.lib.query import malformed_filter_refusal as _malformed_filter
 from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
 from treasure_map.lib.query import refs_in_ledger as _refs_in_ledger
+from treasure_map.lib.query import review_report as _rr
 from treasure_map.lib.query import review_units as _ru
 from treasure_map.lib.query import run_staleness as _run_staleness
 from treasure_map.lib.query import runs_where_function_exists as _runs_where_function_exists
@@ -166,6 +167,12 @@ _MAX_LIMIT = 200
 # of those is what this constant is set against, and it does not promise that every client keeps
 # a page inline.
 _RESPONSE_BYTE_BUDGET = 48_000
+
+# The findings hand-off blocks of a run pair, cached in the process so paging get_diff_handoff does
+# not rebuild every diff's view per page (B-4). Keyed by the pair; the value is (digest, blocks),
+# the digest the count and newest updated_at of the pair's changed_real judgements — a new judgement
+# changes it and the blocks are rebuilt. ``blocks[0]`` is the header, then one block per finding.
+_HANDOFF_CACHE: dict[str, tuple[str, list[str]]] = {}
 
 # D33: the default for a refusal's ``moved`` argument meaning "compute _server_code_moved here".
 # A tool that already probed the disk for its ``server`` head passes the value in instead, so the
@@ -441,7 +448,8 @@ _PAIR_WORKFLOW = (
     "judge each member with annotate_diff(anchor_ref, verdict, ..., diff_id=<its diff>) — or "
     "annotate_diff_batch for a batch, run_pair=... for a binary_presence binary or a file — then "
     "call start_diff_review(run_pair) again: the next unit follows. The report counts what is "
-    "disposed; an unjudged member is UNREAD, which is not 'nothing found'."
+    "disposed; an unjudged member is UNREAD, which is not 'nothing found'. Once the review is "
+    "done, get_diff_handoff(run_pair) pages a standardized hand-off of the changed_real findings."
 )
 _HEADLINE_WITHHELD = "diff_undetermined (meta.banners)"
 _HEADLINE_NONE = "no listed entry"
@@ -641,14 +649,18 @@ _AGENT_GUIDE = (
     "review report <run_pair> prints the same summary and --md / --html write every unit. "
     "Name the unit you judge (annotate_diff(..., unit_id=...)): the answer carries the next one, "
     "and every write is kept in the overlay's history with what this session read before it. A "
-    "no_real_change, a change_inconclusive, or a judgment written before anything of its subject "
-    "was read opens an audit unit: another session reads it blind (its write is a shadow, the "
-    "current judgment unchanged) — a different reading is a disagreement, settled by a person "
-    "(tmap review judge / tmap review audit). Open audits and disagreements hold "
-    "must_read_complete false. A callee_group unit holds the entries that newly call one "
+    "judgment written before anything of its subject was read reads needs_recheck (re-read, not "
+    "disposed) until a later judgment written after reading it; a judgment a second session "
+    "overwrites with a different verdict is a disagreement, settled by a person (tmap review judge "
+    "/ tmap review audit). needs_recheck subjects and disagreements hold must_read_complete false. "
+    "(A blind second reading of a no_real_change / change_inconclusive is sealed off for now.) "
+    "A callee_group unit holds the entries that newly call one "
     "function (its code on both sides given once): judge each with group_ref=<its group_ref>, "
     "and the callee's own entry too; the reduce unit, handed out last, names what still lacks "
-    "it. A reduce owed holds must_read_complete false."
+    "it. A reduce owed holds must_read_complete false. Once the review is done, "
+    "get_diff_handoff(run_pair) pages a standardized hand-off of the changed_real findings — one "
+    "block each, tmap's facts and two placeholders for a person; tmap review report --handoff "
+    "writes the same text to a file."
 )
 
 # What the server sends as its standing instructions: the loop and both entry points, within the
@@ -3665,6 +3677,97 @@ def make_tools(
         finally:
             conn.close()
 
+    def _handoff_blocks(conn: sqlite3.Connection, run_pair: str) -> tuple[str, list[str]]:
+        """The pair's hand-off blocks (header + one per changed_real finding), from the process
+        cache when the pair's changed_real judgements have not moved since, else rebuilt. Returns
+        (digest, blocks)."""
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM overlay "
+            "WHERE anchor_kind = 'diff_subject' AND verdict = 'changed_real' AND run_id = ?",
+            (run_pair,),
+        ).fetchone()
+        digest = f"{row[0]}@{row[1]}"
+        cached = _HANDOFF_CACHE.get(run_pair)
+        if cached is not None and cached[0] == digest:
+            return cached
+        stamp = _rr.HandoffStamp(
+            build_hash=_current_pass_version(), current=_current, commit=_installed_commit()
+        )
+        findings = _rr.handoff_findings(conn, run_pair)
+        blocks = [_rr.handoff_header(run_pair, len(findings))]
+        blocks += [_rr.handoff_chunk(conn, run_pair, f, stamp=stamp) for f in findings]
+        _HANDOFF_CACHE[run_pair] = (digest, blocks)
+        return digest, blocks
+
+    def get_diff_handoff(run_pair: str, offset: int = 0) -> dict[str, Any]:
+        """A standardized hand-off of a run pair's changed_real findings, one block per finding,
+        paged by ``offset`` (a block index) — ``run_pair`` = ``{run_a}::{run_b}`` (see list_runs).
+
+        Each block carries the recorded judgment, tmap's facts for the finding's subject shape
+        (the change, the reachable shape — sink class, size / source kind, one-level callers — and
+        the same-shape unchanged siblings), two analysis placeholders a PERSON fills (unverified
+        hypotheses, device checks) and the status. tmap draws no conclusion here: it states facts,
+        never a reachability or exploitability verdict, and a cell it cannot read states its
+        reason, never blank.
+
+        Blocks are in a fixed order (by anchor_ref); follow ``next_offset`` (null = done). The pages
+        concatenated are byte-for-byte the file ``tmap review report --handoff`` writes. A single
+        block larger than the budget is cut with a note. ``findings_digest`` changes when a
+        judgement is written mid-paging — re-fetch from offset 0 when it does. the status stays
+        awaiting human verification. The pair's files are read through the same stale-run gate as
+        the other pair tools; a stale run is refused."""
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            return {
+                "run_pair": run_pair,
+                "error": f"offset must be an integer >= 0, got {offset!r}",
+            }
+        conn = open_atlas(atlas_path)
+        try:
+            refusal, _runs = _file_pair_gate(conn, run_pair)
+            if refusal is not None:
+                return refusal
+            digest, blocks = _handoff_blocks(conn, run_pair)
+            total = len(blocks)
+            budget = _RESPONSE_BYTE_BUDGET - 2_000  # leaves room for the envelope
+            parts: list[str] = []
+            i = offset
+            cut = False
+            while i < total:
+                block = blocks[i]
+                if not parts and len(block.encode("utf-8")) > budget:
+                    room = max(budget, 1)
+                    kept = block.encode("utf-8")[:room].decode("utf-8", "ignore")
+                    more = len(block.encode("utf-8")) - len(kept.encode("utf-8"))
+                    block = f"{kept}\n[block truncated to fit — {more} more bytes; read it with "
+                    block += "get_diff_patch_view / get_file_diff]\n"
+                    parts.append(block)
+                    i += 1
+                    cut = True
+                    break
+                if parts and len(("".join(parts) + block).encode("utf-8")) > budget:
+                    break
+                parts.append(block)
+                i += 1
+            next_offset = i if i < total else None
+            return {
+                "run_pair": run_pair,
+                "offset": offset,
+                "next_offset": next_offset,
+                "total_blocks": total,
+                "findings": total - 1,  # blocks[0] is the header
+                "findings_digest": digest,
+                "block_truncated": cut,
+                "text": "".join(parts),
+                "note": (
+                    "Concatenate the pages (offset 0 onward) for the whole hand-off — the file "
+                    "`tmap review report --handoff -o <file>` writes. Re-fetch from offset 0 if "
+                    "findings_digest changes between pages (a judgement was written). The analysis "
+                    "placeholders are for a person: " + _rr.HANDOFF_BOUNDARY
+                ),
+            }
+        finally:
+            conn.close()
+
     def get_file_diff(
         run_pair: str,
         kind: str | None = None,
@@ -4593,12 +4696,14 @@ def make_tools(
         worker: Any,
         workers: Any,
         attributed_to: Any,
-    ) -> tuple[dict[str, Any], bool, str | None]:
-        """``(context per anchor, shadow, error)`` of a diff write. A ``unit_id`` (from
-        start_diff_review(run_pair), at the default k) must hold every anchor written; an audit
-        unit's write is a shadow judgement (overlay_history only). ``attributed_to`` takes
-        ``human-via-agent`` only — a person's judgement this agent writes down; a person's own is
-        written on the command line."""
+    ) -> tuple[dict[str, Any], bool, str | None, int]:
+        """``(context per anchor, shadow, error, k)`` of a diff write. A ``unit_id`` (from
+        start_diff_review(run_pair)) must hold every anchor written; an audit unit's write is a
+        shadow judgement (overlay_history only). ``attributed_to`` takes ``human-via-agent`` only —
+        a person's judgement this agent writes down; a person's own is written on the command line.
+        ``k`` is this session's k — the hit unit's k when a unit is named, else the largest k the
+        session asked start_diff_review for; the caller hands it to ``_after_unit_write`` so the
+        next unit and coverage come back at that k (on error it is the default, unused)."""
         from treasure_map.lib.overlay import WriteContext
         from treasure_map.lib.query import read_basis as _rb
 
@@ -4611,17 +4716,28 @@ def make_tools(
                     "down for them); a person records their own with tmap review judge, never "
                     "over MCP"
                 ),
+                _ru.DEFAULT_K,
             )
         if unit_id is None and (worker is not None or workers is not None):
-            return {}, False, "worker / workers go with unit_id (they pick the next unit's shard)"
+            return (
+                {},
+                False,
+                "worker / workers go with unit_id (they pick the next unit's shard)",
+                _ru.DEFAULT_K,
+            )
         if unit_id is not None:
             bad = _pair_review_args(20, worker, workers, None, None)
             if bad is not None:
-                return {}, False, bad
+                return {}, False, bad, _ru.DEFAULT_K
             if not isinstance(unit_id, str) or not unit_id.strip():
-                return {}, False, f"unit_id must be a unit_id from next_unit, got {unit_id!r}"
+                return (
+                    {},
+                    False,
+                    f"unit_id must be a unit_id from next_unit, got {unit_id!r}",
+                    _ru.DEFAULT_K,
+                )
         if runs is None:
-            return {}, False, "the diff names no run pair"
+            return {}, False, "the diff names no run pair", _ru.DEFAULT_K
         lines = _rb.session_lines(call_log)
         session = _session_id()
         reviews: dict[int, Any] = {}
@@ -4639,18 +4755,23 @@ def make_tools(
             return reviews[k]
 
         unit = audit = None
-        k = _ru.DEFAULT_K
+        # The k this write is read at: the default, plus every k this session asked
+        # start_diff_review for. A unit_id does not encode k (kind + anchors), so it can exist at
+        # several k; the write is read at the LARGEST such k the session asked for — fail-closed
+        # (the must-read set, which decides unread_before_verdict, only grows with k, so the
+        # largest k flags the most writes unread, and the next unit / coverage come back at the k
+        # the session is working at, e.g. k=8 not the default). With no unit named, the largest k.
+        ks = [_ru.DEFAULT_K]
+        for ln in lines or []:
+            kk = (ln.get("params") or {}).get("k")
+            if ln.get("tool") == "start_diff_review" and isinstance(kk, int) and kk not in ks:
+                ks.append(kk)
+        k = max(ks)
         if unit_id is not None:
-            # A unit is cut for one k: the default, or one this session asked start_diff_review for.
-            ks = [_ru.DEFAULT_K]
-            for ln in lines or []:
-                kk = (ln.get("params") or {}).get("k")
-                if ln.get("tool") == "start_diff_review" and isinstance(kk, int) and kk not in ks:
-                    ks.append(kk)
-            for k in ks:
+            found = [cand for cand in ks if review(cand).unit(unit_id) is not None]
+            if found:
+                k = max(found)
                 unit = review(k).unit(unit_id)
-                if unit is not None:
-                    break
             if unit is None:
                 return (
                     {},
@@ -4660,11 +4781,12 @@ def make_tools(
                         "the current ones; a unit cut with another k is found when this session "
                         "asked for that k)"
                     ),
+                    _ru.DEFAULT_K,
                 )
             members = {m.anchor_ref for m in unit.members}
             stray = [a for a in anchors if a not in members]
             if stray:
-                return {}, False, f"unit {unit_id} does not hold {stray[:3]}"
+                return {}, False, f"unit {unit_id} does not hold {stray[:3]}", k
             audit = review(k).audit_of(unit_id)
         unit_anchors = [(m.anchor_ref, m.entry_id) for m in unit.members] if unit else []
         out: dict[str, Any] = {}
@@ -4682,7 +4804,7 @@ def make_tools(
                 if rb["basis"] == "none":
                     must = {
                         m.anchor_ref
-                        for u in review().units
+                        for u in review(k).units
                         if u.must_read and u.kind != _ru.AUDIT
                         for m in u.members
                     }
@@ -4692,17 +4814,20 @@ def make_tools(
             out[anchor] = WriteContext(
                 channel="mcp", unit_id=unit_id, read_basis=rb, session=session
             )
-        return out, audit is not None, None
+        return out, audit is not None, None, k
 
     def _after_unit_write(
-        atlas: sqlite3.Connection, runs: Any, worker: Any, workers: Any
+        atlas: sqlite3.Connection, runs: Any, worker: Any, workers: Any, k: int
     ) -> dict[str, Any]:
         """The next unit of the shard after a write that named its unit — or, when none is left,
-        the report's coverage_statement."""
+        the report's coverage_statement. Read at ``k`` (the writing session's k, from
+        ``_write_plan``) so the next unit and coverage match the units this session was handed, not
+        always the default k."""
         review = _ru.review_pair(
             atlas,
             runs[0],
             runs[1],
+            k=k,
             pair_staleness={"source_stale": False, "source_stale_reason": None},
             server_commit=_server_base.get("commit"),
         )
@@ -4792,13 +4917,13 @@ def make_tools(
 
         ``change_kind`` (changed_real only): what the change does, one or more of sink_removed /
         sink_replaced / guard_added / constant_changed / restructured / unknown. ``unit_id`` (from
-        start_diff_review(run_pair), default k) names the work unit this judges — every anchor
-        written must be its member; the answer then carries the next unit of the shard
-        (``worker`` / ``workers``), or the coverage_statement when none is left. On an ``audit``
-        unit the judgment is a shadow: recorded in the history only, the current one unchanged.
-        Every write is recorded in the overlay's history with what this session read before it
-        (``read_basis``). ``attributed_to='human-via-agent'`` marks a person's judgment you write
-        down for them."""
+        start_diff_review(run_pair)) names the work unit this judges — every anchor written must be
+        its member; the answer then carries the next unit of the shard (``worker`` / ``workers``),
+        or the coverage_statement when none is left, read at the session's k. Every write is
+        recorded in the overlay's history with what this session read before it (``read_basis``); a
+        judgment written before anything of its subject was read reads ``needs_recheck`` (re-read,
+        not disposed) until a later one written after reading it.
+        ``attributed_to='human-via-agent'`` marks a person's judgment you write down for them."""
         supplied = {
             "checked": checked,
             "why_unchanged": why_unchanged,
@@ -4823,7 +4948,7 @@ def make_tools(
             if refusal is not None:
                 return refusal
             runs = _pair_of(atlas, diff_id, run_pair)
-            ctxs, shadow, bad = _write_plan(
+            ctxs, shadow, bad, unit_k = _write_plan(
                 atlas,
                 runs,
                 [anchor_ref],
@@ -4853,7 +4978,9 @@ def make_tools(
             if group_ref is not None and not shadow:
                 group_echo = _diff_group_echo(atlas, res.id)
             after_unit = (
-                _after_unit_write(atlas, runs, worker, workers) if unit_id is not None else None
+                _after_unit_write(atlas, runs, worker, workers, unit_k)
+                if unit_id is not None
+                else None
             )
         finally:
             atlas.close()
@@ -4962,7 +5089,7 @@ def make_tools(
                 for item in annotations
                 if isinstance(item, dict) and isinstance(item.get("anchor_ref"), str)
             ]
-            ctxs, shadow, bad = _write_plan(
+            ctxs, shadow, bad, unit_k = _write_plan(
                 atlas,
                 runs,
                 item_anchors,
@@ -5152,7 +5279,7 @@ def make_tools(
                     "current judgments are unchanged"
                 )
             if unit_id is not None:
-                out.update(_after_unit_write(atlas, runs, worker, workers))
+                out.update(_after_unit_write(atlas, runs, worker, workers, unit_k))
             return out
         finally:
             atlas.close()
@@ -5452,6 +5579,7 @@ def make_tools(
         "same_shape_siblings": same_shape_siblings,
         "get_diff_meta": get_diff_meta,
         "get_diff_string_delta": get_diff_string_delta,
+        "get_diff_handoff": get_diff_handoff,
         "get_function_alignment": get_function_alignment,
         "get_diff_capabilities": get_diff_capabilities,
         "list_diffs": list_diffs,

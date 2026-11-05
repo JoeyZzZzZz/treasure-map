@@ -28,6 +28,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
 from treasure_map import mcp_app
 from treasure_map.lib import overlay
 from treasure_map.lib.query import patch_view as pv
+from treasure_map.lib.query import read_basis as rb
 from treasure_map.lib.query import review_units as ru
 
 
@@ -347,14 +348,18 @@ def test_a_unit_id_is_its_kind_members_and_predicate_and_shards_partition_the_un
 # ── disposal, next unit, the report ─────────────────────────────────────────────────────────
 
 
-def test_a_judged_member_is_disposed_and_the_next_unit_moves_on(world: World) -> None:
+def test_a_judged_member_is_disposed_and_the_next_unit_moves_on(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """★ The next unit is the first in the hand-out order with a member not disposed; a judgement
     (concluded or change_inconclusive) disposes it. must_read_complete needs the must-read units
-    only — the second tier keeps ``complete`` false, not it.
+    only — the second tier keeps ``complete`` false, not it. (Blind auditing is sealed by default;
+    this test turns it on — see test_blind_audit_is_sealed_off_by_default for the gate itself.)
 
     MUTATION (verified RED): count change_inconclusive as not disposed -> RED; let the second tier
     hold must_read_complete -> RED; hand a session the audit of its own judgement -> RED; let an
     open audit leave must_read_complete true -> RED."""
+    monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
     r = _review(world, k=0)
     first = r.next_unit()
     assert first is not None and first.members[0].entry_id == "pair:00001000:00001000"
@@ -581,14 +586,16 @@ def _nrc(anchor: str) -> dict[str, Any]:
 
 
 def test_a_no_real_change_is_audited_blind_and_an_agreeing_reading_closes_it(
-    world: World,
+    world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """★ A no_real_change opens an audit unit (its member read without its state); a shadow from
     the session that wrote it is not blind and closes nothing; a blind shadow that agrees closes
-    it, and must_read_complete is no longer held by it.
+    it, and must_read_complete is no longer held by it. (Blind auditing is sealed by default; this
+    test turns it on.)
 
     MUTATION (verified RED): open no audit on no_real_change -> RED; count a non-blind shadow ->
     the writer's own shadow closes it -> RED."""
+    monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
     world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
     r = _review(world, k=0)
     assert len(r.audits.open) == 1
@@ -655,6 +662,83 @@ def test_an_overwrite_by_another_session_is_a_disagreement(world: World) -> None
     assert found[0]["before"] == "changed_real"
 
 
+def test_judged_unread_is_needs_recheck(world: World) -> None:
+    """★ A-2(2), always on while blind auditing is sealed: a subject whose LATEST write was made
+    unread (read_basis ``unread_before_verdict``) reads NEEDS_RECHECK and holds must_read_complete,
+    and opens no blind audit. (a) unread -> NEEDS_RECHECK; (b) a later read-first write clears it;
+    (c) a later unread write keeps it; (d) re-reading the pair without a new write keeps it.
+
+    MUTATION (verified RED): skip the needs_recheck append -> (a) RED; read the flag off any write
+    rather than the latest -> (b) RED; drop needs_recheck from must_read_complete -> RED."""
+    unread = overlay.WriteContext(
+        channel="mcp", session="w", read_basis={"basis": "none", "unread_before_verdict": True}
+    )
+    read_first = overlay.WriteContext(channel="mcp", session="w", read_basis={"basis": "fetched"})
+    # (a) judged unread -> needs recheck, no blind audit
+    world.judge(DX, A1, "changed_real", ctx=unread)
+    r = _review(world, k=0)
+    assert A1 in r.audits.needs_recheck and r.audits.open == []
+    assert r.progress.states[A1] == ru.NEEDS_RECHECK
+    assert r.report["must_read_complete"] is False
+    assert r.report["needs_recheck"]["count"] == 1 and A1 in r.report["needs_recheck"]["subjects"]
+    # (d) reading the pair again (no new write) keeps it
+    assert A1 in _review(world, k=0).audits.needs_recheck
+    # (b) a later read-first write clears it (the latest write is no longer unread)
+    world.judge(DX, A1, "changed_real", ctx=read_first)
+    assert A1 not in _review(world, k=0).audits.needs_recheck
+    # (c) a later unread write brings it back
+    world.judge(DX, A1, "changed_real", ctx=unread)
+    assert A1 in _review(world, k=0).audits.needs_recheck
+
+
+def test_the_report_says_audits_off_while_blind_auditing_is_sealed(world: World) -> None:
+    """★ A-3: with blind auditing sealed (the default), audits.open is null with status
+    'audits off' (not 0, which would read as 'audited, none open'); the coverage statement says
+    'open audits off' and carries the real needs-recheck count.
+
+    MUTATION (verified RED): report len(audits.open) while sealed -> open is 0 not null -> RED;
+    leave the statement saying 'open audits 0' -> RED."""
+    r = _review(world, k=0)
+    assert r.report["audits"]["open"] is None
+    assert r.report["audits"]["status"] == "audits off"
+    assert "open audits off" in r.report["coverage_statement"]
+    assert "needs recheck 0" in r.report["coverage_statement"]
+
+
+def test_the_blind_read_whitelist_excludes_views_that_carry_a_verdict(world: World) -> None:
+    """★ G, soundness: the blind-read whitelist is grounded in real responses. get_diff_patch_view's
+    answer on a judged entry really carries review_state and the verdict, so it is NOT blind-read
+    safe; the fact tool it is nearest (get_diff_meta) carries neither and is.
+
+    MUTATION (verified RED): add get_diff_patch_view to BLIND_SAFE_TOOLS -> it is called blind-safe
+    though its response leaks the verdict -> RED."""
+    world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
+    view = json.dumps(world.view(DX))
+    assert "review_state" in view and "no_real_change" in view  # it really leaks a verdict
+    assert rb._blind_safe({"tool": "get_diff_patch_view", "params": {}}) is False
+    assert "get_diff_patch_view" not in rb.BLIND_SAFE_TOOLS
+    assert rb._blind_safe({"tool": "get_diff_meta", "params": {}}) is True
+
+
+def test_blind_audit_is_sealed_off_by_default(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-1 / acceptance 4: a no_real_change opens NO blind audit unit while the gate is sealed
+    (the default); flipping BLIND_AUDIT_ENABLED on produces one. The sealing never silences the
+    needs_recheck or disagreement signals.
+
+    MUTATION (verified RED): produce audit units regardless of the gate -> the sealed assertion
+    RED; honour the gate for the report count only -> the sealed `open is None` RED."""
+    world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
+    sealed = _review(world, k=0)
+    assert sealed.audits.open == []
+    assert sealed.report["audits"]["open"] is None
+    monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
+    opened = _review(world, k=0)
+    assert len(opened.audits.open) == 1 and opened.audits.open[0].sources == ("no_real_change",)
+    assert opened.report["audits"]["open"] == 1 and opened.report["audits"]["status"] == "on"
+
+
 # ── the MCP writes: unit, shadow, read basis ─────────────────────────────────────────────────
 
 
@@ -669,10 +753,12 @@ def test_a_write_naming_its_unit_records_what_was_read_and_hands_on_the_next(
 ) -> None:
     """★ Through the server: the unit handed out by start_diff_review, judged with its unit_id,
     records read_basis unit_delivered and answers with the next unit; a write on a must-read
-    member that read nothing first records unread_before_verdict — which opens an audit.
+    member that read nothing first records unread_before_verdict — which marks the subject
+    NEEDS_RECHECK (always on, no blind audit). See test_judged_unread_is_needs_recheck for the
+    clear/stay cases.
 
     MUTATION (verified RED): leave read_basis out of the write's context -> RED; never mark
-    unread_before_verdict -> no audit -> RED."""
+    unread_before_verdict -> no needs_recheck -> RED."""
     server = mcp_app.build_server(world.path)
     head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
     nxt = head["next_unit"]
@@ -704,21 +790,94 @@ def test_a_write_naming_its_unit_records_what_was_read_and_hands_on_the_next(
     )
     assert blind.get("written") is True, blind
     assert blind["read_basis"] == {"basis": "none", "unread_before_verdict": True}
-    audits = _review(world, k=0).audits.open
-    assert any(
-        a.member.anchor_ref == p_entry and "unread_before_verdict" in a.sources for a in audits
+    # Judged unread -> NEEDS_RECHECK (never a blind audit), with the gate off as it is here.
+    r = _review(world, k=0)
+    assert r.audits.open == [] and p_entry in r.audits.needs_recheck
+    assert r.progress.states[p_entry] == ru.NEEDS_RECHECK
+    assert r.report["needs_recheck"]["count"] >= 1 and r.report["must_read_complete"] is False
+
+
+def _wide_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int) -> World:
+    """A world with ``n`` aligned pairs in DX (addresses 0x1000, 0x2000, …): at k < n some are
+    second tier, at k >= n all are must-read — so the session's k changes the must-read set."""
+    w = World(tmp_path, monkeypatch)
+    for i in range(1, n + 1):
+        w.pair(DX, f"0000{i}000", f"0000{i}000")
+    return w
+
+
+def test_a_write_naming_a_non_default_k_unit_gets_its_next_unit_at_that_k(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-7 / acceptance 10: start_diff_review at k=8 hands k=8 units; a write naming one gets its
+    next unit read at k=8 (``_after_unit_write`` uses the session's k, not the default). With eight
+    must-read entries at k=8, after the first four writes the next unit is still an ``entry``; at
+    the default k=4 it would be the second-tier batch instead.
+
+    MUTATION (verified RED): _after_unit_write reads at DEFAULT_K -> after four writes the next unit
+    is ``second_tier_batch`` -> RED."""
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    server = mcp_app.build_server(w.path)
+    head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 8})
+    nxt = head["next_unit"]
+    for _ in range(4):
+        assert nxt is not None and nxt["kind"] == "entry"
+        out = _server_call(
+            server,
+            "annotate_diff",
+            {
+                "anchor_ref": nxt["members"][0]["anchor_ref"],
+                "verdict": "changed_real",
+                "rationale": "r",
+                "diff_id": DX,
+                "unit_id": nxt["unit_id"],
+            },
+        )
+        assert out.get("written") is True, out
+        nxt = out["next_unit"]
+    assert nxt is not None and nxt["kind"] == "entry"
+
+
+def test_judged_unread_uses_the_sessions_k_for_the_must_read_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-7 / acceptance 11: a subject that is must-read only at the session's larger k, judged
+    unread, records unread_before_verdict and reads NEEDS_RECHECK — the must-read set is read at
+    the session's k (the largest start_diff_review asked for), not the default.
+
+    MUTATION (verified RED): read the must-read set at DEFAULT_K -> the k=8-only subject is not
+    must-read -> no unread_before_verdict -> not needs_recheck -> RED."""
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    must_k = lambda k: {  # noqa: E731
+        m.anchor_ref
+        for u in _review(w, k=k).units
+        if u.must_read and u.kind != ru.AUDIT
+        for m in u.members
+    }
+    target = sorted(must_k(8) - must_k(4))[0]  # must-read at k=8, not at the default k=4
+    server = mcp_app.build_server(w.path)
+    _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 8})
+    out = _server_call(
+        server,
+        "annotate_diff",
+        {"anchor_ref": target, "verdict": "changed_real", "rationale": "r", "diff_id": DX},
     )
+    assert out.get("written") is True, out
+    assert out["read_basis"] == {"basis": "none", "unread_before_verdict": True}
+    assert target in _review(w, k=8).audits.needs_recheck
 
 
 def test_an_audit_unit_write_is_a_shadow_and_a_person_cannot_be_claimed_over_mcp(
-    world: World,
+    world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """★ A write naming an audit unit is a shadow (the current judgement unchanged); a write
     naming a unit it is not a member of is refused; attributed_to='human' is refused over MCP,
-    'human-via-agent' is recorded.
+    'human-via-agent' is recorded. (Blind auditing is sealed by default; this test turns it on so
+    an audit unit exists to name.)
 
     MUTATION (verified RED): write an audit unit's judgement as a normal write -> the current
     verdict changes -> RED; accept 'human' over MCP -> RED."""
+    monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
     tool = mcp_app.make_tools(world.path)["annotate_diff"]
     world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
     opened = _review(world, k=0).audits.open
@@ -798,6 +957,7 @@ def test_the_worksheet_goes_out_and_comes_back_through_the_same_gates(
 
     from treasure_map.cli import review_cli
 
+    monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
     for var in review_cli.AGENT_ENV_MARKERS:
         monkeypatch.delenv(var, raising=False)
     a2 = _pair_anchor(DX, "00003000", "00003000")
@@ -837,14 +997,18 @@ def test_the_worksheet_goes_out_and_comes_back_through_the_same_gates(
     assert tuple(ch) == ("worksheet", "human-via-agent")
 
 
-def test_the_worksheet_hides_the_audit_verdict_but_keeps_a_disagreement(world: World) -> None:
+def test_the_worksheet_hides_the_audit_verdict_but_keeps_a_disagreement(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """★ spec six.7: a worksheet AUDIT item must NOT carry the verdict under audit — seeing it
     anchors the auditor, whose write then becomes current and closes the audit. A DISAGREEMENT
-    item, settled by seeing the clash, still carries current.
+    item, settled by seeing the clash, still carries current. (Blind auditing is sealed by default;
+    this test turns it on for the AUDIT item.)
 
     MUTATION (verified RED): put `current` back on audit items -> it appears on the audit item."""
     from treasure_map.cli import review_cli
 
+    monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
     a_dis = _pair_anchor(DX, "00003000", "00003000")
     world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
     world.judge(DX, a_dis, "no_real_change", verdict_basis=_nrc(a_dis), ctx=_ctx("writer"))
@@ -898,6 +1062,7 @@ def test_an_auditor_is_shown_nothing_that_depends_on_the_verdict_under_audit(
     MUTATION (verified RED): the audit member's reasons = its sources -> the MCP members and the
     report's reasons column differ -> RED; the worksheet's why carries the sources -> RED; the
     markdown (and, apart, the HTML) member table shows the real state -> RED."""
+    monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
     a = _auditor_view(_build_world(tmp_path / "a", monkeypatch), "no_real_change")
     b = _auditor_view(_build_world(tmp_path / "b", monkeypatch), "change_inconclusive")
     for face in ("mcp", "sheet", "markdown", "html"):

@@ -181,8 +181,11 @@ def test_the_descriptions_and_the_instructions_fit_what_a_client_shows(atlas: Pa
     (The counts in this file are of the whole file run against the mutation.)"""
     listed = asyncio.run(mcp_app.build_server(atlas).list_tools())
     sizes = {t.name: len(t.description or "") for t in listed}
-    assert len(sizes) == 41
-    assert sum(sizes.values()) <= 25_000, sum(sizes.values())
+    assert len(sizes) == 42
+    # Raised from 25,000 when get_diff_handoff (the findings hand-off, Design B) was added as the
+    # 42nd tool: the 41-tool surface was already at ~24,962, and a legitimate new tool needs room.
+    # The per-tool cap (1,200) is unchanged — that is the real per-description UX limit.
+    assert sum(sizes.values()) <= 26_000, sum(sizes.values())
     assert max(sizes.values()) <= 1_200, max(sizes.items(), key=lambda kv: kv[1])
     for t in listed:
         assert t.description == inspect.cleandoc(t.description or ""), t.name
@@ -206,6 +209,7 @@ EXPECTED_FIRST_LINES = {
     "same_shape_siblings": "Required: diff_id; exactly one of evidence_ref / candidate_anchor.",
     "get_diff_meta": "Required: diff_id.",
     "get_diff_string_delta": "Required: diff_id.",
+    "get_diff_handoff": "Required: run_pair.",
     "get_function_alignment": (
         "Required: diff_id, function (addr is its old name, accepted for this version)."
     ),
@@ -642,7 +646,13 @@ APPENDIX_A: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     (
         "pair",
         ("run_pair",),
-        ("get_file_diff", "annotate_diff", "annotate_diff_batch", "start_diff_review"),
+        (
+            "get_file_diff",
+            "get_diff_handoff",
+            "annotate_diff",
+            "annotate_diff_batch",
+            "start_diff_review",
+        ),
     ),
     ("query", ("text",), _TEXT_TOOLS),
     ("query", ("value",), ("get_strings",)),
@@ -668,7 +678,13 @@ APPENDIX_A: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     (
         "runs",
         ("run_pair",),
-        ("get_file_diff", "annotate_diff", "annotate_diff_batch", "start_diff_review"),
+        (
+            "get_file_diff",
+            "get_diff_handoff",
+            "annotate_diff",
+            "annotate_diff_batch",
+            "start_diff_review",
+        ),
     ),
     ("str", ("text",), _TEXT_TOOLS),
     ("str", ("value",), ("get_strings",)),
@@ -704,7 +720,7 @@ def test_appendix_a_is_what_the_refusal_offers_and_nothing_outside_it_offers_any
     MUTATION (verified RED, 1 failed): drop the (stride, side) veto -> RED."""
     accepted = _accepted()
     want = {(w, t): offer for w, offer, ts in APPENDIX_A for t in ts}
-    assert len(want) == 255
+    assert len(want) == 257
     inputs = {p for ps in accepted.values() for p in ps} | set(cards._PARAM_SYNONYMS) | set(_TYPOS)
     seen = 0
     for wrong in sorted(inputs):
@@ -1043,6 +1059,11 @@ def test_every_reference_answer_fits_the_response_budget(
 
 _AMB = "``reason='ambiguous'``"
 BOUNDARY: dict[str, tuple[str, ...]] = {
+    "get_diff_handoff": (
+        "tmap draws no conclusion here",
+        "a cell it cannot read states its reason",
+        "the status stays awaiting human verification",
+    ),
     "list_candidates": (
         "there is NO collapsed score",
         "a '?' never sinks",
@@ -1377,7 +1398,7 @@ def test_the_old_name_addr_still_works_once_and_says_so(
 def test_the_cards_and_the_tools_are_the_same_set_and_the_reference_is_read_only() -> None:
     made = mcp_app.make_tools(Path("/nonexistent.db"))
     assert set(cards.TOOL_CARDS) == set(made)
-    assert len(made) == 41 and "get_tool_reference" in made
+    assert len(made) == 42 and "get_tool_reference" in made
     assert list(made)[-2:] == ["get_tool_reference", "legal_notice"]
     assert "get_tool_reference" not in mcp_app.WRITE_TOOLS
     assert mcp_app.tool_annotations("get_tool_reference").readOnlyHint is True
