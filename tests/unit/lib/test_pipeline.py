@@ -966,3 +966,26 @@ def test_a_final_failure_clears_its_mark_and_a_skipped_store_keeps_it(tmp_path: 
     assert st["svc_c"]["pending"] == 0 and st["svc_c"]["reason"] == "import_failed"
     assert st["svc_d"]["pending"] == 1
     assert res.reanalyze_pending == 1
+
+
+def test_an_interrupt_tells_extracted_failed_and_left_apart(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """★ Ctrl-C once the serial re-run has recorded one binary failed (the other five extracted in
+    phase 1): the warning says 5 extracted, 1 failed and 0 left — they add up to the six to do —
+    never a failure counted with the extracted ones.
+
+    MUTATION (verified RED): report failures with the extracted ones again -> RED."""
+    import logging
+
+    def stop_after_the_retry(step: str, meta: dict[str, Any]) -> None:
+        if step == "ghidra_retry":
+            raise KeyboardInterrupt
+
+    fs = _firmware(tmp_path)
+    cfg = _e2e_cfg(_ghidra(tmp_path))
+    dec = _Decompiler({_NAMES[1]: "import_failed"})
+    with caplog.at_level(logging.WARNING), pytest.raises(KeyboardInterrupt):
+        _scan_e2e(fs, tmp_path / "ws", cfg, dec, progress=stop_after_the_retry)
+    msg = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("interrupted:"))
+    assert "5 binaries extracted and 1 failed this run, 0 left for the next run (of 6" in msg

@@ -705,3 +705,35 @@ def test_the_rescan_tier_counts_what_a_scan_would_remake_of_the_current_firmware
     conn.close()
     assert stale_exports(str(db), "H") == (2, 3)
     assert stale_exports(str(db), None) == (1, 3)  # without the extension: only the gone archive
+
+
+def test_a_failed_extraction_leaves_no_raw_export_behind(tmp_path: Path) -> None:
+    """★ An extraction that failed in both sessions, whose session still wrote export files: the
+    failure is recorded and those raw files are removed — a later scan must not find a session's
+    export that was never kept.
+
+    MUTATION (verified RED): leave the raw export in place on a failure -> RED."""
+    from tests.unit.lib.test_pipeline import _NAMES
+
+    fs = _firmware(tmp_path)
+    home = _ghidra(tmp_path)
+    _with_extension(home)
+    plan = {n: ["ok"] for n in _NAMES}
+    plan[_NAMES[0]] = ["scan_failed", "scan_failed"]
+    sessions = _Sessions(plan)
+
+    def leaves_its_export(self: Any, binary: Path, output_dir: Path, *a: Any, **k: Any) -> Any:
+        res = sessions(self, binary, output_dir, *a, **k)
+        if not res.success:
+            exp, rep = export_paths(output_dir, binary, (a[2] if len(a) > 2 else k["sha8"]))
+            exp.write_bytes(b"a cut-off session's export")
+            rep.write_text("{}")
+        return res
+
+    with patch.object(GhidraRunner, "run_ghidra", leaves_its_export):
+        with Workspace(tmp_path / "ws") as ws:
+            run_analyze(fs, ws, _e2e_cfg(home))
+    out = tmp_path / "ws" / "ghidra_output"
+    assert _exports(tmp_path / "ws" / "analysis.db")[_NAMES[0]][0] == "scan_failed:timeout"
+    assert not list(out.glob(f"{_NAMES[0]}_*.BinExport"))
+    assert not list(out.glob(f"{_NAMES[0]}_*export_report*"))

@@ -627,10 +627,12 @@ def ingest_elfs(
             r.sha256 for r in records if r.sha256 not in already_done and r.sha256 not in skipped
         }
 
+    # "Already done" is what this scan does NOT re-run: a done binary a --reanalyze re-extracts is
+    # dirty, never counted on both sides.
     logger.info(
         "ingest_elfs: %d records, %d already done, %d dirty",
         len(records),
-        len(already_done),
+        len(already_done - dirty_shas),
         len(dirty_shas),
     )
     return sha_to_id, dirty_shas

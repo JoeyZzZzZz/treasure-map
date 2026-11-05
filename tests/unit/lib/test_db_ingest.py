@@ -1382,3 +1382,30 @@ def test_a_binary_detected_under_another_architecture_is_extracted_again(tmp_pat
     row = conn.execute("SELECT arch, bits FROM binaries").fetchone()
     assert tuple(row) == ("AARCH64:LE:64:v8A", 64)
     conn.close()
+
+
+def test_the_log_counts_a_reextracted_binary_as_dirty_not_also_as_done(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """★ A bare --reanalyze continued after one of three done binaries was re-extracted: 2 dirty,
+    1 already done (not re-run) — never "3 already done, 2 dirty".
+
+    MUTATION (verified RED): count every done binary as already done again -> RED."""
+    import logging
+
+    from treasure_map.lib.analyze.db_ingest import REANALYZE_ALL
+
+    conn = open_db(tmp_path / "analysis.db")
+    recs = [_make_record(n, c * 64) for n, c in (("a", "a"), ("b", "b"), ("c", "c"))]
+    ingest_elfs(conn, recs, pass_version="p1")
+    conn.execute("UPDATE binaries SET ghidra_ok = 1, ghidra_status = 'ok', pass_version = 'p1'")
+    conn.commit()
+    ingest_elfs(conn, recs, pass_version="p1", reanalyze=REANALYZE_ALL)  # the request: all three
+    conn.execute("UPDATE binaries SET reanalyze_pending = 0 WHERE name = 'a'")  # a was redone
+    conn.commit()
+    with caplog.at_level(logging.INFO):
+        _, dirty = ingest_elfs(conn, recs, pass_version="p1", reanalyze=REANALYZE_ALL)
+    assert dirty == {"b" * 64, "c" * 64}
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("ingest_elfs"))
+    assert line == "ingest_elfs: 3 records, 1 already done, 2 dirty"
+    conn.close()

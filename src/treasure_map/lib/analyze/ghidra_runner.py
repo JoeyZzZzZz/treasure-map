@@ -740,6 +740,90 @@ def _read_export(export_file: Path, report_file: Path) -> tuple[str, dict[str, A
     return ("degraded" if n > 0 else "ok"), report
 
 
+# ── what a killed scan leaves behind, and whose it is ─────────────────────────────────────────
+#
+# A scan stopped by SIGKILL runs no cleanup: its JVMs (in sessions of their own) outlive it, and
+# its temporary directories stay. The next scan removes them — but only ITS OWN kind's whose owner
+# is dead: another scan, a scratch run or a test may be running beside it, and its directories and
+# JVMs are not this scan's to take. Each session directory carries an owner marker (the creating
+# process's pid and start time, and once the JVM starts, its process group); a directory whose
+# owner is alive, or that carries no marker, or whose owner cannot be told (no /proc), is left.
+
+_OWNER_FILE = ".tmap_owner"
+_SESSION_PREFIXES = ("tm_ghidra_proj_", "tm_ghidra_home_", "tm_elfpatch_")
+
+
+def _process_start(pid: int) -> str | None:
+    """A process's start time (/proc/<pid>/stat, field 22), or None when it cannot be read — a
+    process gone, or a system without /proc."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    fields = stat[stat.rfind(")") + 2 :].split()
+    return fields[19] if len(fields) > 19 else None
+
+
+def _write_owner(directory: Path, pgid: int | None = None) -> None:
+    """Mark ``directory`` as this process's (and, given, its JVM's process group)."""
+    marker = {"pid": os.getpid(), "start": _process_start(os.getpid()), "pgid": pgid}
+    try:
+        (directory / _OWNER_FILE).write_text(json.dumps(marker))
+    except OSError:
+        pass  # a directory that cannot carry a marker is simply never swept
+
+
+def _owner_dead(marker: dict[str, Any]) -> bool:
+    """The marker's owner is known to be gone: its pid runs no process, or a process that started
+    at another time (the pid was reused). Unknown (no start time recorded or readable) is not
+    dead."""
+    pid, start = marker.get("pid"), marker.get("start")
+    if not isinstance(pid, int) or not isinstance(start, str):
+        return False
+    if not Path("/proc").is_dir():
+        return False
+    now = _process_start(pid)
+    return now is None or now != start
+
+
+def _group_runs_in(pgid: int, directory: Path) -> bool:
+    """A process of group ``pgid`` names ``directory`` on its command line — the JVM session this
+    directory belonged to, and not some other group that came to reuse the number."""
+    needle = str(directory).encode()
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            stat = (proc / "stat").read_text()
+            pgrp = int(stat[stat.rfind(")") + 2 :].split()[2])
+            if pgrp == pgid and needle in (proc / "cmdline").read_bytes():
+                return True
+        except (OSError, ValueError, IndexError):
+            continue
+    return False
+
+
+def sweep_orphans(tmp_root: Path | None = None) -> int:
+    """Remove the session directories (and kill the JVM groups) a scan that died left, where their
+    owner is known to be dead; return how many directories went. See the block comment above."""
+    root = Path(tmp_root or tempfile.gettempdir())
+    swept = 0
+    for prefix in _SESSION_PREFIXES:
+        for directory in root.glob(prefix + "*"):
+            try:
+                marker = json.loads((directory / _OWNER_FILE).read_text())
+            except (OSError, ValueError):
+                continue  # no marker: whose it is cannot be told, so it is not touched
+            if not isinstance(marker, dict) or not _owner_dead(marker):
+                continue
+            pgid = marker.get("pgid")
+            if isinstance(pgid, int) and _group_runs_in(pgid, directory):
+                _killpg_quiet(pgid, signal.SIGKILL)
+            shutil.rmtree(directory, ignore_errors=True)
+            swept += 1
+    if swept:
+        logger.info("ghidra: removed %d session directory/ies a stopped scan left", swept)
+    return swept
+
+
 def _run_subprocess(
     cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | None = None
 ) -> tuple[int, str]:
@@ -771,6 +855,8 @@ def _run_subprocess(
             )
             pgid = proc.pid  # session leader: pgid == pid
             _register_pgid(pgid)
+            if cwd is not None and (cwd / _OWNER_FILE).exists():
+                _write_owner(cwd, pgid)  # the session directory now names its JVM's group
         try:
             _, stderr_bytes = proc.communicate(timeout=timeout)
             snippet = stderr_bytes.decode(errors="replace")[-500:]
@@ -920,6 +1006,7 @@ class GhidraRunner:
             patch_result = _patch_elf_for_ghidra(binary)
             if patch_result is not None:
                 patched_file, tmpdir = patch_result
+                _write_owner(tmpdir)
                 try:
                     r2 = self._run_once(
                         patched_file, output_dir, arch, sha8, retry_timeout, headless, large_payload
@@ -999,7 +1086,9 @@ class GhidraRunner:
         # (stub resolution, the table write) must not leave the two directories behind.
         try:
             proj_dir = Path(tempfile.mkdtemp(prefix="tm_ghidra_proj_"))
+            _write_owner(proj_dir)
             ghidra_home_dir = Path(tempfile.mkdtemp(prefix="tm_ghidra_home_"))
+            _write_owner(ghidra_home_dir)
 
             exporting = self._exporting()
             exp = export_paths(output_dir, binary, sha8) if exporting else None
@@ -1235,6 +1324,7 @@ class GhidraRunner:
         immediately rather than N times.
         """
         self.get_headless()  # fail-fast: raise GhidraNotFoundError before any thread work
+        sweep_orphans()  # what a scan stopped by SIGKILL left, where its owner is dead
         # Same for the name registry every extractor JVM reads: a malformed file stops the scan
         # here, once and loudly, instead of failing every binary one JVM at a time.
         validate_registry(self._script_dir / "extractor_names.tsv")

@@ -564,38 +564,6 @@ class FullDiffSummary:
     hunt_marks_left: tuple[str, ...] = ()
 
 
-# ── binary .so location (finding-1 fail-fast) ────────────────────────────────────────
-
-
-def _locate_binary_so(run: RunRow, bin_row: BinaryRow) -> Path | None:
-    """The on-disk ``.so`` for an ALREADY-RESOLVED binary in this run, or None if not locatable.
-
-    BinExport needs the REAL binary file (a Ghidra plugin exports from it), not the analysis.db.
-    Takes the resolved row rather than a selector: the entry resolved it once, and re-resolving
-    here is how the same short name came to be looked up eight times in one diff, each lookup free
-    to land on a different row. ``binaries.path`` is recorded relative and its shape varies across
-    runs (the scan-side absolute-path fix is a separate ticket), so this tries several roots and
-    returns the first that EXISTS: an absolute recorded path, the path joined under the run's
-    firmware root, that root plus the bare file name, and finally the recorded path relative to the
-    CWD. None here is an honest 'cannot locate' that preflight turns into a hard block -- never a
-    guessed path fed to export."""
-    if not bin_row.path:
-        return None
-    raw = Path(bin_row.path)
-    candidates: list[Path] = []
-    if raw.is_absolute():
-        candidates.append(raw)
-    if run.firmware_path:
-        fw = Path(run.firmware_path)
-        candidates.append(fw / raw)
-        candidates.append(fw / raw.name)
-    candidates.append(raw)  # relative to the CWD
-    for c in candidates:
-        if c.is_file():
-            return c
-    return None
-
-
 # ── toolchain discovery (finding-4 fail-fast) ────────────────────────────────────────
 
 
@@ -874,7 +842,7 @@ def _kill_running_groups() -> None:
 
 
 def _run_killable(
-    cmd: list[str], env: dict[str, str], timeout: int
+    cmd: list[str], env: dict[str, str], timeout: int, cwd: Path | str | None = None
 ) -> subprocess.CompletedProcess[bytes]:
     """Run ``cmd`` in its OWN process group and, on timeout OR interrupt, kill the whole group.
 
@@ -888,7 +856,12 @@ def _run_killable(
     if _SWEEP_CANCELLED.is_set():
         raise _SweepCancelledError("the diff sweep was interrupted; not starting another export")
     proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
-        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        cwd=cwd,
     )
     _register_pgid(proc.pid)  # pid == pgid (session leader)
     try:
@@ -939,16 +912,22 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
     runnable in CI. Uses tmap's own non-interactive ``ExportBinExport.java`` (NOT the extension's
     interactive ``BinExport.java``, which ignores the output-path argument and lets analyzeHeadless
     exit 0 with no file). The argv here is the one adjustment point if the export entry changes."""
+    from treasure_map.lib.analyze.elf_inventory import detect_arch
     from treasure_map.lib.analyze.ghidra_runner import find_headless
 
     headless = find_headless(config.ghidra)
     export_path = out_dir / f"{side}.BinExport"
     log_path = out_dir / f"{side}.ghidra.log"
+    # The language the scan imports the binary under, named here too: left to Ghidra's own guess,
+    # a MIPS binary could be read in another variant than the scan's, and its export with it.
+    arch = detect_arch(so_path)
+    processor = ["-processor", arch] if arch else []
     with tempfile.TemporaryDirectory(prefix="tm_binexport_proj_") as proj:
         cmd = [
             str(headless),
             proj,
             "Proj",
+            *processor,
             "-import",
             str(so_path),
             "-postScript",
@@ -965,7 +944,9 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
         ]
         env = {**os.environ, "JAVA_TOOL_OPTIONS": f"-Xmx{_DIFF_BINEXPORT_HEAP_MB}m"}
         try:
-            proc = _run_killable(cmd, env, timeout_s + 120)
+            # Started from the project directory: analyzeHeadless resolves a bare script name
+            # against the directory it starts in first, so a same-named file there would run.
+            proc = _run_killable(cmd, env, timeout_s + 120, cwd=proj)
         except subprocess.TimeoutExpired as exc:
             raise DiffToolchainError(
                 f"BinExport timed out for side {side} ({so_path.name})", kind=FAIL_TIMEOUT
@@ -1429,7 +1410,7 @@ def _read_binaries(analysis_db_path: str) -> dict[str, tuple[str, ...]]:
     identify one file, and say so, instead of comparing two arbitrary picks.
 
     Final shape is per relative firmware path; that is blocked on the recorded paths being
-    comparable across runs (see _locate_binary_so), which has its own ticket."""
+    comparable across runs, which has its own ticket."""
     con = ro_connect(analysis_db_path)
     try:
         rows = con.execute(

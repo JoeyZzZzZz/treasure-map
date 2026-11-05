@@ -395,7 +395,10 @@ def run_analyze(
         )
 
         if dirty_records:
-            kept = 0  # binaries whose final result is committed this scan
+            # binaries whose final result is committed this scan: stored_ok + stored_failed
+            kept = 0
+            stored_ok = 0  # of them, an extraction stored
+            stored_failed = 0  # of them, a failure recorded
 
             def _persist_final(rec: ElfRecord, res: GhidraResult) -> None:
                 """Store one binary's FINAL result and commit it, before the next one arrives.
@@ -406,6 +409,7 @@ def run_analyze(
                 to lose, so it is stamped and committed here. Either way the binary is committed
                 before the next result is handled, so an interrupt keeps what already finished."""
                 nonlocal ghidra_ok, ghidra_failed, ghidra_no_functions, kept
+                nonlocal stored_ok, stored_failed
                 if res.reason == _INTERRUPTED:
                     return  # cut off, not finished: nothing is recorded and it runs again next time
                 if res.success:
@@ -421,6 +425,7 @@ def run_analyze(
                         )
                     if one.binaries_processed == 1:
                         kept += 1
+                        stored_ok += 1
                         # A second transaction: the stamp and rows above are committed inside the
                         # ingest, which cannot take this column with them. An interrupt between the
                         # two commits only means this one binary is re-extracted by a continued
@@ -460,10 +465,13 @@ def run_analyze(
                         # old decompiler produced are not served as this one's.
                         drop_extraction(conn, rec.sha256)
                     conn.commit()
-                    # No export stands for this binary now (its session's was never kept).
+                    # No export stands for this binary now (its session's was never kept), and the
+                    # session's raw export files go too: a later scan must not find them.
                     remove_other_archives(export_ctx.archive_dir, rec.sha256)
+                    _drop_raw_export(rec)
                     ghidra_failed += 1
                     kept += 1
+                    stored_failed += 1
                 finalized.add(rec.sha256)
 
             def _store_extraction(rec: ElfRecord, res: GhidraResult) -> IngestStats:
@@ -550,11 +558,15 @@ def run_analyze(
                     decompile_settled=decompile_settled,
                 )
             except KeyboardInterrupt:
+                # Extracted, failed and left are told apart: a failure is recorded, not extracted.
+                # The three add up to the dirty binaries.
                 logger.warning(
-                    "interrupted: %d binaries kept this run, %d left for the next run; "
-                    "binaries cut off mid-decompile start over",
-                    kept,
-                    len(dirty_records) - kept,
+                    "interrupted: %d binaries extracted and %d failed this run, %d left for the "
+                    "next run (of %d to do); binaries cut off mid-decompile start over",
+                    stored_ok,
+                    stored_failed,
+                    len(dirty_records) - stored_ok - stored_failed,
+                    len(dirty_records),
                 )
                 raise
 

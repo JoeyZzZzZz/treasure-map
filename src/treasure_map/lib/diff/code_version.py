@@ -108,6 +108,10 @@ _EXCLUDED: dict[str, str] = {
     "lib.analyze.ghidra_runner:find_headless": (
         "where Ghidra is installed (its version is recorded)"
     ),
+    "lib.analyze.elf_inventory:detect_arch": (
+        "the language the standalone export (_run_binexport, kept for fixture builds and smoke "
+        "tests) imports under; a stored diff reads the scan's archived exports"
+    ),
     "lib.analyze.ghidra_runner:current_pass_version": (
         "the running extraction pass, compared for the preflight refusal; the binary's own pass "
         "is the extraction stamp"

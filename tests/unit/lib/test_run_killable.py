@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -236,3 +237,36 @@ def test_a_kill_that_lands_as_the_export_starts_still_reaps_it(
     )
     assert leaked == [], f"the export started during the kill survived: {leaked}"
     assert elapsed < 15
+
+
+def test_the_standalone_export_names_its_language_and_starts_in_its_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The standalone BinExport run imports the binary under the language the scan detects
+    (-processor), and starts from its own project directory, so a same-named script in the current
+    directory is never run.
+
+    MUTATION (verified RED): leave -processor out -> RED; start in the current directory -> RED."""
+    import subprocess
+
+    from treasure_map.lib.config.config import Config
+    from treasure_map.lib.diff.driver import DiffToolchainError, _run_binexport
+
+    seen: dict[str, object] = {}
+
+    def fake(cmd: list[str], env: dict[str, str], timeout: int, cwd: object = None) -> object:
+        seen.update(cmd=cmd, cwd=cwd)
+        return subprocess.CompletedProcess(cmd, 1, b"", b"")
+
+    monkeypatch.setattr(driver, "_run_killable", fake)
+    monkeypatch.setattr(
+        "treasure_map.lib.analyze.ghidra_runner.find_headless",
+        lambda cfg: Path("/g/analyzeHeadless"),
+    )
+    elf = Path(__file__).resolve().parents[2] / "fixtures" / "elfs" / "exe_x86_64"
+    with pytest.raises(DiffToolchainError):
+        _run_binexport(elf, Config(), tmp_path, "a", 60)
+    cmd = seen["cmd"]
+    assert isinstance(cmd, list)
+    assert cmd[cmd.index("-processor") + 1] == "x86:LE:64:default"
+    assert seen["cwd"] == cmd[1]  # the project directory

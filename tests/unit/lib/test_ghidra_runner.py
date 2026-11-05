@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from treasure_map.lib.analyze import ghidra_runner
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
 from treasure_map.lib.analyze.ghidra_runner import (
     GhidraRunner,
@@ -1546,3 +1547,73 @@ def test_a_failing_on_final_tears_the_pool_down(tmp_path: Path) -> None:
         assert calls["terminate"] >= 1
     finally:
         ghidra_runner._reset_shutdown()
+
+
+# ── what a killed scan left behind: swept only where its owner is dead ─────────────────────────
+
+_linux = pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+
+
+def _session(root: Path, name: str, marker: dict[str, Any] | None) -> Path:
+    d = root / name
+    d.mkdir()
+    if marker is not None:
+        (d / ghidra_runner._OWNER_FILE).write_text(json.dumps(marker))
+    return d
+
+
+@_linux
+def test_only_a_dead_owners_session_directories_are_swept(tmp_path: Path) -> None:
+    """★ A session directory whose owner is alive (this process) stays; one whose owner is gone, or
+    whose pid now runs a process that started at another time (reused), goes; one with no marker
+    stays — whose it is cannot be told.
+
+    MUTATION (verified RED): sweep without looking at the owner -> the live one goes -> RED; sweep
+    unmarked ones too -> RED."""
+    import os
+
+    me = {"pid": os.getpid(), "start": ghidra_runner._process_start(os.getpid()), "pgid": None}
+    live = _session(tmp_path, "tm_ghidra_proj_live", me)
+    reused = _session(tmp_path, "tm_ghidra_home_reused", {**me, "start": "1"})
+    gone = _session(tmp_path, "tm_elfpatch_gone", {"pid": 2**22 + 7, "start": "5", "pgid": None})
+    unmarked = _session(tmp_path, "tm_ghidra_proj_unmarked", None)
+    other = _session(tmp_path, "unrelated_dir", {"pid": 2**22 + 7, "start": "5"})
+    assert ghidra_runner.sweep_orphans(tmp_path) == 2
+    assert live.exists() and unmarked.exists() and other.exists()
+    assert not reused.exists() and not gone.exists()
+
+
+@_linux
+def test_a_dead_owners_jvm_group_is_killed_only_when_it_runs_in_that_directory(
+    tmp_path: Path,
+) -> None:
+    """★ The marker names the JVM's process group; it is killed only when a process of that group
+    names the session directory on its command line — never a group that merely reuses the number.
+
+    MUTATION (verified RED): kill the recorded group without checking it -> the stranger dies ->
+    RED; never kill -> the orphan lives -> RED."""
+    import subprocess
+    import time
+
+    dead = {"pid": 2**22 + 7, "start": "5"}
+    orphan_dir = tmp_path / "tm_ghidra_proj_orphan"
+    orphan_dir.mkdir()
+    orphan = subprocess.Popen(["sh", "-c", "sleep 60", str(orphan_dir)], start_new_session=True)
+    stranger = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        (orphan_dir / ghidra_runner._OWNER_FILE).write_text(
+            json.dumps({**dead, "pgid": orphan.pid})
+        )
+        _session(tmp_path, "tm_ghidra_proj_stranger", {**dead, "pgid": stranger.pid})
+        assert ghidra_runner.sweep_orphans(tmp_path) == 2
+        for _ in range(50):
+            if orphan.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert orphan.poll() is not None  # the orphaned session's group was killed
+        assert stranger.poll() is None  # a group that only shares the number was not
+    finally:
+        for p in (orphan, stranger):
+            if p.poll() is None:
+                p.kill()
+            p.wait()

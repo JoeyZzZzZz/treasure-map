@@ -14,8 +14,9 @@ with what the same input is now:
 
   * extraction — the diffed binary's own ``binaries.pass_version`` and ``binaries.ghidra_version``,
     looked up by its sha256 in the run's analysis.db. The binary's own values, not the run's
-    roll-up: a run's ``build_hash`` becomes a ``mixed:N`` count when an UNRELATED binary fails a
-    re-extraction, which says nothing about this one.
+    roll-up: a run's ``build_hash`` reads ``mixed:N`` when its binaries hold the extractions of N
+    different passes (one that kept an earlier pass's extraction because its re-extraction failed
+    is enough) — a count of passes over OTHER binaries too, which says nothing about this one.
   * hunt inputs — a digest of exactly the hunt output the diff reads (``hunt_inputs_digest``), so
     a re-hunt that reproduces the same output leaves the diff current.
   * diff code — ``diff_code_version()``, a hash of the Python code that writes the diff
