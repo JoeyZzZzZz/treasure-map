@@ -85,6 +85,40 @@ class StubResolution:
         return any(lo <= addr < hi for lo, hi in self.regions)
 
 
+# Where the decompiler loads a shared object linked at address 0: it rebases the whole image, by
+# 0x10000 on a 32-bit ELF and 0x100000 on a 64-bit one. An executable (ET_EXEC), or a shared object
+# linked at a non-zero address, loads where it was linked. Checked over a whole corpus (every
+# binary agreed) and cross-checked per binary at ingest against the image base the decompiler
+# itself reports.
+_LOAD_SHIFT_32 = 0x10000
+_LOAD_SHIFT_64 = 0x100000
+
+
+def ghidra_load_shift_of(elf: ELFFile) -> int:
+    """How far the decompiler moves this ELF's addresses when it loads it: 0x10000 (32-bit) or
+    0x100000 (64-bit) for an ET_DYN whose lowest PT_LOAD is at virtual address 0, else 0.
+
+    Every address this module reads from the ELF (``sh_addr``) is a link-time address; the callee
+    names and stub regions it hands on are compared with the decompiler's addresses, so they are
+    moved by this amount first."""
+    if elf.header.e_type != "ET_DYN":
+        return 0
+    loads = [seg["p_vaddr"] for seg in elf.iter_segments() if seg["p_type"] == "PT_LOAD"]
+    if not loads or min(loads) != 0:
+        return 0
+    return _LOAD_SHIFT_64 if elf.elfclass == 64 else _LOAD_SHIFT_32
+
+
+def ghidra_load_shift(elf_path: Path | str) -> int | None:
+    """``ghidra_load_shift_of`` for a file; None when it is not a readable ELF."""
+    try:
+        with open(elf_path, "rb") as fh:
+            return ghidra_load_shift_of(ELFFile(fh))
+    except (OSError, ELFError, ValueError, KeyError, AttributeError) as exc:
+        logger.debug("load shift unreadable for %s: %s", elf_path, exc)
+        return None
+
+
 def _dynamic_tags(elf: ELFFile) -> dict[str, int]:
     from elftools.elf.dynamic import DynamicSection
 
@@ -208,6 +242,12 @@ def _has_nonempty_mips_stubs(elf: ELFFile) -> bool:
 def resolve_stubs(elf_path: Path | str) -> StubResolution | None:
     """Every resolvable stub's import name + the stub regions, for one MIPS ELF.
 
+    Addresses are the decompiler's (``ghidra_load_shift_of`` applied), because every consumer
+    compares them with the decompiler's: the extractor's stub lookup, the callee relabelling, the
+    stored stub regions and the consistency check of the table the extractor echoes. Shifting here,
+    once, keeps them all on one number; a shift applied only on the way into the extractor would
+    make the ingest-time recomputation disagree with it on every rebased binary.
+
     None when the file is not a readable MIPS ELF with a dynamic symbol table — an honest "cannot
     tell", never an empty answer read as "no stubs". A best-effort read: a malformed section makes
     that path contribute nothing rather than raising."""
@@ -224,8 +264,11 @@ def resolve_stubs(elf_path: Path | str) -> StubResolution | None:
                 _rel_plt_slot_names(elf, dynsym),
                 _global_got_slot_names(elf, dynsym, tags),
             )
-            names = _plt_stub_names(elf, slot_names)
-            named_regions = _named_stub_regions(elf)
+            shift = ghidra_load_shift_of(elf)
+            names = {a + shift: n for a, n in _plt_stub_names(elf, slot_names).items()}
+            named_regions = tuple(
+                (sec, lo + shift, hi + shift) for sec, lo, hi in _named_stub_regions(elf)
+            )
             complete = not _has_nonempty_mips_stubs(elf) and len(names) == _plt_entry_count(elf)
             return StubResolution(
                 names=names,

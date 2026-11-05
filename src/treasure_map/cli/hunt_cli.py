@@ -3088,6 +3088,15 @@ def _name_unfinished_decompiles(
     finally:
         if atlas is not None:
             atlas.close()
+    probe = extraction_gaps.wrapper_probe_unfinished(db)
+    if probe:
+        small = sum(p["small"] for p in probe)
+        large = sum(p["large"] for p in probe)
+        click.echo(
+            f"{indent}Command-wrapper probe undecided: {small + large} shell-sink caller(s) in "
+            f"{len(probe)} binary/ies could not be decompiled to tell ({small} under 8KB, "
+            f"{large} larger) — information only"
+        )
     if not gaps:
         return
     click.echo(

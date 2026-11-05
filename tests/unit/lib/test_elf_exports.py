@@ -236,3 +236,106 @@ def test_an_unreadable_binary_ingests_as_not_shown_to_be_exported(tmp_path: Path
     assert stats.functions_ingested == 1
     assert conn.execute("SELECT is_exported FROM functions").fetchone()[0] == 0
     conn.close()
+
+
+# ── the imports a decompiler's loader leaves out (one ELF shape) ─────────────────────────────
+
+
+def _shape(tmp_path: Path, name: str, **kw: object) -> Path:
+    from tests.unit.lib.elf_builder import ET_EXEC, dynamic_rel_binary
+
+    p = tmp_path / name
+    kw.setdefault("e_type", ET_EXEC)
+    p.write_bytes(
+        dynamic_rel_binary(
+            symbols=[
+                ("system", "FUNC", False),
+                ("strcpy", "FUNC", False),
+                ("__gmon_start__", "NOTYPE", False),
+                ("environ", "OBJECT", False),
+                ("main_helper", "FUNC", True),
+            ],
+            relocs=[],
+            **kw,  # type: ignore[arg-type]
+        )
+    )
+    return p
+
+
+def test_the_left_out_imports_are_the_undefined_functions_not_yet_recorded(
+    tmp_path: Path,
+) -> None:
+    """★ On the shape the decompiler's loader reads without external symbols (ARM executable, no
+    section headers, DT_HASH and no DT_GNU_HASH): exactly the undefined FUNC and NOTYPE dynamic
+    symbols the decompiler did not record — never an undefined data object, never a defined
+    symbol, never one already recorded (no duplicate).
+
+    MUTATION (verified RED): take every undefined symbol type -> `environ` joins -> RED; drop the
+    recorded names from nothing -> `system` again -> RED."""
+    from treasure_map.lib.analyze.elf_exports import unrecorded_dynamic_imports
+
+    p = _shape(tmp_path, "net-cgi")
+    assert unrecorded_dynamic_imports(p, set()) == ("__gmon_start__", "strcpy", "system")
+    assert unrecorded_dynamic_imports(p, {"system"}) == ("__gmon_start__", "strcpy")
+
+
+def test_every_other_shape_is_left_as_the_decompiler_recorded_it(tmp_path: Path) -> None:
+    """★ Any other shape gets nothing filled: there the decompiler's list is complete, and may
+    name an import otherwise than the dynamic symbol table (a demangled C++ name), so filling by
+    name would list one import twice. A shared object, and an executable with a GNU hash table,
+    each say ()  — and a file that is not an ELF says None (not "nothing to fill").
+
+    MUTATION (verified RED): drop the shape test -> the shared object is filled -> RED; drop the
+    GNU-hash test -> RED."""
+    from tests.unit.lib.elf_builder import ET_DYN
+    from treasure_map.lib.analyze.elf_exports import unrecorded_dynamic_imports
+
+    assert unrecorded_dynamic_imports(_shape(tmp_path, "lib.so", e_type=ET_DYN), set()) == ()
+    assert unrecorded_dynamic_imports(_shape(tmp_path, "gnu", gnu_hash_tag=True), set()) == ()
+    junk = tmp_path / "junk"
+    junk.write_bytes(b"not an elf")
+    assert unrecorded_dynamic_imports(junk, set()) is None
+
+
+def test_the_ingest_stores_the_left_out_imports_with_their_source(tmp_path: Path) -> None:
+    """★ The decompiler's imports are stored as `decompiler`; the left-out ones beside them as
+    `elf_dynamic_symbols`, naming no library (the ELF does not say which one provides it) — so
+    no cross-binary edge is drawn from them.
+
+    MUTATION (verified RED): skip the fill in the ingest -> RED."""
+    import json
+
+    from treasure_map.lib.analyze.elf_inventory import ElfRecord
+    from treasure_map.lib.analyze.ghidra_ingest import ingest_ghidra_output
+    from treasure_map.lib.storage.connection import open_db
+
+    p = _shape(tmp_path, "net-cgi")
+    conn = open_db(tmp_path / "analysis.db")
+    conn.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'net-cgi', ?)", ("c" * 64,))
+    conn.commit()
+    out = tmp_path / "ghidra_output"
+    out.mkdir()
+    data = {
+        "functions": [],
+        "imports": [{"func_name": "system", "lib_name": "libc.so.0"}],
+        "exports": [],
+        "strings": [],
+    }
+    (out / f"net-cgi_{'c' * 8}_ghidra.json").write_text(json.dumps(data))
+    rec = ElfRecord(
+        path=p,
+        name="net-cgi",
+        arch="ARM:LE:32:v7",
+        elf_type="executable",
+        sha256="c" * 64,
+        dt_needed=["libc.so.0"],
+    )
+    ingest_ghidra_output(conn, out, [rec], {"c" * 64: 1})
+    rows = sorted(
+        tuple(r) for r in conn.execute("SELECT func_name, lib_soname, source FROM imports")
+    )
+    assert rows == [
+        ("__gmon_start__", "", "elf_dynamic_symbols"),
+        ("strcpy", "", "elf_dynamic_symbols"),
+        ("system", "libc.so.0", "decompiler"),
+    ]

@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.unit.lib.elf_builder import extractor_image_fields
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
 from treasure_map.lib.analyze.ghidra_runner import GhidraResult, GhidraRunner
 from treasure_map.lib.analyze.pipeline import run_analyze
@@ -68,6 +69,7 @@ def _run_all_with_json(
                     "stub_marker": stub_table_marker(
                         None if resolution is None else resolution.names
                     ),
+                    **extractor_image_fields(r.path),
                     "functions": [
                         {
                             "name": f"func_{r.name}",

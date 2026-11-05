@@ -120,7 +120,7 @@ from typing import Any, Generic, TypeVar
 
 from treasure_map.lib.diff.code_version import diff_code_version, sink_overlay_logic_version
 from treasure_map.lib.diff.layer0 import _thunk_spans, norm_hex
-from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
+from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE, DECOMPILE_ERROR_PLACEHOLDER
 from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review, diff_sink_axes, entry_words, sameness
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN
@@ -860,7 +860,11 @@ def _read_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side
         select += ", call_tokens" if has_ct else ", NULL"
         select += ", size_bytes" if "size_bytes" in cols else ", NULL"
         if "pseudocode" in cols:
-            select += ", (pseudocode IS NOT NULL AND pseudocode != '')"
+            # text to read: neither empty nor the placeholder of a decompile that threw
+            select += (
+                ", (pseudocode IS NOT NULL AND TRIM(pseudocode) != '' AND LTRIM(pseudocode) "
+                f"NOT LIKE '{DECOMPILE_ERROR_PLACEHOLDER}%')"
+            )
         else:
             select += ", NULL"
         rows = conn.execute(select + " FROM functions WHERE binary_id = ?", (found[0],)).fetchall()
@@ -3774,6 +3778,7 @@ def listed_view(
 # causes are the SKIPPED_MICRO_STATE pairs, the other three the UNAVAILABLE ones.
 _UNAVAILABLE_CAUSES = (
     "db_unavailable",
+    "decompile_failed",
     "decompile_empty",
     "size_unknown",
     "one_side_skipped_micro",
@@ -3794,6 +3799,8 @@ def _cause_of(bodies: dict[str, Any] | None) -> str:
     sides = {a, b}
     if sameness.DB_UNAVAILABLE in sides:
         return "db_unavailable"
+    if sameness.DECOMPILE_FAILED in sides:
+        return "decompile_failed"
     if sameness.DECOMPILE_EMPTY in sides:
         return "decompile_empty"
     if sameness.SIZE_UNKNOWN in sides:

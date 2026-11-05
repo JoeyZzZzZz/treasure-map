@@ -68,7 +68,7 @@ from itertools import zip_longest
 from typing import Any, NamedTuple
 
 from treasure_map.lib.diff.layer0 import _decompile_status, norm_hex
-from treasure_map.lib.facts import listing_items
+from treasure_map.lib.facts import DECOMPILE_FAILURES, has_text, listing_items
 from treasure_map.lib.ro_db import ro_connect
 
 # ── the seven states of an aligned pair ────────────────────────────────────────────────────────
@@ -97,6 +97,7 @@ SKIPPED_MICRO_STATE = "skipped_micro"
 DB_UNAVAILABLE = "db_unavailable"  # the analysis.db could not be read at all (bodies is None)
 SKIPPED_MICRO = "skipped_micro"  # empty AND under _DECOMPILE_MIN_SIZE: a design skip, not a failure
 DECOMPILE_EMPTY = "decompile_empty"  # empty AND >= that size: a genuine empty decompile
+DECOMPILE_FAILED = "decompile_failed"  # no text, and the recorded decompile was an error / timeout
 SIZE_UNKNOWN = "size_unknown"  # empty AND size 0 / unrecorded: cannot be told apart
 
 # The not_listed count name for each state (aligned, similarity-1 pairs that place no entry).
@@ -360,9 +361,13 @@ def _body_status(bodies: Bodies | None, addr: str) -> str:
     if addr not in bodies:
         return NO_BODY
     body = bodies[addr] or {}
-    if body.get("pseudocode"):
+    if has_text(body.get("pseudocode")):
         return "ok"
-    # pseudocode empty by the branch above; classify the empty body by the exporter's own reason.
+    # No text by the branch above (an empty one, or the placeholder an earlier extractor wrote for a
+    # decompile that threw): a recorded failure says so; otherwise the size tells a design skip
+    # from an empty decompile.
+    if body.get("decompile_status") in DECOMPILE_FAILURES:
+        return DECOMPILE_FAILED
     status = _decompile_status(None, _size(body))
     return {"failed": DECOMPILE_EMPTY, "unknown": SIZE_UNKNOWN}.get(status, status)
 
@@ -1639,19 +1644,22 @@ def read_function_bodies(analysis_db_path: str | None, sha: str | None) -> Bodie
         select = "SELECT address, pseudocode"
         select += ", size_bytes" if "size_bytes" in cols else ", NULL"
         select += ", body_ranges" if "body_ranges" in cols else ", NULL"
+        select += ", decompile_status" if "decompile_status" in cols else ", NULL"
         rows = conn.execute(select + " FROM functions WHERE binary_id = ?", (found[0],)).fetchall()
     except sqlite3.Error:
         return None
     finally:
         conn.close()
     out: Bodies = {}
-    for address, pseudocode, size, ranges in rows:
+    for address, pseudocode, size, ranges, decompiled in rows:
         addr = norm_hex(address) if address else None
         if addr is not None:
             out[addr] = {
-                "pseudocode": pseudocode or None,
+                # the placeholder of a decompile that threw is no text: never compared as one
+                "pseudocode": pseudocode if has_text(pseudocode) else None,
                 "size_bytes": size if isinstance(size, int) and size > 0 else None,
                 "body_ranges": _closed_ranges(ranges),
+                "decompile_status": decompiled,
             }
     return out
 

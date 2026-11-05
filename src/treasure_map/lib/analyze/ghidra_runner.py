@@ -135,10 +135,15 @@ _GHIDRA_RELEASES_URL = "https://github.com/NationalSecurityAgency/ghidra/release
 # hours-long Ghidra re-extraction. The criterion is "its output is written into the functions cache
 # inside the dirty loop", and ``test_pass_version.py`` locks this set against that criterion
 # mechanically, so a future extraction step cannot be added and silently left out. The lock also
-# covers the whole of each of these three modules' treasure_map reads: they read only one another
+# covers the whole of each of these modules' treasure_map reads: they read only one another
 # (outside type annotations), so the fingerprint — which hashes exactly this set plus the .java and
 # .tsv — is closed, and a read of an undeclared module fails the lock.
-_PIPELINE_PY_MODULES: tuple[str, ...] = ("elf_exports.py", "ghidra_ingest.py", "stub_resolve.py")
+_PIPELINE_PY_MODULES: tuple[str, ...] = (
+    "elf_exports.py",
+    "elf_slots.py",
+    "ghidra_ingest.py",
+    "stub_resolve.py",
+)
 
 
 def pass_version_source_files(script_dir: Path) -> list[Path]:
@@ -264,9 +269,10 @@ class GhidraResult:
     # went on without it and can have missed functions. None when none threw. Recorded onto
     # binaries.ghidra_status_reason of the extracted row.
     degrade_reason: str | None = None
-    # What the extraction's decompile left unfinished, from its JSON's ``decompile_counts``: the
-    # timeouts of a body of 8KB or more, and the outputs past the decompiler's output limit. None
-    # when the output does not record them.
+    # What the extraction's decompile left unfinished, from its JSON's ``decompile_counts``: every
+    # timeout, of them the timeouts of a body of 8KB or more, and the outputs past the decompiler's
+    # output limit. None when the output does not record them.
+    decompile_timeouts: int | None = None
     decompile_large_timeouts: int | None = None
     decompile_payload_exceeded: int | None = None
     # Set by run_all on a phase-2 result when that isolated re-run still left decompiles
@@ -757,32 +763,39 @@ def _analyzer_exception(log_path: Path, offset: int) -> str | None:
 # The head of an extraction JSON: ExportFunctions writes "decompile_counts" first so it can be read
 # without parsing the rest. Anchored at the start of the file — nothing the binary supplies precedes
 # it.
+# The head of an extraction JSON: its decompile counts come first. Further counts may follow the
+# three read here (",..."), which leaves these readable.
 _DECOMPILE_COUNTS = re.compile(
-    rb'\{"decompile_counts":\{"timeouts":(\d+),"timeouts_large":(\d+),"payload_exceeded":(\d+)\}'
+    rb'\{"decompile_counts":\{"timeouts":(\d+),"timeouts_large":(\d+),"payload_exceeded":(\d+)'
+    rb"[,}]"
 )
 
 
-def _decompile_counts(output_file: Path) -> tuple[int | None, int | None]:
-    """(large timeouts, outputs past the limit) from the head of an extraction JSON; (None, None)
-    when it does not record them."""
+def _decompile_counts(output_file: Path) -> tuple[int | None, int | None, int | None]:
+    """(timeouts, of them large, outputs past the limit) from the head of an extraction JSON;
+    (None, None, None) when it does not record them."""
     try:
         with output_file.open("rb") as f:
             head = f.read(256)
     except OSError:
-        return None, None
+        return None, None, None
     m = _DECOMPILE_COUNTS.match(head)
     if m is None:
-        return None, None
-    return int(m.group(2)), int(m.group(3))
+        return None, None, None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
 def unfinished_decompiles(result: GhidraResult) -> int | None:
     """How many decompiles a successful extraction left unfinished that an isolated re-run may
-    finish (large timeouts + outputs past the limit); None when the output did not record it."""
-    large, payload = result.decompile_large_timeouts, result.decompile_payload_exceeded
-    if large is None or payload is None:
+    finish: every timeout — a small body times out under load as well as a large one — and every
+    output past the limit; None when the output did not record it."""
+    timeouts = result.decompile_timeouts
+    if timeouts is None:
+        timeouts = result.decompile_large_timeouts
+    payload = result.decompile_payload_exceeded
+    if timeouts is None or payload is None:
         return None
-    return large + payload
+    return timeouts + payload
 
 
 def _export_failure_reason(log_path: Path, offset: int) -> str:
@@ -1246,13 +1259,14 @@ class GhidraRunner:
             # The export of a session whose extraction failed is never kept, whatever was written.
             export_status = f"scan_failed:{reason}"
         degrade_reason: str | None = None
+        all_timeouts: int | None = None
         large_timeouts: int | None = None
         payload_exceeded: int | None = None
         if success:
             # Both ways a session ends in a finished extraction (above): what it may have missed.
             if log_path.exists():
                 degrade_reason = _analyzer_exception(log_path, log_offset)
-            large_timeouts, payload_exceeded = _decompile_counts(expected_out)
+            all_timeouts, large_timeouts, payload_exceeded = _decompile_counts(expected_out)
         usable = export_status in ("ok", "degraded") and exp is not None
         return GhidraResult(
             binary=binary,
@@ -1265,6 +1279,7 @@ class GhidraRunner:
             stderr_tail=stderr_raw if stderr_raw else None,
             reason=reason,
             degrade_reason=degrade_reason,
+            decompile_timeouts=all_timeouts,
             decompile_large_timeouts=large_timeouts,
             decompile_payload_exceeded=payload_exceeded,
             timeout_budget=budget,
@@ -1315,9 +1330,10 @@ class GhidraRunner:
         ★ Two more kinds of phase-1 success are re-run in phase 2 the same way (finalized at once,
         settled by ``on_export``), because an isolated session gets back what the pool lost:
         one during whose analysis a Ghidra analyzer threw (``degrade_reason``; the analyzers race
-        under load and drop functions when they do), and one whose decompile left a large body
-        unfinished or an output past the decompiler's limit (re-run with the larger limit, which a
-        function that timed out before reaching it may need too). A binary in
+        under load and drop functions when they do), and one whose decompile left a function
+        unfinished — a timeout of a body of any size, or an output past the decompiler's limit
+        (re-run with the larger limit, which a function that timed out before reaching it may need
+        too). A binary in
         ``decompile_settled`` (sha256) is not re-run for the second reason: an isolated re-run
         under this pass, Ghidra and budget already left it unfinished. Of the two sessions, the
         better extraction is kept whole, with its own export (``_settle_rerun``).

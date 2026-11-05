@@ -3112,6 +3112,7 @@ def test_unavailable_by_cause_sums_to_unavailable_and_skipped_micro(
     assert s is not None
     assert s["unavailable_by_cause"] == {
         "db_unavailable": 0,
+        "decompile_failed": 0,
         "decompile_empty": 2,
         "size_unknown": 2,
         "one_side_skipped_micro": 1,
@@ -3124,6 +3125,7 @@ def test_unavailable_by_cause_sums_to_unavailable_and_skipped_micro(
     assert (reading["unavailable"], reading["skipped_micro"]) == (1, 1)
     assert s["alignment_undetermined_unavailable_by_cause"] == {
         "db_unavailable": 0,
+        "decompile_failed": 0,
         "decompile_empty": 1,
         "size_unknown": 0,
         "one_side_skipped_micro": 1,

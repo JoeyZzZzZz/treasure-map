@@ -46,7 +46,7 @@ from treasure_map.lib.diff.currency import (
 )
 from treasure_map.lib.diff.export_report import ExportReport
 from treasure_map.lib.errors import ConfigError
-from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE
+from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE, has_text
 from treasure_map.lib.hunt.refs import _norm_addr
 from treasure_map.lib.query.runs import get_run
 from treasure_map.lib.ro_db import ro_connect
@@ -283,8 +283,10 @@ def _decompile_status(pseudocode: str | None, size_bytes: int | None) -> str:
                             ``INTEGER DEFAULT 0`` so it is never NULL in practice -- 0 is the real
                             "unrecorded" marker. A 0-size real function must NOT be swallowed into
                             skipped_micro (0 < MIN); size-unknown cannot be classified -> unknown.
-    ``unknown`` is checked BEFORE the size comparison so 0 never falls through to skipped_micro."""
-    if pseudocode and pseudocode.strip():
+    ``unknown`` is checked BEFORE the size comparison so 0 never falls through to skipped_micro.
+    The placeholder an earlier extractor stored for a decompile that threw is no pseudocode
+    (``facts.has_text``): two sides holding the same one are two failures, not two equal bodies."""
+    if has_text(pseudocode):
         return "ok"
     if size_bytes is None or size_bytes == 0:
         return "unknown"

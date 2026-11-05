@@ -149,6 +149,7 @@ def _runner_class() -> type:
                 data["pass_version"] = PASS_VERSION
                 data["sha8"] = rec.sha256[:8]
                 data["stub_marker"] = stub_table_marker(None if stubs is None else stubs.names)
+                data.update(_image_fields(rec.path))
                 out = out_dir / f"{rec.name}_{rec.sha256[:8]}_ghidra.json"
                 out.write_text(json.dumps(data, indent=1), encoding="utf-8")
                 result = GhidraResult(
@@ -165,6 +166,20 @@ def _runner_class() -> type:
             return results
 
     return FixtureRunner
+
+
+def _image_fields(path: Path) -> dict[str, str]:
+    """The image-base fields the real extractor writes: where the ELF was linked (its lowest
+    PT_LOAD) and where the decompiler loads it (that plus the load shift)."""
+    from elftools.elf.elffile import ELFFile
+
+    from treasure_map.lib.analyze.stub_resolve import ghidra_load_shift_of
+
+    with path.open("rb") as fh:
+        elf = ELFFile(fh)
+        linked = min(s["p_vaddr"] for s in elf.iter_segments() if s["p_type"] == "PT_LOAD")
+        loaded = linked + ghidra_load_shift_of(elf)
+    return {"image_base": f"0x{loaded:x}", "elf_original_image_base": f"0x{linked:x}"}
 
 
 # ── the run ──────────────────────────────────────────────────────────────────────────

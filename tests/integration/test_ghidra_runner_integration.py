@@ -58,3 +58,10 @@ def test_run_ghidra_real_binary(tmp_path: Path) -> None:
     assert any(len(x) > 1 for x in ref_lists) and any(len(x) > 1 for x in take_lists)
     assert all(x == sorted(x) for x in ref_lists)
     assert all(x == sorted(x) for x in take_lists)
+
+    # The image base the decompiler reports, against the shift computed from the ELF alone (the
+    # one the stub table is moved by): this PIE is linked at 0 and loaded at +0x100000.
+    from treasure_map.lib.analyze.stub_resolve import ghidra_load_shift
+
+    applied = int(data["image_base"], 16) - int(data["elf_original_image_base"], 16)
+    assert applied == ghidra_load_shift(_EXE_ELF) == 0x100000

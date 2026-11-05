@@ -29,6 +29,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.unit.lib.elf_builder import extractor_image_fields
 from tests.unit.lib.test_ghidra_runner import _good_json, _make_runner, _write_small_elf
 from tests.unit.lib.test_pipeline import _NAMES, _e2e_cfg, _firmware, _ghidra
 from tests.unit.lib.test_scan_export import _report, _with_extension
@@ -282,6 +283,7 @@ class _Plan:
             "pass_version": runner.pass_version(),
             "sha8": sha8,
             "stub_marker": stub_table_marker(None if stubs is None else stubs.names),
+            **extractor_image_fields(binary),
             "functions": [
                 {"name": f"f{j}", "address": f"0010{j:04x}", "size": 64, "callees": []}
                 for j in range(n)
@@ -306,6 +308,7 @@ class _Plan:
             analysis_status="ok",
             function_count=n,
             degrade_reason=o.get("threw"),
+            decompile_timeouts=o.get("large", 0) + o.get("small_timeouts", 0),
             decompile_large_timeouts=o.get("large", 0),
             decompile_payload_exceeded=o.get("payload", 0),
             timeout_budget=timeout,
@@ -558,20 +561,51 @@ def test_the_decompile_counts_are_read_from_the_head_of_the_output(tmp_path: Pat
     a.write_text(
         '{"decompile_counts":{"timeouts":3,"timeouts_large":2,"payload_exceeded":1},"x":1}'
     )
-    assert _decompile_counts(a) == (2, 1)
+    assert _decompile_counts(a) == (3, 2, 1)
     b = tmp_path / "b.json"
     # the same object, but not the head: nested under another key
     b.write_text(
         '{"other":{"decompile_counts":{"timeouts":7,"timeouts_large":7,"payload_exceeded":0}}}'
     )
-    assert _decompile_counts(b) == (None, None)
-    assert _decompile_counts(tmp_path / "missing.json") == (None, None)
+    assert _decompile_counts(b) == (None, None, None)
+    assert _decompile_counts(tmp_path / "missing.json") == (None, None, None)
 
 
 def test_a_finished_session_carries_its_decompile_counts(tmp_path: Path) -> None:
+    """★ Every timeout counts as unfinished, not only a large body's: a small function times out
+    under load as well, and an isolated re-run may finish it. 4 timeouts (2 of them large) and 1
+    output past the limit leave 5.
+
+    MUTATION (verified RED): count the large timeouts only -> 3 -> RED."""
     result, _ = _once(tmp_path, counts=(4, 2, 1))
-    assert (result.decompile_large_timeouts, result.decompile_payload_exceeded) == (2, 1)
-    assert ghidra_runner.unfinished_decompiles(result) == 3
+    assert (result.decompile_timeouts, result.decompile_large_timeouts) == (4, 2)
+    assert result.decompile_payload_exceeded == 1
+    assert ghidra_runner.unfinished_decompiles(result) == 5
+
+
+def test_the_head_is_read_when_more_counts_follow(tmp_path: Path) -> None:
+    """The extractor may write further counts after the three read here; the head stays readable.
+
+    MUTATION (verified RED): require the object to close right after payload_exceeded -> RED."""
+    a = tmp_path / "a.json"
+    a.write_text(
+        '{"decompile_counts":{"timeouts":3,"timeouts_large":2,"payload_exceeded":1,'
+        '"wrapper_probe_unfinished":{"small":1,"large":0}},"x":1}'
+    )
+    assert _decompile_counts(a) == (3, 2, 1)
+
+
+def test_a_binary_with_only_small_timeouts_is_rerun_isolated(tmp_path: Path) -> None:
+    """★ A binary whose only unfinished decompiles are small-body timeouts goes to the isolated
+    phase-2 re-run with the larger output limit, like one with a large body left.
+
+    MUTATION (verified RED): send only large timeouts and outputs past the limit -> RED."""
+    plan = _Plan({"small": [{"small_timeouts": 2}, {}], "clean": [{}]})
+    recs = _recs(tmp_path, ("small", "clean"))
+    _run_all(tmp_path, plan, ("small", "clean"))
+    phase2 = {c[0]: c for c in plan.calls[len(recs) :]}
+    assert set(phase2) == {"small"}
+    assert phase2["small"][2] is True  # the larger output limit
 
 
 @pytest.mark.parametrize("extension", [True, False])

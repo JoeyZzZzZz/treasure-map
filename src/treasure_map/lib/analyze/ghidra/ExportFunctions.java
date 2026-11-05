@@ -598,6 +598,11 @@ public class ExportFunctions extends GhidraScript {
     // is a vanishingly small slice — measured across three firmware images, 0.22%-0.38% of all
     // functions, at most 134 in any single binary. The instruction scan runs for every function
     // (cheap), and the decompiler — the expensive part — runs only for that slice.
+    // The shell-sink callers the wrapper probe could not decompile (so could not decide), by body
+    // size: reported beside the decompile counts.
+    private int wrapperProbeUnfinishedSmall = 0;
+    private int wrapperProbeUnfinishedLarge = 0;
+
     private void buildCmdWrapperRegistry(DecompInterface decomp, FunctionManager fm) {
         cmdWrapperSink = new HashMap<>();
         cmdWrapperKeyArg = new HashMap<>();
@@ -633,7 +638,17 @@ public class ExportFunctions extends GhidraScript {
             } catch (Exception e) {
                 pseudocode = null;
             }
-            if (pseudocode == null) continue;
+            if (pseudocode == null) {
+                // Not decided either way: a function this probe could not decompile is no more
+                // "not a wrapper" than a wrapper. Counted by body size; never retried here, so the
+                // decompile retry budget stays with the main loop's functions.
+                if (func.getBody().getNumAddresses() >= DECOMPILE_UNFINISHED_LARGE_BYTES) {
+                    wrapperProbeUnfinishedLarge++;
+                } else {
+                    wrapperProbeUnfinishedSmall++;
+                }
+                continue;
+            }
             String[] hit;
             try {
                 hit = thinCmdWrapper(pseudocode, callees);
@@ -1245,6 +1260,9 @@ public class ExportFunctions extends GhidraScript {
                 // Which records of the run are kept (a data or strict key always; a loose key by its
                 // shape, or by a mostly-strict run); each maximal kept stretch >= MIN_RUN is a table.
                 boolean[] kept = keptRecords(entries);
+                boolean runCapped = entries.size() >= STRTBL_MAX_ENTRIES;
+                String runBefore = boundAt(safeSub(a, stride), ps, blk, mem, fm);
+                String runAfter = runCapped ? BOUND_ENTRY_CAP : boundAt(b, ps, blk, mem, fm);
                 boolean anyTable = false;
                 int i = 0;
                 while (i < entries.size()) {
@@ -1256,7 +1274,9 @@ public class ExportFunctions extends GhidraScript {
                         anyTable = true;
                         if (!firstT) tables.append(",");
                         firstT = false;
-                        appendTable(tables, at, stride, entries.subList(i, j));
+                        String before = i > 0 ? BOUND_LOOSE_KEY : runBefore;
+                        String after = j < entries.size() ? BOUND_LOOSE_KEY : runAfter;
+                        appendTable(tables, at, stride, entries.subList(i, j), before, after);
                     }
                     i = j;
                 }
@@ -1282,17 +1302,23 @@ public class ExportFunctions extends GhidraScript {
     private static final String STRTBL_INCOMPLETE_REASON =
         "got_relative_and_three_field_not_detected_handler_must_be_defined_function";
 
-    private void appendTable(StringBuilder tables, Address at, long stride, List<String[]> entries) {
+    private void appendTable(StringBuilder tables, Address at, long stride, List<String[]> entries,
+                             String before, String after) {
         tables.append("{\"table_addr\":\"0x").append(Long.toHexString(at.getOffset()))
               .append("\",\"stride\":").append(stride)
-              .append(",\"count\":").append(entries.size()).append(",\"entries\":[");
+              .append(",\"count\":").append(entries.size())
+              .append(",\"bounds\":{\"before\":\"").append(before)
+              .append("\",\"after\":\"").append(after).append("\"}")
+              .append(",\"entries\":[");
         for (int i = 0; i < entries.size(); i++) {
             String[] e = entries.get(i);
             if (i > 0) tables.append(",");
             tables.append("{\"key\":\"").append(esc(e[0]))
                   .append("\",\"func_name\":\"").append(esc(e[1]))
                   .append("\",\"func_addr\":\"").append(esc(e[2]))
-                  .append("\",\"func_kind\":\"").append(esc(e[3])).append("\"}");
+                  .append("\",\"func_kind\":\"").append(esc(e[3]))
+                  .append("\",\"key_terminated\":").append(!KEY_UNTERMINATED.equals(e[5]))
+                  .append("}");
         }
         tables.append("]}");
     }
@@ -1339,22 +1365,32 @@ public class ExportFunctions extends GhidraScript {
     private String[] tableKey(Address k, Memory mem) {
         MemoryBlock kb = mem.getBlock(k);
         if (kb == null || !kb.isInitialized()) return null;
+        Listing listing = currentProgram.getListing();
         if (!kb.isExecute()) {
             String key = strAtRodata(k, mem);
-            return key == null || key.isEmpty() ? null : new String[]{ key, KEY_DATA };
+            if (key == null || key.isEmpty()) return null;
+            // A data-block key read as a printable run that stopped at something other than a NUL
+            // (or at the length limit) is not a C string the table points at: it is kept, and
+            // marked, so the table it sits in is not read as cleanly keyed.
+            Data at = listing.getDefinedDataAt(k);
+            boolean defined = at != null && at.getValue() instanceof String;
+            boolean terminated = defined || nulTerminatedPrintable(k, mem) != null;
+            return new String[]{ key, KEY_DATA, terminated ? KEY_TERMINATED : KEY_UNTERMINATED };
         }
-        Listing listing = currentProgram.getListing();
         Data at = listing.getDefinedDataAt(k);
         if (at != null && at.getValue() instanceof String) {
             String v = (String) at.getValue();
-            return v.isEmpty() ? null : new String[]{ v, KEY_STRICT };
+            return v.isEmpty() ? null : new String[]{ v, KEY_STRICT, KEY_TERMINATED };
         }
         String run = nulTerminatedPrintable(k, mem);
         if (run == null) return null;
         Data around = listing.getDataContaining(k);
         boolean inString = around != null && around.getValue() instanceof String;
-        return new String[]{ run, inString ? KEY_STRICT : KEY_LOOSE };
+        return new String[]{ run, inString ? KEY_STRICT : KEY_LOOSE, KEY_TERMINATED };
     }
+
+    private static final String KEY_TERMINATED = "1";
+    private static final String KEY_UNTERMINATED = "0";
 
     // A printable run ended by a NUL within STR_TEXT_LIMIT bytes, or null.
     private String nulTerminatedPrintable(Address a, Memory mem) {
@@ -1473,7 +1509,36 @@ public class ExportFunctions extends GhidraScript {
         String[] fn;
         try { fn = funcAtPtr(toAddr(p1), fm); } catch (Exception e) { fn = null; }
         if (fn == null) return null;
-        return new String[]{ key[0], fn[0], fn[1], fn[2], key[1] };
+        return new String[]{ key[0], fn[0], fn[1], fn[2], key[1], key[2] };
+    }
+
+    // Why a run of records stops at a slot that is not a record. The ingest turns these into each
+    // table's completeness reason: a handler Ghidra did not define (or one outside the image) may
+    // mean the table goes on past it, a non-record does not show that it does.
+    private static final String BOUND_NOT_A_RECORD = "not_a_record";
+    private static final String BOUND_HANDLER_UNDEFINED = "handler_undefined";
+    private static final String BOUND_HANDLER_EXTERNAL = "handler_external";
+    private static final String BOUND_LOOSE_KEY = "loose_key";
+    private static final String BOUND_ENTRY_CAP = "entry_cap";
+    private static final String BOUND_BLOCK_EDGE = "block_edge";
+
+    private String boundAt(Address a, int ps, MemoryBlock blk, Memory mem, FunctionManager fm) {
+        if (a == null || !blk.contains(a) || blk.getEnd().subtract(a) < 2L * ps - 1)
+            return BOUND_BLOCK_EDGE;
+        long p0, p1;
+        try { p0 = readPtr(a, ps, mem); } catch (Exception e) { return BOUND_NOT_A_RECORD; }
+        if (p0 == 0) return BOUND_NOT_A_RECORD;
+        String[] key;
+        try { key = tableKey(toAddr(p0), mem); } catch (Exception e) { key = null; }
+        if (key == null) return BOUND_NOT_A_RECORD;
+        try { p1 = readPtr(a.add(ps), ps, mem); } catch (Exception e) { return BOUND_NOT_A_RECORD; }
+        if (p1 == 0) return BOUND_NOT_A_RECORD;
+        Address to;
+        try { to = toAddr(p1); } catch (Exception e) { return BOUND_NOT_A_RECORD; }
+        if (funcAtPtr(to, fm) != null) return BOUND_NOT_A_RECORD;   // a record after all (defensive)
+        MemoryBlock tb = mem.getBlock(to);
+        if (tb == null || tb.isExternalBlock()) return BOUND_HANDLER_EXTERNAL;
+        return tb.isExecute() ? BOUND_HANDLER_UNDEFINED : BOUND_NOT_A_RECORD;
     }
 
     private long readPtr(Address a, int ps, Memory mem) throws Exception {
@@ -1695,6 +1760,10 @@ public class ExportFunctions extends GhidraScript {
 
     private Address safeAdd(Address a, long delta) {
         try { return a.add(delta); } catch (Exception e) { return null; }
+    }
+
+    private Address safeSub(Address a, long delta) {
+        try { return a.subtract(delta); } catch (Exception e) { return null; }
     }
 
     // Classify ONE key varnode into {"constant","<key>"} / {"parametric","<template>"} /
@@ -2666,7 +2735,10 @@ public class ExportFunctions extends GhidraScript {
                 decompileError = payloadExceeded(msg) ? DECOMPILE_PAYLOAD_EXCEEDED : firstLine(msg);
             }
         } catch (Exception e) {
-            pseudocode = "/* decompile_error: " + e.getMessage() + " */";
+            // No text: the failure is the status and its reason the error message. A note in place
+            // of pseudocode would read as a body, and two decompiles that threw the same message
+            // as two identical ones.
+            pseudocode = "";
             decompileStatus = DECOMPILE_ERROR;
             decompileError = payloadExceeded(e.getMessage())
                     ? DECOMPILE_PAYLOAD_EXCEEDED : firstLine(e.getMessage());
@@ -3051,7 +3123,9 @@ public class ExportFunctions extends GhidraScript {
         }
         String decompileCounts = "{\"timeouts\":" + unfinishedTimeouts
                 + ",\"timeouts_large\":" + unfinishedLarge
-                + ",\"payload_exceeded\":" + unfinishedPayload + "}";
+                + ",\"payload_exceeded\":" + unfinishedPayload
+                + ",\"wrapper_probe_unfinished\":{\"small\":" + wrapperProbeUnfinishedSmall
+                + ",\"large\":" + wrapperProbeUnfinishedLarge + "}}";
         if (!timedOut.isEmpty() || unfinishedPayload > 0) {
             println("[ExportFunctions] decompile timeouts: " + timedOut.size() + ", retried: "
                     + retried + ", recovered: " + recovered + ", retry budget: "
@@ -3276,6 +3350,20 @@ public class ExportFunctions extends GhidraScript {
             // Which stub table this run actually read (content hash, or "none" when none was handed
             // in). The driver and the ingest compare it with the table they meant for this binary.
             pw.print("\"stub_marker\":\"" + esc(stubMarker) + "\",");
+            // Where the decompiler loaded the image and where the ELF was linked: their difference
+            // is the shift it applied to every address here. The ingest checks it against the shift
+            // it computed itself (stub addresses were moved by that one before this run read them)
+            // and refuses the output when the two disagree. null when the loader recorded no
+            // link-time base.
+            Long elfBase = null;
+            try {
+                elfBase = ghidra.app.util.opinion.ElfLoader.getElfOriginalImageBase(currentProgram);
+            } catch (Throwable ignore) {
+                elfBase = null;
+            }
+            pw.print("\"image_base\":\"" + addrHex(currentProgram.getImageBase()) + "\",");
+            pw.print("\"elf_original_image_base\":"
+                     + (elfBase == null ? "null" : "\"0x" + Long.toHexString(elfBase) + "\"") + ",");
             // What PromoteUndefined did in this session; absent when it recorded nothing.
             if (promoteJson != null) pw.print("\"promote\":" + promoteJson + ",");
             // W12: the thunks skipped above (entry + body ranges), so the diff's counterpart probe

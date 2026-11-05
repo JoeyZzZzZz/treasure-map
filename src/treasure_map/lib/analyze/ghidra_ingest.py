@@ -25,16 +25,55 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from treasure_map.lib.analyze.elf_exports import dynamic_function_exports
+from treasure_map.lib.analyze.elf_exports import (
+    dynamic_function_exports,
+    unrecorded_dynamic_imports,
+)
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
+from treasure_map.lib.analyze.elf_slots import (
+    HANDLER_UNVERIFIED,
+    ElfSlots,
+    handler_check,
+    read_elf_slots,
+)
 from treasure_map.lib.analyze.stub_resolve import (
     StubResolution,
+    ghidra_load_shift,
     relabel_callees,
     resolve_stubs,
     stub_table_marker,
 )
 
 logger = logging.getLogger(__name__)
+
+# Where an import row came from (imports.source).
+IMPORT_FROM_DECOMPILER = "decompiler"
+IMPORT_FROM_ELF = "elf_dynamic_symbols"
+
+# The status reason of a binary whose extraction is refused because the decompiler moved its
+# addresses by another amount than this side computed (or the two could not be compared).
+IMAGE_BASE_MISMATCH = "image_base_mismatch"
+
+
+def image_base_disagreement(data: dict[str, Any], elf_path: Path | str) -> str | None:
+    """None when the shift the decompiler applied to this binary's addresses
+    (``image_base - elf_original_image_base``, both reported by the extractor) equals the one
+    ``ghidra_load_shift`` computes from the ELF; otherwise what disagreed.
+
+    The stub table handed to the extractor, and the stub regions stored beside its output, were
+    moved by the computed shift; were the decompiler's another, every stub address would point
+    somewhere else. A shift that cannot be compared (a field missing or unreadable, the ELF
+    unreadable) is a disagreement too: an unchecked shift is not an agreeing one."""
+    expected = ghidra_load_shift(elf_path)
+    try:
+        applied: int | None = int(data["image_base"], 16) - int(data["elf_original_image_base"], 16)
+    except (KeyError, TypeError, ValueError):
+        applied = None
+    if expected is None or applied is None:
+        return f"cannot compare: decompiler shift {applied!r}, ELF shift {expected!r}"
+    if applied != expected:
+        return f"decompiler shift {applied:#x} != ELF shift {expected:#x}"
+    return None
 
 
 @dataclass
@@ -51,6 +90,9 @@ class IngestStats:
     # a JSON whose pass_version / sha8 markers do not match this scan: written by another
     # extraction pass or for another binary, so it is not ingested (same handling as EC1/EC2)
     binaries_stale_json: int = 0
+    # a JSON whose decompiler moved the binary's addresses by another amount than the stub table
+    # was moved by: refused, and the binary recorded failed with IMAGE_BASE_MISMATCH
+    binaries_image_base_mismatch: int = 0
 
 
 def ingest_ghidra_output(
@@ -155,6 +197,27 @@ def ingest_ghidra_output(
             stats.binaries_stale_json += 1
             continue
 
+        # EC4: the decompiler moved this binary's addresses by another amount than the stub table
+        # it was handed (and the stub regions stored below) were moved by. Refused, and recorded
+        # failed with the reason — one binary, never the whole scan; never a silent warning.
+        disagreement = image_base_disagreement(data, rec.path) if pass_version is not None else None
+        if disagreement is not None:
+            logger.warning(
+                "ghidra_ingest: %s (sha8=%s) refused, %s: %s",
+                rec.name,
+                sha8,
+                IMAGE_BASE_MISMATCH,
+                disagreement,
+            )
+            drop_extraction(conn, rec.sha256)
+            conn.execute(
+                "UPDATE binaries SET ghidra_ok = 0, ghidra_status = 'failed', "
+                "ghidra_status_reason = ? WHERE sha256 = ?",
+                (IMAGE_BASE_MISMATCH, rec.sha256),
+            )
+            stats.binaries_image_base_mismatch += 1
+            continue
+
         binary_id = sha_to_id[rec.sha256]
         # Which functions this binary EXPORTS, read from its dynamic symbol table. It is read from
         # the ELF here rather than taken from the decompiler because the decompiler's flag answers
@@ -162,7 +225,10 @@ def ingest_ghidra_output(
         # every function of every real firmware scanned. None means "could not be determined",
         # which stays distinct from "exports nothing".
         exports = dynamic_function_exports(rec.path)
-        _ingest_one_binary(conn, binary_id, data, stats, resolution, exports)
+        slots = read_elf_slots(rec.path)
+        recorded = {i.get("func_name") for i in data.get("imports", []) if isinstance(i, dict)}
+        import_fill = unrecorded_dynamic_imports(rec.path, {n for n in recorded if n}) or ()
+        _ingest_one_binary(conn, binary_id, data, stats, resolution, exports, slots, import_fill)
         # ★ stamp pass_version HERE — in the same transaction as this binary's function rows,
         # committed together at the end of this function. Stamped in the pipeline's own loop (and
         # committed there) BEFORE ingest, an interrupt between the two left a binary marked done
@@ -232,6 +298,7 @@ def drop_extraction(conn: sqlite3.Connection, sha256: str) -> None:
     _delete_extraction_rows(conn, int(row[0]))
     conn.execute(
         "UPDATE binaries SET pass_version = NULL, ghidra_version = NULL, thunk_spans = NULL, "  # noqa: S608
+        "wrapper_probe_unfinished = NULL, "
         + ", ".join(f"{c} = NULL" for c in PROMOTE_COLUMNS)
         + " WHERE id = ?",
         (row[0],),
@@ -437,6 +504,133 @@ def _ingest_listings(conn: sqlite3.Connection, binary_id: int, funcs: list[dict[
     )
 
 
+# A dispatch table is never recorded complete: nothing here proves no record is missing. Its
+# completeness_reason says, for THIS table, what the evidence shows about where it stops and what
+# it holds — a comma-joined, sorted set of:
+#   handler_undefined          it stops at a record whose handler Ghidra did not define (it may
+#                              go on past it)
+#   split_by_undefined_handler one such record separates it from the next table: one table, cut
+#   got_relative_unresolved    it stops at a record whose handler points outside the image
+#   truncated_at_probe_limit   it reached the per-table record cap
+#   split_by_loose_key         it stops at a record whose key was too weak to keep
+#   handler_not_function       a record the ELF fills with a symbol plus an offset, or with a symbol
+#                              that is not a function, was refused here (the table was cut there)
+#   record_in_got              a record lying in the GOT was refused here (cut there)
+#   handler_unverified         a handler the ELF types as untyped, or an ELF that could not be read
+#   key_not_terminated         a data key that is neither a defined string nor NUL-terminated
+#   scope_only                 none of the above: only the absolute 2-field form is read, so a
+#                              table of another form around it would go unseen
+STRTBL_MIN_RUN = 4  # the detector's own minimum: a shorter run is not a table
+_BOUND_REASONS = {
+    "handler_undefined": "handler_undefined",
+    "handler_external": "got_relative_unresolved",
+    "entry_cap": "truncated_at_probe_limit",
+    "loose_key": "split_by_loose_key",
+}
+SCOPE_ONLY = "scope_only"
+
+
+@dataclass(frozen=True)
+class CheckedTable:
+    table_addr: str
+    stride: int
+    entries: list[dict[str, Any]]
+    reason: str
+
+
+def _addr(text: Any) -> int | None:
+    try:
+        return int(str(text), 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def checked_string_tables(tables: Any, slots: ElfSlots | None) -> list[CheckedTable]:
+    """The extractor's dispatch tables after the ELF's own word on each handler slot: a record the
+    ELF does not fill with that handler is refused (``elf_slots.handler_check``), which cuts its
+    table there; a piece so cut that is shorter than the detector's minimum is no table. Each table
+    that remains carries its own completeness reason (see above)."""
+    raw = [t for t in tables if isinstance(t, dict)] if isinstance(tables, list) else []
+    pieces: list[tuple[int, int, list[dict[str, Any]], set[str], str | None, str | None]] = []
+    cut: set[int] = set()  # the start of every piece some refused record bounds
+    for t in raw:
+        base, stride = _addr(t.get("table_addr")), t.get("stride")
+        entries = [e for e in t.get("entries", []) if isinstance(e, dict)]
+        if base is None or not isinstance(stride, int) or stride <= 0:
+            continue
+        bounds = t.get("bounds") if isinstance(t.get("bounds"), dict) else {}
+        verdicts: list[str | None] = []
+        for i, e in enumerate(entries):
+            if slots is None:
+                verdicts.append(HANDLER_UNVERIFIED)
+                continue
+            key_slot = base + i * stride
+            verdicts.append(
+                handler_check(slots, key_slot, key_slot + stride // 2, str(e.get("func_name")))
+            )
+        i = 0
+        while i < len(entries):
+            if verdicts[i] not in (None, HANDLER_UNVERIFIED):
+                i += 1
+                continue
+            j = i
+            while j < len(entries) and verdicts[j] in (None, HANDLER_UNVERIFIED):
+                j += 1
+            notes = {v for v in verdicts[i:j] if v is not None}
+            if any(e.get("key_terminated") is False for e in entries[i:j]):
+                notes.add("key_not_terminated")
+            before = bounds.get("before") if i == 0 else verdicts[i - 1]
+            after = bounds.get("after") if j == len(entries) else verdicts[j]
+            if i > 0 or j < len(entries):
+                cut.add(base + i * stride)
+            pieces.append((base + i * stride, stride, entries[i:j], notes, before, after))
+            i = j
+    # A piece a refusal cut out is held to the detector's own minimum; a table the extractor gave
+    # whole stands as given.
+    tables = [p for p in pieces if p[0] not in cut or len(p[2]) >= STRTBL_MIN_RUN]
+    starts = {(p[0], p[1]) for p in tables}
+    ends = {(p[0] + len(p[2]) * p[1], p[1]) for p in tables}  # the slot just past each table
+    out: list[CheckedTable] = []
+    for start, stride, entries, notes, before, after in tables:
+        reasons = set(notes)
+        end = start + len(entries) * stride
+        for bound, across in (
+            (before, (start - stride, stride) in ends),
+            (after, (end + stride, stride) in starts),
+        ):
+            if bound is None:
+                continue
+            if bound in ("handler_not_function", "record_in_got"):
+                reasons.add(str(bound))
+            elif bound == "handler_undefined" and across:
+                # One record with an undefined handler between this table and another: one table,
+                # cut in two.
+                reasons.add("split_by_undefined_handler")
+            elif str(bound) in _BOUND_REASONS:
+                reasons.add(_BOUND_REASONS[str(bound)])
+        out.append(
+            CheckedTable(
+                table_addr=f"0x{start:x}",
+                stride=stride,
+                entries=entries,
+                reason=",".join(sorted(reasons)) or SCOPE_ONLY,
+            )
+        )
+    return out
+
+
+def _wrapper_probe_unfinished(counts: Any) -> str | None:
+    """``{"small": n, "large": n}`` as stored, from an export's decompile counts; None when it does
+    not carry them in that form."""
+    probe = counts.get("wrapper_probe_unfinished") if isinstance(counts, dict) else None
+    if not isinstance(probe, dict):
+        return None
+    small, large = probe.get("small"), probe.get("large")
+    if not isinstance(small, int) or not isinstance(large, int):
+        return None
+    return json.dumps({"small": small, "large": large}, separators=(",", ":"))
+
+
 def _ingest_one_binary(
     conn: sqlite3.Connection,
     binary_id: int,
@@ -444,8 +638,14 @@ def _ingest_one_binary(
     stats: IngestStats,
     resolution: StubResolution | None = None,
     exports: frozenset[str] | None = None,
+    slots: ElfSlots | None = None,
+    import_fill: tuple[str, ...] = (),
 ) -> None:
-    """Replace this binary's rows in functions/imports/exports/strings."""
+    """Replace this binary's rows in functions/imports/exports/strings. ``slots`` are the ELF's
+    slot facts the dispatch tables are checked against (None: not checked, and said so).
+    ``import_fill`` are the ELF's undefined dynamic symbols the decompiler's loader left out of its
+    imports (see ``elf_exports.unrecorded_dynamic_imports``), stored beside them with their
+    source."""
 
     # DELETE existing rows for this binary_id (idempotent re-ingest)
     _delete_extraction_rows(conn, binary_id)
@@ -539,14 +739,17 @@ def _ingest_one_binary(
         stats.functions_ingested += len(func_rows)
         _ingest_listings(conn, binary_id, data.get("functions", []))
 
-    # imports (JSON's lib_name maps to DB's lib_soname)
+    # imports (JSON's lib_name maps to DB's lib_soname), each with where it came from; the
+    # dynamic symbols the decompiler's loader left out name no library (the ELF does not say
+    # which DT_NEEDED provides a symbol)
     imp_rows = [
-        (binary_id, imp.get("func_name"), imp.get("lib_name") or "")
+        (binary_id, imp.get("func_name"), imp.get("lib_name") or "", IMPORT_FROM_DECOMPILER)
         for imp in data.get("imports", [])
     ]
+    imp_rows += [(binary_id, name, "", IMPORT_FROM_ELF) for name in import_fill]
     if imp_rows:
         conn.executemany(
-            "INSERT INTO imports (binary_id, func_name, lib_soname) VALUES (?, ?, ?)",
+            "INSERT INTO imports (binary_id, func_name, lib_soname, source) VALUES (?, ?, ?, ?)",
             imp_rows,
         )
         stats.imports_ingested += len(imp_rows)
@@ -624,6 +827,14 @@ def _ingest_one_binary(
     )
     conn.execute("UPDATE binaries SET thunk_spans = ? WHERE id = ?", (thunk_spans_json, binary_id))
 
+    # The shell-sink callers the extractor's wrapper probe could not decompile, by body size: not
+    # decided either way (neither a wrapper nor not one). Written on every ingest; NULL when the
+    # export does not record it (not recorded, never "none left").
+    conn.execute(
+        "UPDATE binaries SET wrapper_probe_unfinished = ? WHERE id = ?",
+        (_wrapper_probe_unfinished(data.get("decompile_counts")), binary_id),
+    )
+
     # What PromoteUndefined did in this extraction's session: the functions it created and the
     # instructions still in no function afterwards, by kind and as address ranges (see
     # _promote_columns). Written on every ingest, so a re-extraction whose export carries no record
@@ -678,26 +889,21 @@ def _ingest_one_binary(
         c_reason = comp.get("reason")
         c_scope = comp.get("scope")
         st_rows: list[tuple[Any, ...]] = []
-        for t in string_tables.get("tables", []):
-            if not isinstance(t, dict):
-                continue
-            table_addr = t.get("table_addr")
-            stride = t.get("stride")
-            for i, e in enumerate(t.get("entries", [])):
-                if not isinstance(e, dict):
-                    continue
+        kept_tables = checked_string_tables(string_tables.get("tables", []), slots)
+        for t in kept_tables:
+            for i, e in enumerate(t.entries):
                 st_rows.append(
                     (
                         binary_id,
-                        table_addr,
-                        stride,
+                        t.table_addr,
+                        t.stride,
                         i,
                         e.get("key"),
                         e.get("func_name"),
                         e.get("func_addr"),
                         e.get("func_kind"),
                         c_status,
-                        c_reason,
+                        t.reason,
                         c_scope,
                     )
                 )
@@ -713,7 +919,7 @@ def _ingest_one_binary(
         # st_rows). At zero tables an empty result would otherwise read as "confirmed none"; this
         # row records scanned=1 + scope + cap_hit so a consumer tells genuine-none from
         # unsupported-form or capped. found_count is the number of TABLES (not entries).
-        found_tables = sum(1 for t in string_tables.get("tables", []) if isinstance(t, dict))
+        found_tables = len(kept_tables)
         conn.execute(
             "INSERT INTO detector_scan_status "
             "(binary_id, detector, scanned, supported_scope, unsupported_note, cap_hit, "

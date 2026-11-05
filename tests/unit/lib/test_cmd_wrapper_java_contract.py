@@ -208,3 +208,19 @@ def test_the_export_header_carries_the_stub_marker() -> None:
     src = _source()
     assert re.search(r'pw\.print\("\\"stub_marker\\":\\"" \+ esc\(stubMarker\)', src)
     assert 'loadStubNames(System.getenv("TMAP_STUB_NAMES"));' in src
+
+
+def test_a_caller_the_wrapper_probe_could_not_decompile_is_counted_undecided() -> None:
+    """★ The probe's decompile of a shell-sink caller that does not complete is neither a wrapper
+    nor "not a wrapper": it is counted by body size and reported beside the decompile counts —
+    never dropped silently, and never retried (the retry budget stays with the main loop).
+
+    MUTATION (verified RED): skip it silently again (a bare continue) -> RED."""
+    src = _source()
+    probe = src[src.index("private void buildCmdWrapperRegistry") :]
+    probe = probe[: probe.index('println("[ExportFunctions] cmd wrappers')]
+    undecided = probe[probe.index("if (pseudocode == null)") :][:600]
+    assert "wrapperProbeUnfinishedLarge++" in undecided
+    assert "wrapperProbeUnfinishedSmall++" in undecided
+    assert "decompileFunction(" not in undecided  # no retry
+    assert '\\"wrapper_probe_unfinished\\":{\\"small\\":' in src

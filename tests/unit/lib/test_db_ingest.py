@@ -1335,3 +1335,27 @@ def test_migration_adds_reanalyze_pending_to_old_db(tmp_path: Path) -> None:
     assert "reanalyze_pending" in {r[1] for r in conn.execute("PRAGMA table_info(binaries)")}
     assert _pending_of(conn) == {"svc_a": 0}
     conn.close()
+
+
+def test_migration_adds_the_import_source_to_an_old_db(tmp_path: Path) -> None:
+    """An imports table from before imports.source gains it on open; its rows survive and read
+    NULL (where they came from was not recorded), never a guessed source.
+
+    MUTATION (verified RED): drop the imports.source entry from _ADDED_COLUMNS -> RED."""
+    db_path = tmp_path / "legacy_imports.db"
+    raw = sqlite3.connect(db_path)
+    raw.execute("CREATE TABLE binaries (id INTEGER PRIMARY KEY, name TEXT, sha256 TEXT UNIQUE)")
+    raw.execute(
+        "CREATE TABLE imports (id INTEGER PRIMARY KEY AUTOINCREMENT, binary_id INTEGER NOT NULL, "
+        "func_name TEXT, lib_soname TEXT DEFAULT '')"
+    )
+    raw.execute("INSERT INTO binaries (id, name, sha256) VALUES (1, 'httpd', 'ab')")
+    raw.execute("INSERT INTO imports (binary_id, func_name, lib_soname) VALUES (1, 'system', '')")
+    raw.commit()
+    raw.close()
+    conn = open_db(db_path)
+    try:
+        row = conn.execute("SELECT func_name, source FROM imports").fetchone()
+        assert tuple(row) == ("system", None)
+    finally:
+        conn.close()

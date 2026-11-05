@@ -4132,6 +4132,10 @@ def make_tools(
     ) -> dict[str, Any]:
         """Import and export symbol tables of one binary (cross-binary edge endpoints).
 
+        Each import names its ``source`` (``decompiler``, or ``elf_dynamic_symbols`` for one the
+        decompiler's loader left out). ``imports`` is null with ``imports_state='undetermined'``
+        for a dynamically linked binary with none recorded — not "imports nothing".
+
         Run-aware: ``run_id`` + ``binary`` or ``evidence_ref``; echoes ``resolved_run``.
 
         ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a

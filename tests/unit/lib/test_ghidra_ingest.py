@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 import sqlite3
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.lib.elf_builder import extractor_image_fields
 from treasure_map.lib.analyze import ghidra_ingest as ingest_mod
 from treasure_map.lib.analyze.db_ingest import ingest_elfs
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
@@ -937,6 +939,15 @@ def test_w12_thunk_spans_are_stored_and_absence_is_null(tmp_path: Path) -> None:
 # ── EC3: a JSON written by another extraction pass / for another binary is not ingested ─────────
 
 
+# The records of an ingest that checks its markers are real ELFs on disk: the ingest also checks
+# the image base the extractor reports against the file's own.
+_FIXTURE_ELF = Path(__file__).resolve().parents[2] / "fixtures" / "elfs" / "exe_x86_64"
+
+
+def _disk_record(name: str, sha256: str) -> ElfRecord:
+    return dataclasses.replace(_make_record(name, sha256), path=_FIXTURE_ELF)
+
+
 def _marked(sha256: str, pass_version: str, stub_marker: str = "none") -> dict:  # type: ignore[type-arg]
     # stub_marker "none": these records are not MIPS ELFs, so no stub table resolves and the real
     # extractor, handed none, reports "none".
@@ -944,6 +955,7 @@ def _marked(sha256: str, pass_version: str, stub_marker: str = "none") -> dict: 
         "pass_version": pass_version,
         "sha8": sha256[:8],
         "stub_marker": stub_marker,
+        **extractor_image_fields(_FIXTURE_ELF),
         "binary": "test_bin",
         "functions": [{"name": "main", "address": "0x1000", "pseudocode": "int main(){}"}],
         "imports": [],
@@ -959,7 +971,7 @@ def test_ingest_skips_a_json_from_another_pass_and_counts_it(tmp_path: Path) -> 
     MUTATION (must go RED): drop the EC3 marker check in ingest_ghidra_output."""
     conn, sha_to_id = _setup_db(tmp_path)
     out = tmp_path / "ghidra_output"
-    rec = _make_record("test_bin", "a" * 64)
+    rec = _disk_record("test_bin", "a" * 64)
     for marker_pass, marker_sha8 in (("feedfacefeedface", "a" * 8), ("facefeedfacefeed", "b" * 8)):
         data = _marked("a" * 64, marker_pass)
         data["sha8"] = marker_sha8
@@ -975,7 +987,7 @@ def test_ingest_accepts_a_json_whose_markers_match(tmp_path: Path) -> None:
     out = tmp_path / "ghidra_output"
     _write_ghidra_json(out, "test_bin", "a" * 64, _marked("a" * 64, "facefeedfacefeed"))
     stats = ingest_ghidra_output(
-        conn, out, [_make_record("test_bin", "a" * 64)], sha_to_id, pass_version="facefeedfacefeed"
+        conn, out, [_disk_record("test_bin", "a" * 64)], sha_to_id, pass_version="facefeedfacefeed"
     )
     assert stats.binaries_stale_json == 0
     assert stats.binaries_processed == 1
@@ -990,7 +1002,7 @@ def test_ingest_treats_a_missing_marker_as_stale(tmp_path: Path) -> None:
     del data["pass_version"]
     _write_ghidra_json(out, "test_bin", "a" * 64, data)
     stats = ingest_ghidra_output(
-        conn, out, [_make_record("test_bin", "a" * 64)], sha_to_id, pass_version="facefeedfacefeed"
+        conn, out, [_disk_record("test_bin", "a" * 64)], sha_to_id, pass_version="facefeedfacefeed"
     )
     assert stats.binaries_stale_json == 1
 
@@ -1009,7 +1021,7 @@ def test_ingest_checks_the_stub_marker_against_this_binarys_table(
     are ingested."""
     resolution = StubResolution(names={0x41EB38: "system"}, regions=())
     monkeypatch.setattr(ingest_mod, "resolve_stubs", lambda path: resolution)
-    rec = _make_record("test_bin", "a" * 64)
+    rec = _disk_record("test_bin", "a" * 64)
     good = stub_table_marker(resolution.names)
     for marker in ("none", stub_table_marker({0x41EB38: "popen"}), None):
         case = tmp_path / f"bad_{marker}"
@@ -1051,7 +1063,7 @@ def test_the_success_stamp_is_what_lets_the_next_scan_skip_ghidra(tmp_path: Path
     in ingest_ghidra_output -> the binary stays ghidra_ok=0 / pass_version NULL, so the second
     ingest_elfs still reports it dirty and this assertion fails."""
     conn, sha_to_id = _setup_db(tmp_path)
-    rec = _make_record("test_bin", "a" * 64)
+    rec = _disk_record("test_bin", "a" * 64)
     out = tmp_path / "ghidra_output"
     # new binary -> dirty on the first look
     _, dirty = ingest_elfs(conn, [rec], pass_version=_PASS)
@@ -1090,7 +1102,7 @@ def test_the_success_stamp_and_the_function_rows_are_one_transaction(tmp_path: P
         conn.execute("INSERT INTO binaries (name, sha256) VALUES (?, ?)", (name, sha))
     conn.commit()
     sha_to_id = {r["sha256"]: r["id"] for r in conn.execute("SELECT id, sha256 FROM binaries")}
-    recs = [_make_record("bin_one", "a" * 64), _make_record("bin_two", "b" * 64)]
+    recs = [_disk_record("bin_one", "a" * 64), _disk_record("bin_two", "b" * 64)]
     out = tmp_path / "ghidra_output"
     _write_ghidra_json(out, "bin_one", "a" * 64, _marked("a" * 64, _PASS))
     _write_ghidra_json(out, "bin_two", "b" * 64, _marked("b" * 64, _PASS))
@@ -1156,7 +1168,7 @@ def test_the_listing_truncation_marker_threads_through_ingest(tmp_path: Path) ->
     ]
     _write_ghidra_json(out, "test_bin", "a" * 64, data)
     ingest_ghidra_output(
-        conn, out, [_make_record("test_bin", "a" * 64)], sha_to_id, pass_version=_PASS
+        conn, out, [_disk_record("test_bin", "a" * 64)], sha_to_id, pass_version=_PASS
     )
     stored = conn.execute("SELECT truncated FROM function_listing").fetchone()[0]
     assert stored == 1  # the marker threaded into the DB column
@@ -1166,3 +1178,88 @@ def test_the_listing_truncation_marker_threads_through_ingest(tmp_path: Path) ->
     conn.close()
     assert out_rec["available"] is True
     assert out_rec["listing_truncated"] is True  # and surfaces on the read layer
+
+
+# ── EC4: the decompiler moved the addresses by the shift the stub table was moved by ─────────────
+
+
+def test_an_extraction_whose_image_base_disagrees_is_refused_and_recorded_failed(
+    tmp_path: Path,
+) -> None:
+    """★ The extractor reports where it loaded the image and where the ELF was linked; their
+    difference must be the shift computed from the ELF (stub addresses were moved by it). Another
+    shift, or one that cannot be compared (a field missing), refuses THIS binary: no rows, failed
+    with the reason in the status column, counted — the earlier extraction's rows go too. An
+    agreeing one is ingested.
+
+    MUTATION (verified RED): skip the check -> the disagreeing output is ingested -> RED; accept a
+    missing field as agreeing -> RED."""
+    rec = _disk_record("test_bin", "a" * 64)
+    right = extractor_image_fields(_FIXTURE_ELF)
+    linked = int(right["elf_original_image_base"], 16)
+    cases = {
+        "moved_by_another": {"image_base": hex(linked + 0x10000)},
+        "not_reported": {"image_base": None},
+    }
+    for name, change in cases.items():
+        case = tmp_path / name
+        case.mkdir()
+        conn, sha_to_id = _setup_db(case)
+        out = case / "ghidra_output"
+        # an earlier extraction's rows, which a refused one must not leave standing
+        _write_ghidra_json(out, "test_bin", "a" * 64, _marked("a" * 64, _PASS))
+        ingest_ghidra_output(conn, out, [rec], sha_to_id, pass_version=_PASS)
+        assert conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0] == 1
+        data = _marked("a" * 64, _PASS)
+        data.update(change)
+        if data["image_base"] is None:
+            del data["image_base"]
+        _write_ghidra_json(out, "test_bin", "a" * 64, data)
+        stats = ingest_ghidra_output(conn, out, [rec], sha_to_id, pass_version=_PASS)
+        assert stats.binaries_image_base_mismatch == 1, name
+        assert stats.binaries_processed == 0, name
+        assert conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0] == 0, name
+        row = conn.execute(
+            "SELECT ghidra_ok, ghidra_status, ghidra_status_reason, pass_version FROM binaries"
+        ).fetchone()
+        assert tuple(row) == (0, "failed", ingest_mod.IMAGE_BASE_MISMATCH, None), name
+        conn.close()
+
+
+# ── the wrapper probe's undecided callers (stored beside the decompile counts) ──────────────────
+
+
+def test_the_wrapper_probe_left_undecided_is_stored_and_read_as_information(tmp_path: Path) -> None:
+    """★ The export's count of shell-sink callers the wrapper probe could not decompile is stored on
+    the binary, by size, and read back as an information line; an export that does not carry it
+    stores NULL (not recorded) — never a 0 that reads "none undecided".
+
+    MUTATION (verified RED): do not store it -> RED; store a 0 when absent -> RED."""
+    from treasure_map.lib.query import extraction_gaps
+
+    conn, sha_to_id = _setup_db(tmp_path)
+    out = tmp_path / "ghidra_output"
+    data = _marked("a" * 64, _PASS)
+    data["decompile_counts"] = {
+        "timeouts": 0,
+        "timeouts_large": 0,
+        "payload_exceeded": 0,
+        "wrapper_probe_unfinished": {"small": 2, "large": 1},
+    }
+    _write_ghidra_json(out, "test_bin", "a" * 64, data)
+    rec = _disk_record("test_bin", "a" * 64)
+    ingest_ghidra_output(conn, out, [rec], sha_to_id, pass_version=_PASS)
+    conn.commit()
+    stored = conn.execute("SELECT wrapper_probe_unfinished FROM binaries").fetchone()[0]
+    assert json.loads(stored) == {"small": 2, "large": 1}
+    db = tmp_path / "analysis.db"
+    assert extraction_gaps.wrapper_probe_unfinished(db) == [
+        {"binary": "test_bin", "small": 2, "large": 1}
+    ]
+    del data["decompile_counts"]
+    _write_ghidra_json(out, "test_bin", "a" * 64, data)
+    ingest_ghidra_output(conn, out, [rec], sha_to_id, pass_version=_PASS)
+    conn.commit()
+    assert conn.execute("SELECT wrapper_probe_unfinished FROM binaries").fetchone()[0] is None
+    assert extraction_gaps.wrapper_probe_unfinished(db) == []
+    conn.close()

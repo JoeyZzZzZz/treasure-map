@@ -304,3 +304,75 @@ def test_the_extractor_hashes_the_same_normalisation() -> None:
     )
     assert 'MessageDigest.getInstance("SHA256")' in body
     assert 'stubMarker = "none"' in body
+
+
+# ── addresses are the decompiler's: a shared object linked at 0 is moved ──────────────────────
+
+
+def _write(tmp_path: Path, name: str, data: bytes) -> Path:
+    p = tmp_path / name
+    p.write_bytes(data)
+    return p
+
+
+def test_a_shared_object_linked_at_zero_has_its_stubs_moved_where_the_decompiler_loads_it(
+    tmp_path: Path,
+) -> None:
+    """★ The decompiler loads a 32-bit ET_DYN whose lowest PT_LOAD is at 0 at +0x10000, so the
+    stub it calls is FUN_00010420, not FUN_00000420. The name table and both regions carry the
+    moved addresses, and the moved callee relabels to the import.
+
+    MUTATION (verified RED): read the link-time addresses (no shift) -> RED."""
+    from tests.unit.lib.elf_builder import mips_plt_binary
+
+    r = resolve_stubs(_write(tmp_path, "lib.so", mips_plt_binary()))
+    assert r is not None
+    assert r.names == {0x10420: "system"}
+    assert r.named_regions == ((".plt", 0x10400, 0x10430), (".MIPS.stubs", 0x10600, 0x10620))
+    assert r.regions == ((0x10400, 0x10430), (0x10600, 0x10620))
+    assert relabel_callees(["FUN_00010420"], r).callees == ["system"]
+    assert relabel_callees(["FUN_00010600"], r).unresolved_stub_addrs == ["0x10600"]
+
+
+def test_an_executable_or_a_library_linked_elsewhere_is_not_moved(tmp_path: Path) -> None:
+    """★ An ET_EXEC, and an ET_DYN linked at a non-zero address, load where they were linked:
+    their stub addresses are the link-time ones, byte for byte.
+
+    MUTATION (verified RED): move every ET_DYN (ignore the lowest PT_LOAD) -> the second RED;
+    move every binary -> both RED."""
+    from tests.unit.lib.elf_builder import ET_EXEC, mips_plt_binary
+
+    exe = mips_plt_binary(
+        e_type=ET_EXEC,
+        load_vaddr=0x400000,
+        plt_addr=0x400400,
+        got_plt_addr=0x400800,
+        stubs_addr=0x400600,
+    )
+    high = mips_plt_binary(
+        load_vaddr=0x2000000, plt_addr=0x2000400, got_plt_addr=0x2000800, stubs_addr=0x2000600
+    )
+    for name, data, base in (("exe", exe, 0x400000), ("high.so", high, 0x2000000)):
+        r = resolve_stubs(_write(tmp_path, name, data))
+        assert r is not None
+        assert r.names == {base + 0x420: "system"}, name
+        assert r.regions == ((base + 0x400, base + 0x430), (base + 0x600, base + 0x620)), name
+
+
+def test_the_load_shift_follows_the_class_and_the_lowest_load(tmp_path: Path) -> None:
+    """The shift: 0x10000 for a 32-bit ET_DYN at 0, 0x100000 for a 64-bit one, 0 otherwise; None
+    for a file that is not an ELF (never a guessed 0).
+
+    MUTATION (verified RED): one shift for both classes -> the 64-bit case RED."""
+    from tests.unit.lib.elf_builder import EM_AARCH64, ET_EXEC, Elf
+    from treasure_map.lib.analyze.stub_resolve import ghidra_load_shift
+
+    cases = {
+        "dyn32": (Elf(elfclass=32), 0x10000),
+        "dyn64": (Elf(machine=EM_AARCH64, elfclass=64), 0x100000),
+        "exe64": (Elf(machine=EM_AARCH64, elfclass=64, e_type=ET_EXEC, load_vaddr=0x400000), 0),
+        "dyn32_high": (Elf(load_vaddr=0x10000), 0),
+    }
+    for name, (elf, want) in cases.items():
+        assert ghidra_load_shift(_write(tmp_path, name, elf.build())) == want, name
+    assert ghidra_load_shift(_write(tmp_path, "text", b"not an elf")) is None

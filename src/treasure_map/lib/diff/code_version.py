@@ -77,6 +77,8 @@ DIFF_CODE_ENTRIES: tuple[str, ...] = (
     "lib.atlas.writer:set_callsite_facts_state",
     "lib.atlas.writer:set_instruction_match_facts",
     "lib.facts:_DECOMPILE_MIN_SIZE",
+    "lib.facts:DECOMPILE_ERROR_PLACEHOLDER",
+    "lib.facts:has_text",
     "lib.hunt.analyzer2:_db_has_bridge",
     "lib.pattern.classes:_STUB_NAME_RE",
     "lib.pattern.classes:stub_resolved_name",

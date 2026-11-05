@@ -8,6 +8,7 @@ They verify fail-fast behaviour, dirty-set routing, and result fields.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.unit.lib.elf_builder import extractor_image_fields
 from treasure_map.lib.analyze.elf_inventory import ElfRecord
 from treasure_map.lib.analyze.ghidra_runner import GhidraResult
 from treasure_map.lib.analyze.pipeline import AnalyzeResult, run_analyze
@@ -369,7 +371,8 @@ def test_an_ingest_that_dies_leaves_no_success_stamp(tmp_path: Path) -> None:
     from treasure_map.lib.analyze.stub_resolve import STUB_MARKER_NONE
     from treasure_map.lib.storage.connection import open_db
 
-    rec = _rec("httpd", "facefeed" * 8)
+    # a real ELF on disk: the ingest checks the image base the extractor reports against it
+    rec = dataclasses.replace(_rec("httpd", "facefeed" * 8), path=_FIXTURE_ELF)
     runner = _mock_runner([_ok_ghidra(rec)])
     real_ingest = ghidra_ingest._ingest_one_binary
     rows_written: list[int] = []
@@ -405,6 +408,7 @@ def test_an_ingest_that_dies_leaves_no_success_stamp(tmp_path: Path) -> None:
                                 "pass_version": "testpass",
                                 "sha8": rec.sha256[:8],
                                 "stub_marker": STUB_MARKER_NONE,
+                                **extractor_image_fields(rec.path),
                                 "functions": [
                                     {"name": "main", "address": "0x1000", "pseudocode": "int m(){}"}
                                 ],
@@ -605,6 +609,7 @@ class _Decompiler:
             "pass_version": "another-pass" if outcome == "stale" else runner.pass_version(),
             "sha8": sha8,
             "stub_marker": stub_table_marker(None if stubs is None else stubs.names),
+            **extractor_image_fields(binary),
             "functions": funcs,
             "imports": [],
             "exports": [],

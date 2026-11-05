@@ -245,13 +245,19 @@ def test_the_empty_text_reading_moves_the_diff_stamp_only_through_the_size_floor
 ) -> None:
     """get_pseudocode's empty-text status, its listing read and the read face's micro pair state
     (sameness / patch_view / diff_align) are read at view time and stored nowhere: none is a diff
-    or overlay entry, and of lib/facts only the size floor's own assignment is hashed — changing
-    get_pseudocode's code leaves the diff stamp where it was, changing the floor's value moves
-    it."""
+    or overlay entry. Of lib/facts only what layer0 stores a function's decompile status by is
+    hashed — the size floor, and the test that a stored text is text (an earlier extractor's
+    placeholder for a decompile that threw is not) — so changing get_pseudocode's code leaves the
+    diff stamp where it was, and changing the floor's value or that test moves it."""
+    hashed_facts = {
+        "lib.facts:_DECOMPILE_MIN_SIZE",
+        "lib.facts:DECOMPILE_ERROR_PLACEHOLDER",
+        "lib.facts:has_text",
+    }
     for entry in cv.DIFF_CODE_ENTRIES + cv.OVERLAY_CODE_ENTRIES:
         module = entry.partition(":")[0]
         assert module not in ("lib.query.sameness", "lib.query.diff_align"), entry
-        assert not entry.startswith("lib.facts:") or entry == "lib.facts:_DECOMPILE_MIN_SIZE"
+        assert not entry.startswith("lib.facts:") or entry in hashed_facts, entry
     _copy_entries(tmp_path, cv.DIFF_CODE_ENTRIES)
     before = cv.code_hash(tmp_path, cv.DIFF_CODE_ENTRIES)
     facts_py = tmp_path / "lib" / "facts.py"
@@ -262,6 +268,10 @@ def test_the_empty_text_reading_moves_the_diff_stamp_only_through_the_size_floor
     assert cv.code_hash(tmp_path, cv.DIFF_CODE_ENTRIES) == before
     assert "_DECOMPILE_MIN_SIZE = 10\n" in text
     facts_py.write_text(text.replace("_DECOMPILE_MIN_SIZE = 10\n", "_DECOMPILE_MIN_SIZE = 12\n"))
+    assert cv.code_hash(tmp_path, cv.DIFF_CODE_ENTRIES) != before
+    test = "return not pseudocode.lstrip().startswith(DECOMPILE_ERROR_PLACEHOLDER)"
+    assert test in text
+    facts_py.write_text(text.replace(test, "return True", 1))
     assert cv.code_hash(tmp_path, cv.DIFF_CODE_ENTRIES) != before
 
 

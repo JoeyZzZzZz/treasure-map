@@ -149,6 +149,14 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("binaries", "stub_table_complete", "INTEGER"),
     ("binaries", "stub_regions", "TEXT"),
     ("binaries", "thunk_spans", "TEXT"),
+    # Where an import row came from: the decompiler's external symbols, or the ELF's undefined
+    # dynamic symbols where the decompiler's loader left them out. Back-fill NULL on older DBs:
+    # not recorded until a re-scan. Must match schema.sql.
+    ("imports", "source", "TEXT"),
+    # The shell-sink callers the extractor's wrapper probe could not decompile, by body size
+    # ({"small": n, "large": n}). Back-fill NULL on older DBs: not recorded until a re-scan —
+    # never "none left". Must match schema.sql.
+    ("binaries", "wrapper_probe_unfinished", "TEXT"),
 )
 
 

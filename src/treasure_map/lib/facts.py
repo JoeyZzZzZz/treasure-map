@@ -67,6 +67,8 @@ _LATER_FUNCTION_COLUMNS = (
     "is_exported",
     "unresolved_external_calls",
     "detector_errors",
+    "decompile_status",
+    "decompile_error",
 )
 
 
@@ -522,12 +524,36 @@ def _col(row: Any, name: str) -> Any:
         return None
 
 
-# Why a function's pseudocode is empty, by its recorded size — the same split as
-# lib/diff/layer0._decompile_status (not imported: layer0 imports this module).
+# The text an earlier extractor stored for a function whose decompile threw. It is a note, not
+# pseudocode: two failed decompiles that threw the same message must never read as two identical
+# bodies. The extractor now stores an empty text there; every reader still treats this one as none.
+DECOMPILE_ERROR_PLACEHOLDER = "/* decompile_error"
+
+
+def has_text(pseudocode: str | None) -> bool:
+    """Whether a stored pseudocode is text to read and compare: not empty, and not the placeholder
+    an earlier extractor wrote for a decompile that threw."""
+    if not pseudocode or not pseudocode.strip():
+        return False
+    return not pseudocode.lstrip().startswith(DECOMPILE_ERROR_PLACEHOLDER)
+
+
+# Why a function's pseudocode is empty: its recorded decompile outcome when that was a failure,
+# else by its recorded size — the same split as lib/diff/layer0._decompile_status (not imported:
+# layer0 imports this module).
 PSEUDOCODE_SKIPPED_MICRO = "skipped_micro"
 PSEUDOCODE_DECOMPILE_EMPTY = "decompile_empty"
 PSEUDOCODE_SIZE_UNKNOWN = "size_unknown"
+PSEUDOCODE_DECOMPILE_FAILED = "decompile_failed"
+# The recorded decompile outcomes (functions.decompile_status) that are a failure, not an empty
+# text.
+DECOMPILE_FAILURES = frozenset({"error", "timeout"})
 _PSEUDOCODE_STATUS_NOTES = {
+    PSEUDOCODE_DECOMPILE_FAILED: (
+        "the decompile of this function did not complete (see decompile_status): there is no text "
+        "to read, which says nothing about the function being empty; its instructions may be read "
+        "with get_disassembly"
+    ),
     PSEUDOCODE_SKIPPED_MICRO: (
         "under ~10 bytes; not decompiled by design — a binary property, not a read failure; read "
         "the inline disassembly"
@@ -543,10 +569,13 @@ _PSEUDOCODE_STATUS_NOTES = {
 }
 
 
-def pseudocode_status(size_bytes: int | None) -> str:
-    """The status of a function whose pseudocode is empty: ``size_unknown`` (size 0 or not
-    recorded — checked first, so 0 never reads as a micro-function), ``skipped_micro`` (under
+def pseudocode_status(size_bytes: int | None, decompile_status: str | None = None) -> str:
+    """The status of a function whose pseudocode is empty: ``decompile_failed`` when its recorded
+    decompile outcome is a failure (``DECOMPILE_FAILURES``), else by size: ``size_unknown`` (size 0
+    or not recorded — checked first, so 0 never reads as a micro-function), ``skipped_micro`` (under
     _DECOMPILE_MIN_SIZE: the extractor does not decompile it, by design) or ``decompile_empty``."""
+    if decompile_status in DECOMPILE_FAILURES:
+        return PSEUDOCODE_DECOMPILE_FAILED
     if size_bytes is None or size_bytes == 0:
         return PSEUDOCODE_SIZE_UNKNOWN
     if size_bytes < _DECOMPILE_MIN_SIZE:
@@ -559,11 +588,19 @@ def _empty_text_status(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, 
     ``pseudocode_status_note``, and for a ``skipped_micro`` function its listing inline —
     ``disassembly`` (get_disassembly's instructions, whole: a micro-function holds a few), or
     ``disassembly_status`` ``{available: false, reason}`` when no listing can be read."""
-    status = pseudocode_status(row["size_bytes"])
+    recorded = _col(row, "decompile_status")
+    status = pseudocode_status(row["size_bytes"], recorded)
     out: dict[str, Any] = {
         "pseudocode_status": status,
         "pseudocode_status_note": _PSEUDOCODE_STATUS_NOTES[status],
     }
+    if recorded is not None:
+        # What the extraction recorded for this decompile, so an empty text is never read as an
+        # empty function on its own word.
+        out["decompile_status"] = recorded
+        error = _col(row, "decompile_error")
+        if error:
+            out["decompile_error"] = error
     if status == PSEUDOCODE_SKIPPED_MICRO:
         listing = _listing_for(conn, row)
         if listing["available"]:
@@ -624,7 +661,7 @@ def get_pseudocode(
     }
     if paging is not None:
         result["paging"] = paging
-    if not (row["pseudocode"] or "").strip():
+    if not has_text(row["pseudocode"]):
         result.update(_empty_text_status(conn, row))
     # Stub calls the ELF resolver could not name: a possible unrecognized libc sink this function
     # makes that is left visible rather than read as an ordinary internal call. Surfaced only when
@@ -1440,10 +1477,13 @@ def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, A
         assert miss is not None
         return miss
     bid = brow.id
-    imports = [
-        {"func_name": r["func_name"], "lib_soname": r["lib_soname"]}
+    has_source = "source" in {r[1] for r in conn.execute("PRAGMA table_info(imports)")}
+    imports: list[dict[str, Any]] | None = [
+        {"func_name": r["func_name"], "lib_soname": r["lib_soname"], "source": r["source"]}
         for r in conn.execute(
-            "SELECT func_name, lib_soname FROM imports WHERE binary_id = ? ORDER BY func_name",
+            "SELECT func_name, lib_soname, "
+            + ("source" if has_source else "NULL AS source")
+            + " FROM imports WHERE binary_id = ? ORDER BY func_name",
             (bid,),
         )
     ]
@@ -1454,7 +1494,7 @@ def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, A
             (bid,),
         )
     ]
-    return {
+    out: dict[str, Any] = {
         "found": True,
         "binary": brow.name,
         "binary_path": brow.path,
@@ -1465,6 +1505,29 @@ def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, A
         # dependency resolved to one file, which is a different thing from not having looked.
         "dt_needed_unresolved": list_unresolved_soname_edges(conn, binary_id=bid),
     }
+    # ★ A dynamically linked binary (it names libraries it needs) with no import recorded has
+    # imports nobody recorded, not none: `imports` is null and says so, never an empty list.
+    if not imports and _dt_needed(conn, bid):
+        out["imports"] = None
+        out["imports_state"] = "undetermined"
+        out["imports_note"] = IMPORTS_UNDETERMINED_NOTE
+    return out
+
+
+IMPORTS_UNDETERMINED_NOTE = (
+    "this binary is dynamically linked (it names the libraries it needs) yet no import was "
+    "recorded for it: its imports are not determined, which is not 'it imports nothing'"
+)
+
+
+def _dt_needed(conn: sqlite3.Connection, binary_id: int) -> list[str]:
+    """The libraries a binary names as needed (DT_NEEDED), [] when none or unreadable."""
+    row = conn.execute("SELECT dt_needed FROM binaries WHERE id = ?", (binary_id,)).fetchone()
+    try:
+        value = json.loads(row[0]) if row is not None and row[0] else []
+    except (TypeError, ValueError):
+        return []
+    return [x for x in value if isinstance(x, str) and x] if isinstance(value, list) else []
 
 
 # get_data_bytes standing contract, on EVERY result. The tool hands over bytes; it never reads

@@ -1113,3 +1113,35 @@ def test_with_no_budget_the_whole_body_comes_as_before(tmp_path: Path) -> None:
         conn.close()
     assert whole["pseudocode"] == _LONG and "paging" not in whole
     assert ignored == whole
+
+
+def test_a_dynamically_linked_binary_with_no_import_recorded_reads_undetermined(
+    tmp_path: Path,
+) -> None:
+    """★ No import row for a binary that names the libraries it needs is imports nobody recorded,
+    not none: `imports` is null and says undetermined. A binary that needs no library and has no
+    import row reads an empty list (it imports nothing). Each import names its source.
+
+    MUTATION (verified RED): return the empty list -> RED."""
+    db = tmp_path / "imp.db"
+    conn = open_db(db)
+    for bid, name, needed in ((1, "dyn", '["libc.so.0"]'), (2, "static", "[]"), (3, "has", "[]")):
+        conn.execute(
+            "INSERT INTO binaries (id, name, path, sha256, dt_needed, last_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, '2026-01-01T00:00:00')",
+            (bid, name, f"bin/{name}", str(bid) * 64, needed),
+        )
+    conn.execute(
+        "INSERT INTO imports (binary_id, func_name, lib_soname, source) "
+        "VALUES (3, 'system', '', 'elf_dynamic_symbols')"
+    )
+    conn.commit()
+    dyn = facts.get_imports_exports(conn, binary="dyn")
+    assert dyn["imports"] is None and dyn["imports_state"] == "undetermined"
+    static = facts.get_imports_exports(conn, binary="static")
+    assert static["imports"] == [] and "imports_state" not in static
+    has = facts.get_imports_exports(conn, binary="has")
+    assert has["imports"] == [
+        {"func_name": "system", "lib_soname": "", "source": "elf_dynamic_symbols"}
+    ]
+    conn.close()

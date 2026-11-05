@@ -71,3 +71,48 @@ def dynamic_function_exports(elf_path: Path | str) -> frozenset[str] | None:
     except (OSError, ELFError, ValueError, KeyError, AttributeError) as exc:
         logger.debug("dynamic exports unreadable for %s: %s", elf_path, exc)
         return None
+
+
+# The ELF shape the decompiler's loader reads WITHOUT building external symbols: an ARM executable
+# (ET_EXEC) with no section headers whose dynamic segment carries a DT_HASH and no DT_GNU_HASH.
+# Measured over a whole corpus: every binary of that shape had its imports recorded at under 1%
+# (most at none), while every other shape was at or above 100%. Its PLT stubs become ordinary
+# local functions, so the call graph and the sinks are unaffected — only the import list is empty.
+_UNLOADED_IMPORT_SHAPE = ("EM_ARM", "ET_EXEC")
+
+
+def unrecorded_dynamic_imports(
+    elf_path: Path | str, recorded: frozenset[str] | set[str]
+) -> tuple[str, ...] | None:
+    """The undefined FUNC / NOTYPE dynamic symbols of an ELF the decompiler's loader leaves without
+    external symbols (see ``_UNLOADED_IMPORT_SHAPE``) that ``recorded`` does not already name,
+    sorted; () for every other ELF; None when the file cannot be read.
+
+    Only that shape: elsewhere the decompiler's import list is complete but may name an import
+    another way than the dynamic symbol table does (demangled C++ names), and filling by name
+    there would list the same import twice. FUNC and NOTYPE because that is what the decompiler
+    records as imports everywhere else."""
+    try:
+        with open(elf_path, "rb") as fh:
+            elf = ELFFile(fh)
+            if (elf.header.e_machine, elf.header.e_type) != _UNLOADED_IMPORT_SHAPE:
+                return ()
+            if elf.num_sections() != 0:
+                return ()
+            segment = next((s for s in elf.iter_segments() if isinstance(s, DynamicSegment)), None)
+            if segment is None:
+                return ()
+            tags = {t.entry.d_tag for t in segment.iter_tags()}
+            if "DT_HASH" not in tags or "DT_GNU_HASH" in tags:
+                return ()
+            names = {
+                sym.name
+                for sym in segment.iter_symbols()
+                if sym.name
+                and sym["st_shndx"] == "SHN_UNDEF"
+                and sym["st_info"]["type"] in ("STT_FUNC", "STT_NOTYPE")
+            }
+            return tuple(sorted(names - set(recorded)))
+    except (OSError, ELFError, ValueError, KeyError, AttributeError) as exc:
+        logger.debug("dynamic imports unreadable for %s: %s", elf_path, exc)
+        return None

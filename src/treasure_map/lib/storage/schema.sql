@@ -89,6 +89,9 @@ CREATE TABLE IF NOT EXISTS binaries (
     -- a diff reads these to tell an other-side thunk where a function maps from "no function there".
     -- NULL = not recorded (extracted before this existed).
     thunk_spans TEXT,
+    -- The shell-sink callers the extractor's command-wrapper probe could not decompile, so could
+    -- not decide, by body size: JSON {"small": n, "large": n}. NULL = not recorded.
+    wrapper_probe_unfinished TEXT,
     reanalyze_pending INTEGER DEFAULT 0,   -- 1 = an unfinished bare --reanalyze still has to
                                            --   re-extract this binary; 0 = not part of any
                                            --   unfinished re-extraction request. Cleared by the
@@ -251,6 +254,8 @@ CREATE TABLE IF NOT EXISTS imports (
     binary_id   INTEGER NOT NULL,
     func_name   TEXT,
     lib_soname  TEXT    DEFAULT '',
+    source      TEXT,   -- 'decompiler' (its external symbols) | 'elf_dynamic_symbols' (an undefined
+                        --   dynamic symbol the decompiler's loader left out); NULL = an older scan
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
 

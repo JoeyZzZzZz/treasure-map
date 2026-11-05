@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.unit.lib.elf_builder import extractor_image_fields
 from tests.unit.lib.test_ghidra_runner import _good_json, _make_runner, _write_small_elf
 from tests.unit.lib.test_pipeline import _e2e_cfg, _firmware, _ghidra, _state
 from treasure_map.lib.analyze import ghidra_runner
@@ -245,6 +246,7 @@ class _Sessions:
             "pass_version": runner.pass_version(),
             "sha8": sha8,
             "stub_marker": stub_table_marker(None if stubs is None else stubs.names),
+            **extractor_image_fields(binary),
             "functions": [{"name": "f", "address": "00101000", "size": 64, "callees": []}],
             "imports": [],
             "exports": [],
