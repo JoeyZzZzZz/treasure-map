@@ -132,6 +132,9 @@ def _runner_class() -> type:
         def set_extension(self, extension: Any) -> None:
             pass  # no export is written by the fixture runner
 
+        def set_share(self, share: Any) -> None:
+            pass  # one run: nothing to share
+
         def run_all(
             self, records: list[Any], out_dir: Path, *_a: Any, on_final: Any = None, **_k: Any
         ) -> list[Any]:
