@@ -569,7 +569,15 @@ def _buffer_writes_all_safe(
         if _is_buf_alias(rhs, buf):
             return False  # F-alias: a pointer aliasing buf is stored into another variable
 
-    for off, name, args in _calls_in_function(pseudocode):
+    calls = list(_calls_in_function(pseudocode))
+    sink_name = next((name for off, name, _a in calls if off == sink_pos), None)
+
+    def reads_it(name: str) -> bool:
+        # The candidate's own sink, or a command sink, called again on buf: it reads buf (that IS
+        # the candidate), it never writes it — the same exemption the charset reading makes.
+        return name == sink_name or name in _SHELL_RUN_SINKS or name in CMD
+
+    for off, name, args in calls:
         if off == sink_pos:
             continue  # the sink call itself (类三)
         positions = [i for i, a in enumerate(args) if _buf_contained(a, buf)]
@@ -608,7 +616,11 @@ def _buffer_writes_all_safe(
                     return False
                 saw_fmt_or_conv = True
                 continue
+            if reads_it(name):
+                continue
             return False  # a destination write by some other call
+        if reads_it(name):
+            continue
         return False  # F-escape: buf handed to a call that is neither a safe write nor a read
 
     return saw_fmt_or_conv

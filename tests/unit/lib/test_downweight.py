@@ -1038,3 +1038,30 @@ def test_caller_constant_is_refused_when_the_sink_argument_is_an_address_or_a_lo
             )
             is None
         ), bad_form
+
+
+def _num_cmd(body: str) -> str | None:
+    pc = "void f(char *x)\n{\n  int i;\n  char b [64];\n" + body + "\n}"
+    return detect_form_signal(
+        sink_name="system",
+        pseudocode=pc,
+        callees=["atoi", "sprintf", "system", "strcpy"],
+        sink_arg="b",
+        sink_class="cmd",
+        sink_form="var",
+    )
+
+
+def test_the_same_buffer_run_twice_by_a_command_sink_keeps_the_numeric_mark() -> None:
+    """★ The numeric reading makes the charset reading's exemption: the candidate's buffer handed
+    again to a command sink is READ there (it is what runs), not written — so running the same
+    integer-only command twice keeps numeric_sanitized. A real write between the two still takes
+    it away.
+
+    MUTATION (verified RED): read a second command-sink call as a write again -> the twice-run
+    case loses the mark -> RED. (The strcpy case pins that the exemption is for reads only: a copy
+    into the buffer is still judged as the write it is.)"""
+    twice = 'i = atoi(x);\n  sprintf(b,"echo %d",i);\n  system(b);\n  system(b);'
+    assert _num_cmd(twice) == NUMERIC_SANITIZED
+    written = 'i = atoi(x);\n  sprintf(b,"echo %d",i);\n  system(b);\n  strcpy(b,x);\n  system(b);'
+    assert _num_cmd(written) != NUMERIC_SANITIZED
