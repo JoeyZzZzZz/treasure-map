@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from elftools.common.exceptions import ELFError
 from elftools.elf.dynamic import DynamicSegment
@@ -63,7 +63,7 @@ class ElfSlots:
 
 def _word_reader(elf: ELFFile, fh: Any, size: int) -> Any:
     loads = [s for s in elf.iter_segments() if s["p_type"] == "PT_LOAD"]
-    order = "little" if elf.little_endian else "big"
+    order: Literal["little", "big"] = "little" if elf.little_endian else "big"
 
     def word_at(vaddr: int) -> int:
         for seg in loads:
@@ -116,7 +116,8 @@ def read_elf_slots(elf_path: Path | str) -> ElfSlots | None:
             tags: dict[str, int] = {}
             if dyn is not None:
                 tags = {t.entry.d_tag: t.entry.d_val for t in dyn.iter_tags()}
-                for table in dyn.get_relocation_tables().values():
+                tables: dict[str, Any] = dict(dyn.get_relocation_tables())
+                for table in tables.values():
                     for rel in table.iter_relocations():
                         at = rel["r_offset"]
                         addend = rel["r_addend"] if rel.is_RELA() else word_at(at)

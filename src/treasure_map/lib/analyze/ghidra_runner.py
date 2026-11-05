@@ -937,6 +937,8 @@ class GhidraRunner:
         # The BinExport copy this scan loads, decided once before any JVM (lib/export_stamp).
         # None, or one with no ext_dir, = no export: binaries are recorded extension_missing.
         self._extension = extension
+        # The rescan's shared sessions (set_share); None runs every session.
+        self._share: ExtractionShare | None = None
 
     def set_share(self, share: ExtractionShare | None) -> None:
         """The rescan's shared sessions (lib/analyze/extraction_share): a session another run of
@@ -947,7 +949,6 @@ class GhidraRunner:
     def set_extension(self, extension: ScanExtension | None) -> None:
         """The BinExport copy the scan's JVMs load (None = none: no export is attempted)."""
         self._extension = extension
-        self._share: ExtractionShare | None = None
 
     def _exporting(self) -> bool:
         return self._extension is not None and self._extension.ext_dir is not None
@@ -980,6 +981,7 @@ class GhidraRunner:
     ) -> GhidraResult:
         """``_run_session``, or — within a rescan that shares sessions (``set_share``) — the outcome
         of the session another run already ran under the same key, copied into ``output_dir``."""
+        # A runner built without __init__ (as tests do) shares nothing.
         share = getattr(self, "_share", None)
         if share is None:
             return self._run_session(binary, output_dir, timeout, arch, sha8, retry, large_payload)

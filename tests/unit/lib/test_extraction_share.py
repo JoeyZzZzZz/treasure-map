@@ -171,3 +171,15 @@ def test_phase_one_hands_the_largest_binaries_to_the_pool_first() -> None:
     ]
     order = [rec.name for _i, rec in ghidra_runner.phase_one_order(recs)]
     assert order == ["d", "b", "a", "c"]
+
+
+def test_setting_the_extension_keeps_the_share(tmp_path: Path) -> None:
+    """The share is the runner's own setting, apart from the extension: setting the extension after
+    the share leaves the share in place (the order the caller sets them in does not matter).
+
+    MUTATION (verified RED): reset the share in set_extension -> RED."""
+    share = ExtractionShare(tmp_path / "share")
+    runner = GhidraRunner(GhidraConfig(), headless=tmp_path / "analyzeHeadless")
+    runner.set_share(share)
+    runner.set_extension(None)
+    assert runner._share is share

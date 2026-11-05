@@ -558,7 +558,8 @@ def checked_string_tables(tables: Any, slots: ElfSlots | None) -> list[CheckedTa
         entries = [e for e in t.get("entries", []) if isinstance(e, dict)]
         if base is None or not isinstance(stride, int) or stride <= 0:
             continue
-        bounds = t.get("bounds") if isinstance(t.get("bounds"), dict) else {}
+        raw_bounds = t.get("bounds")
+        bounds: dict[str, Any] = raw_bounds if isinstance(raw_bounds, dict) else {}
         verdicts: list[str | None] = []
         for i, e in enumerate(entries):
             if slots is None:
