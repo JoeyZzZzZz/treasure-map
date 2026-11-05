@@ -243,3 +243,26 @@ def test_the_agent_prompts_are_written_out_in_full(capsys: pytest.CaptureFixture
     for line in (*_AUDIT_PROMPT, *_DIFF_PROMPT):
         assert f"     {line}\n" in out
     assert "annotate_diff" in out and "start_diff_review" in out
+
+
+def test_init_prints_each_run_that_kept_an_earlier_extraction(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """★ The line naming a run whose binaries kept an earlier pass's extraction is printed in the
+    next steps (its wording is the runs report's; not pinned here).
+
+    MUTATION (verified RED): skip printing kept_earlier -> RED."""
+    from treasure_map.cli.init_cli import _next_steps
+    from treasure_map.lib.setup.doctor import RunsCurrency
+    from treasure_map.lib.setup.initializer import InitResult
+
+    line = "runX: 1 binary kept an earlier extraction (svc_x)"
+    result = InitResult(
+        config_path=tmp_path / "c.yaml",
+        env_path=tmp_path / ".env",
+        atlas_dir=tmp_path,
+        checks=(),
+        runs=RunsCurrency(count=0, kept_earlier=(line,)),
+    )
+    _next_steps(result, any_red=False)
+    assert line in capsys.readouterr().out.splitlines()

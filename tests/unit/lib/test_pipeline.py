@@ -975,7 +975,8 @@ def test_an_interrupt_tells_extracted_failed_and_left_apart(
     phase 1): the warning says 5 extracted, 1 failed and 0 left — they add up to the six to do —
     never a failure counted with the extracted ones.
 
-    MUTATION (verified RED): report failures with the extracted ones again -> RED."""
+    MUTATION (verified RED): report failures with the extracted ones again -> RED; record a failure
+    without committing it -> lost with the interrupt -> RED."""
     import logging
 
     def stop_after_the_retry(step: str, meta: dict[str, Any]) -> None:
@@ -989,3 +990,6 @@ def test_an_interrupt_tells_extracted_failed_and_left_apart(
         _scan_e2e(fs, tmp_path / "ws", cfg, dec, progress=stop_after_the_retry)
     msg = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("interrupted:"))
     assert "5 binaries extracted and 1 failed this run, 0 left for the next run (of 6" in msg
+    # the failure the serial re-run recorded was committed before the interrupt: it survives it
+    st = _state(tmp_path / "ws" / "analysis.db")
+    assert (st[_NAMES[1]]["ghidra_ok"], st[_NAMES[1]]["ghidra_status"]) == (0, "failed")
