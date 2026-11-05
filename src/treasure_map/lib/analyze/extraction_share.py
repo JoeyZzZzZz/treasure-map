@@ -68,8 +68,23 @@ class ExtractionShare:
     _seen: dict[tuple[str, str], tuple[Any, ...]] = field(default_factory=dict)
     _hashes: dict[tuple[str, int, int], str] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    # phase-1 session name -> whether its holders re-run it for unfinished decompiles (the first
+    # holder's decision; see ``rerun_decision``)
+    _rerun: dict[str, bool] = field(default_factory=dict)
     sessions: int = 0  # sessions kept (run once)
     handed: int = 0  # outcomes handed to a later holder instead of a session
+
+    def rerun_decision(self, session: str, own: bool) -> bool:
+        """Whether the holders of phase-1 session ``session`` re-run it in phase 2 for its
+        unfinished decompiles: the decision its first holder made (``own`` when this is the first
+        holder).
+
+        Each run decides from its own database (an earlier isolated re-run recorded there), so two
+        holders of one shared session could decide apart and end with different sessions. Deciding
+        once per session keeps every holder on the same outcome: the phase-2 session is shared by
+        its own key, and the settling of two identical inputs is identical."""
+        with self._lock:
+            return self._rerun.setdefault(session, own)
 
     def key(
         self,

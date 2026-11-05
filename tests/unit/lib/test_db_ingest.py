@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 from pathlib import Path
@@ -1363,11 +1364,12 @@ def test_migration_adds_the_import_source_to_an_old_db(tmp_path: Path) -> None:
 
 def test_a_binary_detected_under_another_architecture_is_extracted_again(tmp_path: Path) -> None:
     """★ The decompiler is started with the architecture, so an extraction stored under another one
-    than detected now is not this scan's: the binary is dirty again, and its row carries the
-    detected architecture and word size. The same architecture leaves it cached.
+    than detected now is not this scan's: the binary is dirty again. Its row keeps the architecture
+    its extraction ran under until the next attempt's stamp moves it (an interrupt in between must
+    not make the old extraction look current). The same architecture leaves it cached.
 
-    MUTATION (verified RED): skip the comparison -> stays cached -> RED; leave the stored arch as
-    it was -> RED."""
+    MUTATION (verified RED): skip the comparison -> stays cached -> RED; write the detected arch in
+    ingest_elfs again -> RED."""
     conn = open_db(tmp_path / "analysis.db")
     old = _make_record("httpd", "a" * 64, arch="ARM:LE:32:v7")
     _, dirty = ingest_elfs(conn, [old], pass_version="p1")
@@ -1380,7 +1382,51 @@ def test_a_binary_detected_under_another_architecture_is_extracted_again(tmp_pat
     _, dirty = ingest_elfs(conn, [now], pass_version="p1")
     assert "a" * 64 in dirty
     row = conn.execute("SELECT arch, bits FROM binaries").fetchone()
-    assert tuple(row) == ("AARCH64:LE:64:v8A", 64)
+    assert tuple(row) == ("ARM:LE:32:v7", 32)
+    conn.close()
+
+
+def test_a_scan_interrupted_after_the_architecture_moved_still_re_extracts(tmp_path: Path) -> None:
+    """★ The architecture detected for a binary moved, and the scan was cut off before the binary
+    was extracted again. The next scan must still see it as dirty: nothing but an extraction
+    attempt may move the stored architecture.
+
+    MUTATION (verified RED, 1 failed): write arch/bits in ingest_elfs' step-3 refresh again ->
+    the second look reads "stored = detected" and the old extraction is never redone."""
+    conn = open_db(tmp_path / "analysis.db")
+    first = _make_record("httpd", "a" * 64, arch="MIPS:BE:32:default")
+    ingest_elfs(conn, [first], pass_version="p1")
+    conn.execute("UPDATE binaries SET ghidra_ok = 1, ghidra_status = 'ok', pass_version = 'p1'")
+    conn.commit()
+    moved = _make_record("httpd", "a" * 64, arch="MIPS:BE:32:R6")
+    _, first = ingest_elfs(conn, [moved], pass_version="p1")
+    assert "a" * 64 in first
+    # interrupted here: no extraction, no stamp
+    _, second = ingest_elfs(conn, [moved], pass_version="p1")
+    assert "a" * 64 in second
+    conn.close()
+
+
+def test_a_timeout_under_the_old_architecture_does_not_skip_the_new_one(tmp_path: Path) -> None:
+    """★ A binary that timed out at the budget this scan repeats is skipped — but not once its
+    architecture moved: the timeout was an attempt under the other one. After an attempt under the
+    new architecture times out too (its failure stamp records that architecture), the ordinary skip
+    applies again, so it is not re-run forever.
+
+    MUTATION (verified RED, 1 failed): drop ``- moved`` from the timeout skip -> the moved binary
+    stays skipped."""
+    conn, rec, budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+    _, dirty = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 not in dirty  # premise: the same arch is skipped
+    moved = dataclasses.replace(rec, arch="AARCH64:LE:64:v8A")
+    _, dirty = ingest_elfs(conn, [moved], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 in dirty
+    # the attempt under the new arch timed out as well; the pipeline's failure stamp records it
+    _record_failure(conn, rec.sha256, budget=budget, pass_version="p1")
+    conn.execute("UPDATE binaries SET arch = ?, bits = 64", (moved.arch,))
+    conn.commit()
+    _, dirty = ingest_elfs(conn, [moved], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 not in dirty
     conn.close()
 
 

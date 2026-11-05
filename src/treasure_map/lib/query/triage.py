@@ -279,6 +279,11 @@ _DEGRADED_ANCHOR_NOTE = (
     "this ref is a FUNCTION-level degraded anchor: the call could not be pinned to an address, so "
     "several callsites of this function may share it; it cannot carry a per-callsite judgment"
 )
+_OUT_OF_BODY_ANCHOR_NOTE = (
+    "this ref is the formal anchor of a call that lies outside the recorded body of every "
+    "function that claims it (anchor_degraded); its offset is counted from the lowest-entry "
+    "claimant, and it carries a per-callsite judgment"
+)
 _FAILED_EXTRACTION_NOTE = (
     "this candidate comes from an earlier extraction: this scan's extraction of its binary did "
     "not succeed, so the facts are those of the extraction pass named in extraction_pass"
@@ -292,11 +297,14 @@ _OLDER_PASS_NOTE = (
 def anchor_facts(flow_evidence: Evidence) -> dict[str, Any]:
     """The stored facts about a candidate's ANCHOR and EXTRACTION, verbatim, each with its note.
 
-    Two facts, both recorded by the hunt and both easy to miss inside flow_evidence: the ref is a
-    function-level degraded anchor (``callsite_located: false`` + ``anchor_degraded``), and/or the
-    candidate was read from an earlier extraction (``extraction_current: false`` +
-    ``extraction_pass`` [+ ``attempted_pass``]). Empty when neither applies, so a reader can surface
-    the dict whenever it is non-empty. A pure read; never computes either fact."""
+    Two facts, both recorded by the hunt and both easy to miss inside flow_evidence: where the
+    anchor's call lies (``anchor_degraded``) — on a function-level degraded anchor
+    (``callsite_located: false``) or on the formal anchor the hunt minted for a call outside every
+    claimant's body (``callsite_located`` not false: the fact is shown on its own, never hidden with
+    the marker) — and/or the candidate was read from an earlier extraction
+    (``extraction_current: false`` + ``extraction_pass`` [+ ``attempted_pass``]). Empty when neither
+    applies, so a reader can surface the dict whenever it is non-empty. A pure read; never computes
+    either fact."""
     data = _as_evidence(flow_evidence)
     if data is None:
         return {}
@@ -305,6 +313,9 @@ def anchor_facts(flow_evidence: Evidence) -> dict[str, Any]:
         out["callsite_located"] = False
         out["anchor_degraded"] = data.get("anchor_degraded")
         out["anchor_note"] = _DEGRADED_ANCHOR_NOTE
+    elif data.get("anchor_degraded"):
+        out["anchor_degraded"] = data.get("anchor_degraded")
+        out["anchor_note"] = _OUT_OF_BODY_ANCHOR_NOTE
     if data.get("extraction_current") is False:
         out["extraction_current"] = False
         out["extraction_pass"] = data.get("extraction_pass")
@@ -518,13 +529,7 @@ def _writer_args_class(conn: sqlite3.Connection, fmt: Any, varargs: Any) -> str:
 # the command constant is a false negative — real firmware has execve("/bin/sh", __argv, envp) with
 # a constant arg0 and an argv nobody proved anything about.
 #
-# ``execvpe`` removed. It is NOT in ``classes.CMD``, and this set is only consulted once a candidate
-# is already a CMD member judged const (see _record_class below) — so its membership here could
-# never reach a real candidate. It was false coverage: it made "execvpe is handled" look true while
-# the actual gap is upstream, in CMD not recognizing it as a sink at all. Removing it deletes the
-# illusion, NOT the gap — execvpe is a real glibc function and a future firmware may well call it.
-# That recall gap is registered for the CMD/registry decision rather than left to vanish with this
-# edit (an unrecorded deletion of coverage is itself a silent drop).
+# ``execvpe`` is here for the same reason as ``execve``: its command is in argv, not arg0.
 #
 # ``doSystem`` is the same KIND of false negative but not the same mechanism: it is printf-style
 # variadic, so its arg0 is a FORMAT and a constant template does not make the command constant. It
@@ -533,16 +538,17 @@ def _writer_args_class(conn: sqlite3.Connection, fmt: Any, varargs: Any) -> str:
 # (``_FORMAT_COMMAND_SINKS``), and must not be folded in here: this set asks about ARITY, that one
 # about a template's CONTENT, and a name belongs to at most one of those questions.
 #
-# A literal set on purpose. Deriving it from CMD or from hunt's EXEC_SINKS would make the test that
-# guards it compare a value against itself, and lib/query must not import lib/hunt (the read layer
-# does not depend on the write layer).
-_MULTI_ARG_COMMAND_SINKS: frozenset[str] = frozenset(
-    {"execl", "execle", "execlp", "execv", "execve", "execvp"}
+# Derived from the name registry: every command sink that is not a shell-running one
+# (forward_cmd) — the exec family. A new exec-family row in the registry joins this set with no
+# second list to edit; hunt's exec-edge builder derives its own exec set the same way, so the two
+# cannot drift apart. (The registry lives in lib/pattern, which the read layer may import.)
+_MULTI_ARG_COMMAND_SINKS: frozenset[str] = (
+    frozenset(_EXTRACTOR_NAMES.sink_cmd) - _EXTRACTOR_NAMES.forward_cmd
 )
 
 # printf-style VARIADIC command sinks: arg0 is a FORMAT template, so a constant template does NOT
-# make the command constant — the varargs it splices do. A literal set on purpose, like
-# _MULTI_ARG_COMMAND_SINKS, and for the same reason.
+# make the command constant — the varargs it splices do. A literal set: the registry does not say
+# which shell-running sink takes a template.
 #
 # ``system`` / ``popen`` are deliberately NOT here, and their danger is not missed: a runtime-built
 # ``system(buf)`` (buf from ``snprintf("cmd %s", user)``) has a stack_buf arg0 and is judged on the

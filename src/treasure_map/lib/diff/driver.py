@@ -921,7 +921,9 @@ def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, time
     # The language the scan imports the binary under, named here too: left to Ghidra's own guess,
     # a MIPS binary could be read in another variant than the scan's, and its export with it.
     arch = detect_arch(so_path)
-    processor = ["-processor", arch] if arch else []
+    # An architecture detect_arch does not support comes back as an ``UNKNOWN_…`` label, which is
+    # no Ghidra language: Ghidra is left to its own guess rather than handed a name it rejects.
+    processor = ["-processor", arch] if arch and not arch.startswith("UNKNOWN_") else []
     with tempfile.TemporaryDirectory(prefix="tm_binexport_proj_") as proj:
         cmd = [
             str(headless),

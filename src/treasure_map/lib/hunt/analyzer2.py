@@ -26,7 +26,7 @@ import json
 import logging
 import sqlite3
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -244,22 +244,42 @@ def _load_detector_errors(db_path: Path | str) -> dict[int, list[str]]:
 def _mint_out_of_body_anchors(atlas: sqlite3.Connection, source_run_id: str) -> int:
     """Give each call that only bare (out-of-body) candidates name one formal, offset-carrying
     anchor — the claimant with the lowest function entry (refs.mint_out_of_body_refs). Runs inside
-    the run's write transaction, after every candidate of the run is written; changes only those
-    rows' evidence_ref, drops none. Returns the number of rows re-anchored."""
-    rows = []
+    the run's write transaction, after every candidate of the run is written; drops no row.
+    Returns the number of rows re-anchored.
+
+    A minted row is no longer a function-level anchor: its ref pins one call, so its flow_evidence
+    says ``callsite_located: true`` (the overlay accepts a judgment on it) while keeping
+    ``anchor_degraded: out_of_body`` and ``callsite_addr`` as the facts of where the call lies. The
+    other claimants keep their bare ref and ``callsite_located: false``.
+
+    Only rows that can be claimants (``out_of_body`` in their evidence) have their evidence parsed;
+    every other row contributes its ref alone (an offset ref marks its call as already anchored)."""
+    rows: list[tuple[Hashable, str, dict[str, Any]]] = []
+    evidence_of: dict[Hashable, dict[str, Any]] = {}
     for iid, ref, flow in atlas.execute(
-        "SELECT instance_id, evidence_ref, flow_evidence FROM instance WHERE source_run_id = ?",
+        "SELECT instance_id, evidence_ref,"
+        " CASE WHEN instr(flow_evidence, 'out_of_body') > 0 THEN flow_evidence END"
+        " FROM instance WHERE source_run_id = ?",
         (source_run_id,),
     ):
-        try:
-            evidence = json.loads(flow) if flow else {}
-        except ValueError:
+        evidence: Any = {}
+        if flow:
+            try:
+                evidence = json.loads(flow)
+            except ValueError:
+                evidence = {}
+        if not isinstance(evidence, dict):
             evidence = {}
-        rows.append((iid, ref or "", evidence if isinstance(evidence, dict) else {}))
+        if evidence:
+            evidence_of[iid] = evidence
+        rows.append((iid, ref or "", evidence))
     minted = mint_out_of_body_refs(rows)
+    updates = []
+    for iid, ref in minted.items():
+        located = {**evidence_of[iid], "callsite_located": True}
+        updates.append((ref, json.dumps(located, sort_keys=True), iid))
     atlas.executemany(
-        "UPDATE instance SET evidence_ref = ? WHERE instance_id = ?",
-        [(ref, iid) for iid, ref in minted.items()],
+        "UPDATE instance SET evidence_ref = ?, flow_evidence = ? WHERE instance_id = ?", updates
     )
     if minted:
         logger.info("hunt: %d out-of-body call(s) given a formal anchor", len(minted))

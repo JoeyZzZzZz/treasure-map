@@ -208,3 +208,63 @@ def test_each_table_names_its_own_reason(tmp_path: Path) -> None:
     assert reason(_table(a, 4), None) == HANDLER_UNVERIFIED  # the ELF could not be read
     both = reason(_table(a, 4, after="handler_undefined", key_terminated=False))
     assert both == "handler_undefined,key_not_terminated"
+
+
+def test_the_ingest_checks_the_tables_against_the_binarys_own_slots(tmp_path: Path) -> None:
+    """★ Through the real ingest, on a real ELF: a table whose every handler slot the ELF fills with
+    a vtable symbol plus an offset is not stored; two tables the ELF does not contradict are, each
+    with its OWN completeness reason (one stops at an undefined handler, the other at a handler
+    outside the image) — never the detector-level reason shared by both.
+
+    MUTATION (verified RED, 1 failed): hand the ingest an empty ``ElfSlots()`` instead of
+    ``read_elf_slots(rec.path)`` -> the refused table is stored. Store the detector-level reason in
+    place of each table's ``t.reason`` -> the two reasons read the same."""
+    import json
+    import sqlite3
+
+    from treasure_map.lib.analyze.elf_inventory import ElfRecord
+    from treasure_map.lib.analyze.ghidra_ingest import ingest_ghidra_output
+    from treasure_map.lib.storage.connection import open_db
+
+    elf = tmp_path / "libsvc.so"
+    elf.write_bytes(
+        dynamic_rel_binary(
+            symbols=[("_ZTVfake", "OBJECT", False)],
+            relocs=[(0x44 + 8 * i, 1, R_ARM_ABS32, 8) for i in range(4)],
+        )
+    )
+    assert read_elf_slots(elf) is not None  # premise: the ELF is readable, so the check is made
+    refused, undef, ext = LOADED + 0x40, LOADED + 0x100, LOADED + 0x200
+    sha = "c" * 64
+    data = {
+        "functions": [],
+        "imports": [],
+        "exports": [],
+        "strings": [],
+        "string_tables": {
+            "tables": [
+                _table(refused, 4),
+                _table(undef, 4, after="handler_undefined"),
+                _table(ext, 4, before="handler_external"),
+            ],
+            "completeness": {"status": "incomplete", "reason": "shared", "scope": "s"},
+        },
+    }
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / f"libsvc.so_{sha[:8]}_ghidra.json").write_text(json.dumps(data))
+    conn: sqlite3.Connection = open_db(tmp_path / "analysis.db")
+    try:
+        conn.execute("INSERT INTO binaries (name, sha256) VALUES ('libsvc.so', ?)", (sha,))
+        bid = conn.execute("SELECT id FROM binaries").fetchone()[0]
+        rec = ElfRecord(path=elf, name="libsvc.so", arch="ARM:LE:32:v7", elf_type="shared",
+                        sha256=sha, size=elf.stat().st_size)  # fmt: skip
+        ingest_ghidra_output(conn, out, [rec], {sha: bid})
+        stored = dict(
+            conn.execute("SELECT DISTINCT table_addr, completeness_reason FROM string_tables")
+        )
+    finally:
+        conn.close()
+    assert set(stored) == {f"0x{undef:x}", f"0x{ext:x}"}
+    assert stored[f"0x{undef:x}"] == "handler_undefined"
+    assert stored[f"0x{ext:x}"] == "got_relative_unresolved"

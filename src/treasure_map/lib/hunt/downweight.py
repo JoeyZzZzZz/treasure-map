@@ -548,7 +548,15 @@ def _buffer_writes_all_safe(
     """Every write to ``buf`` up to the sink is a safe write: a literal, a constant memset,
     a single inline converter, or an integer/literal-only format; nothing escapes or aliases it;
     it is a local array; and at least one write is a format/converter (otherwise it is pure
-    constant, not numeric-constrained)."""
+    constant, not numeric-constrained).
+
+    A write must enclose and precede the sink (``write_ok``) — except a PURE-LITERAL one: a literal
+    element assignment, a constant memset, a copy of a string/char literal, or a format write whose
+    format is a literal and every argument a literal. It writes the same bytes wherever it sits, so
+    its position says nothing (a sibling block's constant command does not hide the numeric write
+    that does enclose the sink). An exempt write never counts as the format/converter write the
+    mark needs; a converter copy or a format with any non-literal argument stays
+    position-checked."""
     if not _is_local_array(pseudocode, buf):
         return False  # F1
     depths = _brace_depths(pseudocode)
@@ -561,11 +569,10 @@ def _buffer_writes_all_safe(
     # an alias (F-alias).
     for m in re.finditer(r"([^;\n{}]*?)(?<![<>!=+\-*/%&|^~])=(?!=)([^;\n{}]*)", pseudocode):
         lhs, rhs = m.group(1).strip(), m.group(2)
-        lpos = m.start()
         if lhs and _is_buf_target(lhs, buf):
-            if not _is_literal_arg(rhs) or not write_ok(lpos):
+            if not _is_literal_arg(rhs):
                 return False
-            continue
+            continue  # pure literal: no position check
         if _is_buf_alias(rhs, buf):
             return False  # F-alias: a pointer aliasing buf is stored into another variable
 
@@ -591,15 +598,11 @@ def _buffer_writes_all_safe(
             if name in _MEMSET:
                 if len(args) < 2 or not _is_literal_arg(args[1]):
                     return False
-                if not write_ok(off):
-                    return False
-                continue
+                continue  # pure literal: no position check
             if name in _COPY_WRITE:
                 src = args[1] if len(args) > 1 else ""
                 if _STRING_OR_CHAR_LIT.match(src):
-                    if not write_ok(off):
-                        return False
-                    continue
+                    continue  # pure literal: no position check
                 if _is_converter_call(src, converters):
                     if not write_ok(off):
                         return False
@@ -612,6 +615,8 @@ def _buffer_writes_all_safe(
                     return False
                 if not _format_write_safe(args[fpos], args[fpos + 1 :], converters):
                     return False
+                if all(_is_literal_arg(a) for a in args[fpos + 1 :]):
+                    continue  # pure literal (the format is a literal, checked above): exempt
                 if not write_ok(off):
                     return False
                 saw_fmt_or_conv = True

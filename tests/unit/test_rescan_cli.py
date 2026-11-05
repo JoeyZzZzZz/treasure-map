@@ -409,6 +409,39 @@ def test_rescan_invokes_scan_per_runnable_run(
     assert "rescanned 2/2" in out.output
 
 
+def test_every_run_of_a_rescan_scans_inside_one_shared_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The runs of one rescan share their Ghidra sessions: each run's scan executes while the
+    same ExtractionShare is open (``pipeline._SHARE``), so a binary the runs hold byte for byte is
+    decompiled once. A scan run outside the block would decompile everything again.
+
+    MUTATION (verified RED, 1 failed): call ``_rescan_each_sharing`` outside
+    ``with sharing_extractions()`` in ``_rescan_each``."""
+    from treasure_map.lib.analyze import pipeline
+
+    db = _two_runnable(tmp_path, monkeypatch)
+    seen: list[object] = []
+
+    def _fake_scan(
+        fs_root: Path,
+        workspace: str | None,
+        run_id: str | None,
+        atlas_path: Path | None,
+        config: Path | None,
+        rehunt: bool,
+        top_n: int | None,
+    ) -> None:
+        seen.append(pipeline._SHARE.get())
+
+    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    out = CliRunner().invoke(rescan, ["--atlas", str(db)])
+    assert out.exit_code == 0, out.output
+    assert len(seen) == 2
+    assert seen[0] is not None and seen[0] is seen[1]
+    assert pipeline._SHARE.get() is None  # closed when the rescan ends
+
+
 def test_one_failing_firmware_does_not_abandon_the_rest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

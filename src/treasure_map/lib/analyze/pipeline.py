@@ -40,6 +40,7 @@ from treasure_map.lib.analyze.extraction_share import ExtractionShare
 from treasure_map.lib.analyze.file_inventory import build_file_inventory
 from treasure_map.lib.analyze.ghidra_ingest import (
     IngestStats,
+    bits_of,
     drop_extraction,
     ingest_ghidra_output,
 )
@@ -445,9 +446,6 @@ def run_analyze(
                 if res.reason == _INTERRUPTED:
                     return  # cut off, not finished: nothing is recorded and it runs again next time
                 if res.success:
-                    ghidra_ok += 1
-                    if res.analysis_status == "no_functions":
-                        ghidra_no_functions += 1
                     one = _store_extraction(rec, res)
                     for f in dataclasses.fields(IngestStats):
                         setattr(
@@ -455,6 +453,15 @@ def run_analyze(
                             f.name,
                             getattr(ingest_stats, f.name) + getattr(one, f.name),
                         )
+                    if one.binaries_image_base_mismatch:
+                        # The ingest refused the output and recorded the binary failed: it is one
+                        # of the failed, never counted with the extracted ones.
+                        ghidra_failed += 1
+                        stored_failed += 1
+                    else:
+                        ghidra_ok += 1
+                        if res.analysis_status == "no_functions":
+                            ghidra_no_functions += 1
                     if one.binaries_processed == 1:
                         kept += 1
                         stored_ok += 1
@@ -479,7 +486,7 @@ def run_analyze(
                     conn.execute(
                         "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, ghidra_status_reason=?, "
                         "timeout_budget=?, timeout_pass_version=?, reanalyze_pending=0, "
-                        "binexport_status=?, binexport_scan_meta=? "
+                        "binexport_status=?, binexport_scan_meta=?, arch=?, bits=? "
                         "WHERE sha256=?",
                         (
                             0,
@@ -489,6 +496,9 @@ def run_analyze(
                             pass_version,
                             res.export_status or f"scan_failed:{res.reason or 'unknown'}",
                             _export_meta(export_ctx, res, None),
+                            # the architecture this attempt ran under (see db_ingest step 1e)
+                            rec.arch,
+                            bits_of(rec.arch),
                             rec.sha256,
                         ),
                     )

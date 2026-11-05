@@ -361,10 +361,24 @@ def _arguments_after(line: str, name: str) -> list[str] | None:
     return out
 
 
+def _variable_launches(command: str, symtab: _SymbolTable) -> list[_Launch]:
+    """Each literal value of the variable a command word names (``$X``, ``${X}``, ``$BASE/$X``)."""
+    for rx in _VARIABLE_TOKENS:
+        m = rx.match(command)
+        if m and m.group(1) in symtab.literals:
+            return [
+                _Launch(value.rsplit("/", 1)[-1], "variable", assigned)
+                for value, assigned in symtab.literals[m.group(1)]
+            ]
+    return []
+
+
 def _launches_from_line(line: str, symtab: _SymbolTable, lineno: int) -> list[_Launch]:
     """Every command this line runs that can be named: the literal one, the first command of each
     command substitution, a function's positional parameter given here as a literal argument, and
-    each literal value of a variable used as the command. Not filtered to binaries; not deduped."""
+    each literal value of a variable used as the command — the line's own command or the one a
+    substitution runs (``IP=$($CONFIG get ip)`` runs ``$CONFIG``). Not filtered to binaries; not
+    deduped."""
     out: list[_Launch] = []
     lit = launched_command(line)
     if lit:
@@ -376,6 +390,7 @@ def _launches_from_line(line: str, symtab: _SymbolTable, lineno: int) -> list[_L
         command = _subst_command(inner)
         if command:
             out.append(_Launch(command, "inline", lineno))
+            out.extend(_variable_launches(command, symtab))
     if lit and lit in symtab.functions:
         args = _arguments_after(line, lit)
         if args is not None:
@@ -399,12 +414,7 @@ def _launches_from_line(line: str, symtab: _SymbolTable, lineno: int) -> list[_L
                     continue
                 out.append(_Launch(arg.rsplit("/", 1)[-1], "function_arg", defline))
     if lit:
-        for rx in _VARIABLE_TOKENS:
-            m = rx.match(lit)
-            if m and m.group(1) in symtab.literals:
-                for value, assigned in symtab.literals[m.group(1)]:
-                    out.append(_Launch(value.rsplit("/", 1)[-1], "variable", assigned))
-                break
+        out.extend(_variable_launches(lit, symtab))
     return out
 
 

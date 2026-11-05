@@ -270,3 +270,37 @@ def test_the_standalone_export_names_its_language_and_starts_in_its_project(
     assert isinstance(cmd, list)
     assert cmd[cmd.index("-processor") + 1] == "x86:LE:64:default"
     assert seen["cwd"] == cmd[1]  # the project directory
+
+
+def test_an_architecture_ghidra_has_no_language_for_is_not_passed_as_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ELF machine detect_arch does not support comes back as ``UNKNOWN_…``: that is no Ghidra
+    language, so no ``-processor`` is passed (Ghidra guesses) rather than one it rejects.
+
+    MUTATION (verified RED, 1 failed): pass any detected arch as -processor again."""
+    import subprocess
+
+    from treasure_map.lib.config.config import Config
+    from treasure_map.lib.diff.driver import DiffToolchainError, _run_binexport
+
+    seen: dict[str, object] = {}
+
+    def fake(cmd: list[str], env: dict[str, str], timeout: int, cwd: object = None) -> object:
+        seen.update(cmd=cmd)
+        return subprocess.CompletedProcess(cmd, 1, b"", b"")
+
+    monkeypatch.setattr(driver, "_run_killable", fake)
+    monkeypatch.setattr(
+        "treasure_map.lib.analyze.ghidra_runner.find_headless",
+        lambda cfg: Path("/g/analyzeHeadless"),
+    )
+    monkeypatch.setattr(
+        "treasure_map.lib.analyze.elf_inventory.detect_arch",
+        lambda p: "UNKNOWN_EM_999:LE:32:default",
+    )
+    with pytest.raises(DiffToolchainError):
+        _run_binexport(tmp_path / "lib.so", Config(), tmp_path, "a", 60)
+    cmd = seen["cmd"]
+    assert isinstance(cmd, list) and "-import" in cmd
+    assert "-processor" not in cmd

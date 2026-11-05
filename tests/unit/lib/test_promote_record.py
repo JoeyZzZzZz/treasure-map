@@ -10,8 +10,11 @@ none) or does not hold together is NULL — "not recorded" — and never reads a
 outside a function" / "analysis".
 
 Zero real data: hand-written extractor output and hand-built databases. The Ghidra behaviour itself
-(the instruction walk finding what the block iterator skips) is guarded by the live rescan anchors,
-not here; the two script-text tests below pin the parts of it a reader can check statically.
+is checked elsewhere: the instruction walk finding what the block iterator skips by the live rescan
+anchors; what the pass counts and marks where a block's entry already holds a function, its log's
+per-pass counts and the analysis option it freezes and puts back, through real Ghidra on compiled
+fixtures (tests/integration/test_extraction_fixtures.py). The script-text tests below pin only what
+no output shows.
 """
 
 from __future__ import annotations
@@ -669,22 +672,6 @@ def test_promotion_never_walks_the_program_wide_block_iterator() -> None:
     assert "getCodeBlocksContaining(" not in code
 
 
-def test_block_promotion_counts_only_new_functions_and_logs_the_pass_breakdown() -> None:
-    """★ createFunction returns the EXISTING function when one already sits at the entry (Ghidra's
-    handleExistingFunction returns it for a body of more than one byte), so counting every non-null
-    return over-counts `created` and stamps a Ghidra-analysed function origin='promoted'.
-    promoteBlocks reads getFunctionAt(entry) BEFORE createFunction and counts/bookmarks only a
-    genuinely-new function; the stored `created` is that count, while the log keeps the raw
-    first-pass count (pass1_created, the old method) so A4 can compare it to the r6 single-pass log.
-
-    MUTATION (verified RED): drop the getFunctionAt(entry) guard (count/bookmark every non-null
-    return) -> RED; stop logging the per-pass breakdown -> RED."""
-    code = _code(_GHIDRA_DIR / "PromoteUndefined.java")
-    assert "getFunctionAt(entry)" in code
-    assert "pass1_created=" in code
-    assert "pass2_created=" in code
-
-
 def test_the_two_scripts_spell_the_handoff_the_same_way() -> None:
     """ExportFunctions reads what PromoteUndefined left in the session by the option category and
     bookmark category; a typo on either side would make every export read "not recorded".
@@ -753,39 +740,17 @@ def test_w14_bookmarks_recovered_functions_and_export_reads_the_origin() -> None
     assert export.index("PROMOTE_RECOVERED", export.index("originField")) < prom_at
 
 
-def test_promotion_counts_and_marks_only_a_function_that_was_not_there() -> None:
-    """★ Source contract for what no compiled fixture reaches. createFunction returns the EXISTING
-    function at an entry, and on the synthetic fixtures no promoted block's entry already holds one
-    (tests/integration/test_extraction_fixtures.py checks the count and the mark where it can). So
-    the shape is pinned here: whether a function was there is read BEFORE the call; one guard holds
-    both the count and the 'promoted' bookmark; the stored ``created`` sums the real counts; the
-    log's pass-1 count and the re-analysis gate keep the raw count.
+def test_re_analysis_follows_every_applied_create_function() -> None:
+    """Source contract for the one part of the existing-entry handling no output shows. After each
+    block-promotion pass the program is re-analysed whenever createFunction was applied at all (the
+    raw count), not only when it made a new function: createFunction handed an existing function
+    changes nothing a later step reads, so gating on the real count instead leaves every output of
+    the compiled fixtures the same (measured: the integration tests stay green under that change).
+    What the pass counts, marks and logs there is checked through real Ghidra instead
+    (tests/integration/test_extraction_fixtures.py).
 
-    MUTATION (verified RED): bypass the guard; bookmark outside it; store the raw sum; log the real
-    pass-1 count; gate re-analysis on the real count."""
+    MUTATION (verified RED, 1 failed): gate the first pass's re-analysis on the real count -> RED;
+    the same for the second pass -> RED."""
     code = _code(_GHIDRA_DIR / "PromoteUndefined.java")
-    body = code[code.index("private int[] promoteBlocks()") :]
-    body = body[: body.index("return new int[] {tried, createdReal, createdRaw};")]
-    assert body.index("boolean existed = fm.getFunctionAt(entry) != null;") < body.index(
-        "createFunction(entry, null)"
-    )
-    guarded = body[body.index("if (!existed) {") :]
-    guarded = guarded[: guarded.index("}")]
-    assert "createdReal++;" in guarded
-    assert "setBookmark(fn.getEntryPoint(), BookmarkType.INFO, BOOKMARK_CATEGORY" in guarded
-    assert body.count("BOOKMARK_CATEGORY") == 1  # the guarded bookmark is the only one
-    assert "int created = p1[1] + p2[1];" in code
-    assert '+ " pass1_created=" + p1[2]' in code
-    assert "if (p1[2] > 0) {" in code and "if (p2[2] > 0) {" in code
-
-
-def test_the_no_return_restore_writes_the_value_it_saved() -> None:
-    """The restore at the end puts back the value the freeze saved — what Ghidra had, not a fixed
-    one. Pinned in the source: the restored option is never seen by any output (the session's
-    project is deleted after the export), so no fixture can tell.
-
-    MUTATION (verified RED): restore "false" instead of the saved value -> RED."""
-    code = _code(_GHIDRA_DIR / "PromoteUndefined.java")
-    restore = code[code.index("private void restoreNoReturn(String was)") :]
-    restore = restore[: restore.index("\n  }")]
-    assert "setAnalysisOption(currentProgram, NO_RETURN_OPTION, was);" in restore
+    assert "if (p1[2] > 0) {" in code
+    assert "if (p2[2] > 0) {" in code

@@ -180,3 +180,19 @@ def test_minting_is_per_call_per_class_and_needs_an_out_of_body_address() -> Non
         2: f"{bare}@0x008010",
         4: "r#aaaaaaaa:00405000@copy@0x004020",
     }
+
+
+def test_only_an_out_of_body_row_is_minted() -> None:
+    """A bare row that recovered a call address for another reason than ``out_of_body`` is no
+    claimant of that call: only the out-of-body degrade puts a call outside every claimant's body,
+    which is what makes a minted anchor necessary.
+
+    MUTATION (verified RED, 1 failed): mint any bare row with an address (drop the
+    ``anchor_degraded == "out_of_body"`` check in mint_out_of_body_refs)."""
+    from treasure_map.lib.hunt.refs import mint_out_of_body_refs
+
+    bare = "run#0a1b2c3d:00401000@copy"
+    other = {"anchor_degraded": "no_bridge_data", "callsite_addr": "0x409020"}
+    assert mint_out_of_body_refs([("k1", bare, other)]) == {}
+    out_of_body = {"anchor_degraded": "out_of_body", "callsite_addr": "0x409020"}
+    assert mint_out_of_body_refs([("k1", bare, out_of_body)]) == {"k1": bare + "@0x008020"}

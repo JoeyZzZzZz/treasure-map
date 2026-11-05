@@ -135,8 +135,11 @@ _CAP_ARG: dict[str, int] = {
     "__snprintf_chk": 1,  # __snprintf_chk(dst, CAP, flag, objsize, fmt, ...)
     "__vsnprintf_chk": 1,  # __vsnprintf_chk(dst, CAP, flag, objsize, fmt, ap)
     # vswprintf is absent on purpose: its cap counts WIDE characters, so a byte-sized bound such as
-    # sizeof(dst) would read as a bound it is not. Its size reads untraced instead.
+    # sizeof(dst) would read as a bound it is not. Its size reads untraced instead (_WIDE_CAP).
 }
+# Formatters whose signature carries a cap counted in wide characters (vswprintf(dst, CAP, fmt,
+# ap)): the size reads untraced — there IS a length parameter, so no_bound would be false.
+_WIDE_CAP: frozenset[str] = frozenset({"vswprintf"})
 _APPEND_ARG: dict[str, int] = {
     "strncat": 2,  # strncat(dst, src, HOW MUCH TO APPEND)
     "__strncat_chk": 2,  # __strncat_chk(dst, src, HOW MUCH TO APPEND, objsize)
@@ -388,6 +391,10 @@ def classify_format_size(
     if pos is None:
         pos = _APPEND_ARG.get(sink_name)
         const_kind, var_kind = SIZE_APPEND_CONST, SIZE_APPEND_VARIABLE
+    if pos is None and sink_name in _WIDE_CAP:
+        # The signature has a cap, but it counts wide characters: not readable as a byte bound,
+        # and not "no length parameter" either.
+        return CopySize(SIZE_UNTRACED, None, None)
     if pos is None:
         # No length parameter in the signature at all. Not a failure to read one — there is none.
         return CopySize(SIZE_NO_BOUND, None, None)

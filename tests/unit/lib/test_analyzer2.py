@@ -4158,13 +4158,14 @@ def test_a_token_less_row_in_a_bridged_db_degrades_to_bare_never_index(tmp_path:
 
 def test_out_of_body_siblings_each_get_the_anchor_of_their_call_and_say_so(tmp_path: Path) -> None:
     """Two calls whose addresses fall outside the function body (inlined into a neighbour) both
-    degrade to the bare class; each row says ``callsite_located: false`` with ``anchor_degraded:
-    out_of_body`` and the recovered call address. No other candidate claims either call, so each
-    row becomes the formal anchor of its own call (``copy@<offset>``, signed from this entry) —
-    one anchor per call, the evidence still saying where the call was found.
+    degrade to the bare class with ``anchor_degraded: out_of_body`` and the recovered call address.
+    No other candidate claims either call, so each row becomes the formal anchor of its own call
+    (``copy@<offset>``, signed from this entry) and so is no longer function-level
+    (``callsite_located: true``) — one anchor per call, the evidence still saying where the call was
+    found.
 
-    MUTATION (must go RED): drop the ``callsite_located`` / ``anchor_degraded`` / ``callsite_addr``
-    keys; skip the minting (the two rows share the bare ref again)."""
+    MUTATION (must go RED): drop the ``anchor_degraded`` / ``callsite_addr`` keys; skip the minting
+    (the two rows share the bare ref again)."""
     pc = "void Inl(char *a,char *b,int n) {\n  memcpy(a,b,4);\n  memcpy(a,b,n);\n}\n"
     fn = _bridged(
         "Inl", 0x401000, pc, ["memcpy"],
@@ -4175,7 +4176,7 @@ def test_out_of_body_siblings_each_get_the_anchor_of_their_call_and_say_so(tmp_p
     run_analyzer2(db, atlas, source_run_id="run_b")
     rows = _rows_for(atlas, "Inl")
     assert sorted(ref.split("@", 1)[1] for ref, _ in rows) == ["copy@0x008000", "copy@0x008010"]
-    assert [ev.get("callsite_located") for _, ev in rows] == [False, False]
+    assert [ev.get("callsite_located") for _, ev in rows] == [True, True]
     assert [ev.get("anchor_degraded") for _, ev in rows] == ["out_of_body", "out_of_body"]
     # the out_of_body physical address the degrade would drop is recovered into flow_evidence, and
     # it distinguishes the two shared-ref siblings (what the cross-side overlay folds / aligns on).
@@ -4222,6 +4223,103 @@ def test_a_call_only_bare_candidates_name_gets_one_formal_anchor(tmp_path: Path)
         assert conn.execute("SELECT count(*) FROM instance").fetchone()[0] == 4
     finally:
         conn.close()
+
+
+def test_a_minted_anchor_takes_a_judgment_and_keeps_its_out_of_body_fact(tmp_path: Path) -> None:
+    """★ The formal anchor minted for an out-of-body call pins that one call, so the overlay must
+    accept a judgment on it — while the claimant left bare (function-level, shared) is still
+    refused. Its evidence keeps ``anchor_degraded`` and ``callsite_addr``, and the read face still
+    shows where the call lies (anchor_facts), with a note that is not the degraded one.
+
+    Inl (entry 0x401000) and Late (entry 0x405000) both reach 0x409020 outside their bodies: Inl's
+    row is minted, Late's stays bare.
+
+    MUTATION (verified RED, 1 failed): mint the ref without rewriting flow_evidence (the UPDATE sets
+    evidence_ref only) -> the annotate on the minted ref is refused.
+    MUTATION (verified RED, 1 failed): anchor_facts shows anchor_degraded only under
+    ``callsite_located is False`` -> the minted anchor's facts are empty."""
+    from treasure_map.lib.errors import ConfigError
+    from treasure_map.lib.overlay import upsert_overlay
+    from treasure_map.lib.query.triage import anchor_facts
+
+    inl_pc = "void Inl(char *a,char *b,int n) {\n  memcpy(a,b,4);\n  memcpy(a,b,n);\n}\n"
+    inl = _bridged(
+        "Inl", 0x401000, inl_pc, ["memcpy"],
+        body=(0x401000, 0x401100), addr_of={"memcpy": [0x409010, 0x409020]},
+    )  # fmt: skip
+    late = _bridged(
+        "Late", 0x405000, "void Late(char *a,char *b) {\n  memcpy(a,b,8);\n}\n", ["memcpy"],
+        body=(0x405000, 0x405100), addr_of={"memcpy": [0x409020]},
+    )  # fmt: skip
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [inl, late]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_b")
+    by_addr = {ev["callsite_addr"]: (ref, ev) for ref, ev in _rows_for(atlas, "Inl")}
+    assert "0x409020" in by_addr
+    minted_ref, minted_ev = by_addr["0x409020"]
+    assert minted_ref.endswith("00401000@copy@0x008020")
+    assert minted_ev.get("callsite_located") is True
+    assert minted_ev.get("anchor_degraded") == "out_of_body"
+    ((late_ref, late_ev),) = _rows_for(atlas, "Late")
+    assert late_ref.endswith("00405000@copy") and late_ev.get("callsite_located") is False
+
+    facts = anchor_facts(json.dumps(minted_ev))
+    assert facts.get("anchor_degraded") == "out_of_body"
+    assert "formal anchor" in str(facts.get("anchor_note"))
+    assert "callsite_located" not in facts
+    assert anchor_facts(json.dumps(late_ev)).get("callsite_located") is False
+
+    conn = open_atlas(atlas)
+    try:
+        upsert_overlay(
+            conn, evidence_ref=minted_ref, verdict="suspicious", rationale="read the call",
+            attributed_to="agent-via-mcp",
+        )  # fmt: skip
+        with pytest.raises(ConfigError, match="degraded anchor"):
+            upsert_overlay(
+                conn, evidence_ref=late_ref, verdict="suspicious", rationale="read the call",
+                attributed_to="agent-via-mcp",
+            )  # fmt: skip
+    finally:
+        conn.close()
+
+
+def test_minting_parses_only_the_evidence_of_out_of_body_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The minting step reads every row of the run but parses the flow_evidence only of rows that
+    can be claimants (their evidence names ``out_of_body``); every other row contributes its ref
+    alone. Parsing the whole run's evidence is what set the hunt's peak memory on a large run.
+
+    MUTATION (verified RED, 1 failed): select flow_evidence unfiltered (drop the CASE) -> the
+    in-body row's evidence is parsed too."""
+    holder = _bridged(
+        "Holder", 0x409000, "void Holder(char *a,char *b) {\n  memcpy(a,b,4);\n}\n", ["memcpy"],
+        body=(0x409000, 0x409018), addr_of={"memcpy": [0x409010]},
+    )  # fmt: skip
+    inl = _bridged(
+        "Inl", 0x401000, "void Inl(char *a,char *b) {\n  memcpy(a,b,4);\n}\n", ["memcpy"],
+        body=(0x401000, 0x401100), addr_of={"memcpy": [0x409030]},
+    )  # fmt: skip
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [holder, inl]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_b")
+    parsed: list[str] = []
+    real_loads = json.loads
+
+    def counting_loads(text: str) -> object:
+        parsed.append(text)
+        return real_loads(text)
+
+    conn = open_atlas(atlas)
+    try:
+        n_rows = conn.execute("SELECT count(*) FROM instance").fetchone()[0]
+        assert n_rows == 2
+        monkeypatch.setattr(analyzer2_mod.json, "loads", counting_loads)
+        analyzer2_mod._mint_out_of_body_anchors(conn, "run_b")
+    finally:
+        conn.close()
+    assert len(parsed) == 1 and "out_of_body" in parsed[0]
 
 
 def test_a_binary_whose_extraction_failed_marks_its_candidates_not_current(tmp_path: Path) -> None:
@@ -4356,9 +4454,9 @@ def test_wrapper_candidate_per_call_with_its_own_offset_ref(tmp_path: Path) -> N
 
 def test_wrapper_call_out_of_body_degrades_like_a_direct_call(tmp_path: Path) -> None:
     """A wrapper call whose address falls outside the body degrades exactly as a direct sink call
-    does: ``callsite_located: false``, ``anchor_degraded: out_of_body``, the recovered call address
-    — and, no other candidate claiming that call, the row is its formal anchor (axis ref with the
-    offset of the call to the wrapper).
+    does: ``anchor_degraded: out_of_body`` and the recovered call address — and, no other candidate
+    claiming that call, the row is its formal anchor (axis ref with the offset of the call to the
+    wrapper), so it is no longer function-level (``callsite_located: true``).
 
     MUTATION (verified RED): drop the degrade keys from the wrapper path -> no marker."""
     pc = "void Inl(char *a) {\n  do_cmd(a);\n}\n"
@@ -4372,7 +4470,7 @@ def test_wrapper_call_out_of_body_degrades_like_a_direct_call(tmp_path: Path) ->
     run_analyzer2(db, atlas, source_run_id="run_w")
     ((ref, ev, _),) = _wrapper_rows(atlas, "Inl")
     assert ref.endswith("@cmd_via_wrapper@0x008000")
-    assert ev["callsite_located"] is False and ev["anchor_degraded"] == "out_of_body"
+    assert ev["callsite_located"] is True and ev["anchor_degraded"] == "out_of_body"
     assert ev["callsite_addr"] == "0x409000"
 
 
@@ -4464,6 +4562,63 @@ def test_every_patterns_spread_is_its_live_count_after_runs_and_a_rehunt(tmp_pat
         conn.close()
     assert rows and all(spread == live for spread, live in rows)
     assert max(spread for spread, _ in rows) == 2
+
+
+def test_the_spread_recount_is_part_of_the_runs_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The end-of-run recount runs INSIDE the run's write transaction: when it fails, the run's
+    candidates roll back with it — never committed with their patterns' spreads left stale.
+
+    MUTATION (verified RED, 1 failed): move ``recompute_device_spread(atlas, touched_patterns)``
+    after the ``with atlas:`` block (after the commit) -> the candidates stay written."""
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
+    atlas = tmp_path / "atlas.db"
+
+    def boom(conn: sqlite3.Connection, pattern_ids: object) -> None:
+        raise RuntimeError("recount failed")
+
+    monkeypatch.setattr(analyzer2_mod, "recompute_device_spread", boom)
+    with pytest.raises(RuntimeError, match="recount failed"):
+        run_analyzer2(db, atlas, source_run_id="run_1")
+    conn = open_atlas(atlas)
+    try:
+        assert conn.execute("SELECT count(*) FROM instance").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_a_runs_write_recounts_each_pattern_once_not_per_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Two candidates of one pattern in a run: that pattern's spread is recounted once, at the
+    end — the per-insert recount (a recount over the instance table per candidate) made a run's
+    write quadratic.
+
+    MUTATION (verified RED, 1 failed): make add_instance recount whatever ``recompute`` says."""
+    from treasure_map.lib.atlas import writer
+
+    funcs = [_cmd_injection_fn("handle"), _cmd_injection_fn("handle_two")]
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": funcs}])
+    atlas = tmp_path / "atlas.db"
+    counted: list[int] = []
+    real = writer._recompute_device_spread
+
+    def counting(conn: sqlite3.Connection, pattern_id: int) -> None:
+        counted.append(pattern_id)
+        real(conn, pattern_id)
+
+    monkeypatch.setattr(writer, "_recompute_device_spread", counting)
+    run_analyzer2(db, atlas, source_run_id="run_1")
+    conn = open_atlas(atlas)
+    try:
+        per_pattern = conn.execute(
+            "SELECT pattern_id, count(*) FROM instance GROUP BY pattern_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert any(n >= 2 for _pid, n in per_pattern)  # premise: a pattern with two candidates
+    assert sorted(counted) == sorted(pid for pid, _n in per_pattern)
 
 
 def test_the_four_recalled_gap_sinks_now_make_candidates(tmp_path: Path) -> None:

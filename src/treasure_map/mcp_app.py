@@ -2460,8 +2460,14 @@ def make_tools(
         the rest)."""
         got = get_pseudocode(function=function, binary=binary, run_id=run)
         text = got.get("pseudocode") if isinstance(got, dict) else None
-        if not isinstance(text, str):
-            return {"unavailable": (got or {}).get("error") or (got or {}).get("pseudocode_status")}
+        if not isinstance(text, str) or text == "":
+            # An empty text is no reading of the function: say why (its status, and the decompile
+            # outcome the extraction recorded), never hand over an empty pseudocode.
+            got = got if isinstance(got, dict) else {}
+            gone: dict[str, Any] = {"unavailable": got.get("error") or got.get("pseudocode_status")}
+            if got.get("decompile_status") is not None:
+                gone["decompile_status"] = got["decompile_status"]
+            return gone
         out: dict[str, Any] = {"pseudocode": text[:cap]}
         if len(text) > cap:
             out["cut_at"] = cap

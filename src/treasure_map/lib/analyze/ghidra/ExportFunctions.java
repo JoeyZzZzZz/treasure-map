@@ -53,8 +53,8 @@ public class ExportFunctions extends GhidraScript {
     // rather than extracting with an empty lexicon, which would look like "no sinks here".
     //
     //   SINK_KEYARG    provenance sinks (command + format-string) -> 0-based key argument. Buffer
-    //                  formatters (snprintf/sprintf) are WRITERS, not provenance sinks. Extra sinks
-    //                  (firmware-specific wrappers) can be appended via TMAP_EXTRA_SINKS.
+    //                  formatters (snprintf/sprintf) are WRITERS, not provenance sinks. (The
+    //                  TMAP_EXTRA_SINKS hook below is inactive: the launcher does not pass it.)
     //   WRITERS        functions that fill a destination buffer — candidate writers of a stack_buf
     //                  sink argument (registry roles writer + writer_fmt).
     //   WRITER_FMTARG  format-string argument of the printf-family writers (0-based over the
@@ -284,7 +284,9 @@ public class ExportFunctions extends GhidraScript {
         }
     }
 
-    // Per-run sink map = registry lexicon + optional TMAP_EXTRA_SINKS (comma-separated, key arg 0).
+    // Per-run sink map = registry lexicon + TMAP_EXTRA_SINKS when the JVM sees it (comma-separated,
+    // key arg 0). The scan's launcher passes the JVM a whitelisted environment without it
+    // (ghidra_launch.JVM_INHERITED_KEYS), so in a scan the map is the registry lexicon alone.
     private Map<String, Integer> sinkKeyArg = SINK_KEYARG;
 
     // Escape a string for JSON: handles control chars, quotes, backslashes
@@ -2989,8 +2991,9 @@ public class ExportFunctions extends GhidraScript {
         decomp.setOptions(opts);
         decomp.openProgram(currentProgram);
 
-        // Optional extra provenance sinks (firmware-specific command wrappers), comma-separated.
-        // Key arg defaults to 0. Keeps the committed default lexicon vendor-neutral (CMD + FMT).
+        // Optional extra provenance sinks, comma-separated, key arg 0. Inactive in a scan: the
+        // launcher's environment whitelist does not pass TMAP_EXTRA_SINKS to the JVM, so a sink is
+        // added through the name registry (extractor_names.tsv), never here.
         String extraSinks = System.getenv("TMAP_EXTRA_SINKS");
         if (extraSinks != null && !extraSinks.trim().isEmpty()) {
             sinkKeyArg = new HashMap<>(SINK_KEYARG);

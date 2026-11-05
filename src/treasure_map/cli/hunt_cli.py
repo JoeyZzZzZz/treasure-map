@@ -1358,9 +1358,10 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
     click.echo(f"  shape        = {ex.call_sequence_shape or '?'}")
     click.echo(f"  function     = {c.function or '?'}")
     click.echo(f"  binary       = {c.binary_path or '?'}   (open this in the decompiler)")
-    if c.anchor_facts.get("callsite_located") is False:
+    if "anchor_note" in c.anchor_facts:
+        label = "degraded" if c.anchor_facts.get("callsite_located") is False else "formal"
         click.echo(
-            f"  anchor       = degraded ({c.anchor_facts.get('anchor_degraded')}): "
+            f"  anchor       = {label} ({c.anchor_facts.get('anchor_degraded')}): "
             f"{c.anchor_facts['anchor_note']}"
         )
     if c.anchor_facts.get("extraction_current") is False:

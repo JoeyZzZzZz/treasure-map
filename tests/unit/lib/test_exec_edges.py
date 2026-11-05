@@ -103,13 +103,27 @@ def _edges(
 # ── the sink lexicon (the extractor's own list is the authority) ──────────────────────
 
 
-def test_sink_families_are_disjoint_and_exclude_the_unextracted_ones() -> None:
-    # posix_spawn and execvpe are NOT in the extractor's provenance lexicon, so no provenance
-    # record can ever name them. Claiming them here would promise coverage that does not exist —
-    # the scan status declares the gap instead. (Soft teeth: this pins the declared scope.)
+def test_sink_families_are_disjoint_and_follow_the_registry() -> None:
+    # Both families are derived from the name registry. posix_spawn is NOT in it, so no provenance
+    # record can ever name it and claiming it here would promise coverage that does not exist.
+    # execvpe IS a registry command sink (argv at arg1, like execvp), so it is an exec sink: left
+    # out, its launch edge was skipped as if it were a format-string sink.
+    #
+    # MUTATION (verified RED, 1 failed): EXEC_SINKS back to the six-name literal without execvpe.
     assert SHELL_SINKS & EXEC_SINKS == frozenset()
     assert "posix_spawn" not in (SHELL_SINKS | EXEC_SINKS)
-    assert "execvpe" not in (SHELL_SINKS | EXEC_SINKS)
+    assert "execvpe" in EXEC_SINKS
+    assert {"system", "popen", "doSystem"} <= SHELL_SINKS
+
+
+def test_execvpe_launch_produces_an_exec_edge() -> None:
+    # Behaviour, not membership: a constant-path execvpe call yields a launch edge with argv
+    # declared invisible, exactly like execvp.
+    #
+    # MUTATION (verified RED, 1 failed): EXEC_SINKS back to the six-name literal without execvpe.
+    edges = _edges([_prov("execvpe", _const("/usr/sbin/web_daemon"))])
+    assert len(edges) == 1
+    assert edges[0].argv_visibility == "structurally_invisible"
 
 
 # ── the interpreter link: the headline case ───────────────────────────────────────────

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, has_substantial_text
 from treasure_map.lib.analyze.fs_names import db_text
+from treasure_map.lib.analyze.ghidra_ingest import bits_of
 from treasure_map.lib.analyze.ghidra_runner import retry_budget_seconds
 from treasure_map.lib.binexport_archive import (
     FAILED_ARCHIVE_ERROR,
@@ -306,17 +307,6 @@ def _pending(conn: sqlite3.Connection, shas: list[str], ph: str) -> set[str]:
     }
 
 
-def _bits_of(arch: str | None) -> int | None:
-    """The word size a Ghidra language id names (``ARM:LE:32:v7`` -> 32), or None."""
-    parts = arch.split(":") if arch else []
-    if len(parts) >= 3:
-        try:
-            return int(parts[2])
-        except ValueError:
-            return None
-    return None
-
-
 def ingest_elfs(
     conn: sqlite3.Connection,
     records: list[ElfRecord],
@@ -477,7 +467,12 @@ def ingest_elfs(
     # Step 1e: a binary stored under another architecture than the one detected now. The decompiler
     # is started with the architecture (-processor), so an extraction made under the stored one is
     # not this scan's: re-extracted. (detect_arch is no part of the pass fingerprint: a change to
-    # it re-extracts only the binaries whose answer it changes, found here.)
+    # it re-extracts only the binaries whose answer it changes, found here.) The stored arch moves
+    # only with an extraction attempt (its success or failure stamp), never here: written before
+    # the attempt, an interrupt in between would leave "stored = detected" over the old extraction
+    # and no later scan would re-extract it. ``moved`` also overrides a timeout skip: a timeout
+    # under the old architecture says nothing about the new one.
+    moved: set[str] = set()
     if shas:
         detected = {r.sha256: r.arch for r in records}
         moved = {
@@ -498,7 +493,7 @@ def ingest_elfs(
     # Step 2: INSERT OR IGNORE new rows (existing sha256 rows are untouched here; their observed and
     # detected values are refreshed in step 3)
     for rec in records:
-        bits = _bits_of(rec.arch)
+        bits = bits_of(rec.arch)
 
         conn.execute(
             """INSERT OR IGNORE INTO binaries
@@ -531,19 +526,16 @@ def ingest_elfs(
     # row ingested by an older reader keeps what that reader saw (an sstrip'd binary read as
     # needing nothing) until the reader's own answer is written back.
     #
-    # arch / bits ride along too: what the detector says of the bytes now (step 1e re-extracts a
-    # binary whose stored value it no longer matches; this keeps the row on the detected one).
+    # arch / bits do NOT ride along: they describe the extraction a row holds, and move with the
+    # next attempt's stamp (see step 1e).
     if records:
         conn.executemany(
-            "UPDATE binaries SET last_seen_at = ?, path = ?, dt_needed = ?, arch = ?, bits = ? "
-            "WHERE sha256 = ?",
+            "UPDATE binaries SET last_seen_at = ?, path = ?, dt_needed = ? WHERE sha256 = ?",
             [
                 (
                     scan_timestamp,
                     db_text(str(r.path)),
                     r.dt_needed_json(),
-                    r.arch,
-                    _bits_of(r.arch),
                     r.sha256,
                 )
                 for r in records
@@ -616,6 +608,7 @@ def ingest_elfs(
                     ghidra_version=ghidra_version,
                 )
                 - pending
+                - moved
             )
             if skipped:
                 logger.info(

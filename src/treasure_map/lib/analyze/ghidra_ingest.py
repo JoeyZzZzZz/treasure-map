@@ -55,6 +55,17 @@ IMPORT_FROM_ELF = "elf_dynamic_symbols"
 IMAGE_BASE_MISMATCH = "image_base_mismatch"
 
 
+def bits_of(arch: str | None) -> int | None:
+    """The word size a Ghidra language id names (``ARM:LE:32:v7`` -> 32), or None."""
+    parts = arch.split(":") if arch else []
+    if len(parts) >= 3:
+        try:
+            return int(parts[2])
+        except ValueError:
+            return None
+    return None
+
+
 def image_base_disagreement(data: dict[str, Any], elf_path: Path | str) -> str | None:
     """None when the shift the decompiler applied to this binary's addresses
     (``image_base - elf_original_image_base``, both reported by the extractor) equals the one
@@ -237,10 +248,20 @@ def ingest_ghidra_output(
         if stamp is not None:
             # The reason of an extracted row is its blind spot (an analyzer threw), else NULL.
             analysis_status, ghidra_version, degrade_reason = stamp
+            # arch / bits: the architecture this extraction ran under (the scan's detection).
             conn.execute(
                 "UPDATE binaries SET ghidra_ok = 1, ghidra_status = ?, "
-                "ghidra_status_reason = ?, pass_version = ?, ghidra_version = ? WHERE id = ?",
-                (analysis_status, degrade_reason, pass_version, ghidra_version, binary_id),
+                "ghidra_status_reason = ?, pass_version = ?, ghidra_version = ?, arch = ?, "
+                "bits = ? WHERE id = ?",
+                (
+                    analysis_status,
+                    degrade_reason,
+                    pass_version,
+                    ghidra_version,
+                    rec.arch,
+                    bits_of(rec.arch),
+                    binary_id,
+                ),
             )
         export = (export_stamp or {}).get(rec.sha256)
         if export is not None:

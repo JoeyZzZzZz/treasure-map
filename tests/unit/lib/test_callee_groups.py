@@ -288,3 +288,25 @@ def test_the_material_pack_says_when_the_groups_premise_rests_on_unread_members(
     mat = out["material"]
     assert sorted(mat["members_a_side_unread"]) == sorted([_pair_id(*P2), _pair_id(*P4)])
     assert mat["premise_relies_on_unread"] is True
+
+
+def test_the_material_pack_never_hands_an_empty_pseudocode_as_a_reading(tmp_path: Path) -> None:
+    """★ The callee's B side has no text (its decompile timed out): the pack says it is unavailable,
+    with the status and the recorded decompile outcome — not ``{"pseudocode": ""}``, which reads as
+    an empty function.
+
+    MUTATION (verified RED, 1 failed): let an empty string through as pseudocode in _side_code."""
+    from treasure_map import mcp_app
+
+    w = _world(tmp_path)
+    w.adb["b"].execute(
+        "UPDATE functions SET pseudocode = '', decompile_status = 'timeout', size_bytes = 400 "
+        "WHERE name = 'new_helper'"
+    )
+    w.commit()
+    group = next(u for u in _review(w).units if u.kind == ru.GROUP)
+    out = mcp_app.make_tools(w.path)["start_diff_review"](run_pair="runA::runB", unit=group.unit_id)
+    b_side = out["material"]["callee"]["b_side"]
+    assert "pseudocode" not in b_side
+    assert b_side.get("unavailable") == "decompile_failed"
+    assert b_side.get("decompile_status") == "timeout"

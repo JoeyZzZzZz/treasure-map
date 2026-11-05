@@ -248,6 +248,28 @@ def test_a_single_quoted_substitution_is_not_expanded(tmp_path: Path) -> None:
     assert _launches(tmp_path, "echo '$(svc_a)'\n") == []
 
 
+def test_a_variable_command_inside_a_substitution_is_read_as_its_value(tmp_path: Path) -> None:
+    """★ A substitution whose command is a variable runs that variable's value — in an assignment
+    (``$( )`` and backquotes alike), and inside a test. Each gives one ``variable`` row pointing at
+    the assignment line; the line itself names no command (an assignment is not a literal launch).
+
+    MUTATION (verified RED, 1 failed): stop resolving the variable on the substitution path —
+    delete ``out.extend(_variable_launches(command, symtab))`` in _launches_from_line."""
+    text = (
+        "CFG=/usr/sbin/svc_a\n"
+        "IP=$($CFG get lan_ip)\n"
+        'if [ "$(${CFG} get x)" = 1 ]; then\n'
+        "V=`$CFG get y`\n"
+    )
+    assert _launches(tmp_path, text) == [
+        (2, "svc_a", "variable", 1),
+        (3, "svc_a", "variable", 1),
+        (4, "svc_a", "variable", 1),
+    ]
+    # the assignment form still names no command of its own
+    assert launched_command("IP=$($CFG get lan_ip)") is None
+
+
 # ── T-5 one row per (line, command); risk rows ───────────────────────────────────────────────
 
 

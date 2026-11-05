@@ -30,13 +30,13 @@ from treasure_map.lib.atlas.writer import (
     add_web_form_field_rows,
     upsert_pattern,
 )
-from treasure_map.lib.hunt import exec_edges
 from treasure_map.lib.hunt.refs import (
     _norm_offset,
     build_evidence_ref,
     callsite_offset_suffix,
 )
 from treasure_map.lib.pattern import classes
+from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.query import sort_candidates, triage
 from treasure_map.lib.query.triage import (
     _MULTI_ARG_COMMAND_SINKS,
@@ -1357,7 +1357,12 @@ def test_constant_still_asserted_when_the_anchored_sink_is_present(tmp_path: Pat
         conn.close()
 
 
-@pytest.mark.parametrize("sink", sorted(exec_edges.EXEC_SINKS))
+# The exec family as the NAME REGISTRY declares it, read here independently of the module constant
+# under test: a row that is a command sink but not a shell-running one carries its command in argv.
+_REGISTRY_EXEC_FAMILY = sorted(set(REGISTRY.sink_cmd) - set(REGISTRY.forward_cmd))
+
+
+@pytest.mark.parametrize("sink", _REGISTRY_EXEC_FAMILY)
 def test_variadic_iron_law_is_untouched_by_the_gate(sink: str, tmp_path: Path) -> None:
     # The two completeness rules are at different levels and must both keep working. Here the
     # anchor IS present (the gate passes), and the RECORD-level rule still refuses to call a
@@ -1367,9 +1372,16 @@ def test_variadic_iron_law_is_untouched_by_the_gate(sink: str, tmp_path: Path) -
     # `execve` was missing from _MULTI_ARG_COMMAND_SINKS — the whole false negative sat outside the
     # one case the test happened to name. The family is the property; a single member is an example.
     #
+    # ★ Parametrized from the REGISTRY, not from _MULTI_ARG_COMMAND_SINKS: `execvpe` joined CMD
+    # through the registry while the set here was a six-name literal, so a constant-arg0 execvpe
+    # read ('proven', 'constant') and sank. Enumerating the set under test would have skipped it.
+    #
     # MUTATION (verified RED, 1 failed): in triage._record_class drop the variadic downgrade —
     # delete `if cls == "const" and rec.get("sink") in _MULTI_ARG_COMMAND_SINKS: return "unknown"`
     # -> this candidate reads ('proven', 'constant').
+    # MUTATION (verified RED, 1 failed — the execvpe case): set _MULTI_ARG_COMMAND_SINKS back to the
+    # literal {"execl", "execle", "execlp", "execv", "execve", "execvp"}.
+    assert sink in classes.CMD  # premise: the candidate reaches the const-command exits at all
     conn = open_atlas(tmp_path / "atlas.db")
     try:
         pid = _pattern(conn, f"fp_g4_{sink}")
@@ -1384,39 +1396,23 @@ def test_variadic_iron_law_is_untouched_by_the_gate(sink: str, tmp_path: Path) -
         conn.close()
 
 
-def test_the_multi_arg_set_is_exactly_the_exec_family() -> None:
-    """★ The set is a hand-kept literal, so something independent has to say what belongs in it.
+def test_the_multi_arg_set_keeps_the_exec_family_and_nothing_shell_running() -> None:
+    """The multi-arg set is derived from the registry, so it is not compared with another derived
+    set (that would be a value against itself). Two claims an edit to the registry could break:
 
-    ``exec_edges.EXEC_SINKS`` is that something: maintained on the hunt side, for its own reasons,
-    and never imported by triage.py — so the two can disagree, which is the only way this can fail.
-    Deriving the literal FROM EXEC_SINKS would make every assertion below compare a value with
-    itself and the guard would be incapable of going red.
+      A. a literal FLOOR — the seven exec-family names stay in, so deleting a registry row cannot
+         silently drop a sink back into the constant-command exits;
+      B. no shell-running or template sink is in it — system/popen take the whole command in one
+         argument and doSystem is downgraded by its own content rule, so none of them belongs to a
+         set that asks about arity.
 
-    Three separate claims, because they fail for different reasons:
-      A. every exec sink is covered — the `execve` false negative this file exists for;
-      B. nothing outside CMD is listed — `execvpe` sat here for a set it is not a member of, so its
-         presence could never reach a candidate and only made the gap look handled;
-      C. the two sets are EQUAL — the membership lock. A and B both pass for `doSystem` (it IS in
-         CMD), so C is the only assertion that catches it being folded in here. doSystem is the same
-         kind of false negative reached through a different exit and is fixed separately; if it is
-         ever meant to join this set, this line and
-         test_variadic_iron_law_is_untouched_by_the_gate move together, deliberately.
-
-    MUTATION: drop `execve` from the literal -> RED (A and C). Add `execvpe` back -> RED (B and C).
-    Add `doSystem` -> RED (C only). Measured: 2, 2 and 1 failed respectively.
+    MUTATION: drop `execvpe` from the derived set (``- {"execvpe"}``) -> RED (A). Derive it from
+    ``sink_cmd`` alone, without ``- forward_cmd`` -> RED (B).
     """
-    assert exec_edges.EXEC_SINKS <= _MULTI_ARG_COMMAND_SINKS, (
-        f"exec sinks missing from the multi-arg set: "
-        f"{sorted(exec_edges.EXEC_SINKS - _MULTI_ARG_COMMAND_SINKS)}"
-    )
-    assert _MULTI_ARG_COMMAND_SINKS <= classes.CMD, (
-        f"listed here but not a command sink at all, so never consulted: "
-        f"{sorted(_MULTI_ARG_COMMAND_SINKS - classes.CMD)}"
-    )
-    assert _MULTI_ARG_COMMAND_SINKS == exec_edges.EXEC_SINKS, (
-        f"drift: missing={sorted(exec_edges.EXEC_SINKS - _MULTI_ARG_COMMAND_SINKS)}, "
-        f"extra={sorted(_MULTI_ARG_COMMAND_SINKS - exec_edges.EXEC_SINKS)}"
-    )
+    floor = {"execl", "execle", "execlp", "execv", "execve", "execvp", "execvpe"}
+    assert floor <= _MULTI_ARG_COMMAND_SINKS, sorted(floor - _MULTI_ARG_COMMAND_SINKS)
+    assert not ({"system", "popen", "doSystem"} & _MULTI_ARG_COMMAND_SINKS)
+    assert _MULTI_ARG_COMMAND_SINKS <= classes.CMD, sorted(_MULTI_ARG_COMMAND_SINKS - classes.CMD)
 
 
 def test_a_sink_class_def_use_does_not_cover_is_never_read_as_an_escape() -> None:

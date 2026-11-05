@@ -700,15 +700,17 @@ def _decompile_counts(output_file: Path) -> tuple[int | None, int | None, int | 
 
 def unfinished_decompiles(result: GhidraResult) -> int | None:
     """How many decompiles a successful extraction left unfinished that an isolated re-run may
-    finish: every timeout — a small body times out under load as well as a large one — and every
-    output past the limit; None when the output did not record it."""
-    timeouts = result.decompile_timeouts
-    if timeouts is None:
-        timeouts = result.decompile_large_timeouts
-    payload = result.decompile_payload_exceeded
-    if timeouts is None or payload is None:
+    finish (timeouts of large bodies + outputs past the limit); None when the output did not record
+    it.
+
+    A small body's timeout is not counted: measured, an isolated re-run at a doubled budget
+    finished none of them (0 of 12, each re-run costing 11–15 minutes of serial time, every other
+    function of those binaries already finished). Such a function stays recorded as ``timeout`` —
+    the read face names it unfinished — it is only not re-run."""
+    large, payload = result.decompile_large_timeouts, result.decompile_payload_exceeded
+    if large is None or payload is None:
         return None
-    return timeouts + payload
+    return large + payload
 
 
 def _export_failure_reason(log_path: Path, offset: int) -> str:
@@ -996,12 +998,21 @@ class GhidraRunner:
             extension=self._extension.stamp if self._exporting() and self._extension else None,
             environment={k: v for k, v in os.environ.items() if k in JVM_INHERITED_KEYS},
         )
-        handed = share.get(key, binary, output_dir)
+        # The share is an optimisation: a copy it cannot make (its directory full, a file gone)
+        # costs a session run here instead, never the binary's extraction.
+        try:
+            handed = share.get(key, binary, output_dir)
+        except OSError as exc:
+            logger.warning("extraction share: %s not handed on (%s): extracted here", binary, exc)
+            handed = None
         if handed is not None:
             return handed  # type: ignore[no-any-return]
         result = self._run_session(binary, output_dir, timeout, arch, sha8, retry, large_payload)
         if result.reason not in (_INTERRUPTED, "launch_failed"):
-            share.put(key, result)
+            try:
+                share.put(key, result)
+            except OSError as exc:
+                logger.warning("extraction share: the session of %s not kept (%s)", binary, exc)
         return result
 
     def _run_session(
@@ -1371,9 +1382,10 @@ class GhidraRunner:
         settled by ``on_export``), because an isolated session gets back what the pool lost:
         one during whose analysis a Ghidra analyzer threw (``degrade_reason``; the analyzers race
         under load and drop functions when they do), and one whose decompile left a function
-        unfinished — a timeout of a body of any size, or an output past the decompiler's limit
-        (re-run with the larger limit, which a function that timed out before reaching it may need
-        too). A binary in
+        unfinished — a timeout of a large body, or an output past the decompiler's limit (re-run
+        with the larger limit). A small body's timeout does not send the binary to phase 2: an
+        isolated re-run at a doubled budget was measured to finish none (see
+        ``unfinished_decompiles``). A binary in
         ``decompile_settled`` (sha256) is not re-run for the second reason: an isolated re-run
         under this pass, Ghidra and budget already left it unfinished. Of the two sessions, the
         better extraction is kept whole, with its own export (``_settle_rerun``).
@@ -1469,13 +1481,18 @@ class GhidraRunner:
         # ...and the extractions an isolated session can make whole (see the docstring).
         degraded = {i for i in range(n) if by_idx[i].success and by_idx[i].degrade_reason}
         settled_shas = decompile_settled or set()
-        unfinished = {
-            i
-            for i in range(n)
-            if by_idx[i].success
-            and (unfinished_decompiles(by_idx[i]) or 0) > 0
-            and records[i].sha256 not in settled_shas
-        }
+        share = getattr(self, "_share", None)
+        unfinished = set()
+        for i in range(n):
+            if not (by_idx[i].success and (unfinished_decompiles(by_idx[i]) or 0) > 0):
+                continue
+            rerun = records[i].sha256 not in settled_shas
+            session = by_idx[i].session
+            if share is not None and session:
+                # Within a rescan that shares sessions, the first holder's decision binds the rest.
+                rerun = share.rerun_decision(session, rerun)
+            if rerun:
+                unfinished.add(i)
         rerun_success = export_retry | degraded | unfinished
         failed = [i for i in range(n) if not by_idx[i].success or i in rerun_success]
         if failed:

@@ -169,6 +169,33 @@ def test_build_cmd_structure(tmp_path: Path) -> None:
     assert "-log" in cmd
 
 
+def test_build_cmd_is_exactly_the_launch_line(tmp_path: Path) -> None:
+    """★ The whole argv, compared for EQUALITY: a membership check passes with any extra argument
+    slipped in (``-noanalysis`` would switch Ghidra's analysis off and every check above stays
+    green). Without an export, nothing runs after the extraction; with one, exactly the export
+    post-script with its two paths and mode, and its scripts' directory is searched too.
+
+    MUTATION (verified RED, 1 failed): add ``-noanalysis`` to ``after`` in _build_cmd."""
+    from treasure_map.lib.analyze.ghidra_runner import EXPORT_SCRIPT, EXPORT_SCRIPT_DIR
+
+    hl, binary, proj = tmp_path / "analyzeHeadless", tmp_path / "httpd", tmp_path / "proj"
+    out, scripts = tmp_path / "out", tmp_path / "scripts"
+    head = [str(hl), str(proj), "Proj", "-processor", "ARM:LE:32:v7", "-postScript",
+            "PromoteUndefined.java", "-postScript", "ExportFunctions.java"]  # fmt: skip
+    tail = ["-deleteProject", "-log", str(out / "httpd_deadbeef.log"),
+            "-analysisTimeoutPerFile", "300", "-import", str(binary)]  # fmt: skip
+    plain = _build_cmd(hl, binary, "ARM:LE:32:v7", proj, out, scripts, "deadbeef", 300)
+    assert plain == [*head, "-scriptPath", str(scripts), *tail]
+    exp, rep = tmp_path / "e.BinExport", tmp_path / "e.json"
+    exporting = _build_cmd(
+        hl, binary, "ARM:LE:32:v7", proj, out, scripts, "deadbeef", 300, export=(exp, rep)
+    )
+    assert exporting == [
+        *head, "-postScript", EXPORT_SCRIPT, str(exp), str(rep), "scan",
+        "-scriptPath", f"{scripts};{EXPORT_SCRIPT_DIR}", *tail,
+    ]  # fmt: skip
+
+
 # ── _classify_analysis (red-line: success requires produced functions, not file size) ──
 
 MODULE = "treasure_map.lib.analyze.ghidra_runner"
@@ -1569,7 +1596,7 @@ def test_only_a_dead_owners_session_directories_are_swept(tmp_path: Path) -> Non
     stays — whose it is cannot be told.
 
     MUTATION (verified RED): sweep without looking at the owner -> the live one goes -> RED; sweep
-    unmarked ones too -> RED."""
+    unmarked ones too -> RED; read a marker with no start time as dead -> "nostart" goes -> RED."""
     import os
 
     me = {"pid": os.getpid(), "start": ghidra_runner._process_start(os.getpid()), "pgid": None}
@@ -1578,8 +1605,11 @@ def test_only_a_dead_owners_session_directories_are_swept(tmp_path: Path) -> Non
     gone = _session(tmp_path, "tm_elfpatch_gone", {"pid": 2**22 + 7, "start": "5", "pgid": None})
     unmarked = _session(tmp_path, "tm_ghidra_proj_unmarked", None)
     other = _session(tmp_path, "unrelated_dir", {"pid": 2**22 + 7, "start": "5"})
+    # a marker without a start time: whether its pid is the owner cannot be told, so it stays even
+    # though that pid runs nothing
+    no_start = _session(tmp_path, "tm_ghidra_proj_nostart", {"pid": 2**22 + 7, "pgid": None})
     assert ghidra_runner.sweep_orphans(tmp_path) == 2
-    assert live.exists() and unmarked.exists() and other.exists()
+    assert live.exists() and unmarked.exists() and other.exists() and no_start.exists()
     assert not reused.exists() and not gone.exists()
 
 

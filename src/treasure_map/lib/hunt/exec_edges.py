@@ -68,11 +68,14 @@ from typing import Any
 from treasure_map.lib.atlas.models import ExecEdgeRow
 from treasure_map.lib.diff.loader import FuncRow
 from treasure_map.lib.fmt_spec import conversions
+from treasure_map.lib.pattern.extractor_names import REGISTRY
 
+# Both families come from the name registry, so a new command sink there is classified here with
+# no second list to edit (triage's multi-arg exec set derives the same way).
 # The command-string family: the argument is a shell command line, not an image path.
-SHELL_SINKS = frozenset({"system", "popen", "doSystem"})
+SHELL_SINKS: frozenset[str] = REGISTRY.forward_cmd
 # The image-path family: the argument is the program to run.
-EXEC_SINKS = frozenset({"execl", "execlp", "execle", "execv", "execvp", "execve"})
+EXEC_SINKS: frozenset[str] = frozenset(REGISTRY.sink_cmd) - REGISTRY.forward_cmd
 
 # Interpreters recognized as "a shell was launched". Deliberately a small, literal set: guessing
 # from a name would be a semantic claim about what the launched program does.

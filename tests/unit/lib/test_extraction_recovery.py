@@ -572,15 +572,16 @@ def test_the_decompile_counts_are_read_from_the_head_of_the_output(tmp_path: Pat
 
 
 def test_a_finished_session_carries_its_decompile_counts(tmp_path: Path) -> None:
-    """★ Every timeout counts as unfinished, not only a large body's: a small function times out
-    under load as well, and an isolated re-run may finish it. 4 timeouts (2 of them large) and 1
-    output past the limit leave 5.
+    """★ The session carries all three counts as recorded (timeouts and outputs past the limit kept
+    apart), but only a large body's timeout and an output past the limit count as unfinished work
+    an isolated re-run may finish: a small body's timeout was measured to finish under no re-run
+    (0 of 12 at a doubled budget). 4 timeouts (2 of them large) and 1 output past the limit leave 3.
 
-    MUTATION (verified RED): count the large timeouts only -> 3 -> RED."""
+    MUTATION (verified RED): count every timeout -> 5 -> RED."""
     result, _ = _once(tmp_path, counts=(4, 2, 1))
     assert (result.decompile_timeouts, result.decompile_large_timeouts) == (4, 2)
     assert result.decompile_payload_exceeded == 1
-    assert ghidra_runner.unfinished_decompiles(result) == 5
+    assert ghidra_runner.unfinished_decompiles(result) == 3
 
 
 def test_the_head_is_read_when_more_counts_follow(tmp_path: Path) -> None:
@@ -595,17 +596,24 @@ def test_the_head_is_read_when_more_counts_follow(tmp_path: Path) -> None:
     assert _decompile_counts(a) == (3, 2, 1)
 
 
-def test_a_binary_with_only_small_timeouts_is_rerun_isolated(tmp_path: Path) -> None:
-    """★ A binary whose only unfinished decompiles are small-body timeouts goes to the isolated
-    phase-2 re-run with the larger output limit, like one with a large body left.
+def test_a_binary_with_only_small_timeouts_is_not_rerun(tmp_path: Path) -> None:
+    """★ A binary whose only unfinished decompiles are small-body timeouts does NOT go to the
+    isolated phase-2 re-run (measured: such a re-run finished none, at 11–15 minutes each); one that
+    also left a large body unfinished does, with the larger output limit.
 
-    MUTATION (verified RED): send only large timeouts and outputs past the limit -> RED."""
-    plan = _Plan({"small": [{"small_timeouts": 2}, {}], "clean": [{}]})
-    recs = _recs(tmp_path, ("small", "clean"))
-    _run_all(tmp_path, plan, ("small", "clean"))
+    MUTATION (verified RED): count every timeout as unfinished -> "small" re-runs -> RED."""
+    plan = _Plan(
+        {
+            "small": [{"small_timeouts": 2}],
+            "mixed": [{"small_timeouts": 2, "large": 1}, {}],
+            "clean": [{}],
+        }
+    )
+    recs = _recs(tmp_path, ("small", "mixed", "clean"))
+    _run_all(tmp_path, plan, ("small", "mixed", "clean"))
     phase2 = {c[0]: c for c in plan.calls[len(recs) :]}
-    assert set(phase2) == {"small"}
-    assert phase2["small"][2] is True  # the larger output limit
+    assert set(phase2) == {"mixed"}
+    assert phase2["mixed"][2] is True  # the larger output limit
 
 
 @pytest.mark.parametrize("extension", [True, False])

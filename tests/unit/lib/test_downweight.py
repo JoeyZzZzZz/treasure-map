@@ -1106,3 +1106,121 @@ def test_a_cast_builder_destination_is_named_by_its_variable() -> None:
         sink_form="var",
     )
     assert got == CHARSET_CONSTRAINED
+
+
+# ── a pure-literal write is exempt from the encloses-and-precedes check ──────────────────────
+
+
+def _cmd_num(sibling_write: str, numeric_write_wrapped: bool = True) -> str | None:
+    """A command buffer first filled in one block (a pidfile lookup that runs a constant command),
+    then, in a later block, filled with an integer and run again — the candidate is the second run.
+    ``sibling_write`` is the first block's write to the buffer."""
+    numeric = '      sprintf(b,"kill -9 %d",i);\n      system(b);\n'
+    if not numeric_write_wrapped:
+        numeric = '      sprintf(b,"kill -9 %d",i);\n    }\n    {\n      system(b);\n'
+    pc = (
+        "void f(char *x,char *y)\n{\n  int i;\n  char b [128];\n  memset(b,0,0x80);\n"
+        "  if (y == 0) {\n"
+        f"    {sibling_write}\n"
+        "    system(b);\n"
+        "  }\n"
+        "  if (x != 0) {\n"
+        "    i = atoi(x);\n"
+        "    if (i != 0) {\n"
+        f"{numeric}"
+        "    }\n"
+        "  }\n"
+        "}"
+    )
+    second = 1  # the second system() call is the candidate
+    return detect_form_signal(
+        sink_name="system",
+        pseudocode=pc,
+        callees=["atoi", "system", "sprintf", "memset"],
+        sink_arg="b",
+        sink_class="cmd",
+        sink_form="var",
+        occurrence=second,
+    )
+
+
+@pytest.mark.parametrize(
+    "pure",
+    [
+        'sprintf(b,"pidof %s > %s","svc","/tmp/svc.pid");',  # a format with literal arguments only
+        'strcpy(b,"pidof svc");',  # a copy of a string literal
+        "memset(b,0,0x80);",  # a constant memset
+        "b[0] = '\\0';",  # a literal element assignment
+    ],
+)
+def test_a_pure_literal_write_in_a_sibling_block_does_not_hide_the_numeric_write(
+    pure: str,
+) -> None:
+    """★ A write whose content is a literal with only literal arguments writes the same bytes
+    wherever it sits, so where it sits relative to the sink says nothing: it is exempt from the
+    encloses-and-precedes check (a sibling block's constant command). The numeric write that does
+    enclose the sink still has to be there, and still has to enclose it.
+
+    PRE-FIX (recorded): the sibling literal format write failed the position check, so the case
+    read None.
+    MUTATION (verified RED, 1 failed each): restore the position check on the pure-literal format
+    write / the literal copy / the constant memset / the literal element assignment."""
+    assert _cmd_num(pure) == NUMERIC_SANITIZED
+
+
+def test_the_numeric_write_still_has_to_enclose_the_sink() -> None:
+    """The exemption is for constant content only: with a pure-literal write in a sibling block and
+    the integer-format write outside the sink's block, nothing marks the candidate.
+
+    (An exempt write also never sets the format-or-converter flag. That is not separately
+    observable: a converter result is on the buffer's path only through a non-literal write, which
+    itself sets the flag or refuses the mark — so a mutation letting the exempt write set it stays
+    green, and is equivalent.)
+
+    MUTATION (verified RED, 1 failed): drop the position check on a non-literal format write."""
+    pure = 'sprintf(b,"pidof %s > %s","svc","/tmp/svc.pid");'
+    assert _cmd_num(pure, numeric_write_wrapped=False) is None
+
+
+@pytest.mark.parametrize(
+    "sibling",
+    [
+        'sprintf(b,"pidof %s > %s",y,"/tmp/svc.pid");',  # a non-literal argument
+        'sprintf(b,"pidof %d",i);',  # an integer argument: not a literal
+        "strcpy(b,y);",  # a non-literal copy
+    ],
+)
+def test_a_sibling_write_with_non_literal_content_is_not_exempt(sibling: str) -> None:
+    """Only a pure-literal write is exempt: one with a non-literal argument still has to enclose
+    and precede the sink (or, if it is not a safe write at all, fails on its own).
+
+    The non-literal %s argument and the non-literal copy are refused as unsafe writes wherever they
+    sit; the integer-argument format is a safe write and so is the case the position check decides.
+
+    MUTATION (verified RED, 1 failed — the integer-argument case): drop the position check on a
+    non-literal format write."""
+    assert _cmd_num(sibling) is None
+
+
+def test_a_write_by_the_sinks_own_callee_is_still_checked_as_a_write() -> None:
+    """The sink's own callee is exempt as a READER of the buffer (the candidate itself, or another
+    call of it reading the buffer) — but when that callee WRITES the buffer (it is a copy whose
+    destination is the buffer), the write is checked like any other: a non-literal copy into the
+    buffer means not every write is safe.
+
+    MUTATION (verified RED, 1 failed): test the reader exemption before the safe-write checks
+    -> the non-literal strcpy into the buffer is skipped and the candidate is marked."""
+    pc = (
+        "void f(char *x,char *y,char *o)\n{\n  int i;\n  char b [64];\n"
+        '  i = atoi(x);\n  strcpy(b,y);\n  sprintf(b,"/proc/%d",i);\n  strcpy(o,b);\n}'
+    )
+    got = detect_form_signal(
+        sink_name="strcpy",
+        pseudocode=pc,
+        callees=["atoi", "strcpy", "sprintf"],
+        sink_arg="b",
+        sink_class=None,
+        sink_form="var",
+        occurrence=1,
+    )
+    assert got != NUMERIC_SANITIZED

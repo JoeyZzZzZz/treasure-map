@@ -213,6 +213,20 @@ def test_each_formatter_family_reports_what_its_signature_provides() -> None:
     assert classify_format_size("strcat(d, s);", "strcat").kind == SIZE_NO_BOUND
 
 
+def test_a_wide_character_cap_reads_untraced_not_no_bound() -> None:
+    """vswprintf HAS a length parameter (arg 1) but it counts wide characters, so it is not a byte
+    bound: its size reads untraced. no_bound would state a false fact (that the signature carries
+    no length). wcscat really has no length parameter and stays no_bound; snprintf keeps its cap.
+
+    MUTATION (verified RED, 1 failed): remove the wide-cap branch in classify_format_size ->
+    vswprintf reads no_bound."""
+    assert classify_format_size("vswprintf(buf, 0x40, fmt, ap);", "vswprintf").kind == (
+        SIZE_UNTRACED
+    )
+    assert classify_format_size("wcscat(d, s);", "wcscat").kind == SIZE_NO_BOUND
+    assert classify_format_size('snprintf(d, 64, "%s", x);', "snprintf").kind == SIZE_CAP_CONST
+
+
 def test_a_constant_format_string_does_not_remove_a_cap() -> None:
     """★ The kind comes from the signature, never from how readable the format string is.
 

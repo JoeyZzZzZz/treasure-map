@@ -583,7 +583,7 @@ class _Decompiler:
     ) -> GhidraResult:
         self.calls.append(binary.name)
         outcome = self.outcomes.get(binary.name, "ok")
-        if outcome not in ("ok", "no_functions", "stale"):
+        if outcome not in ("ok", "no_functions", "stale", "moved_base"):
             budget = 1800 if outcome == "timeout" else 60
             return GhidraResult(
                 binary=binary,
@@ -605,11 +605,14 @@ class _Decompiler:
             }
             for j in range(n)
         ]
+        image = extractor_image_fields(binary)
+        if outcome == "moved_base":  # the decompiler moved it by another amount than the stubs
+            image = {**image, "image_base": hex(int(image["image_base"], 16) + 0x10000)}
         data = {
             "pass_version": "another-pass" if outcome == "stale" else runner.pass_version(),
             "sha8": sha8,
             "stub_marker": stub_table_marker(None if stubs is None else stubs.names),
-            **extractor_image_fields(binary),
+            **image,
             "functions": funcs,
             "imports": [],
             "exports": [],
@@ -966,6 +969,38 @@ def test_a_final_failure_clears_its_mark_and_a_skipped_store_keeps_it(tmp_path: 
     assert st["svc_c"]["pending"] == 0 and st["svc_c"]["reason"] == "import_failed"
     assert st["svc_d"]["pending"] == 1
     assert res.reanalyze_pending == 1
+
+
+def test_a_binary_the_ingest_refuses_is_counted_failed_not_ok(tmp_path: Path) -> None:
+    """★ The session succeeded but the ingest refused its output (the image base disagrees with
+    the stub table's shift) and recorded the binary failed: the scan's summary counts it with the
+    failed, not with "Ghidra OK".
+
+    MUTATION (verified RED, 1 failed): count every successful session as ok again (increment
+    before the ingest's answer) -> 6 ok."""
+    fs = _firmware(tmp_path)
+    cfg = _e2e_cfg(_ghidra(tmp_path))
+    res = _scan_e2e(fs, tmp_path / "ws", cfg, _Decompiler({_NAMES[2]: "moved_base"}))
+    st = _state(tmp_path / "ws" / "analysis.db")
+    assert (st[_NAMES[2]]["ghidra_ok"], st[_NAMES[2]]["reason"]) == (0, "image_base_mismatch")
+    assert (res.ghidra_ok, res.ghidra_failed) == (5, 1)
+
+
+def test_an_interrupt_in_phase_one_counts_what_is_left(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """★ Ctrl-C after the second of six phase-1 results: 2 extracted, 0 failed, 4 left — the three
+    add up to the six to do, the ones not reached counted as left (never as extracted or failed).
+
+    MUTATION (verified RED, 1 failed): report ``left`` as 0 -> RED."""
+    import logging
+
+    fs = _firmware(tmp_path)
+    cfg = _e2e_cfg(_ghidra(tmp_path))
+    with caplog.at_level(logging.WARNING), pytest.raises(KeyboardInterrupt):
+        _scan_e2e(fs, tmp_path / "ws", cfg, _Decompiler(), progress=_interrupt_at(2))
+    msg = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("interrupted:"))
+    assert "2 binaries extracted and 0 failed this run, 4 left for the next run (of 6" in msg
 
 
 def test_an_interrupt_tells_extracted_failed_and_left_apart(
