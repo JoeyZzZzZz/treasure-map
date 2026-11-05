@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import signal
-import struct
 import subprocess
 import tempfile
 import threading
@@ -28,6 +27,11 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.analyze.elf_inventory import ElfRecord, has_substantial_text
+from treasure_map.lib.analyze.ghidra_launch import (
+    _patch_elf_for_ghidra,
+    build_cmd,
+    build_env,
+)
 from treasure_map.lib.analyze.stub_resolve import (
     resolve_stubs,
     serialize_stub_table,
@@ -142,6 +146,7 @@ _PIPELINE_PY_MODULES: tuple[str, ...] = (
     "elf_exports.py",
     "elf_slots.py",
     "ghidra_ingest.py",
+    "ghidra_launch.py",
     "stub_resolve.py",
 )
 
@@ -422,88 +427,6 @@ def find_headless(config: GhidraConfig) -> Path:
     )
 
 
-def _patch_elf_for_ghidra(src: Path) -> tuple[Path, Path] | None:
-    """Create a patched ELF copy with sections that trigger Ghidra 11.1.2's
-    StringIndexOutOfBoundsException neutralised (sh_type → SHT_NULL).
-
-    Affected: SHT_NOTE sections whose name is "GNU" (3-4 bytes), and
-    SHT_ARM_ATTRIBUTES sections.  Both are safe to nullify for decompilation.
-
-    Returns (patched_file, tmpdir) where patched_file has the SAME NAME as src
-    so Ghidra's currentProgram.getName() matches what the caller expects.
-    Caller must shutil.rmtree(tmpdir) after use.
-    Returns None if no patch is needed or if patching fails.
-    """
-    try:
-        data = bytearray(src.read_bytes())
-    except OSError:
-        return None
-
-    if data[:4] != b"\x7fELF" or len(data) < 64:
-        return None
-
-    ei_class = data[4]
-    fmt = "<" if data[5] == 1 else ">"
-
-    if ei_class == 1:  # ELF32
-        e_shoff: int = struct.unpack_from(fmt + "I", data, 32)[0]
-        e_shentsize: int = struct.unpack_from(fmt + "H", data, 46)[0]
-        e_shnum: int = struct.unpack_from(fmt + "H", data, 48)[0]
-        sh_off_off, sh_sz_off, sh_off_fmt = 16, 20, fmt + "I"
-        min_entsize = 40
-    elif ei_class == 2:  # ELF64
-        e_shoff = struct.unpack_from(fmt + "Q", data, 40)[0]
-        e_shentsize = struct.unpack_from(fmt + "H", data, 58)[0]
-        e_shnum = struct.unpack_from(fmt + "H", data, 60)[0]
-        sh_off_off, sh_sz_off, sh_off_fmt = 24, 32, fmt + "Q"
-        min_entsize = 64
-    else:
-        return None
-
-    if e_shoff == 0 or e_shentsize < min_entsize:
-        return None
-
-    sht_note = 7
-    sht_arm_attributes = 0x70000003
-
-    patched = False
-    for i in range(e_shnum):
-        off = e_shoff + i * e_shentsize
-        if off + e_shentsize > len(data):
-            break
-
-        sh_type: int = struct.unpack_from(fmt + "I", data, off + 4)[0]
-        neutralise = False
-
-        if sh_type == sht_arm_attributes:
-            neutralise = True
-        elif sh_type == sht_note:
-            sec_off: int = struct.unpack_from(sh_off_fmt, data, off + sh_off_off)[0]
-            sec_size: int = struct.unpack_from(sh_off_fmt, data, off + sh_sz_off)[0]
-            if sec_size >= 12 and 0 < sec_off <= len(data) - sec_size:
-                namesz: int = struct.unpack_from(fmt + "I", data, sec_off)[0]
-                if namesz in (3, 4) and data[sec_off + 12 : sec_off + 15] == b"GNU":
-                    neutralise = True
-
-        if neutralise:
-            struct.pack_into(fmt + "I", data, off + 4, 0)
-            struct.pack_into(sh_off_fmt, data, off + sh_off_off, 0)
-            struct.pack_into(sh_off_fmt, data, off + sh_sz_off, 0)
-            patched = True
-
-    if not patched:
-        return None
-
-    tmpdir = Path(tempfile.mkdtemp(prefix="tm_elfpatch_"))
-    try:
-        patched_file = tmpdir / src.name  # same name → Ghidra uses correct program name
-        patched_file.write_bytes(bytes(data))
-        return patched_file, tmpdir
-    except Exception:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return None
-
-
 def _probe_function_count(
     output_file: Path,
 ) -> tuple[int | None, str | None, str | None, str | None]:
@@ -618,8 +541,6 @@ def _retry_deadline_ms(session_start: float, wall: int, export_budget: int | Non
 
 # The scripts a scan runs after Ghidra's analysis, in this order: create the functions the analysis
 # left out, extract, then (when the BinExport extension is available) export.
-PROMOTE_SCRIPT = "PromoteUndefined.java"
-EXTRACT_SCRIPT = "ExportFunctions.java"
 
 
 def export_paths(output_dir: Path, binary: Path, sha8: str) -> tuple[Path, Path]:
@@ -639,33 +560,18 @@ def _build_cmd(
     timeout_s: int,
     export: tuple[Path, Path] | None = None,
 ) -> list[str]:
-    """Build the analyzeHeadless invocation command list. With ``export`` (the export and report
-    paths) the session also writes the BinExport export, after the extraction."""
+    """Build the analyzeHeadless invocation command list (``ghidra_launch.build_cmd``). With
+    ``export`` (the export and report paths) the session also writes the BinExport export, after
+    the extraction."""
     log_path = output_dir / f"{binary.name}_{sha8}.log"
-    post = ["-postScript", PROMOTE_SCRIPT, "-postScript", EXTRACT_SCRIPT]
+    after: list[str] = []
     script_path = str(script_dir)
     if export is not None:
-        post += ["-postScript", EXPORT_SCRIPT, str(export[0]), str(export[1]), "scan"]
+        after = ["-postScript", EXPORT_SCRIPT, str(export[0]), str(export[1]), "scan"]
         # Ghidra takes several script directories separated by ';'. The export scripts stay beside
         # the diff code and out of the extraction pass's fingerprint (lib/export_stamp).
         script_path = f"{script_dir};{EXPORT_SCRIPT_DIR}"
-    return [
-        str(headless),
-        str(proj_dir),
-        "Proj",
-        "-processor",
-        arch,
-        *post,
-        "-scriptPath",
-        script_path,
-        "-deleteProject",
-        "-log",
-        str(log_path),
-        "-analysisTimeoutPerFile",
-        str(timeout_s),
-        "-import",
-        str(binary),
-    ]
+    return build_cmd(headless, binary, arch, proj_dir, log_path, script_path, timeout_s, after)
 
 
 # The analysis states a finished extraction is recorded under (see GhidraResult.analysis_status).
@@ -1127,24 +1033,6 @@ class GhidraRunner:
             if large_payload:
                 heap_mb = max(heap_mb, _LARGE_PAYLOAD_HEAP_MB)
                 xms_mb = max(64, heap_mb // 8)
-            env: dict[str, str] = {
-                **dict(os.environ),
-                "OUTPUT_DIR": str(output_dir),
-                "SHA8": sha8,
-                # echoed back into the JSON by the extractor, so the output proves which pass
-                # wrote it
-                "PASS_VERSION": expected_pass,
-                "JAVA_TOOL_OPTIONS": (
-                    f"-Xmx{heap_mb}m -Xms{xms_mb}m -Duser.home={ghidra_home_dir}"
-                ),
-            }
-            # Never inherit a table from the parent environment: this binary's table, or none.
-            env.pop("TMAP_STUB_NAMES", None)
-            # Every Ghidra setting stays inside the temporary user home: with XDG_CONFIG_HOME
-            # inherited, Ghidra would write its settings into the user's real configuration tree.
-            env.pop("XDG_CONFIG_HOME", None)
-            if resolution is not None:
-                env["TMAP_STUB_NAMES"] = str(stub_table)
             if exporting and self._extension is not None:
                 # A copy in the user settings directory is not seen under this JVM's temporary
                 # user home: link it there (lib/export_stamp.link_into_home).
@@ -1154,22 +1042,27 @@ class GhidraRunner:
             # wall clock pushed binaries that analyse close to their limit over it at the export.
             export_budget = timeout if exporting else None
             wall = timeout + 60 + (export_budget or 0)
-            # The one budget the extraction's decompile retries share (ExportFunctions): half the
-            # analysis budget when the session exports (its wall clock carries E besides), a little
-            # when it does not (its wall clock is T + 60).
-            env["TMAP_DECOMPILE_RETRY_BUDGET_S"] = str(
-                timeout // 2 if exporting else _DECOMPILE_RETRY_NO_EXPORT_S
+            # The JVM's whole environment, a whitelist (ghidra_launch.build_env): this binary's
+            # stub table or none (never one inherited from the parent), and:
+            env = build_env(
+                os.environ,
+                output_dir=output_dir,
+                sha8=sha8,
+                pass_version=expected_pass,
+                heap_mb=heap_mb,
+                xms_mb=xms_mb,
+                user_home=ghidra_home_dir,
+                stub_table=stub_table if resolution is not None else None,
+                # The one budget the extraction's decompile retries share (ExportFunctions): half
+                # the analysis budget when the session exports (its wall clock carries E besides),
+                # a little when it does not (its wall clock is T + 60)...
+                retry_budget_s=timeout // 2 if exporting else _DECOMPILE_RETRY_NO_EXPORT_S,
+                # ...and, at least that, until the deadline: whatever the session's wall clock still
+                # holds once the export's reserve and the margin are set aside. A session that
+                # analysed quickly has minutes left there, which a fixed budget left unspent.
+                deadline_ms=_retry_deadline_ms(time.time(), wall, export_budget),
+                payload_mb=_LARGE_PAYLOAD_MB if large_payload else None,
             )
-            # ...and, at least that, until the deadline: whatever the session's wall clock still
-            # holds once the export's reserve and the margin are set aside. A session that analysed
-            # quickly has minutes left there, which a fixed budget left unspent.
-            env["TMAP_DECOMPILE_DEADLINE_MS"] = str(
-                _retry_deadline_ms(time.time(), wall, export_budget)
-            )
-            if large_payload:
-                env["TMAP_DECOMPILE_PAYLOAD_MB"] = str(_LARGE_PAYLOAD_MB)
-            else:
-                env.pop("TMAP_DECOMPILE_PAYLOAD_MB", None)
             rc, stderr_raw = _run_subprocess(cmd, env, wall, cwd=proj_dir)
         finally:
             for d in (proj_dir, ghidra_home_dir):

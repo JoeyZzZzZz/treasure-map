@@ -306,6 +306,17 @@ def _pending(conn: sqlite3.Connection, shas: list[str], ph: str) -> set[str]:
     }
 
 
+def _bits_of(arch: str | None) -> int | None:
+    """The word size a Ghidra language id names (``ARM:LE:32:v7`` -> 32), or None."""
+    parts = arch.split(":") if arch else []
+    if len(parts) >= 3:
+        try:
+            return int(parts[2])
+        except ValueError:
+            return None
+    return None
+
+
 def ingest_elfs(
     conn: sqlite3.Connection,
     records: list[ElfRecord],
@@ -463,15 +474,31 @@ def ingest_elfs(
             )
         already_done -= set(redo)
 
-    # Step 2: INSERT OR IGNORE new rows (existing sha256 rows are untouched)
+    # Step 1e: a binary stored under another architecture than the one detected now. The decompiler
+    # is started with the architecture (-processor), so an extraction made under the stored one is
+    # not this scan's: re-extracted. (detect_arch is no part of the pass fingerprint: a change to
+    # it re-extracts only the binaries whose answer it changes, found here.)
+    if shas:
+        detected = {r.sha256: r.arch for r in records}
+        moved = {
+            row["sha256"]
+            for row in conn.execute(
+                f"SELECT sha256, arch FROM binaries WHERE sha256 IN ({ph})",  # noqa: S608
+                shas,
+            )
+            if row["arch"] != detected.get(row["sha256"])
+        }
+        if moved & already_done:
+            logger.info(
+                "%d binary/ies re-extracted: stored under another architecture than detected now",
+                len(moved & already_done),
+            )
+        already_done -= moved
+
+    # Step 2: INSERT OR IGNORE new rows (existing sha256 rows are untouched here; their observed and
+    # detected values are refreshed in step 3)
     for rec in records:
-        bits: int | None = None
-        parts = rec.arch.split(":") if rec.arch else []
-        if len(parts) >= 3:
-            try:
-                bits = int(parts[2])
-            except ValueError:
-                pass
+        bits = _bits_of(rec.arch)
 
         conn.execute(
             """INSERT OR IGNORE INTO binaries
@@ -503,10 +530,24 @@ def ingest_elfs(
     # dt_needed rides along although it is a property of the bytes: it is READ by this code, and a
     # row ingested by an older reader keeps what that reader saw (an sstrip'd binary read as
     # needing nothing) until the reader's own answer is written back.
+    #
+    # arch / bits ride along too: what the detector says of the bytes now (step 1e re-extracts a
+    # binary whose stored value it no longer matches; this keeps the row on the detected one).
     if records:
         conn.executemany(
-            "UPDATE binaries SET last_seen_at = ?, path = ?, dt_needed = ? WHERE sha256 = ?",
-            [(scan_timestamp, db_text(str(r.path)), r.dt_needed_json(), r.sha256) for r in records],
+            "UPDATE binaries SET last_seen_at = ?, path = ?, dt_needed = ?, arch = ?, bits = ? "
+            "WHERE sha256 = ?",
+            [
+                (
+                    scan_timestamp,
+                    db_text(str(r.path)),
+                    r.dt_needed_json(),
+                    r.arch,
+                    _bits_of(r.arch),
+                    r.sha256,
+                )
+                for r in records
+            ],
         )
 
     conn.commit()

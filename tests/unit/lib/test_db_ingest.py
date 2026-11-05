@@ -1359,3 +1359,26 @@ def test_migration_adds_the_import_source_to_an_old_db(tmp_path: Path) -> None:
         assert tuple(row) == ("system", None)
     finally:
         conn.close()
+
+
+def test_a_binary_detected_under_another_architecture_is_extracted_again(tmp_path: Path) -> None:
+    """★ The decompiler is started with the architecture, so an extraction stored under another one
+    than detected now is not this scan's: the binary is dirty again, and its row carries the
+    detected architecture and word size. The same architecture leaves it cached.
+
+    MUTATION (verified RED): skip the comparison -> stays cached -> RED; leave the stored arch as
+    it was -> RED."""
+    conn = open_db(tmp_path / "analysis.db")
+    old = _make_record("httpd", "a" * 64, arch="ARM:LE:32:v7")
+    _, dirty = ingest_elfs(conn, [old], pass_version="p1")
+    assert "a" * 64 in dirty
+    conn.execute("UPDATE binaries SET ghidra_ok = 1, ghidra_status = 'ok', pass_version = 'p1'")
+    conn.commit()
+    _, dirty = ingest_elfs(conn, [old], pass_version="p1")
+    assert dirty == set()  # same architecture: cached
+    now = _make_record("httpd", "a" * 64, arch="AARCH64:LE:64:v8A")
+    _, dirty = ingest_elfs(conn, [now], pass_version="p1")
+    assert "a" * 64 in dirty
+    row = conn.execute("SELECT arch, bits FROM binaries").fetchone()
+    assert tuple(row) == ("AARCH64:LE:64:v8A", 64)
+    conn.close()

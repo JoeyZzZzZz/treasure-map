@@ -101,7 +101,16 @@ def test_the_declared_set_matches_the_dirty_loop_functions_writers() -> None:
     #
     # MUTATION (verified RED): drop "stub_resolve.py" from _PIPELINE_PY_MODULES in ghidra_runner.py
     # -> the computed set includes it (read in ingest) but the declared set does not -> mismatch.
-    computed = {"ghidra_ingest.py"} | {src for src, _ in _treasure_map_reads(_INGEST)}
+    #
+    # ...plus the module the extraction JVM is started by (its command line, its environment, the
+    # patched ELF it may be handed): what the JVM reads decides what it writes, so ghidra_launch is
+    # fingerprinted as surely as the extractor's own scripts, and so is what it reads.
+    launch = _ANALYZE / "ghidra_launch.py"
+    computed = (
+        {"ghidra_ingest.py", "ghidra_launch.py"}
+        | {src for src, _ in _treasure_map_reads(_INGEST)}
+        | {src for src, _ in _treasure_map_reads(launch)}
+    )
     assert _DECLARED == computed, f"declared {_DECLARED} != writers-in-dirty-loop {computed}"
 
 
