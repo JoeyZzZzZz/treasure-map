@@ -95,6 +95,7 @@ from treasure_map.lib.hunt.refs import (
     _norm_addr,
     build_evidence_ref,
     callsite_offset_suffix,
+    mint_out_of_body_refs,
 )
 from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
@@ -238,6 +239,31 @@ def _load_detector_errors(db_path: Path | str) -> dict[int, list[str]]:
         if names:
             out[func_id] = names
     return out
+
+
+def _mint_out_of_body_anchors(atlas: sqlite3.Connection, source_run_id: str) -> int:
+    """Give each call that only bare (out-of-body) candidates name one formal, offset-carrying
+    anchor — the claimant with the lowest function entry (refs.mint_out_of_body_refs). Runs inside
+    the run's write transaction, after every candidate of the run is written; changes only those
+    rows' evidence_ref, drops none. Returns the number of rows re-anchored."""
+    rows = []
+    for iid, ref, flow in atlas.execute(
+        "SELECT instance_id, evidence_ref, flow_evidence FROM instance WHERE source_run_id = ?",
+        (source_run_id,),
+    ):
+        try:
+            evidence = json.loads(flow) if flow else {}
+        except ValueError:
+            evidence = {}
+        rows.append((iid, ref or "", evidence if isinstance(evidence, dict) else {}))
+    minted = mint_out_of_body_refs(rows)
+    atlas.executemany(
+        "UPDATE instance SET evidence_ref = ? WHERE instance_id = ?",
+        [(ref, iid) for iid, ref in minted.items()],
+    )
+    if minted:
+        logger.info("hunt: %d out-of-body call(s) given a formal anchor", len(minted))
+    return len(minted)
 
 
 def _detector_error_keys(errors_by_func: Mapping[int, list[str]], func_id: int) -> dict[str, Any]:
@@ -2048,6 +2074,7 @@ def run_analyzer2(
                 instances_written += 1
                 wrapper_propagated += 1
                 by_status["unknown"] += 1
+            _mint_out_of_body_anchors(atlas, source_run_id)
             recompute_device_spread(atlas, touched_patterns)
         # The instance write committed cleanly: mark the run 'complete' + record its analysis
         # counts. Reached only if the transaction above did NOT raise (an exception skips this and

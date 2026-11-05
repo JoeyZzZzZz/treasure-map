@@ -28,6 +28,17 @@ anchors carry {name, addr, kind} for exactly that. A ref deliberately does not p
 
 from __future__ import annotations
 
+import re
+from collections.abc import Hashable, Iterable, Mapping
+from typing import Any
+
+from treasure_map.lib.callsite_ref import (
+    callsite_abs_addr,
+    is_wrapper_class,
+    ref_suffix_parts,
+    wrapper_call_abs_addr,
+)
+
 _BIN_ANCHOR_LEN = 8  # sha256 prefix; distinct across every binary of a real firmware tested
 
 # Per-axis labels for a wrapper-propagated candidate: (call_sequence_shape prefix, evidence_ref
@@ -164,3 +175,88 @@ def build_evidence_ref(
     if not fn_anchor:
         fn_anchor = f"id{func_id}" if func_id is not None else "nofn"
     return f"{run_id}#{bin_anchor or 'nobin'}:{fn_anchor}@{suffix}"
+
+
+# ── one formal anchor per call, for the calls only a degraded anchor names ─────────────────────
+
+
+def _bare_parts(evidence_ref: str) -> tuple[str, int, str] | None:
+    """(``<run>#<bin>`` prefix, entry, class) of a bare ``…:<entry>@<class>`` ref (no callsite
+    tail), or None for any other shape."""
+    head, sep, tail = evidence_ref.rpartition(":")
+    if not sep:
+        return None
+    entry_hex, at, cls = tail.partition("@")
+    if not at or not re.fullmatch(r"[a-z_]+", cls):
+        return None
+    try:
+        entry = int(entry_hex, 16)
+    except ValueError:
+        return None
+    return head, entry, cls
+
+
+def _anchored_call(evidence_ref: str) -> tuple[str, str, int] | None:
+    """(``<run>#<bin>`` prefix, class, absolute call address) of a ref that carries an offset —
+    the call it is the formal anchor of — or None. Read by the one suffix parser."""
+    parts = ref_suffix_parts(evidence_ref)
+    if parts is None:
+        return None
+    cls = parts[0]
+    addr = (
+        wrapper_call_abs_addr(evidence_ref)
+        if is_wrapper_class(cls)
+        else callsite_abs_addr(evidence_ref)
+    )
+    if addr is None:
+        return None
+    return evidence_ref.rpartition(":")[0], cls, addr
+
+
+def mint_out_of_body_refs(
+    rows: Iterable[tuple[Hashable, str, Mapping[str, Any] | None]],
+) -> dict[Hashable, str]:
+    """For one run's candidate rows, ``{row key: offset ref}`` — the rows whose bare ref becomes
+    the formal anchor of their call.
+
+    ``rows`` are (row key, evidence_ref, flow_evidence). A bare ref is one per (function, class):
+    calls the bridge located in the text but not inside the function's body (the ``out_of_body``
+    degrade) share it, each in its own row, with the call's address recovered as
+    ``flow_evidence.callsite_addr``. Per (``<run>#<bin>``, class, call address):
+
+      * a row already anchored at that call by an offset ref: it is the call's anchor; the bare
+        rows stay bare and fold onto it (sink_overlay, by ``callsite_addr``) — nothing is minted;
+      * else the rows of the LOWEST function entry among the call's bare claimants get
+        ``<bare ref>@<offset>``, the offset signed from that entry (the call is outside its body;
+        the evidence keeps ``anchor_degraded``); the other claimants stay bare and fold onto it.
+
+    Deterministic, needs nothing but the refs and the recovered addresses, and drops no row: one
+    formal anchor per call, every claimant kept."""
+    anchored: set[tuple[str, str, int]] = set()
+    claims: dict[tuple[str, str, int], list[tuple[int, Hashable, str]]] = {}
+    for key, ref, evidence in rows:
+        call = _anchored_call(ref)
+        if call is not None:
+            anchored.add(call)
+            continue
+        parts = _bare_parts(ref)
+        ev = evidence or {}
+        if parts is None or ev.get("anchor_degraded") != "out_of_body":
+            continue
+        addr = _addr_to_int(ev.get("callsite_addr"))
+        if addr is None:
+            continue
+        head, entry, cls = parts
+        claims.setdefault((head, cls, addr), []).append((entry, key, ref))
+    minted: dict[Hashable, str] = {}
+    for (_head, _cls, addr), claimants in claims.items():
+        if (_head, _cls, addr) in anchored:
+            continue
+        first = min(entry for entry, _k, _r in claimants)
+        offset = _norm_offset(addr, first)
+        if offset is None:
+            continue
+        for entry, key, ref in claimants:
+            if entry == first:
+                minted[key] = f"{ref}@{offset}"
+    return minted

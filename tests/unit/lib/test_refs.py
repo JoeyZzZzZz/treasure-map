@@ -138,3 +138,45 @@ def test_offset_ref_splits_on_the_first_at_sign() -> None:
     head, suffix = ref.split("@", 1)
     assert head == "runx#c0ffee01:00415cd0"
     assert suffix.split("@") == ["cmd", "0x000480"]
+
+
+def test_a_minted_anchor_reads_as_a_row_ref() -> None:
+    """A formal anchor minted for an out-of-body call has the shape of every per-call anchor, so a
+    judgement citing it reads it as a candidate row (row_ref), not as free text.
+
+    MUTATION (verified RED): drop the row_ref marker -> None -> RED."""
+    from treasure_map.lib.hunt.refs import mint_out_of_body_refs
+    from treasure_map.lib.query.diff_annotations import _anchor_marker
+
+    bare = "run_b#49c76a98:00401000@copy"
+    ev = {"anchor_degraded": "out_of_body", "callsite_addr": "0x3ff000"}
+    (minted,) = mint_out_of_body_refs([(1, bare, ev)]).values()
+    assert minted == "run_b#49c76a98:00401000@copy@-0x002000"  # signed: below the entry
+    assert _anchor_marker(minted) == "row_ref"
+
+
+def test_minting_is_per_call_per_class_and_needs_an_out_of_body_address() -> None:
+    """Two rows of one bare ref on two calls get two anchors; a call anchored for ANOTHER class is
+    no anchor for this one; a bare row with no out-of-body address is left as it is.
+
+    MUTATION (verified RED): key the claims without the class -> the cmd anchor at 0x409020 is
+    taken for the copy call -> nothing minted there -> RED."""
+    from treasure_map.lib.hunt.refs import mint_out_of_body_refs
+
+    bare = "r#aaaaaaaa:00401000@copy"
+    rows = [
+        (1, bare, {"anchor_degraded": "out_of_body", "callsite_addr": "0x409000"}),
+        (2, bare, {"anchor_degraded": "out_of_body", "callsite_addr": "0x409010"}),
+        (3, "r#aaaaaaaa:00409000@cmd@0x000020", {}),
+        (
+            4,
+            "r#aaaaaaaa:00405000@copy",
+            {"anchor_degraded": "out_of_body", "callsite_addr": "0x409020"},
+        ),
+        (5, "r#aaaaaaaa:00406000@copy", {"anchor_degraded": "no_bridge_data"}),
+    ]
+    assert mint_out_of_body_refs(rows) == {
+        1: f"{bare}@0x008000",
+        2: f"{bare}@0x008010",
+        4: "r#aaaaaaaa:00405000@copy@0x004020",
+    }

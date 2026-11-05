@@ -4156,14 +4156,15 @@ def test_a_token_less_row_in_a_bridged_db_degrades_to_bare_never_index(tmp_path:
     assert rows[0][1]["anchor_degraded"] == "no_bridge_data"
 
 
-def test_out_of_body_siblings_share_a_bare_ref_and_both_say_so(tmp_path: Path) -> None:
+def test_out_of_body_siblings_each_get_the_anchor_of_their_call_and_say_so(tmp_path: Path) -> None:
     """Two calls whose addresses fall outside the function body (inlined into a neighbour) both
-    degrade to the bare class and so share one ref; each row says ``callsite_located: false`` with
-    ``anchor_degraded: out_of_body``, so no reader takes the shared ref for one call.
+    degrade to the bare class; each row says ``callsite_located: false`` with ``anchor_degraded:
+    out_of_body`` and the recovered call address. No other candidate claims either call, so each
+    row becomes the formal anchor of its own call (``copy@<offset>``, signed from this entry) —
+    one anchor per call, the evidence still saying where the call was found.
 
     MUTATION (must go RED): drop the ``callsite_located`` / ``anchor_degraded`` / ``callsite_addr``
-    keys. The bare ref STAYS shared; the recovered physical ``callsite_addr`` is what the sink
-    overlay uses to tell the two apart without re-anchoring the ref (overlay judgements hold)."""
+    keys; skip the minting (the two rows share the bare ref again)."""
     pc = "void Inl(char *a,char *b,int n) {\n  memcpy(a,b,4);\n  memcpy(a,b,n);\n}\n"
     fn = _bridged(
         "Inl", 0x401000, pc, ["memcpy"],
@@ -4173,13 +4174,54 @@ def test_out_of_body_siblings_share_a_bare_ref_and_both_say_so(tmp_path: Path) -
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_b")
     rows = _rows_for(atlas, "Inl")
-    assert [ref.split("@", 1)[1] for ref, _ in rows] == ["copy", "copy"]
+    assert sorted(ref.split("@", 1)[1] for ref, _ in rows) == ["copy@0x008000", "copy@0x008010"]
     assert [ev.get("callsite_located") for _, ev in rows] == [False, False]
     assert [ev.get("anchor_degraded") for _, ev in rows] == ["out_of_body", "out_of_body"]
     # the out_of_body physical address the degrade would drop is recovered into flow_evidence, and
     # it distinguishes the two shared-ref siblings (what the cross-side overlay folds / aligns on).
     cas = [ev.get("callsite_addr") for _, ev in rows]
     assert all(cas) and cas[0] != cas[1]
+
+
+def test_a_call_only_bare_candidates_name_gets_one_formal_anchor(tmp_path: Path) -> None:
+    """★ One anchor per call, no candidate dropped (spec B-4):
+
+    * Holder's own in-body copy at 0x409010 is anchored there by offset; Inl's out-of-body copy at
+      the same address stays bare (it folds onto Holder's in the overlay) — no second anchor;
+    * Inl and Late both reach 0x409020 out of their bodies and nothing else claims it: the lower
+      entry (Inl) is its formal anchor, Late stays bare (folds onto it);
+    * every row is still there.
+
+    MUTATION (verified RED): ignore an existing offset anchor -> Inl gets a second anchor on
+    0x409010 -> RED; take the HIGHEST entry -> Late is minted instead -> RED; skip the minting ->
+    Inl's 0x409020 row stays bare -> RED."""
+    holder = _bridged(
+        "Holder", 0x409000, "void Holder(char *a,char *b) {\n  memcpy(a,b,4);\n}\n", ["memcpy"],
+        body=(0x409000, 0x409018), addr_of={"memcpy": [0x409010]},
+    )  # fmt: skip
+    inl_pc = "void Inl(char *a,char *b,int n) {\n  memcpy(a,b,4);\n  memcpy(a,b,n);\n}\n"
+    inl = _bridged(
+        "Inl", 0x401000, inl_pc, ["memcpy"],
+        body=(0x401000, 0x401100), addr_of={"memcpy": [0x409010, 0x409020]},
+    )  # fmt: skip
+    late = _bridged(
+        "Late", 0x405000, "void Late(char *a,char *b) {\n  memcpy(a,b,8);\n}\n", ["memcpy"],
+        body=(0x405000, 0x405100), addr_of={"memcpy": [0x409020]},
+    )  # fmt: skip
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [holder, inl, late]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_b")
+    holder_refs = [ref.split(":", 1)[1] for ref, _ in _rows_for(atlas, "Holder")]
+    assert holder_refs == ["00409000@copy@0x000010"]
+    inl_rows = {ev["callsite_addr"]: ref.split(":", 1)[1] for ref, ev in _rows_for(atlas, "Inl")}
+    assert inl_rows == {"0x409010": "00401000@copy", "0x409020": "00401000@copy@0x008020"}
+    late_refs = [ref.split(":", 1)[1] for ref, _ in _rows_for(atlas, "Late")]
+    assert late_refs == ["00405000@copy"]
+    conn = sqlite3.connect(atlas)
+    try:
+        assert conn.execute("SELECT count(*) FROM instance").fetchone()[0] == 4
+    finally:
+        conn.close()
 
 
 def test_a_binary_whose_extraction_failed_marks_its_candidates_not_current(tmp_path: Path) -> None:
@@ -4314,8 +4356,9 @@ def test_wrapper_candidate_per_call_with_its_own_offset_ref(tmp_path: Path) -> N
 
 def test_wrapper_call_out_of_body_degrades_like_a_direct_call(tmp_path: Path) -> None:
     """A wrapper call whose address falls outside the body degrades exactly as a direct sink call
-    does: bare axis ref, ``callsite_located: false``, ``anchor_degraded: out_of_body``, and the
-    recovered call address.
+    does: ``callsite_located: false``, ``anchor_degraded: out_of_body``, the recovered call address
+    — and, no other candidate claiming that call, the row is its formal anchor (axis ref with the
+    offset of the call to the wrapper).
 
     MUTATION (verified RED): drop the degrade keys from the wrapper path -> no marker."""
     pc = "void Inl(char *a) {\n  do_cmd(a);\n}\n"
@@ -4328,7 +4371,7 @@ def test_wrapper_call_out_of_body_degrades_like_a_direct_call(tmp_path: Path) ->
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_w")
     ((ref, ev, _),) = _wrapper_rows(atlas, "Inl")
-    assert ref.endswith("@cmd_via_wrapper")
+    assert ref.endswith("@cmd_via_wrapper@0x008000")
     assert ev["callsite_located"] is False and ev["anchor_degraded"] == "out_of_body"
     assert ev["callsite_addr"] == "0x409000"
 

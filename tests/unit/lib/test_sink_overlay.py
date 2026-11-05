@@ -1723,3 +1723,28 @@ def _golden_v4(conn: sqlite3.Connection) -> None:
            offset="0x0000c0")  # fmt: skip
     _aplus(conn, "a", _fj(("popen", None, "name_only")), offset="0x0000d0")
     _aplus(conn, "b", _fj(), sink="cmd", offset="0x0000e0")
+
+
+def test_a_minted_anchor_owns_its_call_and_the_other_claimant_folds_onto_it(
+    atlas: sqlite3.Connection,
+) -> None:
+    """★ The hunt's B-4 step gives a call only bare candidates claim one formal anchor (the lowest
+    entry's row). The overlay is unchanged and reads it like any per-call candidate: the call is
+    owned, the other claimant folds into its ``coclaimed_by`` instead of reading
+    ``coclaim_unresolved``, and every candidate is still represented.
+
+    MUTATION (verified RED): skip the minting -> both keys read coclaim_unresolved -> RED."""
+    from treasure_map.lib.hunt.analyzer2 import _mint_out_of_body_anchors
+
+    for fa, fb in (("00012000", "00022000"), ("00013000", "00023000")):
+        _falign(atlas, fa, fb, 0.95, "aligned")
+        _inst(atlas, "runA", SHA_A, _ref("runA", fa, "copy"), "copy", _deg("0x12090"))
+        _inst(atlas, "runB", SHA_B, _ref("runB", fb, "copy"), "copy", _deg(None))
+    assert _mint_out_of_body_anchors(atlas, "runA") == 1
+    assert _mint_out_of_body_anchors(atlas, "runB") == 0  # no recovered address: nothing to own
+    res = so.compute_sink_overlay(atlas, DIFF_ID)
+    owner = _by(res.rows, a_off=":00012000@copy@0x000090")
+    assert owner is not None and owner.key_granularity == "callsite"
+    assert owner.coclaimed_by == ["00013000"]
+    assert not [r for r in res.rows if r.presence_reason == "coclaim_unresolved"]
+    _assert_full_coverage(res)
