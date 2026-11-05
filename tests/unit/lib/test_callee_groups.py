@@ -44,11 +44,12 @@ def _fresh(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _world(tmp: Path) -> World:
+def _world(tmp: Path, *, p2_a_readable: bool = True) -> World:
     """X (new_helper at B 00009000) is paired with A's old_helper (00008000). P1 and P2 call X on
     B and nothing like it on A; P3's A side calls old_helper (X's counterpart) — not new; P4's A
     side has no function in that analysis.db (its call list cannot be read); every B side also
-    calls ``system``, an import, never a key."""
+    calls ``system``, an import, never a key. ``p2_a_readable=False`` leaves P2's A side out
+    too, so P1 is the one member whose "newly calls X" is confirmed."""
     w = World(tmp)
     w.pair(X_A, X_B, 0.97, 0.9)
     w.fn("a", X_A, [], name="old_helper")
@@ -57,7 +58,8 @@ def _world(tmp: Path) -> World:
         w.pair(a, b, 0.97, 0.6)
         w.fn("b", b, ["system", "new_helper"], name=f"fn_{b}")
     w.fn("a", P1[0], ["system"], name=f"fn_{P1[1]}")
-    w.fn("a", P2[0], ["system"], name=f"fn_{P2[1]}")
+    if p2_a_readable:
+        w.fn("a", P2[0], ["system"], name=f"fn_{P2[1]}")
     w.fn("a", P3[0], ["system", "old_helper"], name=f"fn_{P3[1]}")
     w.commit()
     return w
@@ -268,3 +270,21 @@ def test_the_material_pack_names_the_unreadable_a_side_member(tmp_path: Path) ->
     assert _pair_id(*P4) in mat["members_a_side_unread"]
     assert "CAVEAT" in mat["how"]
     assert mat["premise_relies_on_unread"] is False
+
+
+def test_the_material_pack_says_when_the_groups_premise_rests_on_unread_members(
+    tmp_path: Path,
+) -> None:
+    """★ With P2's A side unreadable as well, P1 is the only member that is known to newly call X:
+    the group's ">= 2 members newly call X" holds only by counting P2 and P4, and the material
+    pack says so (premise_relies_on_unread true), naming both.
+
+    MUTATION (verified RED): premise_relies_on_unread always False -> RED."""
+    from treasure_map import mcp_app
+
+    w = _world(tmp_path, p2_a_readable=False)
+    group = next(u for u in _review(w).units if u.kind == ru.GROUP)
+    out = mcp_app.make_tools(w.path)["start_diff_review"](run_pair="runA::runB", unit=group.unit_id)
+    mat = out["material"]
+    assert sorted(mat["members_a_side_unread"]) == sorted([_pair_id(*P2), _pair_id(*P4)])
+    assert mat["premise_relies_on_unread"] is True

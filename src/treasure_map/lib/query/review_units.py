@@ -815,7 +815,10 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
                 sources.append("unread_before_verdict")
             if not sources or blind:
                 continue
-            audited = replace(m, reasons=tuple(sources))
+            # The member an auditor reads names no source: a source is the verdict under audit
+            # (or that it was written unread), and an audit is read blind (spec six.7). The
+            # sources stay on the Audit, counted only in the report's ``audits.by_source``.
+            audited = replace(m, reasons=(AUDIT,))
             wid = last["id"] if last is not None else None
             unit = Unit(
                 unit_id=unit_id(AUDIT, [f"{m.anchor_ref}@{wid if wid is not None else 'legacy'}"]),

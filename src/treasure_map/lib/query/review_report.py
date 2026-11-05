@@ -3,7 +3,8 @@
 """The pair review's report in three faces — terminal summary, markdown, HTML — all rendered from
 one reading (lib/query/review_units.PairReview), so they never part. The terminal summary's first
 line is the ``coverage_statement``; markdown and HTML add every unit in the hand-out order, each
-member with its review state and the reasons it is must-read.
+member with its review state and the reasons it is must-read. A subject under an open audit
+shows neither: its state names the verdict under audit, which an audit reads blind.
 
 A reading face only: nothing here writes. Every string taken from the firmware (binary names,
 paths, entry ids) is escaped in the HTML, which carries no script.
@@ -28,6 +29,20 @@ _NOT_SEEN_NOTE = (
     "What this view cannot see — a gap here is closed only by a judgement on the subject that "
     "holds it, never by acknowledging it."
 )
+
+
+# The state a subject under an open audit shows, in every row it appears in: its own state
+# (inconclusive / concluded) would name the verdict the audit reads blind.
+UNDER_AUDIT = "under audit"
+
+
+def _shown_states(review: ru.PairReview) -> dict[str, str]:
+    """Each member's state as the member tables show it: a subject under an open audit as
+    ``UNDER_AUDIT``."""
+    shown = dict(review.progress.states)
+    for a in review.audits.open:
+        shown[a.member.anchor_ref] = UNDER_AUDIT
+    return shown
 
 
 def _short(stream: str) -> str:
@@ -132,6 +147,7 @@ def markdown(review: ru.PairReview, *, header: dict[str, Any] | None = None) -> 
     """The whole report as markdown: the summary, then every unit in the hand-out order."""
     rep = review.report
     states = review.progress.states
+    shown = _shown_states(review)
     out = [f"# Review of {_md_cell(rep['run_pair'])}", "", f"**{rep['coverage_statement']}**", ""]
     out.append(f"_{_STATEMENT_NOTE}_")
     out.append("")
@@ -194,7 +210,7 @@ def markdown(review: ru.PairReview, *, header: dict[str, Any] | None = None) -> 
         for m in u.members:
             out.append(
                 f"| `{_md_cell(m.entry_id or m.anchor_ref)}` | {_md_cell(m.bucket or '')} | "
-                f"{_md_cell(states.get(m.anchor_ref, ''))} | {_md_cell(', '.join(m.reasons))} |"
+                f"{_md_cell(shown.get(m.anchor_ref, ''))} | {_md_cell(', '.join(m.reasons))} |"
             )
         out.append("")
     return "\n".join(out) + "\n"
@@ -212,6 +228,7 @@ def html_page(review: ru.PairReview, *, header: dict[str, Any] | None = None) ->
     """The whole report as one static HTML page — no script; every value escaped."""
     rep = review.report
     states = review.progress.states
+    shown = _shown_states(review)
     e = html.escape
     out = [
         "<!doctype html><html><head><meta charset='utf-8'>",
@@ -253,7 +270,7 @@ def html_page(review: ru.PairReview, *, header: dict[str, Any] | None = None) ->
         for m in u.members:
             out.append(
                 f"<tr><td><code>{e(m.entry_id or m.anchor_ref)}</code></td>"
-                f"<td>{e(m.bucket or '')}</td><td>{e(states.get(m.anchor_ref, ''))}</td>"
+                f"<td>{e(m.bucket or '')}</td><td>{e(shown.get(m.anchor_ref, ''))}</td>"
                 f"<td>{e(', '.join(m.reasons))}</td></tr>"
             )
         out.append("</table>")

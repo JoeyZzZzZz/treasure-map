@@ -38,6 +38,10 @@ def _clear_unit_cache() -> None:
 
 @pytest.fixture
 def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
+    return _build_world(tmp_path, monkeypatch)
+
+
+def _build_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
     w = World(tmp_path, monkeypatch)
     # libx: an A entry (attention 0), an undetermined pair (R), a changed aligned pair with no
     # candidate (C, attention 2), a function in no pair (P). liby: an R entry and a P entry.
@@ -853,6 +857,53 @@ def test_the_worksheet_hides_the_audit_verdict_but_keeps_a_disagreement(world: W
     assert "current" not in items[A1]  # blind: the verdict under audit is hidden
     assert items[a_dis]["why"][0] == "disagreement"
     assert items[a_dis]["current"] is not None  # a disagreement is settled by seeing both
+
+
+def _auditor_view(w: World, verdict: str) -> dict[str, Any]:
+    """Everything an auditor of A1 is shown once A1 is judged ``verdict``: the MCP unit material,
+    the worksheet item, and every markdown / HTML report row that names A1."""
+    from treasure_map.cli import review_cli
+    from treasure_map.lib.query import review_report as rr
+
+    basis = _nrc(A1) if verdict == "no_real_change" else None
+    w.judge(DX, A1, verdict, verdict_basis=basis, ctx=_ctx("writer"))
+    r = _review(w, k=0)
+    [audit] = r.audits.open
+    uid = audit.unit.unit_id
+    mcp = mcp_app.make_tools(w.path)["start_diff_review"](run_pair=PAIR, k=0, unit=uid)
+    assert mcp.get("unit", {}).get("kind") == ru.AUDIT, mcp
+    sheet = review_cli.worksheet(w.atlas, r, PAIR)
+    entry = audit.member.entry_id
+    assert entry is not None
+    md = [ln for ln in rr.markdown(r).splitlines() if entry in ln]
+    page = [ln for ln in rr.html_page(r).splitlines() if entry in ln]
+    assert len(md) >= 2 and len(page) >= 2  # its own unit's row and the audit unit's row
+    return {
+        "mcp": {k: v for k, v in mcp.items() if k != "server"},
+        "sheet": [it for it in sheet["items"] if it["anchor_ref"] == A1],
+        "markdown": md,
+        "html": page,
+    }
+
+
+def test_an_auditor_is_shown_nothing_that_depends_on_the_verdict_under_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ spec six.7, read blind: the same subject audited once over a no_real_change and once over
+    a change_inconclusive — what the auditor is shown (the MCP material of the audit unit, the
+    worksheet item, each report row naming the subject) is IDENTICAL, so no field of it can carry
+    the verdict, nor its why_unchanged, nor the review state that names it. The sources are still
+    counted, in the report's audits.by_source only.
+
+    MUTATION (verified RED): the audit member's reasons = its sources -> the MCP members and the
+    report's reasons column differ -> RED; the worksheet's why carries the sources -> RED; the
+    markdown (and, apart, the HTML) member table shows the real state -> RED."""
+    a = _auditor_view(_build_world(tmp_path / "a", monkeypatch), "no_real_change")
+    b = _auditor_view(_build_world(tmp_path / "b", monkeypatch), "change_inconclusive")
+    for face in ("mcp", "sheet", "markdown", "html"):
+        assert a[face] == b[face], face
+    assert [m["reasons"] for m in a["mcp"]["members"]] == [[ru.AUDIT]]
+    assert a["sheet"][0]["why"] == ["audit"]
 
 
 def test_a_batch_naming_its_unit_records_it_and_hands_on_the_next(world: World) -> None:
