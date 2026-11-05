@@ -1065,3 +1065,44 @@ def test_the_same_buffer_run_twice_by_a_command_sink_keeps_the_numeric_mark() ->
     assert _num_cmd(twice) == NUMERIC_SANITIZED
     written = 'i = atoi(x);\n  sprintf(b,"echo %d",i);\n  system(b);\n  strcpy(b,x);\n  system(b);'
     assert _num_cmd(written) != NUMERIC_SANITIZED
+
+
+def test_a_returned_element_is_no_declaration_of_a_local_array() -> None:
+    """★ The safe direction: ``return b[0];`` names b with an index after a word, but `return` is a
+    keyword, not a type — b is not declared here (a global), so nothing proves its writes are all
+    seen and it gets no numeric mark.
+
+    MUTATION (verified RED): accept a control keyword as a type word -> b reads as a local array
+    -> numeric_sanitized -> RED."""
+    pc = (
+        'void f(char *x)\n{\n  int i;\n  i = atoi(x);\n  sprintf(b,"/proc/%d",i);\n'
+        '  fopen(b,"r");\n  return b[0];\n}'
+    )
+    got = detect_form_signal(
+        sink_name="fopen",
+        pseudocode=pc,
+        callees=["atoi", "fopen"],
+        sink_arg="b",
+        sink_class="path_sink",
+        sink_form="var",
+    )
+    assert got != NUMERIC_SANITIZED
+
+
+def test_a_cast_builder_destination_is_named_by_its_variable() -> None:
+    """The inline builder writes into ``(char *)c``: its destination is c (the argument's root), not
+    the first identifier of the text (``char``) — so c is still read as charset-constrained.
+
+    MUTATION (verified RED): name the destination by the first identifier -> RED."""
+    pc = (
+        "void f(struct ether_addr* mac){ char c[64]; "
+        'snprintf((char *)c,64,"arp -s %s",ether_ntoa(mac)); system(c); }'
+    )
+    got = detect_form_signal(
+        sink_name="system",
+        pseudocode=pc,
+        callees=["ether_ntoa", "snprintf", "system"],
+        sink_arg="c",
+        sink_form="var",
+    )
+    assert got == CHARSET_CONSTRAINED

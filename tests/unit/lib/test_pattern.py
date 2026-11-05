@@ -1819,3 +1819,35 @@ def test_the_cached_taint_readings_cannot_be_changed_in_place() -> None:
     for seeds in (strong, weak, par):
         with pytest.raises(AttributeError):
             seeds.add("x")  # type: ignore[attr-defined]
+
+
+# The whole source vocabulary, name by name. A name added to (or dropped from) either strength is a
+# change to what the hunt calls an input, and has to be made here too, on purpose.
+_SOURCE_STRONG_ALL = frozenset(
+    {
+        "__libc_recv", "__libc_recvfrom", "__libc_recvmsg", "__recv", "getKeyValue", "get_cgi",
+        "recv", "recvfrom", "recvmmsg", "recvmsg", "webGetVar", "websGetVar",
+    }
+)  # fmt: skip
+_SOURCE_WEAK_ALL = frozenset(
+    {
+        "__getdelim", "__isoc99_fscanf", "__isoc99_scanf", "__isoc99_sscanf", "__libc_pread",
+        "__libc_pread64", "__libc_read", "__pread64", "__read_nocancel", "b64_decode",
+        "base64_decode", "fgets", "fgets_unlocked", "fread", "fread_unlocked", "fscanf", "getdelim",
+        "getenv", "getline", "getopt", "getopt_long", "getopt_long_only", "gets",
+        "json_object_get_string", "json_object_get_string_len", "mq_receive", "msgrcv",
+        "nvram_bufget", "nvram_get", "nvram_safe_get", "pread", "pread64", "read", "readv",
+        "scanf", "sscanf",
+    }
+)  # fmt: skip
+
+
+def test_the_source_vocabulary_is_exactly_what_it_is() -> None:
+    """★ Each strength of the source set is pinned name by name — equality, not a subset — so a name
+    slipped into either one (which makes every call to it an input) turns this red, and so does one
+    dropped from it.
+
+    MUTATION (verified RED): add an unrelated name to SOURCE_WEAK -> RED."""
+    assert SOURCE_STRONG == _SOURCE_STRONG_ALL
+    assert SOURCE_WEAK == _SOURCE_WEAK_ALL
+    assert SOURCE == _SOURCE_STRONG_ALL | _SOURCE_WEAK_ALL
