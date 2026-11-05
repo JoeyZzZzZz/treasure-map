@@ -85,20 +85,25 @@ def _split_respecting_quotes(line: str) -> list[str]:
 
 def launched_command(line: str) -> str | None:
     """The executable a shell line runs: past ``VAR=value`` assignments and wrappers (``nohup``,
-    ``exec``, ``nice -n 10`` …), the ``-x``/``--exec``/``--startas`` of ``start-stop-daemon``, and
-    the command inside a ``VAR=$(cmd …)`` substitution. None when there is none to name."""
+    ``exec``, ``nice -n 10`` …) and the ``-x``/``--exec``/``--startas`` of ``start-stop-daemon``.
+    None when there is none to name — for a ``start-stop-daemon -K`` / ``--stop`` line, which names
+    the binary it stops, and for a ``VAR=$(cmd …)`` assignment, whose cmd runs in a substitution
+    (named by the inline reading)."""
     tokens = _split_respecting_quotes(line)
     i = 0
     while i < len(tokens):
         tok = tokens[i]
-        m = _SUBST_RE.match(tok)
-        if m:
-            return m.group(1).rstrip(");`")
+        if _SUBST_RE.match(tok):
+            # NAME=$(cmd …): the line runs cmd inside a substitution, which the inline reading
+            # names (via inline); the assignment itself runs nothing to name here.
+            return None
         if _ASSIGN_RE.match(tok):
             i += 1
             continue
         base = tok.rsplit("/", 1)[-1]
         if base == "start-stop-daemon":
+            if any(t in ("-K", "--stop") for t in tokens[i + 1 :]):
+                return None  # a stop line names the binary it stops, never a launch
             for j in range(i + 1, len(tokens) - 1):
                 if tokens[j] in ("-x", "--exec", "-a", "--startas"):
                     return tokens[j + 1].rstrip("&;")
@@ -403,6 +408,95 @@ def _launches_from_line(line: str, symtab: _SymbolTable, lineno: int) -> list[_L
     return out
 
 
+# Words the shell runs itself: never a function defined elsewhere.
+_SHELL_BUILTINS = frozenset(
+    {
+        ".",
+        ":",
+        "[",
+        "alias",
+        "break",
+        "cd",
+        "command",
+        "continue",
+        "echo",
+        "eval",
+        "exit",
+        "export",
+        "false",
+        "getopts",
+        "kill",
+        "local",
+        "printf",
+        "read",
+        "readonly",
+        "return",
+        "set",
+        "shift",
+        "source",
+        "test",
+        "trap",
+        "true",
+        "type",
+        "ulimit",
+        "umask",
+        "unset",
+        "wait",
+        "start-stop-daemon",
+    }
+)
+# A command word, possibly behind a variable prefix (``${DEBUG}service_start``): the bare name.
+_PREFIXED_WORD = re.compile(r"^(?:\$\{?\w+\}?)?([A-Za-z_][\w-]*)$")
+_BARE_VARIABLE = re.compile(r"^\$\{?([A-Za-z_]\w*)\}?$")
+
+
+@dataclass(frozen=True)
+class _Handoff:
+    binary_path: str
+    function: str
+    via_line: int | None
+
+
+def _handoff_from_line(
+    line: str, symtab: _SymbolTable, commands: frozenset[str], binaries: set[str]
+) -> _Handoff | None:
+    """The firmware binary this line hands to a function defined OUTSIDE this file, or None.
+
+    The command word (past assignments and a variable prefix) must be a bare name that is no shell
+    builtin, no wrapper, no function of this file and no command of the firmware (a binary or a
+    link); its first argument must be a path, given on the line or as the one literal value of a
+    variable of this file, naming one of the firmware's binaries. The function itself is defined
+    in some other file (a sourced one): nothing here says what it does with the binary."""
+    tokens = _split_respecting_quotes(line)
+    i = 0
+    while i < len(tokens) and _ASSIGN_RE.match(tokens[i]) and not _SUBST_RE.match(tokens[i]):
+        i += 1
+    if i + 1 >= len(tokens):
+        return None
+    m = _PREFIXED_WORD.match(tokens[i])
+    if m is None:
+        return None
+    function = m.group(1)
+    if (
+        function in _SHELL_BUILTINS
+        or function in _WRAPPERS
+        or function in symtab.functions
+        or function in commands
+        or function in binaries
+    ):
+        return None
+    value, via_line = tokens[i + 1], None
+    mv = _BARE_VARIABLE.match(value)
+    if mv:
+        assigned = symtab.literals.get(mv.group(1)) or []
+        if len({v for v, _ in assigned}) != 1:
+            return None  # unassigned, or several values: no one path to name
+        value, via_line = assigned[0]
+    if not value.startswith("/") or value.rsplit("/", 1)[-1] not in binaries:
+        return None
+    return _Handoff(value, function, via_line)
+
+
 def _ingest_shell(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) -> int:
     """Insert script_calls rows for the lines that launch one of this firmware's binaries and the
     risk-marked lines.
@@ -421,8 +515,16 @@ def _ingest_shell(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) -> i
     except sqlite3.OperationalError:
         binaries = set()
 
+    try:
+        commands = frozenset(
+            r[0] for r in conn.execute("SELECT link_name FROM fs_symlinks") if r[0]
+        )
+    except sqlite3.OperationalError:
+        commands = frozenset()
+
     symtab = _scan_symbols(f.text)
     rows: list[tuple[int, str | None, str, int, str, str, int | None]] = []
+    handoffs: list[tuple[int, str, str, str, int, int | None]] = []
     for lineno, raw in enumerate(f.text.splitlines(), start=1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
@@ -447,10 +549,29 @@ def _ingest_shell(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) -> i
                 row = (file_id, launch.command, raw, lineno, args_pattern)
                 rows.append((*row, launch.via, launch.via_line))
         elif any(pattern.search(stripped) for _, pattern in _COMPILED_RULES):
-            rows.append(
-                (file_id, launched_command(stripped), raw, lineno, args_pattern, "literal", None)
+            # The line's own command; on a NAME=$(cmd) line, the command its substitution runs.
+            command, via, via_line = launched_command(stripped), "literal", None
+            if command is None:
+                inner = next(
+                    (c for _, sub in _substitutions(stripped) if (c := _subst_command(sub))),
+                    None,
+                )
+                if inner is not None:
+                    command, via, via_line = inner, "inline", lineno
+            rows.append((file_id, command, raw, lineno, args_pattern, via, via_line))
+        handoff = _handoff_from_line(stripped, symtab, commands, binaries)
+        if handoff is not None and handoff.binary_path not in best:
+            handoffs.append(
+                (file_id, handoff.binary_path, handoff.function, raw, lineno, handoff.via_line)
             )
 
+    if handoffs:
+        conn.executemany(
+            """INSERT INTO script_handoffs
+               (file_id, binary_path, function, raw_line, line_number, via_line)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            handoffs,
+        )
     if rows:
         conn.executemany(
             """INSERT INTO script_calls

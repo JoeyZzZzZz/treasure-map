@@ -480,6 +480,21 @@ CREATE TABLE IF NOT EXISTS script_calls (
     FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
 );
 
+-- A script line that hands one of the firmware's binaries (its path, directly or through a literal
+-- variable of the same file) to a function NOT defined in that file — `service_start $PATH` with
+-- service_start in a sourced file. Not a launch: what that function does with it is not read here,
+-- so these rows are no entry evidence; they say where the trail leaves the file.
+CREATE TABLE IF NOT EXISTS script_handoffs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id         INTEGER NOT NULL,
+    binary_path     TEXT,             -- the path the line names (or its variable's literal value)
+    function        TEXT,             -- the function it is handed to, defined outside this file
+    raw_line        TEXT,             -- script's OWN source line; analysis evidence
+    line_number     INTEGER,
+    via_line        INTEGER,          -- the variable's assignment line; NULL when named on the line
+    FOREIGN KEY(file_id) REFERENCES non_binary_files(id) ON DELETE CASCADE
+);
+
 -- config file entries (ConfigFile ingester sub-table; FK -> non_binary_files)
 -- Flagged-only: one row per security-relevant entry. value is evidence of
 -- firmware content, never a generated payload. Export/case-study paths MUST redact

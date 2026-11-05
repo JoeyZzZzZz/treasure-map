@@ -1791,7 +1791,52 @@ def get_script_callsites(
     for site in sites:
         by_via[site["via"]] = by_via.get(site["via"], 0) + 1
     page, paging = _byte_page(sites, offset, max_chars)
-    return {"found": True, "binary": binary, "callsites": page, "paging": paging, "by_via": by_via}
+    out: dict[str, Any] = {
+        "found": True,
+        "binary": binary,
+        "callsites": page,
+        "paging": paging,
+        "by_via": by_via,
+    }
+    handoffs = _script_handoffs(conn, binary, name)
+    if handoffs is not None:
+        out["handoffs"] = handoffs
+        out["handoffs_note"] = SCRIPT_HANDOFFS_NOTE
+    return out
+
+
+SCRIPT_HANDOFFS_NOTE = (
+    "lines that hand this binary to a function defined OUTSIDE the script (in a file it sources): "
+    "not launches — what that function does with the binary is not read here, so they are no "
+    "entry evidence; they show where the trail leaves the script"
+)
+
+
+def _script_handoffs(
+    conn: sqlite3.Connection, binary: str, name: str
+) -> list[dict[str, Any]] | None:
+    """The script lines handing this binary to a function defined outside their file; None on an
+    analysis.db scanned before these were recorded (not recorded, never "none")."""
+    try:
+        rows = conn.execute(
+            "SELECT f.path AS script, h.binary_path, h.function, h.raw_line, h.line_number, "
+            "h.via_line FROM script_handoffs h JOIN non_binary_files f ON f.id = h.file_id "
+            "ORDER BY f.path, h.line_number, h.id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    return [
+        {
+            "script": r["script"],
+            "function": r["function"],
+            "binary_path": r["binary_path"],
+            "line_number": r["line_number"],
+            "raw_line": r["raw_line"],
+            "via_line": r["via_line"],
+        }
+        for r in rows
+        if (r["binary_path"] or "").rsplit("/", 1)[-1] == name or r["binary_path"] == binary
+    ]
 
 
 def _byte_reader(

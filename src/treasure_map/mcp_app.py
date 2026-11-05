@@ -4354,7 +4354,9 @@ def make_tools(
         a command substitution); ``via_line`` is the line it was derived from (null for literal).
         ``via`` is a mechanical provenance label, not a reachability verdict. Paged losslessly by
         size under ``paging`` — pass ``offset`` = ``paging.next_offset`` for the rest; ``by_via``
-        counts every matching site, not just this page.
+        counts every matching site, not just this page. ``handoffs`` are lines handing the binary
+        to a function defined outside the script (``service_start $PATH``): NOT launches and no
+        entry evidence — where the trail leaves the script.
 
         Without binary (or an evidence_ref that supplies one) it is an error naming the run, not an
         empty answer."""

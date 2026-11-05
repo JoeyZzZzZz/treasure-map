@@ -111,9 +111,11 @@ def test_unpaired_quotes_fall_back_to_whitespace_splitting() -> None:
 
 
 def test_the_direct_launch_reading_is_unchanged() -> None:
+    """MUTATION (verified RED): name the command of a VAR=$(cmd) assignment again -> RED."""
     assert launched_command("nohup foo &") == "foo"
     assert launched_command("start-stop-daemon -x /bin/foo") == "/bin/foo"
-    assert launched_command("VAR=$(foo)") == "foo"
+    # an assignment's substitution runs its command inside $( ): named by the inline reading
+    assert launched_command("VAR=$(foo)") is None
     assert launched_command("/usr/sbin/svc_a -p 80 &") == "/usr/sbin/svc_a"
 
 
@@ -224,10 +226,12 @@ def test_a_backquoted_command_is_an_inline_launch(tmp_path: Path) -> None:
     assert _launches(tmp_path, "echo `svc_a -x`\n") == [(1, "svc_a", "inline", 1)]
 
 
-def test_a_quoted_substitution_assignment_is_one_literal_row(tmp_path: Path) -> None:
-    """With its quotes removed the assignment names svc_a itself; the substitution names it again.
-    One row, and literal wins."""
-    assert _launches(tmp_path, 'RES="$(svc_a | grep x)"\n') == [(1, "svc_a", "literal", None)]
+def test_a_quoted_substitution_assignment_is_one_inline_row(tmp_path: Path) -> None:
+    """★ An assignment whose value is a command substitution runs that command inside the
+    substitution: one row, via inline (the line names no command of its own) — not a literal one.
+
+    MUTATION (verified RED): read the assignment as a literal launch again -> RED."""
+    assert _launches(tmp_path, 'RES="$(svc_a | grep x)"\n') == [(1, "svc_a", "inline", 1)]
 
 
 def test_a_substitution_inside_a_test_is_read(tmp_path: Path) -> None:
@@ -256,7 +260,7 @@ def test_a_line_gives_one_row_per_distinct_command(tmp_path: Path) -> None:
         (1, "/usr/sbin/svc_a", "literal", None),
         (1, "svc_b", "inline", 1),
     ]
-    assert _launches(tmp_path, "X=$(svc_c)\n") == [(1, "svc_c", "literal", None)]
+    assert _launches(tmp_path, "X=$(svc_c)\n") == [(1, "svc_c", "inline", 1)]
 
 
 def test_a_launch_line_writes_no_extra_risk_row(tmp_path: Path) -> None:
@@ -434,3 +438,77 @@ def test_an_older_database_opened_for_writing_gains_the_columns(tmp_path: Path) 
         tuple(r) for r in conn.execute("SELECT command, via, via_line FROM script_calls")
     ]
     conn.close()
+
+
+# ── a stop line launches nothing; a hand-off to a function elsewhere is recorded apart ─────────
+
+_INIT = """#!/bin/sh
+SERVICE_PATH="/usr/sbin/httpd"
+. /lib/functions/service.sh
+start() {
+    ${SVCDBG}service_start ${SERVICE_PATH} -d
+}
+stop() {
+    service_stop ${SERVICE_PATH}
+    start-stop-daemon -K -x ${SERVICE_PATH} -s SIGKILL
+    start-stop-daemon --stop --exec /usr/sbin/dropbear
+    ls /usr/sbin/httpd
+    start-stop-daemon -S -x /usr/sbin/dropbear
+}
+"""
+
+
+def _handoffs(conn: sqlite3.Connection) -> list[tuple[Any, ...]]:
+    return [
+        tuple(r)
+        for r in conn.execute(
+            "SELECT line_number, binary_path, function, via_line FROM script_handoffs "
+            "ORDER BY line_number"
+        )
+    ]
+
+
+def test_a_stop_line_is_no_launch(tmp_path: Path) -> None:
+    """★ `start-stop-daemon -K` / `--stop` names the binary it stops: no launch row. A `-S` line
+    launches.
+
+    MUTATION (verified RED): read the -x of a stop line as a launch again -> RED."""
+    conn = _db(tmp_path, ("httpd", "dropbear"))
+    conn.execute("INSERT INTO fs_symlinks (link_name) VALUES ('ls')")
+    _ingest(conn, _INIT)
+    assert _rows(conn) == [(12, "/usr/sbin/dropbear", "literal", None)]
+
+
+def test_a_binary_handed_to_a_function_defined_elsewhere_is_recorded_apart_not_launched(
+    tmp_path: Path,
+) -> None:
+    """★ `service_start ${SERVICE_PATH}` (service_start defined in a sourced file) hands httpd to a
+    function this file does not define: recorded in script_handoffs, with the function and the
+    variable's line — not as a launch, so it is no entry evidence. A command of the firmware (`ls`,
+    a link here) hands nothing; get_script_callsites lists the hand-offs apart, as not launches.
+
+    MUTATION (verified RED): record nothing -> RED; take a firmware command for a function ->
+    `ls` reads as a hand-off -> RED."""
+    conn = _db(tmp_path, ("httpd", "dropbear"))
+    conn.execute("INSERT INTO fs_symlinks (link_name) VALUES ('ls')")
+    _ingest(conn, _INIT)
+    assert _handoffs(conn) == [
+        (5, "/usr/sbin/httpd", "service_start", 2),
+        (8, "/usr/sbin/httpd", "service_stop", 2),
+    ]
+    got = facts.get_script_callsites(conn, binary="httpd")
+    assert got["callsites"] == []
+    assert [h["function"] for h in got["handoffs"]] == ["service_start", "service_stop"]
+    assert "not launches" in got["handoffs_note"]
+    index = load_entry_index(conn)
+    assert index.sites_for("httpd", "usr/sbin/httpd") == []  # no entry evidence
+
+
+def test_a_risk_line_in_an_assignment_names_the_command_its_substitution_runs(
+    tmp_path: Path,
+) -> None:
+    """A risk-marked VAR=$(cmd …) line keeps its one row, naming cmd (via inline) — never a row
+    with no command.
+
+    MUTATION (verified RED): keep launched_command's None as the row's command -> RED."""
+    assert _all_rows(tmp_path, "X=$(eval $CMD)\n") == [(1, "eval", "inline", 1)]

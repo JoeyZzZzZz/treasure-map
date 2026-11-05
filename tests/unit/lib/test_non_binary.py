@@ -1209,3 +1209,25 @@ def test_a_line_that_launches_a_firmware_binary_is_recorded(tmp_path: Path) -> N
         ("/usr/bin/agent", 3),
         ("/usr/sbin/svc", 4),
     ]
+
+
+def test_an_action_input_names_no_entered_value() -> None:
+    """★ An <input type=button> or type=reset only triggers an action: its name is no value the
+    user enters, so it is not a form field. A submit or image input names a value the form sends
+    and stays; a name that is a button in one tag and a text field in another stays (from the
+    text field).
+
+    MUTATION (verified RED): collect button / reset inputs again -> RED; drop submit too -> RED."""
+    from treasure_map.lib.analyze.non_binary.web_asset import _extract_form_fields
+
+    page = """
+    <input type="button" name="apply_btn" onclick="go()">
+    <input type='reset' name="clear_form">
+    <input type=submit name="save_settings">
+    <input type="image" name="map_click" src="x.gif">
+    <input type="button" name="lan_ip">
+    <input type="text" name="lan_ip">
+    <button type="submit" name="not_read_here">Go</button>
+    """
+    names = {name for name, _rule in _extract_form_fields(page)}
+    assert names == {"save_settings", "map_click", "lan_ip"}

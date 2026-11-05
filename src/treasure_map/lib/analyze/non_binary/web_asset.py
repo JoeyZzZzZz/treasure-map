@@ -97,13 +97,20 @@ _NVRAM_ASCII_RE = re.compile(
 )
 
 
+# The <input> types whose name carries no value the user enters: a hidden one is a read-only
+# round-trip value, a button or reset one only triggers an action. A submit / image input stays: it
+# names a value the form sends. (A <button> tag is not read here at all.)
+_NOT_ENTRY_INPUT_TYPES = frozenset({"hidden", "button", "reset"})
+
+
 def _extract_form_fields(text: str) -> list[tuple[str, str]]:
     """Extract (field_keyword, source_rule) pairs for USER-EDITABLE web form fields.
 
-    Editable = a <textarea>/<select> (always user-entry), a NON-hidden <input>, a JS form-value
-    assignment, or an nvram_char_to_ascii form-fill. A ``<input type="hidden">`` is a read-only
-    round-trip value (e.g. a firmware-version echo from nvram_get) — DELIBERATELY excluded, so a
-    displayed-but-not-settable key never enters the front-end surface. Deduped on (keyword, rule).
+    Editable = a <textarea>/<select> (always user-entry), an <input> that is not hidden / button /
+    reset, a JS form-value assignment, or an nvram_char_to_ascii form-fill. A
+    ``<input type="hidden">`` is a read-only round-trip value (e.g. a firmware-version echo from
+    nvram_get) — DELIBERATELY excluded, so a displayed-but-not-settable key never enters the
+    front-end surface. Deduped on (keyword, rule).
     """
     out: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -119,8 +126,8 @@ def _extract_form_fields(text: str) -> list[tuple[str, str]]:
 
     for attrs in _INPUT_TAG_RE.findall(text):
         tm = _TYPE_ATTR_RE.search(attrs)
-        if tm is not None and tm.group(1).lower() == "hidden":
-            continue  # a hidden input is a read-only round-trip value, not user-editable
+        if tm is not None and tm.group(1).lower() in _NOT_ENTRY_INPUT_TYPES:
+            continue  # carries no value the user enters (see _NOT_ENTRY_INPUT_TYPES)
         nm = _NAME_ATTR_RE.search(attrs)
         emit(nm.group(1) if nm else None, "input")
     for attrs in _TEXTAREA_TAG_RE.findall(text):
