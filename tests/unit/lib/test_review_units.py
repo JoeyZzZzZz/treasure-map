@@ -833,6 +833,28 @@ def test_the_worksheet_goes_out_and_comes_back_through_the_same_gates(
     assert tuple(ch) == ("worksheet", "human-via-agent")
 
 
+def test_the_worksheet_hides_the_audit_verdict_but_keeps_a_disagreement(world: World) -> None:
+    """★ spec six.7: a worksheet AUDIT item must NOT carry the verdict under audit — seeing it
+    anchors the auditor, whose write then becomes current and closes the audit. A DISAGREEMENT
+    item, settled by seeing the clash, still carries current.
+
+    MUTATION (verified RED): put `current` back on audit items -> it appears on the audit item."""
+    from treasure_map.cli import review_cli
+
+    a_dis = _pair_anchor(DX, "00003000", "00003000")
+    world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
+    world.judge(DX, a_dis, "no_real_change", verdict_basis=_nrc(a_dis), ctx=_ctx("writer"))
+    # a blind shadow that DISAGREES turns a_dis into a disagreement (not an open audit)
+    world.judge(DX, a_dis, "changed_real", shadow=True, ctx=_ctx("auditor"))
+    reading = _review(world, k=0)
+    sheet = review_cli.worksheet(world.atlas, reading, "runA::runB")
+    items = {it["anchor_ref"]: it for it in sheet["items"]}
+    assert items[A1]["why"][0] == "audit"
+    assert "current" not in items[A1]  # blind: the verdict under audit is hidden
+    assert items[a_dis]["why"][0] == "disagreement"
+    assert items[a_dis]["current"] is not None  # a disagreement is settled by seeing both
+
+
 def test_a_batch_naming_its_unit_records_it_and_hands_on_the_next(world: World) -> None:
     """annotate_diff_batch with unit_id writes every item with the unit in its history and answers
     with the next unit; an item outside the unit refuses the batch, nothing written.

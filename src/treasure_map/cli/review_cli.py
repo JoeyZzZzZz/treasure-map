@@ -456,13 +456,16 @@ def worksheet(conn: sqlite3.Connection, reading: Any, run_pair: str) -> dict[str
     }
     items: list[dict[str, object]] = []
     for a in reading.audits.open:
+        # An audit is a BLIND second reading (spec six.7): the auditor must NOT see the verdict
+        # under audit, or they are anchored by it (and their write becomes current and closes the
+        # audit). So an audit item carries no ``current`` — unlike a disagreement below, which is
+        # settled precisely by seeing the conflicting conclusions.
         items.append(
             {
                 "unit_id": a.unit.unit_id,
                 "anchor_ref": a.member.anchor_ref,
                 "scope": _scope(a.member, run_pair),
                 "why": ["audit", *a.sources],
-                "current": current.get(a.member.anchor_ref),
                 **blank,
             }
         )
