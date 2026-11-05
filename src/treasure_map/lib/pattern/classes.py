@@ -9,6 +9,7 @@ generic, public C/libc and common-embedded API names; no vendor-proprietary symb
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -498,8 +499,13 @@ def path_arg_ref(
     return first
 
 
+@functools.lru_cache(maxsize=512)
 def _literal_spans(text: str) -> tuple[tuple[int, int], ...]:
     """(open_quote_index, close_quote_index) for every C string/char literal, escapes honoured.
+
+    Cached here, where it is defined, so every reader that imports it by name shares one cache:
+    the same pseudocode is scanned once, not once per callsite. The answer is a tuple of tuples —
+    immutable, so a cached one can be handed to every caller.
 
     A ``name(`` whose paren falls inside one of these spans is text inside a printed message, not a
     call — the decompiler emits ``syslog(1,"... snprintf() failed")`` verbatim. Used by

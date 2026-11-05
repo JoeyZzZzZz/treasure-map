@@ -1773,3 +1773,22 @@ def test_a_parenthesis_inside_a_literal_does_not_end_the_call() -> None:
     assert not all_format_calls_literal(
         'void f(char *q){ printf(q, "("); printf("ok %d", 1); }', "printf"
     )
+
+
+def test_the_literal_spans_of_a_text_are_read_once_for_every_reader() -> None:
+    """★ The literal-span reading is cached where it is defined, so the readers that import it by
+    name (the per-call readers, the down-weighting, the taint reading) share one cache: a text read
+    again is a hit, not a second scan.
+
+    MUTATION (verified RED): drop the cache -> no cache_info / a miss -> RED."""
+    from treasure_map.lib.hunt import downweight
+    from treasure_map.lib.pattern import classes
+    from treasure_map.lib.reachability import taint
+
+    text = 'syslog(1, "x (y) z"); system(buf);'
+    classes._literal_spans.cache_clear()
+    first = classes._literal_spans(text)
+    assert downweight._literal_spans is classes._literal_spans is taint._literal_spans
+    assert taint._literal_spans(text) is first
+    info = classes._literal_spans.cache_info()
+    assert (info.hits, info.misses) == (1, 1)

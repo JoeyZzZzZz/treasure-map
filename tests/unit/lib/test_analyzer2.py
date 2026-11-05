@@ -4398,3 +4398,26 @@ def test_wrapper_called_through_a_pointer_keeps_the_function_level_candidate(
         "wrapped_sink": "system",
         "addr": "00410000",
     }
+
+
+def test_every_patterns_spread_is_its_live_count_after_runs_and_a_rehunt(tmp_path: Path) -> None:
+    """★ The hunt recounts each pattern it wrote once, at the end of its transaction: after two
+    runs and a re-hunt of the first, every pattern's device_spread equals COUNT(DISTINCT
+    source_run_id) over its instances.
+
+    MUTATION (verified RED): drop the end-of-run recount -> the spreads stay 0 -> RED."""
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer2(db, atlas, source_run_id="run_2")
+    run_analyzer2(db, atlas, source_run_id="run_1", rehunt=True)
+    conn = open_atlas(atlas)
+    try:
+        rows = conn.execute(
+            "SELECT p.device_spread, (SELECT COUNT(DISTINCT i.source_run_id) FROM instance i "
+            "WHERE i.pattern_id = p.pattern_id) FROM pattern p"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows and all(spread == live for spread, live in rows)
+    assert max(spread for spread, _ in rows) == 2

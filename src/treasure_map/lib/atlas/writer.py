@@ -9,6 +9,7 @@ Field names and query examples are neutral; they describe mechanism only.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from treasure_map.lib.atlas.models import (
@@ -46,10 +47,19 @@ def delete_run_instances(
     """Delete all instances of one run (replace-by-run refresh). Returns rows deleted.
 
     Touches ONLY this run_id's instance rows — other runs' append-and-corroborate evidence is
-    untouched, and pattern rows (the shared accumulation layer) are never deleted. With
-    commit=False the delete joins the caller's transaction (so a run refresh is atomic).
+    untouched, and pattern rows (the shared accumulation layer) are never deleted, though the
+    device_spread of each pattern the run held is recounted (a pattern only deleted from, and not
+    written again, must not keep the run in its count). With commit=False the delete joins the
+    caller's transaction (so a run refresh is atomic).
     """
+    held = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT pattern_id FROM instance WHERE source_run_id = ?", (source_run_id,)
+        )
+    ]
     cur = conn.execute("DELETE FROM instance WHERE source_run_id = ?", (source_run_id,))
+    recompute_device_spread(conn, held)
     if commit:
         conn.commit()
     return cur.rowcount
@@ -1083,18 +1093,29 @@ def _recompute_device_spread(conn: sqlite3.Connection, pattern_id: int) -> None:
     )
 
 
+def recompute_device_spread(conn: sqlite3.Connection, pattern_ids: Iterable[int]) -> None:
+    """Recount ``pattern.device_spread`` (COUNT(DISTINCT source_run_id)) for each pattern, once.
+    Not committed: it joins the caller's transaction."""
+    for pid in sorted(set(pattern_ids)):
+        _recompute_device_spread(conn, pid)
+
+
 def add_instance(
     conn: sqlite3.Connection,
     instance: InstanceRow,
     *,
     external_anchor: str | None = None,
     commit: bool = True,
+    recompute: bool = True,
 ) -> int:
     """Insert one instance; return instance_id. Commits unless commit=False.
 
     Validates traceability, source_run_id, origin enum, and L2/L3 anchor requirement.
-    Recomputes pattern.device_spread = COUNT(DISTINCT source_run_id) after insert. commit=False
-    lets the caller batch many inserts (and a preceding delete) into one atomic transaction.
+    Recomputes pattern.device_spread = COUNT(DISTINCT source_run_id) after insert, unless
+    recompute=False: a caller writing a whole run recounts each pattern it touched once, at the
+    end of its transaction (``recompute_device_spread``) — per insert, the recount over the
+    instance table made a run's write quadratic. commit=False lets the caller batch many inserts
+    (and a preceding delete) into one atomic transaction.
     """
     _validate_instance(instance, external_anchor)
 
@@ -1127,7 +1148,8 @@ def add_instance(
             instance.flow_evidence,
         ),
     )
-    _recompute_device_spread(conn, instance.pattern_id)
+    if recompute:
+        _recompute_device_spread(conn, instance.pattern_id)
     if commit:
         conn.commit()
     return int(cur.lastrowid)  # type: ignore[arg-type]
@@ -1185,8 +1207,7 @@ def add_instances(
     )
 
     pattern_ids = {inst.pattern_id for inst in instances}
-    for pid in pattern_ids:
-        _recompute_device_spread(conn, pid)
+    recompute_device_spread(conn, pattern_ids)
     conn.commit()
 
     return AtlasStats(patterns_touched=len(pattern_ids), instances_added=len(instances))

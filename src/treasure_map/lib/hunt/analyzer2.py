@@ -62,6 +62,7 @@ from treasure_map.lib.atlas.writer import (
     delete_run_string_keyed_edges,
     delete_run_web_form_fields,
     finish_run,
+    recompute_device_spread,
     refresh_run_lineage,
     upsert_pattern,
 )
@@ -1435,6 +1436,9 @@ def run_analyzer2(
         # instances are deleted; pattern rows (shared accumulation layer) are not.
         with atlas:
             delete_run_instances(atlas, source_run_id, commit=False)
+            # Each pattern this run writes to has its device_spread recounted ONCE, at the end of
+            # this transaction (recounting after every insert made the write quadratic).
+            touched_patterns: set[int] = set()
             # refresh this run's nvram key-flow rows in the SAME transaction as its
             # instances (replace-by-run: delete own rows, then insert the fresh flatten).
             delete_run_nvram_flow(atlas, source_run_id, commit=False)
@@ -1767,6 +1771,7 @@ def run_analyzer2(
                     fingerprint_algo_version=match.fingerprint_algo_version,
                     commit=False,
                 )
+                touched_patterns.add(pattern_id)
                 add_instance(
                     atlas,
                     InstanceRow(
@@ -1817,6 +1822,7 @@ def run_analyzer2(
                         flow_evidence=flow_evidence,
                     ),
                     commit=False,
+                    recompute=False,
                 )
                 instances_written += 1
                 by_status[status] = by_status.get(status, 0) + 1
@@ -1992,6 +1998,7 @@ def run_analyzer2(
                     fingerprint_algo_version="callseq-v1",
                     commit=False,
                 )
+                touched_patterns.add(pattern_id)
                 add_instance(
                     atlas,
                     InstanceRow(
@@ -2036,10 +2043,12 @@ def run_analyzer2(
                         ),
                     ),
                     commit=False,
+                    recompute=False,
                 )
                 instances_written += 1
                 wrapper_propagated += 1
                 by_status["unknown"] += 1
+            recompute_device_spread(atlas, touched_patterns)
         # The instance write committed cleanly: mark the run 'complete' + record its analysis
         # counts. Reached only if the transaction above did NOT raise (an exception skips this and
         # leaves scan_status='in_progress' — the honest half-finished signal).

@@ -1188,3 +1188,50 @@ def test_a_lookup_by_evidence_ref_uses_an_index(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert "USING INDEX" in plan or "USING COVERING INDEX" in plan, plan
+
+
+def test_a_run_deleted_and_not_written_again_leaves_the_spread(
+    atlas_conn: sqlite3.Connection,
+) -> None:
+    """★ A pattern only deleted from (its run's instances replaced by none of it) no longer counts
+    that run: device_spread follows the live COUNT(DISTINCT source_run_id).
+
+    MUTATION (verified RED): skip the recount on delete -> it stays 2 -> RED."""
+    from treasure_map.lib.atlas.writer import delete_run_instances
+
+    pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
+    for run_id in ("run-A", "run-B"):
+        add_instance(atlas_conn, _base_instance(pid, run_id))
+    delete_run_instances(atlas_conn, "run-B")
+    breadth = atlas_conn.execute(
+        "SELECT device_spread FROM pattern WHERE pattern_id = ?", (pid,)
+    ).fetchone()[0]
+    assert breadth == 1
+
+
+def test_a_run_write_that_fails_halfway_leaves_spread_and_rows_as_they_were(
+    atlas_conn: sqlite3.Connection,
+) -> None:
+    """★ A run's write in one transaction — delete, inserts without per-insert recount, one recount
+    at the end — that raises halfway rolls back whole: the rows and device_spread are what they
+    were, and still agree.
+
+    MUTATION (verified RED): commit the delete on its own -> the run's old row is gone after the
+    rollback while its count stayed -> RED."""
+    from treasure_map.lib.atlas.writer import delete_run_instances, recompute_device_spread
+
+    pid = upsert_pattern(atlas_conn, source_class="sc", sink_class="snk", call_sequence_shape="s")
+    add_instance(atlas_conn, _base_instance(pid, "run-A"))
+    with pytest.raises(RuntimeError), atlas_conn:
+        delete_run_instances(atlas_conn, "run-A", commit=False)
+        add_instance(atlas_conn, _base_instance(pid, "run-A"), commit=False, recompute=False)
+        add_instance(atlas_conn, _base_instance(pid, "run-B"), commit=False, recompute=False)
+        recompute_device_spread(atlas_conn, {pid})
+        raise RuntimeError("the hunt died before its commit")
+    spread = atlas_conn.execute(
+        "SELECT device_spread FROM pattern WHERE pattern_id = ?", (pid,)
+    ).fetchone()[0]
+    live = atlas_conn.execute(
+        "SELECT COUNT(DISTINCT source_run_id) FROM instance WHERE pattern_id = ?", (pid,)
+    ).fetchone()[0]
+    assert (spread, live) == (1, 1)
