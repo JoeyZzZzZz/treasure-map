@@ -751,3 +751,41 @@ def test_w14_bookmarks_recovered_functions_and_export_reads_the_origin() -> None
     prom_at = export.index("PROMOTE_BOOKMARK", export.index("originField"))
     assert rec_at < export.index('"recovered"')
     assert export.index("PROMOTE_RECOVERED", export.index("originField")) < prom_at
+
+
+def test_promotion_counts_and_marks_only_a_function_that_was_not_there() -> None:
+    """★ Source contract for what no compiled fixture reaches. createFunction returns the EXISTING
+    function at an entry, and on the synthetic fixtures no promoted block's entry already holds one
+    (tests/integration/test_extraction_fixtures.py checks the count and the mark where it can). So
+    the shape is pinned here: whether a function was there is read BEFORE the call; one guard holds
+    both the count and the 'promoted' bookmark; the stored ``created`` sums the real counts; the
+    log's pass-1 count and the re-analysis gate keep the raw count.
+
+    MUTATION (verified RED): bypass the guard; bookmark outside it; store the raw sum; log the real
+    pass-1 count; gate re-analysis on the real count."""
+    code = _code(_GHIDRA_DIR / "PromoteUndefined.java")
+    body = code[code.index("private int[] promoteBlocks()") :]
+    body = body[: body.index("return new int[] {tried, createdReal, createdRaw};")]
+    assert body.index("boolean existed = fm.getFunctionAt(entry) != null;") < body.index(
+        "createFunction(entry, null)"
+    )
+    guarded = body[body.index("if (!existed) {") :]
+    guarded = guarded[: guarded.index("}")]
+    assert "createdReal++;" in guarded
+    assert "setBookmark(fn.getEntryPoint(), BookmarkType.INFO, BOOKMARK_CATEGORY" in guarded
+    assert body.count("BOOKMARK_CATEGORY") == 1  # the guarded bookmark is the only one
+    assert "int created = p1[1] + p2[1];" in code
+    assert '+ " pass1_created=" + p1[2]' in code
+    assert "if (p1[2] > 0) {" in code and "if (p2[2] > 0) {" in code
+
+
+def test_the_no_return_restore_writes_the_value_it_saved() -> None:
+    """The restore at the end puts back the value the freeze saved — what Ghidra had, not a fixed
+    one. Pinned in the source: the restored option is never seen by any output (the session's
+    project is deleted after the export), so no fixture can tell.
+
+    MUTATION (verified RED): restore "false" instead of the saved value -> RED."""
+    code = _code(_GHIDRA_DIR / "PromoteUndefined.java")
+    restore = code[code.index("private void restoreNoReturn(String was)") :]
+    restore = restore[: restore.index("\n  }")]
+    assert "setAnalysisOption(currentProgram, NO_RETURN_OPTION, was);" in restore
