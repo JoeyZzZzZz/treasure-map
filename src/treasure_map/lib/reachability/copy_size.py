@@ -112,7 +112,9 @@ _SIZED_COPY: frozenset[str] = frozenset(
 )
 # Copies with an IMPLICIT length = the source string length (no length argument): the source is
 # the second argument, as for strcpy.
-_UNSIZED_COPY: frozenset[str] = frozenset({"strcpy", "stpcpy", "__strcpy_chk", "__stpcpy_chk"})
+_UNSIZED_COPY: frozenset[str] = frozenset(
+    {"strcpy", "wcscpy", "stpcpy", "__strcpy_chk", "__stpcpy_chk"}
+)
 # Copies whose length is an ELEMENT count, not a byte count. sizeof() yields bytes, so sizeof(dst)
 # as one of these lengths is a unit mismatch (it copies element-width times too many bytes), not a
 # proof the write fits — the opposite of the bound a byte copy's sizeof is.
@@ -132,6 +134,8 @@ _CAP_ARG: dict[str, int] = {
     "vsnprintf": 1,  # vsnprintf(dst, CAP, fmt, ap)
     "__snprintf_chk": 1,  # __snprintf_chk(dst, CAP, flag, objsize, fmt, ...)
     "__vsnprintf_chk": 1,  # __vsnprintf_chk(dst, CAP, flag, objsize, fmt, ap)
+    # vswprintf is absent on purpose: its cap counts WIDE characters, so a byte-sized bound such as
+    # sizeof(dst) would read as a bound it is not. Its size reads untraced instead.
 }
 _APPEND_ARG: dict[str, int] = {
     "strncat": 2,  # strncat(dst, src, HOW MUCH TO APPEND)

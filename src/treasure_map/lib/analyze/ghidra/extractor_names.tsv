@@ -29,6 +29,7 @@ execlp	sink_cmd		0					program path; argv follows
 execle	sink_cmd		0					program path; argv follows
 execv	sink_cmd		0					program path; argv vector at arg1
 execvp	sink_cmd		0					program path; argv vector at arg1
+execvpe	sink_cmd		0					program path; argv vector at arg1, environment at arg2
 execve	sink_cmd		0					program path; argv vector at arg1
 doSystem	sink_cmd		0					printf-style command template
 printf	sink_fmt		0
@@ -53,6 +54,7 @@ sprintf	writer_fmt					1		sprintf(dst, fmt, ...)
 vsprintf	writer_fmt					1		vsprintf(dst, fmt, ap)
 snprintf	writer_fmt					2		snprintf(dst, cap, fmt, ...)
 vsnprintf	writer_fmt					2		vsnprintf(dst, cap, fmt, ap)
+vswprintf	writer_fmt					2		vswprintf(dst, cap, fmt, ap): wide characters
 __sprintf_chk	writer_fmt					3		(dst, flag, objsize, fmt, ...)
 __snprintf_chk	writer_fmt					4		(dst, cap, flag, objsize, fmt, ...)
 __vsprintf_chk	writer_fmt					3		(dst, flag, objsize, fmt, ap)
@@ -60,7 +62,9 @@ __vsnprintf_chk	writer_fmt					4		(dst, cap, flag, objsize, fmt, ap)
 strcpy	writer
 strncpy	writer
 strcat	writer
+wcscpy	writer							wide-character strcpy
 strncat	writer
+wcscat	writer							wide-character strcat
 memcpy	writer
 memmove	writer
 stpcpy	writer

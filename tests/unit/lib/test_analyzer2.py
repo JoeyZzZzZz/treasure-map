@@ -4421,3 +4421,55 @@ def test_every_patterns_spread_is_its_live_count_after_runs_and_a_rehunt(tmp_pat
         conn.close()
     assert rows and all(spread == live for spread, live in rows)
     assert max(spread for spread, _ in rows) == 2
+
+
+def test_the_four_recalled_gap_sinks_now_make_candidates(tmp_path: Path) -> None:
+    """★ The exec-path variant (execvpe) is a command sink, and the wide-character copy / append /
+    formatter (wcscpy, wcscat, vswprintf) are buffer writers: each, fed from a source, is now a
+    candidate on its axis. execvpe replaces the process image without a shell, so it carries the
+    no-shell form note, like the rest of the exec family (derived from the registry).
+
+    MUTATION (verified RED): drop the four rows from the name registry -> no candidate -> RED; keep
+    the hand-written exec list -> execvpe reads as a shell sink, no note -> RED."""
+    fns = [
+        {
+            "name": "run_path",
+            "pseudocode": "void run_path(){ char buf[64]; recv(fd,buf,64); "
+            "execvpe(buf, argv, envp); }",
+            "hash": "h_run_path",
+            "callees": ["recv", "execvpe"],
+        },
+        {
+            "name": "copy_wide",
+            "pseudocode": "void copy_wide(){ wchar_t d[8]; wchar_t s[64]; recv(fd,s,64); "
+            "wcscpy(d, s); wcscat(d, s); }",
+            "hash": "h_copy_wide",
+            "callees": ["recv", "wcscpy", "wcscat"],
+        },
+        {
+            "name": "fmt_wide",
+            "pseudocode": "void fmt_wide(){ wchar_t d[8]; char s[64]; recv(fd,s,64); "
+            "vswprintf(d, 8, s, ap); }",
+            "hash": "h_fmt_wide",
+            "callees": ["recv", "vswprintf"],
+        },
+    ]
+    db = _make_db(tmp_path, [{"name": "svcd", "funcs": fns}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_1")
+    conn = open_atlas(atlas)
+    try:
+        rows = conn.execute(
+            "SELECT i.source_anchor, i.sink_anchor, i.blocking_mechanism FROM instance i"
+        ).fetchall()
+    finally:
+        conn.close()
+    sinks = {(r[0], r[1]) for r in rows}
+    assert {
+        ("run_path", "execvpe"),
+        ("copy_wide", "wcscpy"),
+        ("copy_wide", "wcscat"),
+        ("fmt_wide", "vswprintf"),
+    } <= sinks
+    exec_notes = {r[2] for r in rows if r[1] == "execvpe"}
+    assert any(n and "no_shell_exec" in n for n in exec_notes), exec_notes

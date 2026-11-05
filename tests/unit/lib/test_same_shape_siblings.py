@@ -272,7 +272,7 @@ def _build(w: World) -> None:
     w.inst("runA", _ref("runA", "00024000", "copy", "0x10"), "copy", "strcpy", SRC, fp=None)
     w.inst("runA", _ref("runA", "00026000", "copy", "0x10"), "copy", None, SRC)
     # A sink the hunt does not recall, named in a callee list of the binary.
-    w.fn("a", "00030000", ["wcscpy"], name="run_cmd")
+    w.fn("a", "00030000", ["_eval"], name="run_cmd")
     # libx's content in another run: never drawn into a group of this diff.
     w.inst("runC", _ref("runC", "00003000", "copy", "0x10"), "copy", "strcpy", SRC)
     _not_diffed(w)
@@ -767,7 +767,7 @@ def test_the_bounds_are_each_counted(world: World) -> None:
     by path -> libonly, one content at two paths, counts 2. MUTATION (verified RED):
     undetermined_alignment_n not from by_landing.R -> 0."""
     bounds = _group(world, LISTED)["sibling_set_bounds"]
-    assert bounds["recall_gaps"] == {"families": ["wide_char_string"], "state": "read"}
+    assert bounds["recall_gaps"] == {"families": ["argv_runner"], "state": "read"}
     assert bounds["undetermined_alignment_n"] == 1
     assert bounds["binaries_not_diffed"] == {
         "shadowed_by_name_collision": {"binaries": 1, "calls": 1},
@@ -791,10 +791,10 @@ def test_recall_gaps_that_cannot_be_read_are_null_never_empty(
 
     MUTATION (verified RED): return [] when the lists cannot be read -> families [] on an
     unreadable side."""
-    world.fn("a", "00031000", ["vswprintf"], trunc=1)
+    world.fn("a", "00031000", ["_eval"], trunc=1)
     world.commit()
     gaps = _group(world, LISTED)["sibling_set_bounds"]["recall_gaps"]
-    assert gaps == {"families": ["wide_char_string"], "state": "partial:1"}
+    assert gaps == {"families": ["argv_runner"], "state": "partial:1"}
 
     stale = {"source_stale": True, "source_stale_reason": "x", "toolchain_checked": True}
     monkeypatch.setattr(pv, "diff_source_staleness", lambda atlas, diff_id: stale)
@@ -833,14 +833,14 @@ def test_recall_gaps_are_three_state_on_truncation_callees_and_source_stale(
         pv._clear_view_caches()
         return _group(world, LISTED)["sibling_set_bounds"]["recall_gaps"]
 
-    assert gaps() == {"families": ["wide_char_string"], "state": "read"}
+    assert gaps() == {"families": ["argv_runner"], "state": "read"}
 
     # M01: truncation not recorded (NULL) is still partial — the list may have been cut.
     world.adb["a"].execute(
         "UPDATE functions SET callees_truncated = NULL WHERE address = '00030000'"
     )
     world.commit()
-    assert gaps() == {"families": ["wide_char_string"], "state": "partial:1"}
+    assert gaps() == {"families": ["argv_runner"], "state": "partial:1"}
 
     # M02: a callee list that cannot be read (NULL) is partial, and reads no family from it.
     world.adb["a"].execute(

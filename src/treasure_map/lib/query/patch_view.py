@@ -166,9 +166,8 @@ _ROW_GROUPS = ("not_persisted", "size_signal", "rest")
 # callees name one of these is B, never C: there the absence of a candidate is the hunt's blind
 # spot, not a fact about the function. Matched by exact name.
 RECALL_GAP_SINKS: dict[str, tuple[str, ...]] = {
-    "wide_char_string": ("wcscpy", "wcscat", "vswprintf"),
+    # an argv-array runner: its argument 0 is an argv vector, which no sink class reads yet
     "argv_runner": ("_eval",),
-    "exec_path_variant": ("execvpe",),
 }
 # The sink names a callee-set difference is read against (``sink_callee_swap``): the hunt's sink
 # classes, as the extractor registry holds them, plus the sinks it does not recall. Matched by

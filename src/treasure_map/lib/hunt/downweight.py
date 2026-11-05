@@ -44,6 +44,7 @@ from treasure_map.lib.pattern.classes import (
     call_args_at,
     call_offsets,
 )
+from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.reachability.taint import (
     _CALL_HEAD_RE,
     flows_into,
@@ -62,11 +63,10 @@ CONST_SINK_ARG = "const_sink_arg"
 CHARSET_CONSTRAINED = "charset_constrained"
 
 # exec-family sinks that replace the process image directly (execve(2) path) — no shell, so
-# shell metacharacters in an argument are inert. system/popen/doSystem run via a shell and are
-# deliberately NOT here.
-_EXEC_NO_SHELL: frozenset[str] = frozenset(
-    {"execl", "execlp", "execle", "execv", "execvp", "execve"}
-)
+# shell metacharacters in an argument are inert. Derived from the name registry: every command sink
+# that is not a shell-running one (forward_cmd). system/popen/doSystem run via a shell and so are
+# NOT here; a new exec-family row in the registry joins without a second list to edit.
+_EXEC_NO_SHELL: frozenset[str] = frozenset(REGISTRY.sink_cmd) - REGISTRY.forward_cmd
 
 # A shell explicitly launched through an exec sink ("/bin/sh -c <cmd>") is shell-like after all.
 _SHELL_TARGET_RE = re.compile(r'"/bin/sh"|"/bin/bash"|"-c"')
@@ -75,7 +75,7 @@ _SHELL_TARGET_RE = re.compile(r'"/bin/sh"|"/bin/bash"|"-c"')
 # literal first argument is a constant command (const_sink_arg). Exec-family sinks are excluded:
 # their first argument is the program path (a constant path is normal) and the controllable argv
 # is a later argument, so a literal first argument says nothing about the dangerous value.
-_SHELL_RUN_SINKS: frozenset[str] = frozenset({"system", "popen", "doSystem"})
+_SHELL_RUN_SINKS: frozenset[str] = REGISTRY.forward_cmd  # the registry's shell-running sinks
 
 # Shell-running sinks whose first argument is a printf-style TEMPLATE, the command being the
 # template with its varargs spliced in: doSystem("ifconfig %s up", name) runs whatever name holds.

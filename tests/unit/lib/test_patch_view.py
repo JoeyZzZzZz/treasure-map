@@ -323,7 +323,7 @@ def _rich(w: World) -> None:
     # A changed pair with no candidate that calls a sink the hunt does not recall.
     w.pair("0001c000", "0001d000", 0.97, 0.6)
     w.fn("a", "0001c000", ["strlen"])
-    w.fn("b", "0001d000", ["strlen", "wcscpy"])
+    w.fn("b", "0001d000", ["strlen", "_eval"])
     # Undetermined pairs, without and with a candidate.
     w.pair("0001e000", "0001f000", 0.5, 0.4)
     w.pair("00020000", "00021000", 0.5, 0.4)
@@ -1303,11 +1303,10 @@ def test_an_undetermined_pair_is_r_with_or_without_a_candidate(world: World) -> 
 
 
 def test_the_gap_lists_are_fixed() -> None:
-    assert pv.RECALL_GAP_SINKS == {
-        "wide_char_string": ("wcscpy", "wcscat", "vswprintf"),
-        "argv_runner": ("_eval",),
-        "exec_path_variant": ("execvpe",),
-    }
+    """The one sink family the hunt still does not recall: the argv-array runner. The wide-character
+    copy / append / formatter and the exec-path variant are recalled (the name registry lists them),
+    so a reader is not told the hunt is blind there."""
+    assert pv.RECALL_GAP_SINKS == {"argv_runner": ("_eval",)}
     assert pv.SOURCE_GAP_PREFIXES == {"uci_ubus": ("uci_", "ubus_")}
 
 
@@ -1315,10 +1314,10 @@ def test_a_sink_the_hunt_does_not_recall_keeps_a_pair_out_of_c(world: World) -> 
     e = _entry(world, _pair_id("0001c000", "0001d000"))
     assert (e["bucket"], e["subclass"], e["tier"]) == (
         "B",
-        "recall_gap_sink:wide_char_string",
+        "recall_gap_sink:argv_runner",
         "no_sink",
     )
-    assert "recall_gap_sink:wide_char_string" in e["blind_spots"]
+    assert "recall_gap_sink:argv_runner" in e["blind_spots"]
 
 
 def test_an_unmodelled_source_is_only_a_tag(world: World) -> None:
@@ -1898,7 +1897,7 @@ def test_an_entry_with_no_candidate_comes_after_every_entry_with_one() -> None:
     b0 = _e("B", 0, "instruction_unmatched", addr="b0")
     r_none = _e("R", "no_sink", "alignment_low_confidence", sim=0.0, addr="r_none")
     c = _e("C", "no_sink", "no_sink_candidate", sim=0.0, addr="c")
-    gap = _e("B", "no_sink", "recall_gap_sink:wide_char_string", sim=0.9, addr="gap")
+    gap = _e("B", "no_sink", "recall_gap_sink:argv_runner", sim=0.9, addr="gap")
     unchecked = _e("C", "no_sink", "no_sink_candidate_unchecked", sim=0.9, addr="unchecked")
     p = _e("P", 3, "unmatched_analysis_complete", addr="p")
     assert _order(p, c, unchecked, r_none, gap, b0) == [

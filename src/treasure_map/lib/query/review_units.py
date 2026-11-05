@@ -58,8 +58,8 @@ MAX_K = 200
 # A batch unit holds at most this many members: what one annotate_diff_batch call takes.
 BATCH_MAX = 200
 
-# The sinks whose fewer calls on the B side make an aligned pair must-read: the command class and
-# the command-like families the hunt does not recall (argv_runner, exec_path_variant).
+# The sinks whose fewer calls on the B side make an aligned pair must-read: the command class (the
+# exec-path variant among it) and the argv-array runner the hunt does not recall.
 COMMAND_CALL_SINKS: frozenset[str] = frozenset(classes.CMD) | frozenset({"_eval", "execvpe"})
 
 REASONS = (

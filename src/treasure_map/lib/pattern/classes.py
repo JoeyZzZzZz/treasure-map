@@ -126,6 +126,8 @@ FORMAT: frozenset[str] = frozenset(
         "vsprintf",
         "strcat",
         "strncat",
+        "wcscat",
+        "vswprintf",
         "__sprintf_chk",
         "__snprintf_chk",
         "__vsprintf_chk",
@@ -152,6 +154,7 @@ COPY: frozenset[str] = frozenset(
     {
         "strcpy",
         "strncpy",
+        "wcscpy",
         "memcpy",
         "memmove",
         "mempcpy",

@@ -147,7 +147,11 @@ _ADDED_WRITERS = frozenset(
         "__vsnprintf_chk",
     }
 )
-_ADDED_WRITER_FMTARG = {"__vsprintf_chk": 3, "__vsnprintf_chk": 4}
+_ADDED_WRITER_FMTARG = {"__vsprintf_chk": 3, "__vsnprintf_chk": 4, "vswprintf": 2}
+# The recall gaps the hunt now recalls (they were read-face gap families until then): the exec-path
+# variant as a command sink, the wide-character copy / append / formatter as buffer writers.
+_ADDED_SINK_KEYARG = {"execvpe": 0}
+_ADDED_WIDE_WRITERS = frozenset({"wcscpy", "wcscat", "vswprintf"})
 _ADDED_NVRAM = {"nvram_bufget": ("read", 1, -1, -1), "nvram_bufset": ("write", 1, -1, 2)}
 _PREDICATE_READS = frozenset(
     {"nvram_contains_word", "nvram_pf_match", "nvram_is_empty", "nvram_get_bitflag"}
@@ -158,12 +162,12 @@ def test_the_sink_lexicon_moved_unchanged() -> None:
     """Every provenance sink and its key position, exactly as hard-coded before.
 
     MUTATION (verified RED): change fprintf's key_idx to 0 in the TSV -> mismatch."""
-    assert {**REGISTRY.sink_cmd, **REGISTRY.sink_fmt} == _OLD_SINK_KEYARG
+    assert {**REGISTRY.sink_cmd, **REGISTRY.sink_fmt} == _OLD_SINK_KEYARG | _ADDED_SINK_KEYARG
     assert not set(REGISTRY.sink_cmd) & set(REGISTRY.sink_fmt)
 
 
 def test_the_writer_lists_grew_by_exactly_the_intended_names() -> None:
-    assert REGISTRY.writers == _OLD_WRITERS | _ADDED_WRITERS
+    assert REGISTRY.writers == _OLD_WRITERS | _ADDED_WRITERS | _ADDED_WIDE_WRITERS
     assert dict(REGISTRY.writer_fmt) == _OLD_WRITER_FMTARG | _ADDED_WRITER_FMTARG
 
 
