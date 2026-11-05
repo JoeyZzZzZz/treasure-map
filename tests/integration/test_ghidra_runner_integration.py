@@ -44,3 +44,17 @@ def test_run_ghidra_real_binary(tmp_path: Path) -> None:
     assert "exports" in data
     assert "strings" in data
     assert isinstance(data["functions"], list)
+
+    # Reference lists come out in a total order — by source address — so the same binary extracted
+    # twice yields the same bytes (Ghidra's getReferencesTo iterates in no fixed order). This
+    # fixture holds a string and functions referenced from several places, so the order is real.
+    # MUTATION (verified RED): emit the references in iteration order -> one list of each kind
+    # comes out unsorted on this fixture.
+    def addresses(rows: list[dict[str, str]], key: str) -> list[int]:
+        return [int(r[key], 16) for r in rows]
+
+    ref_lists = [addresses(s["refs"], "ref_at") for s in data["string_refs"]["strings"]]
+    take_lists = [addresses(f["address_taken"]["edges"], "taken_at") for f in data["functions"]]
+    assert any(len(x) > 1 for x in ref_lists) and any(len(x) > 1 for x in take_lists)
+    assert all(x == sorted(x) for x in ref_lists)
+    assert all(x == sorted(x) for x in take_lists)

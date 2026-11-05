@@ -1507,6 +1507,35 @@ public class ExportFunctions extends GhidraScript {
         return "0x" + Long.toHexString(a.getOffset());
     }
 
+    // One reference record awaiting output: its source address (the sort key) and its JSON.
+    private static final class RefRow {
+        final long at;
+        final String json;
+        RefRow(long at, String json) { this.at = at; this.json = json; }
+    }
+
+    // Reference lists are emitted in a TOTAL order (source address, then the record text), sorted
+    // BEFORE the cap is applied. ReferenceManager.getReferencesTo iterates in no fixed order, so the
+    // same binary analysed twice listed the same references in a different order — and, past a
+    // cap, kept a different subset. Sorting first makes the record a pure function of the
+    // references. Out-param: refRowsTruncated (more rows than the cap).
+    private boolean refRowsTruncated;
+
+    private String sortedRefRows(List<RefRow> rows, int cap) {
+        rows.sort((x, y) -> {
+            int c = Long.compareUnsigned(x.at, y.at);
+            return c != 0 ? c : x.json.compareTo(y.json);
+        });
+        refRowsTruncated = rows.size() > cap;
+        StringBuilder arr = new StringBuilder("[");
+        int n = Math.min(cap, rows.size());
+        for (int i = 0; i < n; i++) {
+            if (i > 0) arr.append(",");
+            arr.append(rows.get(i).json);
+        }
+        return arr.append("]").toString();
+    }
+
     // ADDRTAKEN_LIMIT caps one function's address-taken record. When hit, the extra takes are NOT
     // silently dropped: truncated=true flags the record (same silent-drop red line as callees).
     private static final int ADDRTAKEN_LIMIT = 100;
@@ -1528,9 +1557,7 @@ public class ExportFunctions extends GhidraScript {
         FunctionManager  fm      = currentProgram.getFunctionManager();
         Memory           mem     = currentProgram.getMemory();
         SymbolTable       symtab  = currentProgram.getSymbolTable();
-        StringBuilder arr = new StringBuilder("[");
-        boolean first = true, truncated = false;
-        int count = 0;
+        List<RefRow> rows = new ArrayList<>();
         ReferenceIterator it = refMgr.getReferencesTo(entry);
         while (it.hasNext()) {
             Reference ref = it.next();
@@ -1548,7 +1575,6 @@ public class ExportFunctions extends GhidraScript {
             // rule still holds.
             MemoryBlock fromBlk = mem.getBlock(from);
             if (fromBlk == null || !fromBlk.isInitialized()) continue;
-            if (count >= ADDRTAKEN_LIMIT) { truncated = true; break; }
             Function inFunc = fm.getFunctionContaining(from);
             String takenInName = (inFunc != null) ? inFunc.getName() : null;
             String takenInAddr = (inFunc != null) ? addrHex(inFunc.getEntryPoint()) : null;
@@ -1556,8 +1582,7 @@ public class ExportFunctions extends GhidraScript {
             Symbol nsym = symtab.getPrimarySymbol(from);
             String nearby = (nsym != null && nsym.getName() != null && !nsym.getName().isEmpty())
                             ? nsym.getName() : null;
-            if (!first) arr.append(",");
-            first = false;
+            StringBuilder arr = new StringBuilder();
             arr.append("{\"taken_at\":\"").append(esc(addrHex(from))).append("\"")
                .append(",\"taken_in_func\":")
                .append(takenInName != null ? "\"" + esc(takenInName) + "\"" : "null")
@@ -1567,10 +1592,10 @@ public class ExportFunctions extends GhidraScript {
                .append(",\"nearby_symbol\":")
                .append(nearby != null ? "\"" + esc(nearby) + "\"" : "null")
                .append("}");
-            count++;
+            rows.add(new RefRow(from.getOffset(), arr.toString()));
         }
-        arr.append("]");
-        return "{\"edges\":" + arr + ",\"truncated\":" + truncated + "}";
+        String edges = sortedRefRows(rows, ADDRTAKEN_LIMIT);
+        return "{\"edges\":" + edges + ",\"truncated\":" + refRowsTruncated + "}";
     }
 
     // The source-segment LABEL for an address holding F's pointer — METADATA to tell a static table
@@ -1632,9 +1657,7 @@ public class ExportFunctions extends GhidraScript {
         ReferenceIterator it = refMgr.getReferencesTo(stringAddr);
         if (!it.hasNext()) return null;   // early out: the overwhelmingly common unreferenced string
         int cap = Math.min(STRINGREF_PER_STRING_LIMIT, budget);
-        StringBuilder arr = new StringBuilder("[");
-        boolean first = true;
-        int count = 0;
+        List<RefRow> rows = new ArrayList<>();
         while (it.hasNext()) {
             Reference ref = it.next();
             RefType rt = ref.getReferenceType();
@@ -1649,12 +1672,10 @@ public class ExportFunctions extends GhidraScript {
             // literal pool, .data, .got — has a block, so no segment is lost.
             MemoryBlock fromBlk = mem.getBlock(from);
             if (fromBlk == null || !fromBlk.isInitialized()) continue;
-            if (count >= cap) { srefTruncated = true; break; }
             Function inFunc = fm.getFunctionContaining(from);
             String inName = (inFunc != null) ? inFunc.getName() : null;
             String inAddr = (inFunc != null) ? addrHex(inFunc.getEntryPoint()) : null;
-            if (!first) arr.append(",");
-            first = false;
+            StringBuilder arr = new StringBuilder();
             arr.append("{\"ref_at\":\"").append(esc(addrHex(from))).append("\"")
                .append(",\"ref_in_func\":")
                .append(inName != null ? "\"" + esc(inName) + "\"" : "null")
@@ -1662,13 +1683,14 @@ public class ExportFunctions extends GhidraScript {
                .append(inAddr != null ? "\"" + esc(inAddr) + "\"" : "null")
                .append(",\"segment\":\"").append(esc(segmentLabel(fromBlk))).append("\"")
                .append("}");
-            count++;
+            rows.add(new RefRow(from.getOffset(), arr.toString()));
         }
-        arr.append("]");
-        if (count == 0) return null;   // every reference to it was control flow / loader noise
-        srefEmitted = count;
+        if (rows.isEmpty()) return null;   // every reference to it was control flow / loader noise
+        String refs = sortedRefRows(rows, cap);
+        srefTruncated = refRowsTruncated;
+        srefEmitted = Math.min(cap, rows.size());
         return "{\"string_addr\":\"" + esc(addrHex(stringAddr)) + "\",\"value\":\"" + esc(value)
-             + "\",\"refs\":" + arr + ",\"truncated\":" + srefTruncated + "}";
+             + "\",\"refs\":" + refs + ",\"truncated\":" + srefTruncated + "}";
     }
 
     private Address safeAdd(Address a, long delta) {
