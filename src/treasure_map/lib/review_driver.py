@@ -201,7 +201,8 @@ def run_agent(argv: Sequence[str], *, cwd: Path, timeout: float, keep_full: bool
     """Run one agent launch in its own process group, killed whole at ``timeout``. A per-unit
     launch keeps only the tail of the output (the judgement is read from the overlay history, not
     the text); the hand-off launch (``keep_full``) keeps all of it, because the driver reads the
-    finished document out of it — the agent, with every built-in tool off, cannot write a file."""
+    agent's analysis texts out of it — the agent, with every built-in tool off, cannot write a
+    file."""
     env = {k: v for k, v in os.environ.items() if k not in _PARENT_AGENT_ENV}
     t0 = time.monotonic()
     proc = subprocess.Popen(  # noqa: S603 — the user's own agent command line
@@ -460,47 +461,101 @@ def drive(
 
 # ── the findings hand-off launch (B-5) ──────────────────────────────────────────────────────────
 # A FINAL launch, run once the review is done (no unit left): one agent reads the whole findings
-# skeleton through the MCP tool get_diff_handoff, fills the analysis placeholders and prints the
-# finished document. Its full output is kept and the driver reads the document out of it — the
-# agent, with every built-in tool off, cannot write a file. Only claude-code's result is extracted
-# this version; an experimental preset is refused, never served a silent miss.
+# skeleton through the MCP tool get_diff_handoff and prints, as its final message, only its two
+# analysis texts per finding — a JSON object keyed by anchor_ref. The driver writes the document
+# itself: handoff_document (the CLI's function) with those texts under each block's placeholders,
+# so every fact line, the basis and the status are tmap's own text, never the agent's retyping. Its
+# full output is kept and read out of it — the agent, with every built-in tool off, cannot write a
+# file. Only claude-code's result is read this version; an experimental preset is refused, never
+# served a silent miss.
 HANDOFF_PRESETS = frozenset({"claude-code"})
+# The two texts the agent writes per finding, under the block's two placeholders.
+HANDOFF_FIELDS = ("hypotheses", "device_checks")
 
 
 def handoff_prompt(run_pair: str) -> str:
-    """The hand-off agent's prompt (B-7): read the skeleton, fill hypotheses and device checks,
-    print the whole document — and the boundary, never a working attack."""
+    """The hand-off agent's prompt (B-7): read the skeleton, write hypotheses and device checks per
+    finding as one JSON object — and the boundary, never a working attack."""
     return (
         f"You are writing the findings hand-off for the firmware version diff {run_pair} with the "
         "tmap tools. tmap draws no conclusion: the analysis is yours, and it is unverified. "
         f'1. Page the whole skeleton: get_diff_handoff(run_pair="{run_pair}", offset=0), then '
         "follow next_offset until it is null (re-start from offset 0 if findings_digest changes). "
-        "2. It has one block per finding, each with tmap's facts and two analysis placeholders. "
-        "Under 'agent analysis — unverified hypotheses' write your unverified hypotheses; under "
-        "'to check on a device' write concrete things a person could verify on a device. Keep "
-        "every other line as it is. 3. Print the COMPLETE document — every block, in order — as "
-        "your final message, and nothing else. " + _rr.HANDOFF_BOUNDARY
+        "2. It has one block per finding, headed by its anchor_ref (the text inside ## `...`), "
+        "each with tmap's facts and two analysis placeholders: 'agent analysis — unverified "
+        "hypotheses' and 'to check on a device'. 3. Your final message is ONE JSON object and "
+        "nothing else: each key a block's anchor_ref exactly as written, each value "
+        '{"hypotheses": "<your unverified hypotheses>", "device_checks": "<concrete things a '
+        'person could verify on a device>"}. Do not repeat the facts — tmap writes the document '
+        "and puts your two texts under each block's placeholders. " + _rr.HANDOFF_BOUNDARY
     )
 
 
-def extract_handoff(preset: Preset, launch: Launch) -> tuple[str | None, str | None]:
-    """The finished document from a hand-off launch's output, or ``(None, error)``. claude-code
-    prints ``--output-format json`` whose ``result`` is the agent's final message; other presets
-    print it differently and are not supported this version (B-5) — refused, never a silent miss."""
+def _strip_fence(text: str) -> str:
+    """``text`` without one code fence around it (```json … ```), as an agent may wrap JSON."""
+    body = text.strip()
+    if body.startswith("```") and body.endswith("```") and "\n" in body:
+        body = body[body.index("\n") + 1 : -3].strip()
+    return body
+
+
+def parse_handoff_analysis(text: str) -> tuple[dict[str, dict[str, str]] | None, str | None]:
+    """The agent's ``{anchor_ref: {"hypotheses": …, "device_checks": …}}`` from its final message,
+    or ``(None, error)``: not JSON, not an object, a value not an object, a field that is not text
+    or a key that is neither field — each refused, never half-read."""
+    try:
+        data = json.loads(_strip_fence(text))
+    except ValueError as exc:
+        return None, f"the agent's final message is not the JSON object asked for ({exc})"
+    if not isinstance(data, dict):
+        return None, "the agent's final message is JSON but not an object keyed by anchor_ref"
+    out: dict[str, dict[str, str]] = {}
+    for anchor, value in data.items():
+        if not isinstance(value, dict):
+            return None, f"the value for {str(anchor)[:120]!r} is not an object"
+        extra = sorted(set(value) - set(HANDOFF_FIELDS))
+        if extra:
+            return None, f"the value for {str(anchor)[:120]!r} has keys {extra} besides the two"
+        texts: dict[str, str] = {}
+        for name in HANDOFF_FIELDS:
+            v = value.get(name, "")
+            if not isinstance(v, str):
+                return None, f"{name} for {str(anchor)[:120]!r} is not text"
+            texts[name] = v
+        out[str(anchor)] = texts
+    return out, None
+
+
+def extract_handoff(
+    preset: Preset, launch: Launch
+) -> tuple[dict[str, dict[str, str]] | None, str | None]:
+    """The agent's analysis texts from a hand-off launch's output, or ``(None, error)``. claude-code
+    prints ``--output-format json``: the launch must have exited 0 and its JSON say ``is_error``
+    false and ``subtype`` "success"; its ``result`` (the agent's final message) is then read by
+    parse_handoff_analysis. Other presets print it differently and are not supported this version
+    (B-5) — refused, never a silent miss."""
     if preset.name not in HANDOFF_PRESETS:
         return None, (
-            f"the hand-off reads the finished document from the launch output, which only the "
+            f"the hand-off reads the agent's analysis from the launch output, which only the "
             f"claude-code preset is supported for this version; {preset.name!r} is experimental "
             "and prints its result another way"
         )
+    if launch.exit != 0:
+        return None, f"the hand-off launch exited {launch.exit}"
     try:
         data = json.loads(launch.output)
     except (TypeError, ValueError) as exc:
         return None, f"the launch did not print the expected JSON result ({exc})"
-    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None, "the launch's JSON is not an object"
+    if data.get("is_error") is not False:
+        return None, f"the launch reported an error: {str(data.get('result'))[:300]}"
+    if data.get("subtype") != "success":
+        return None, f"the launch ended with subtype {data.get('subtype')!r}, not 'success'"
+    result = data.get("result")
     if not isinstance(result, str) or not result.strip():
         return None, "the launch's JSON carried no 'result' text"
-    return result, None
+    return parse_handoff_analysis(result)
 
 
 def run_handoff(
@@ -513,9 +568,13 @@ def run_handoff(
     timeout: float = DEFAULT_TIMEOUT,
     runner: Callable[..., Launch] = run_agent,
 ) -> dict[str, Any]:
-    """Launch the hand-off agent and write the document it prints to ``out_file``. The agent reads
-    only through get_diff_handoff; its full output is kept (``keep_full``) and the document read out
-    of it. An experimental preset is refused before the launch (B-5)."""
+    """Launch the hand-off agent, then write the document to ``out_file``: handoff_document (the
+    CLI's function) with the agent's texts under each block's placeholders — a finding it wrote
+    nothing for says so. Nothing is written when the launch failed or reported an error, or when
+    its texts name an anchor the hand-off does not hold. An experimental preset is refused before
+    the launch (B-5)."""
+    from treasure_map.lib.atlas.connection import open_atlas
+
     if preset.name not in HANDOFF_PRESETS:
         return {"ok": False, "error": extract_handoff(preset, Launch(0, 0.0, False))[1]}
     values = _values(preset, atlas_path, workdir, handoff_prompt(run_pair), "handoff", run_pair)
@@ -526,8 +585,33 @@ def run_handoff(
             "error": "the hand-off launch hit its deadline",
             "seconds": launch.seconds,
         }
-    document, err = extract_handoff(preset, launch)
-    if document is None:
+    analysis, err = extract_handoff(preset, launch)
+    if analysis is None:
         return {"ok": False, "error": err}
+    atlas = open_atlas(atlas_path)
+    try:
+        stamp, file_staleness = _rr.local_handoff_context(atlas)
+        findings = _rr.handoff_findings(atlas, run_pair, file_staleness=file_staleness)
+        known = {str(f["anchor_ref"]) for f in findings}
+        extra = sorted(set(analysis) - known)
+        if extra:
+            return {
+                "ok": False,
+                "error": (
+                    f"the agent wrote for {len(extra)} anchor(s) the hand-off does not hold "
+                    f"(first: {extra[0][:200]!r}); nothing was written"
+                ),
+            }
+        document = _rr.handoff_header(run_pair, len(findings)) + "".join(
+            _rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=analysis)
+        )
+    finally:
+        atlas.close()
     out_file.write_text(document, encoding="utf-8")
-    return {"ok": True, "out_file": str(out_file), "bytes": len(document)}
+    return {
+        "ok": True,
+        "out_file": str(out_file),
+        "bytes": len(document),
+        "findings": len(findings),
+        "nothing_written": len(known - set(analysis)),
+    }

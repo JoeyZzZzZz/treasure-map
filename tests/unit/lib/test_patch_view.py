@@ -7594,6 +7594,7 @@ _START_KEYS = {
     "diff_id",
     "server",
     "workflow",
+    "whole_pair",
     "meta",
     "headline",
     "headline_note",
@@ -7630,8 +7631,12 @@ def test_start_diff_review_is_the_view_and_the_meta_as_they_are(
     ``read_next.more`` is the call for the summary's next page (copied, it reads that page) and is
     absent when there is none.
 
+    ``whole_pair`` is the one key of its own: the pair's start_diff_review call, filled in from
+    the diff id (never a placeholder).
+
     MUTATION (verified RED, 1 failed — this test alone): put a key of its own into ``view`` ->
-    RED; MUTATION (verified RED, 1 failed): read the headline without rows_limit=0 -> RED."""
+    RED; MUTATION (verified RED, 1 failed): read the headline without rows_limit=0 -> RED;
+    MUTATION (verified RED, 1 failed): give whole_pair the '<run_a>::<run_b>' placeholder -> RED."""
     w = _summary_world(tmp_path)
     _a_entry_first(w)  # a headline with rows, so rows_limit=0 shows
     tools = mcp_app.make_tools(w.path)
@@ -7642,6 +7647,7 @@ def test_start_diff_review_is_the_view_and_the_meta_as_they_are(
         assert "error" not in out and "over_budget" not in out, out
         assert set(out) <= _START_KEYS and "headline_note" not in out
         assert out["workflow"] == DIFF_WORKFLOW
+        assert out.get("whole_pair") == "start_diff_review(run_pair='runA::runB')"
         view = view_tool(DIFF, detail="summary", limit=limit)
         assert json.dumps(out["view"]) == json.dumps(view)
         head = pv.get_diff_patch_view(w.atlas, DIFF, limit=1, rows_limit=0)["entries"][0]
@@ -7832,10 +7838,12 @@ def test_start_diff_review_is_registered_read_only_beside_the_view() -> None:
     assert names.index("start_diff_review") + 1 == names.index("get_diff_patch_view")
     assert mcp_app.tool_annotations("start_diff_review").readOnlyHint is True
     doc = " ".join((tools["start_diff_review"].__doc__ or "").split())
-    assert doc.startswith(
+    # The whole pair first, then one diff.
+    assert doc.startswith("START HERE for the whole pair with ``run_pair``")
+    assert (
         "START HERE for one diff: the entries to read first and the calls to read and judge them — "
         "composed from get_diff_patch_view and get_diff_meta, nothing computed of its own."
-    )
+    ) in doc
     assert (tools["get_diff_patch_view"].__doc__ or "").startswith(
         "The function patch view of one diff"
     )

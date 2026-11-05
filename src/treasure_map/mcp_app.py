@@ -112,7 +112,8 @@ from treasure_map.lib.query.diff_align import (
 )
 from treasure_map.lib.query.diff_align import staleness_summary as _staleness_summary
 from treasure_map.lib.query.diff_align import toolchain_checked as _toolchain_checked
-from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW
+from treasure_map.lib.query.diff_workflow import DIFF_ONE_DIFF, DIFF_WORKFLOW
+from treasure_map.lib.query.diff_workflow import PAIR_WORKFLOW as _PAIR_WORKFLOW
 from treasure_map.lib.query.patch_view import ROWS_INLINE_LIMIT as _ROWS_INLINE_LIMIT
 from treasure_map.lib.query.patch_view import get_diff_patch_view as _get_diff_patch_view
 from treasure_map.lib.query.same_shape_siblings import (
@@ -169,10 +170,23 @@ _MAX_LIMIT = 200
 _RESPONSE_BYTE_BUDGET = 48_000
 
 # The findings hand-off blocks of a run pair, cached in the process so paging get_diff_handoff does
-# not rebuild every diff's view per page (B-4). Keyed by the pair; the value is (digest, blocks),
-# the digest the count and newest updated_at of the pair's changed_real judgements — a new judgement
-# changes it and the blocks are rebuilt. ``blocks[0]`` is the header, then one block per finding.
-_HANDOFF_CACHE: dict[str, tuple[str, list[str]]] = {}
+# not rebuild every diff's view per page (B-4). Keyed by (the atlas's resolved path, the pair); the
+# value is (digest, blocks), the digest a sha256 of the pair's findings as each page reads them
+# (verdict, rationale, basis, review state, source staleness, updated_at): any change to one —
+# a rewrite within the same second, a swapped judgement, a basis that moved — rebuilds the blocks.
+# ``blocks[0]`` is the header, then one block per finding.
+_HANDOFF_CACHE: dict[tuple[str, str], tuple[str, list[str]]] = {}
+
+# How much of a caller-supplied string an error echoes back.
+_ECHO_LIMIT = 200
+
+
+def _echo(value: Any) -> Any:
+    """``value`` as an error echoes it: a string longer than _ECHO_LIMIT is cut, with its length."""
+    if isinstance(value, str) and len(value) > _ECHO_LIMIT:
+        return f"{value[:_ECHO_LIMIT]}… ({len(value)} chars)"
+    return value
+
 
 # D33: the default for a refusal's ``moved`` argument meaning "compute _server_code_moved here".
 # A tool that already probed the disk for its ``server`` head passes the value in instead, so the
@@ -443,13 +457,10 @@ _START_META_KEYS = (
 )
 # A binary_presence unit's material: its binary's first candidates in the triage order.
 _PRESENCE_TOP = 20
-_PAIR_WORKFLOW = (
-    "Read next_unit.material (start_diff_review(run_pair, unit=<unit_id>) reads one unit alone), "
-    "judge each member with annotate_diff(anchor_ref, verdict, ..., diff_id=<its diff>) — or "
-    "annotate_diff_batch for a batch, run_pair=... for a binary_presence binary or a file — then "
-    "call start_diff_review(run_pair) again: the next unit follows. The report counts what is "
-    "disposed; an unjudged member is UNREAD, which is not 'nothing found'. Once the review is "
-    "done, get_diff_handoff(run_pair) pages a standardized hand-off of the changed_real findings."
+# A diff write made before anything of its subject was read: what that reads as, on its answer.
+_JUDGED_UNREAD = (
+    "written before anything of its subject was read: it reads needs_recheck (not disposed) "
+    "until judged again after reading the subject (its unit's material, or the entry in full)"
 )
 _HEADLINE_WITHHELD = "diff_undetermined (meta.banners)"
 _HEADLINE_NONE = "no listed entry"
@@ -529,6 +540,21 @@ def _fit_members(result: dict[str, Any], offset: int) -> dict[str, Any]:
 # legal_notice tool). A client shows only the first few thousand characters of a server's
 # instructions, so the server sends the shorter _AGENT_INSTRUCTIONS below and serves this whole text
 # through get_tool_reference(name="guide").
+
+
+def _blind_audit_sentence(enabled: bool) -> str:
+    """The guide's one sentence on blind auditing, from review_units.BLIND_AUDIT_ENABLED, so the
+    guide cannot say it is sealed while it is on, or the other way round."""
+    if enabled:
+        return (
+            "(A no_real_change / change_inconclusive is read a second time, blind, by another "
+            "session: an audit unit, closed by an agreeing blind reading.) "
+        )
+    return (
+        "(A blind second reading of a no_real_change / change_inconclusive is sealed off for now.) "
+    )
+
+
 _AGENT_GUIDE = (
     "Treasure Map exposes a firmware analysis knowledge base as read-only fact tools, plus five "
     "that write only YOUR judgments onto an overlay (annotate, annotate_diff, "
@@ -593,7 +619,8 @@ _AGENT_GUIDE = (
     "with it off. list_overlays(run_id=...) reviews what you concluded last time and flags any "
     "whose underlying facts have since moved. A row already marked in_exploit_ledger was confirmed "
     "by a person — you cannot write that (people do, from the command line), and it is usually not "
-    "worth re-verifying. DIFF: " + DIFF_WORKFLOW + " get_diff_patch_view(diff_id) — "
+    "worth re-verifying. DIFF: " + DIFF_ONE_DIFF + " " + DIFF_WORKFLOW + " "
+    "get_diff_patch_view(diff_id) — "
     "rows_limit=0 scans the ranking with each entry's summary and inline_hunk (the changed lines "
     "themselves, as the original text has them, or why withheld: read get_pseudocode then), and "
     "detail='summary' gives each entry only its counts plus the anchor template (walk the whole "
@@ -653,8 +680,8 @@ _AGENT_GUIDE = (
     "disposed) until a later judgment written after reading it; a judgment a second session "
     "overwrites with a different verdict is a disagreement, settled by a person (tmap review judge "
     "/ tmap review audit). needs_recheck subjects and disagreements hold must_read_complete false. "
-    "(A blind second reading of a no_real_change / change_inconclusive is sealed off for now.) "
-    "A callee_group unit holds the entries that newly call one "
+    + _blind_audit_sentence(_ru.BLIND_AUDIT_ENABLED)
+    + "A callee_group unit holds the entries that newly call one "
     "function (its code on both sides given once): judge each with group_ref=<its group_ref>, "
     "and the callee's own entry too; the reduce unit, handed out last, names what still lacks "
     "it. A reduce owed holds must_read_complete false. Once the review is done, "
@@ -1204,7 +1231,8 @@ def make_tools(
     def _unknown_pair(atlas: sqlite3.Connection, pair: str | None) -> dict[str, Any] | None:
         """The hard error for a run pair (``{run_a}::{run_b}``) that does not name two runs of this
         atlas, else None. A diff is only computed between two runs the atlas records, and runs are
-        never removed from it, so any pair a diff or a judgement can be filed under passes."""
+        never removed from it, so any pair a diff or a judgement can be filed under passes. An
+        over-long pair is echoed cut (``_echo``)."""
         if pair is None:
             return None
         parts = pair.split("::")
@@ -1214,7 +1242,7 @@ def make_tools(
                 return None
         return _error(
             atlas,
-            f"run pair '{pair}' does not name two runs in this atlas — pass "
+            f"run pair '{_echo(pair)}' does not name two runs in this atlas — pass "
             "'{run_a}::{run_b}' with both taken from runs_in_atlas.",
         )
 
@@ -2682,13 +2710,14 @@ def make_tools(
         unit: str | None = None,
         k: int | None = None,
     ) -> dict[str, Any]:
-        """START HERE for one diff: the entries to read first and the calls to read and judge them —
-        composed from get_diff_patch_view and get_diff_meta, nothing computed of its own. Or, with
-        ``run_pair`` (exactly one of diff_id / run_pair), START HERE for the whole pair: its review
-        cut into work units (below).
+        """START HERE for the whole pair with ``run_pair`` (exactly one of diff_id / run_pair): its
+        review cut into work units (below). START HERE for one diff: the entries to read first and
+        the calls to read and judge them — composed from get_diff_patch_view and get_diff_meta,
+        nothing computed of its own.
 
         ``diff_id`` = ``{run_a}::{run_b}::{binary}`` (list_diffs gives the ids). ``workflow``: how a
-        diff is read, in one sentence. ``meta``: get_diff_meta's ``functions``, ``banners``,
+        diff is read. ``whole_pair``: the start_diff_review(run_pair=...) call of this diff's pair,
+        filled in. ``meta``: get_diff_meta's ``functions``, ``banners``,
         ``source_stale``, ``source_stale_reason``, ``toolchain_checked`` and its
         ``meta.version_skew`` (here ``meta.version_skew``), as get_diff_meta gives them.
         ``headline``: the first entry of get_diff_patch_view(diff_id, limit=1, rows_limit=0) — in
@@ -2789,11 +2818,15 @@ def make_tools(
                 )
             return calls
 
+        whole_pair = "::".join(diff_id.split("::")[:2])
+
         def compose(head_entry: dict[str, Any] | None) -> dict[str, Any]:
             out: dict[str, Any] = {
                 "diff_id": diff_id,
                 "server": server,
                 "workflow": DIFF_WORKFLOW,
+                # The whole pair's entry, filled in: the review this diff is one stream of.
+                "whole_pair": f"start_diff_review(run_pair='{whole_pair}')",
                 "meta": meta,
                 "headline": head_entry,
             }
@@ -3685,92 +3718,120 @@ def make_tools(
 
     def _handoff_blocks(conn: sqlite3.Connection, run_pair: str) -> tuple[str, list[str]]:
         """The pair's hand-off blocks (header + one per changed_real finding), from the process
-        cache when the pair's changed_real judgements have not moved since, else rebuilt. Returns
-        (digest, blocks)."""
-        row = conn.execute(
-            "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM overlay "
-            "WHERE anchor_kind = 'diff_subject' AND verdict = 'changed_real' AND run_id = ?",
-            (run_pair,),
-        ).fetchone()
-        digest = f"{row[0]}@{row[1]}"
-        cached = _HANDOFF_CACHE.get(run_pair)
+        cache when the pair's findings read the same as when they were built, else rebuilt from
+        that same reading. Returns (digest, blocks); the digest is a sha256 of the findings."""
+        import hashlib
+
+        findings = _rr.handoff_findings(conn, run_pair, file_staleness=_file_staleness(conn))
+        digest = hashlib.sha256(
+            json.dumps(findings, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        key = (str(atlas_path.resolve()), run_pair)
+        cached = _HANDOFF_CACHE.get(key)
         if cached is not None and cached[0] == digest:
             return cached
         stamp = _rr.HandoffStamp(
             build_hash=_current_pass_version(), current=_current, commit=_installed_commit()
         )
-        findings = _rr.handoff_findings(conn, run_pair)
         blocks = [_rr.handoff_header(run_pair, len(findings))]
-        blocks += [_rr.handoff_chunk(conn, run_pair, f, stamp=stamp) for f in findings]
-        _HANDOFF_CACHE[run_pair] = (digest, blocks)
+        blocks += _rr.handoff_blocks(conn, run_pair, findings, stamp=stamp)
+        _HANDOFF_CACHE[key] = (digest, blocks)
         return digest, blocks
+
+    def _handoff_cut(block: str, room: int) -> str:
+        """A block alone larger than a page (a budget below the render cap): its longest prefix
+        whose JSON string form fits ``room`` with the note, and the note — never dropped."""
+        more_note = "\n[block truncated to fit — {} more bytes; read it with get_diff_patch_view / "
+        more_note += "get_file_diff]\n"
+        lo, hi = 0, len(block)
+        while lo < hi:  # the longest prefix that fits; its size grows with its length
+            mid = (lo + hi + 1) // 2
+            if len(json.dumps(block[:mid] + more_note.format(len(block)))) - 2 <= room:
+                lo = mid
+            else:
+                hi = mid - 1
+        left = len(block[lo:].encode("utf-8"))
+        return block[:lo] + more_note.format(left)
 
     def get_diff_handoff(run_pair: str, offset: int = 0) -> dict[str, Any]:
         """A standardized hand-off of a run pair's changed_real findings, one block per finding,
         paged by ``offset`` (a block index) — ``run_pair`` = ``{run_a}::{run_b}`` (see list_runs).
 
         Each block carries the recorded judgment, tmap's facts for the finding's subject shape
-        (the change, the reachable shape — sink class, size / source kind, one-level callers — and
-        the same-shape unchanged siblings), two analysis placeholders a PERSON fills (unverified
-        hypotheses, device checks) and the status. tmap draws no conclusion here: it states facts,
-        never a reachability or exploitability verdict, and a cell it cannot read states its
-        reason, never blank.
+        (the change, the reachable shape — the candidate rows with their sink class, landing and
+        size / source kind, the one-level callers — and the same-shape unchanged siblings), two
+        analysis placeholders a PERSON fills (unverified hypotheses, device checks) and the
+        status. tmap draws no conclusion here: it states facts, never a reachability or
+        exploitability verdict, and a cell it cannot read states its reason, never blank. Each
+        fact is what its own tool answers (get_diff_patch_view, get_xrefs, get_file_diff,
+        same_shape_siblings); a list cut short says so and names the call that reads the rest.
 
-        Blocks are in a fixed order (by anchor_ref); follow ``next_offset`` (null = done). The pages
-        concatenated are byte-for-byte the file ``tmap review report --handoff`` writes. A single
-        block larger than the budget is cut with a note. ``findings_digest`` changes when a
-        judgement is written mid-paging — re-fetch from offset 0 when it does. the status stays
-        awaiting human verification. The pair's files are read through the same stale-run gate as
-        the other pair tools; a stale run is refused."""
-        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        Blocks are in a fixed order (by anchor_ref); follow ``next_offset`` (null = done; an
+        ``offset`` past ``total_blocks`` is an error). The pages concatenated are byte-for-byte the
+        file ``tmap review report --handoff`` writes: a block too long for a page is cut where it
+        is rendered, with a note, the same in the file. ``findings_digest`` changes when a finding
+        reads differently mid-paging (a judgement written or rewritten, a basis moved) — re-fetch
+        from offset 0 when it does. Throughout, the status stays awaiting human verification. The
+        pair's files are read through the same stale-run gate as the other pair tools; a stale run
+        is refused, with the ``server`` block."""
+        if not isinstance(offset, int) or offset < 0:
             return {
-                "run_pair": run_pair,
-                "error": f"offset must be an integer >= 0, got {offset!r}",
+                "run_pair": _echo(run_pair),
+                "error": f"offset must be an integer >= 0, got {_echo(offset)!r}",
             }
+        server, _moved = _server_block()
         conn = open_atlas(atlas_path)
         try:
             refusal, _runs = _file_pair_gate(conn, run_pair)
             if refusal is not None:
+                refusal["server"] = server
                 return refusal
             digest, blocks = _handoff_blocks(conn, run_pair)
             total = len(blocks)
-            budget = _RESPONSE_BYTE_BUDGET - 2_000  # leaves room for the envelope
-            parts: list[str] = []
-            i = offset
-            cut = False
-            while i < total:
-                block = blocks[i]
-                if not parts and len(block.encode("utf-8")) > budget:
-                    room = max(budget, 1)
-                    kept = block.encode("utf-8")[:room].decode("utf-8", "ignore")
-                    more = len(block.encode("utf-8")) - len(kept.encode("utf-8"))
-                    block = f"{kept}\n[block truncated to fit — {more} more bytes; read it with "
-                    block += "get_diff_patch_view / get_file_diff]\n"
-                    parts.append(block)
-                    i += 1
-                    cut = True
-                    break
-                if parts and len(("".join(parts) + block).encode("utf-8")) > budget:
-                    break
-                parts.append(block)
-                i += 1
-            next_offset = i if i < total else None
-            return {
+            if offset >= total:
+                return {
+                    "run_pair": run_pair,
+                    "error": f"offset past total_blocks {total}",
+                    "total_blocks": total,
+                    "findings_digest": digest,
+                    "server": server,
+                }
+            out: dict[str, Any] = {
                 "run_pair": run_pair,
                 "offset": offset,
-                "next_offset": next_offset,
+                "next_offset": total,  # the widest value it can take, while the page is measured
                 "total_blocks": total,
                 "findings": total - 1,  # blocks[0] is the header
                 "findings_digest": digest,
-                "block_truncated": cut,
-                "text": "".join(parts),
+                "block_truncated": False,
+                "text": "",
                 "note": (
                     "Concatenate the pages (offset 0 onward) for the whole hand-off — the file "
                     "`tmap review report --handoff -o <file>` writes. Re-fetch from offset 0 if "
-                    "findings_digest changes between pages (a judgement was written). The analysis "
-                    "placeholders are for a person: " + _rr.HANDOFF_BOUNDARY
+                    "findings_digest changes between pages (a finding reads differently). The "
+                    "analysis placeholders are for a person: " + _rr.HANDOFF_BOUNDARY
                 ),
+                "server": server,
             }
+            # The page contract: json.dumps' default form of the whole response within the budget.
+            room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out))
+            parts: list[str] = []
+            size = 0
+            i = offset
+            while i < total:
+                cost = len(json.dumps(blocks[i])) - 2
+                if size + cost > room:
+                    if not parts:  # one block alone over the page: cut, never dropped
+                        parts.append(_handoff_cut(blocks[i], max(room, 0)))
+                        out["block_truncated"] = True
+                        i += 1
+                    break
+                parts.append(blocks[i])
+                size += cost
+                i += 1
+            out["next_offset"] = i if i < total else None
+            out["text"] = "".join(parts)
+            return out
         finally:
             conn.close()
 
@@ -3953,9 +4014,11 @@ def make_tools(
         matched_pairs, version_skew, its ``functions`` counts AND its diff status (diff_ok /
         diff_status / diff_status_reason / diff_attempts). Optionally filter to a run-pair.
         ``baseline_dropped=1`` = the diff had a stored candidate baseline that a re-diff dropped (it
-        failed, or the baseline could not be stored again). The entry point after a full diff —
-        see which binaries were compared and which FAILED to diff, then open one with
-        get_diff_patch_view (get_diff_meta for the per-function split).
+        failed, or the baseline could not be stored again). ``review_pairs`` comes first: one row
+        per run pair in the answer, with its diff count and its whole-pair review call
+        (start_diff_review(run_pair=...)) — the entry point after a full diff. Read the rows to see
+        which binaries were compared and which FAILED to diff (get_diff_meta for the per-function
+        split).
 
         ★ ``functions`` is read from what the diff stored, at no cost: ``aligned`` pairs, how many
         of them scored below similarity 1 (``aligned_similarity_below_1``; a pair with no
@@ -4001,9 +4064,21 @@ def make_tools(
         try:
             out = _list_diffs(conn, run_a_id, run_b_id, file_staleness=_file_staleness(conn))
             out.update(_reverse_hint(conn, run_a_id, run_b_id, ("run_a_id", "run_b_id")))
-            return out
+            # First key: the answer can run long, and the whole-pair entry must not sit past it.
+            return {"review_pairs": _review_pairs(out.get("diffs") or []), **out}
         finally:
             conn.close()
+
+    def _review_pairs(diffs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """One row per run pair of ``diffs`` (in their order), single-diff pairs included."""
+        counts: dict[str, int] = {}
+        for d in diffs:
+            pair = f"{d.get('run_a_id')}::{d.get('run_b_id')}"
+            counts[pair] = counts.get(pair, 0) + 1
+        return [
+            {"run_pair": pair, "diffs": n, "call": f"start_diff_review(run_pair='{pair}')"}
+            for pair, n in counts.items()
+        ]
 
     def list_diff_blindspots(
         run_a_id: str | None = None, run_b_id: str | None = None
@@ -4761,17 +4836,23 @@ def make_tools(
             return reviews[k]
 
         unit = audit = None
-        # The k this write is read at: the default, plus every k this session asked
-        # start_diff_review for. A unit_id does not encode k (kind + anchors), so it can exist at
-        # several k; the write is read at the LARGEST such k the session asked for — fail-closed
-        # (the must-read set, which decides unread_before_verdict, only grows with k, so the
-        # largest k flags the most writes unread, and the next unit / coverage come back at the k
-        # the session is working at, e.g. k=8 not the default). With no unit named, the largest k.
-        ks = [_ru.DEFAULT_K]
+        # The k this write is read at: every k this session's start_diff_review calls were
+        # ANSWERED for (a refused call, or a k out of range, sets nothing; a call without k is
+        # the default) — the default only when there is no such call. A unit_id does not encode k
+        # (kind + anchors), so it can exist at several k; the write is read at the LARGEST such k
+        # — fail-closed (the must-read set, which decides unread_before_verdict, only grows with
+        # k, so the largest k flags the most writes unread, and the next unit / coverage come back
+        # at the k the session is working at, e.g. k=8 or k=0, not the default). With no unit
+        # named, the largest k.
+        ks: list[int] = []
         for ln in lines or []:
+            if ln.get("tool") != "start_diff_review" or ln.get("error"):
+                continue
             kk = (ln.get("params") or {}).get("k")
-            if ln.get("tool") == "start_diff_review" and isinstance(kk, int) and kk not in ks:
+            kk = _ru.DEFAULT_K if kk is None else kk
+            if _is_int(kk) and 0 <= kk <= _ru.MAX_K and kk not in ks:
                 ks.append(kk)
+        ks = ks or [_ru.DEFAULT_K]
         k = max(ks)
         if unit_id is not None:
             found = [cand for cand in ks if review(cand).unit(unit_id) is not None]
@@ -4795,6 +4876,10 @@ def make_tools(
                 return {}, False, f"unit {unit_id} does not hold {stray[:3]}", k
             audit = review(k).audit_of(unit_id)
         unit_anchors = [(m.anchor_ref, m.entry_id) for m in unit.members] if unit else []
+        # The units this session was handed WITH their material (the log records only those): a
+        # write that names no unit is read against them — for its read basis only, never as the
+        # unit it judges (no unit_id is recorded, no audit, no next unit).
+        handed = {ln["unit"] for ln in lines or [] if ln.get("unit")} if unit_id is None else set()
         out: dict[str, Any] = {}
         for anchor in anchors:
             if attributed_to == "human-via-agent":
@@ -4807,6 +4892,8 @@ def make_tools(
                     unit_id=unit_id,
                     unit_anchors=unit_anchors,
                 )
+                if handed and rb["basis"] != "unit_delivered":
+                    rb = _inferred_unit_basis(lines, anchor, handed, ks, review) or rb
                 if rb["basis"] == "none":
                     must = {
                         m.anchor_ref
@@ -4816,19 +4903,53 @@ def make_tools(
                     }
                     rb["unread_before_verdict"] = anchor in must
             if audit is not None:
-                rb["non_blind"] = not _rb.blind(lines, audit.write_session, session)
+                rb["non_blind"] = not _rb.blind(
+                    lines, audit.write_session, session, audit.unit.unit_id
+                )
             out[anchor] = WriteContext(
                 channel="mcp", unit_id=unit_id, read_basis=rb, session=session
             )
         return out, audit is not None, None, k
 
+    def _whole_pair_note(runs: Any) -> str:
+        """Where a write that named no unit goes next: the whole pair's calls, filled in."""
+        pair = f"{runs[0]}::{runs[1]}"
+        return (
+            f"whole pair: start_diff_review(run_pair='{pair}') for the next unit and the "
+            f"coverage_statement; get_diff_handoff(run_pair='{pair}') for the hand-off."
+        )
+
+    def _inferred_unit_basis(
+        lines: Any, anchor: str, handed: set[str], ks: list[int], review: Any
+    ) -> dict[str, Any] | None:
+        """The read basis of a write that names no unit, read as if it named a unit this session
+        was handed that holds ``anchor`` (largest k first; the first such unit whose delivery
+        counts), marked ``unit_inferred``; None when no handed unit holds it or none counts."""
+        from treasure_map.lib.query import read_basis as _rb
+
+        for kk in sorted(ks, reverse=True):
+            for u in review(kk).units:
+                if u.unit_id not in handed or all(m.anchor_ref != anchor for m in u.members):
+                    continue
+                got = _rb.infer(
+                    lines,
+                    anchor_ref=anchor,
+                    entry_id=_entry_id_of(anchor),
+                    unit_id=u.unit_id,
+                    unit_anchors=[(m.anchor_ref, m.entry_id) for m in u.members],
+                )
+                if got["basis"] == "unit_delivered":
+                    return {**got, "unit_inferred": True}
+        return None
+
     def _after_unit_write(
-        atlas: sqlite3.Connection, runs: Any, worker: Any, workers: Any, k: int
+        atlas: sqlite3.Connection, runs: Any, worker: Any, workers: Any, k: int, used: int
     ) -> dict[str, Any]:
-        """The next unit of the shard after a write that named its unit — or, when none is left,
-        the report's coverage_statement. Read at ``k`` (the writing session's k, from
-        ``_write_plan``) so the next unit and coverage match the units this session was handed, not
-        always the default k."""
+        """The next unit of the shard after a write that named its unit, WITH its material (fitted
+        beside the ``used`` bytes of the rest of the answer, as start_diff_review(run_pair) fits
+        it) — or, when none is left, the report's coverage_statement. Read at ``k`` (the writing
+        session's k, from ``_write_plan``) so the next unit and coverage match the units this
+        session was handed, not always the default k; its ``read_with`` names that k."""
         review = _ru.review_pair(
             atlas,
             runs[0],
@@ -4841,16 +4962,27 @@ def make_tools(
         pair = f"{runs[0]}::{runs[1]}"
         if nxt is None:
             return {"next_unit": None, "coverage_statement": review.report["coverage_statement"]}
-        return {
-            "next_unit": {
-                **_unit_head(nxt, review.progress.states),
-                "members": _members_json(nxt, review.progress.states),
-                "read_with": (
-                    f"start_diff_review(run_pair={json.dumps(pair)}, "
-                    f"unit={json.dumps(nxt.unit_id)})"
-                ),
-            }
+        states = review.progress.states
+        head: dict[str, Any] = {
+            **_unit_head(nxt, states),
+            "members": _members_json(nxt, states),
+            "read_with": (
+                f"start_diff_review(run_pair={json.dumps(pair)}, unit={json.dumps(nxt.unit_id)}"
+                + (f", k={k}" if k != _ru.DEFAULT_K else "")
+                + ")"
+            ),
         }
+        room = _RESPONSE_BYTE_BUDGET - used - len(json.dumps({"next_unit": head})) - 200
+        if room < 2_000:
+            # A batch's member list alone fills the page: the material is read by read_with.
+            head["members"] = head["members"][:20]
+            head["members_truncated"] = True
+            room = _RESPONSE_BYTE_BUDGET - used - len(json.dumps({"next_unit": head})) - 200
+        head["material"] = _unit_material(atlas, review, nxt, max(room, 0))
+        head["material_cut"] = bool(head.get("members_truncated")) or _material_cut(
+            head["material"]
+        )
+        return {"next_unit": head}
 
     def annotate_diff(
         anchor_ref: str,
@@ -4983,42 +5115,45 @@ def make_tools(
                 return {"written": False, "error": str(exc)}
             if group_ref is not None and not shadow:
                 group_echo = _diff_group_echo(atlas, res.id)
-            after_unit = (
-                _after_unit_write(atlas, runs, worker, workers, unit_k)
-                if unit_id is not None
-                else None
-            )
+            result: dict[str, Any] = {
+                "written": True,
+                "action": res.action,
+                "id": res.id,
+                "diff_id": diff_id,
+                "anchor_ref": anchor_ref,
+                "verdict": verdict,
+                "atlas": str(atlas_path),
+                "note": "recorded on the diff layer (YOUR judgment, never a tool fact). The view "
+                "is unchanged; "
+                + (
+                    "list_overlays(anchor_kind='diff_subject', run_id=<run pair>) resumes these."
+                    if unit_id is not None
+                    else _whole_pair_note(runs)
+                ),
+            }
+            if run_pair is not None:
+                result["run_pair"] = run_pair
+            if group_echo is not None:
+                result["group"] = group_echo
+            if res.action == "updated":
+                result["overwrote"] = {
+                    "attributed_to": res.prior_attributed_to,
+                    "updated_at": res.prior_updated_at,
+                }
+            if shadow:
+                result["note"] = (
+                    "recorded as a SHADOW judgment (an audit): in the overlay's history only; the "
+                    "current judgment is unchanged — a different verdict goes to the disagreements"
+                )
+            result["read_basis"] = ctxs[anchor_ref].read_basis
+            if result["read_basis"].get("unread_before_verdict"):
+                result["needs_recheck"] = _JUDGED_UNREAD
+            if unit_id is not None:
+                result.update(
+                    _after_unit_write(atlas, runs, worker, workers, unit_k, len(json.dumps(result)))
+                )
         finally:
             atlas.close()
-        result: dict[str, Any] = {
-            "written": True,
-            "action": res.action,
-            "id": res.id,
-            "diff_id": diff_id,
-            "anchor_ref": anchor_ref,
-            "verdict": verdict,
-            "atlas": str(atlas_path),
-            "note": "recorded on the diff layer (YOUR judgment, never a tool fact). The view is "
-            "unchanged; list_overlays(anchor_kind='diff_subject', run_id=<run pair>) resumes "
-            "these.",
-        }
-        if run_pair is not None:
-            result["run_pair"] = run_pair
-        if group_echo is not None:
-            result["group"] = group_echo
-        if res.action == "updated":
-            result["overwrote"] = {
-                "attributed_to": res.prior_attributed_to,
-                "updated_at": res.prior_updated_at,
-            }
-        if shadow:
-            result["note"] = (
-                "recorded as a SHADOW judgment (an audit): in the overlay's history only; the "
-                "current judgment is unchanged — a different verdict goes to the disagreements"
-            )
-        result["read_basis"] = ctxs[anchor_ref].read_basis
-        if after_unit is not None:
-            result.update(after_unit)
         return result
 
     def annotate_diff_batch(
@@ -5251,6 +5386,9 @@ def make_tools(
                             "attributed_to": res.prior_attributed_to,
                             "updated_at": res.prior_updated_at,
                         }
+                    ctx = ctxs.get(p.anchor_ref)
+                    if ctx is not None and (ctx.read_basis or {}).get("unread_before_verdict"):
+                        echo["needs_recheck"] = _JUDGED_UNREAD
                     gref = item.get("group_ref")
                     if gref:
                         echo["group_ref"] = gref
@@ -5275,8 +5413,18 @@ def make_tools(
                 "count": len(results),
                 "results": results,
                 "note": "recorded on the diff layer (YOUR judgments). "
-                f"list_overlays(anchor_kind='diff_subject', run_id='{pair}') resumes these.",
+                + (
+                    f"list_overlays(anchor_kind='diff_subject', run_id='{pair}') resumes these."
+                    if unit_id is not None
+                    else _whole_pair_note(runs)
+                ),
             }
+            unread = sum(1 for r in results if "needs_recheck" in r)
+            if unread:
+                out["note"] += (
+                    f" {unread} of them written before their subject was read: see needs_recheck "
+                    "on those results."
+                )
             if groups_echo:
                 out["groups"] = groups_echo
             if shadow:
@@ -5285,7 +5433,9 @@ def make_tools(
                     "current judgments are unchanged"
                 )
             if unit_id is not None:
-                out.update(_after_unit_write(atlas, runs, worker, workers, unit_k))
+                out.update(
+                    _after_unit_write(atlas, runs, worker, workers, unit_k, len(json.dumps(out)))
+                )
             return out
         finally:
             atlas.close()

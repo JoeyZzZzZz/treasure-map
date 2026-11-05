@@ -724,10 +724,10 @@ class Audit:
 class Audits:
     open: list[Audit] = field(default_factory=list)
     disagreements: list[dict[str, Any]] = field(default_factory=list)
-    # Subjects whose LATEST write was made before anything of the subject was read
-    # (``unread_before_verdict``). Always computed, independent of ``BLIND_AUDIT_ENABLED``; the
-    # caller sets each to NEEDS_RECHECK (not disposed). Cleared only by a newer write that read
-    # first (then the latest write no longer carries the flag).
+    # Subjects judged unread: a write flagged ``unread_before_verdict`` not followed by a write
+    # whose basis is other than ``none``, or a latest write with basis ``none`` on a subject the
+    # report's own k makes must-read. Always computed, independent of ``BLIND_AUDIT_ENABLED``; the
+    # caller sets each to NEEDS_RECHECK (not disposed).
     needs_recheck: list[str] = field(default_factory=list)
 
 
@@ -746,10 +746,14 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
     * ``open`` (blind audit units) — a judgement that is change_inconclusive or no_real_change,
       never a person's (``human``). GATED by ``BLIND_AUDIT_ENABLED``: none are produced while blind
       auditing is sealed. An audit closes when a blind shadow judgement follows the write (one whose
-      session neither wrote it nor read the overlay's verdicts first: ``non_blind`` is not counted).
-    * ``needs_recheck`` (ALWAYS on) — a subject whose latest write was made before anything of it
-      was read (``unread_before_verdict``). The caller marks it NEEDS_RECHECK; it does not open a
-      blind audit. Cleared only by a newer write that read first.
+      session neither wrote it nor made any call off the blind-read whitelist first:
+      ``non_blind`` is not counted).
+    * ``needs_recheck`` (ALWAYS on) — a subject judged before anything of it was read. Walking its
+      writes in order, one flagged ``unread_before_verdict`` sets it and only a newer write whose
+      read basis is not ``none`` clears it (a basis-``none`` write that carries no flag — not
+      must-read at its writer's k — changes nothing); and a subject whose latest write has basis
+      ``none`` is set too when it is must-read at ``units``' own k, whatever k its writer worked
+      at. The caller marks it NEEDS_RECHECK; it does not open a blind audit.
     * ``disagreements`` (ALWAYS on) — a blind shadow that reads otherwise than the current judgement
       (from history, even once the gate is off), or a judgement overwritten by another session with
       another verdict; a person's write settles it."""
@@ -781,6 +785,13 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
         )
     out = Audits()
     index = {u.stream: u.stream_index for u in units}
+    # The must-read set at the k these units were cut for (the report's k).
+    must_now = {
+        mm.anchor_ref
+        for uu in units
+        if uu.must_read and uu.kind not in (AUDIT, REDUCE)
+        for mm in uu.members
+    }
     seen: set[str] = set()
     for u in units:
         for m in u.members:
@@ -828,11 +839,22 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
                             "before": was,
                         }
                     )
-            # Always on, independent of the gate: a subject whose LATEST write was made unread is
-            # re-read (NEEDS_RECHECK), not audited blind. unread_before_verdict rides only the
-            # latest write (set per must-read anchor when the basis is ``none``), so its presence
-            # here means the newest verdict was written unread; a newer read-first write clears it.
-            if last is not None and last["read_basis"].get("unread_before_verdict"):
+            # Always on, independent of the gate: a subject judged unread is re-read
+            # (NEEDS_RECHECK), not audited blind. A flagged write sets it; only a newer write that
+            # read something (basis not ``none``) clears it. A latest basis-``none`` write on a
+            # subject must-read at this k sets it too (its writer may have worked at a smaller k).
+            flagged = False
+            for h in writes:
+                hb = h["read_basis"]
+                if hb.get("unread_before_verdict"):
+                    flagged = True
+                elif hb.get("basis") != "none":
+                    flagged = False
+            if flagged or (
+                last is not None
+                and last["read_basis"].get("basis") == "none"
+                and m.anchor_ref in must_now
+            ):
                 out.needs_recheck.append(m.anchor_ref)
             # Below: the blind audit unit. Sealed off by default (A-1); produced only when the
             # sealed section is satisfied and the flag is flipped back on.
@@ -962,7 +984,7 @@ def report(
     statement = (
         f"must-read {len(must_members)} / disposed {must_done}; "
         f"all subjects {len(all_members)} / disposed {all_done}; "
-        f"open audits {open_text}; needs recheck {len(audits.needs_recheck)}; "
+        f"open audits {open_text}; judged unread {len(audits.needs_recheck)}; "
         f"disagreements {len(audits.disagreements)}; "
         f"{'reduce done' if not reduce_owed else f'reduce owed {len(reduce_owed)}'}; "
         f"predicate {PREDICATE_VERSION} (k={k}); server {server}"

@@ -874,6 +874,10 @@ REPLACED = {
         ),
     },
     "start_diff_review": {
+        "``workflow``: how a diff is read, in one sentence.": (
+            "the workflow leads with the whole pair now and is no longer one sentence; "
+            "whole_pair gives the pair's call filled in"
+        ),
         '``view``: get_diff_patch_view(diff_id, detail="summary", limit=limit) as that call '
         "returns it — ``limit`` (1-200, default 20) entries in the default order, with the "
         "progress and annotation blocks.": (
@@ -965,6 +969,12 @@ REPLACED = {
         ),
     },
     "list_diffs": {
+        "The entry point after a full diff — see which binaries were compared and which FAILED "
+        "to diff, then open one with get_diff_patch_view (get_diff_meta for the per-function "
+        "split).": (
+            "the entry point after a full diff is the whole pair now: review_pairs, first in the "
+            "answer, names each pair's start_diff_review(run_pair=...) call"
+        ),
         "true, with ``source_stale_reason``: ``source_binary_absent`` / ``source_content_changed`` "
         "(a side's binary is gone or its bytes changed), ``diff_logic_changed`` (computed by "
         "different diff code, or another export script), ``toolchain_changed`` (computed by "

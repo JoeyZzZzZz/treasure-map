@@ -60,6 +60,7 @@ KEY_PARAMS: frozenset[str] = frozenset(
         "k",
         "verdict",
         "detail",
+        "overlay",
         "view",
         "side",
         "bucket",
@@ -156,13 +157,19 @@ def build_line(
         "truncated": _is_cut(result),
         "error": None if error is None else _value(error),
     }
-    # A work unit handed out with its material (start_diff_review(run_pair=...)): which, and
-    # whether its material was cut — what a later write's read basis is read from.
+    # A work unit handed out with its material (start_diff_review(run_pair=...), or a write's
+    # answer naming the next unit): which, and whether its material was cut — what a later
+    # write's read basis is read from. A unit named WITHOUT its material (or with a material that
+    # is only an error) was not handed out, so it is not recorded.
     if isinstance(result, dict):
         unit = result.get("next_unit") if "next_unit" in result else result.get("unit")
         if isinstance(unit, dict) and isinstance(unit.get("unit_id"), str):
-            line["unit"] = unit["unit_id"]
-            line["unit_material_cut"] = bool(unit.get("material_cut") or result.get("material_cut"))
+            material = unit.get("material") if "material" in unit else result.get("material")
+            if isinstance(material, dict) and "error" not in material:
+                line["unit"] = unit["unit_id"]
+                line["unit_material_cut"] = bool(
+                    unit.get("material_cut") or result.get("material_cut")
+                )
     return line
 
 

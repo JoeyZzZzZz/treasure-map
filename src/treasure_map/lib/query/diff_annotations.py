@@ -697,6 +697,7 @@ def list_diff_overlays(
     verdict: str | None = None,
     run_id: str | None = None,
     file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
+    progress: bool = True,
 ) -> dict[str, Any]:
     """Every judgement on a diff entry, optionally one verdict and/or one run pair
     (``run_id`` = ``{run_a}::{run_b}``), each read against its diff's view as it is now.
@@ -712,7 +713,8 @@ def list_diff_overlays(
     pseudocode once (which pairs are bucket S): measured on a pair of 126 diffs whose stored
     overlay baselines all had to be recomputed, about 80 s the first time and 50 s after; less when
     the baselines are current. The binaries no diff covers are read straight from the atlas, not
-    by recomputing the pair's sink overlay."""
+    by recomputing the pair's sink overlay. ``progress=False`` leaves ``review_progress`` out and
+    builds only the views the listed judgements are read against (the findings hand-off)."""
     if verdict is not None and verdict not in _DIFF_VERDICTS:
         raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
     conds, params = ["anchor_kind = 'diff_subject'"], []
@@ -742,7 +744,7 @@ def list_diff_overlays(
         r["id"]: None if _pair_scoped(r) else _diff_of(r, pairs.get(r["run_id"], [])) for r in rows
     }
     wanted = {d for d in of_row.values() if d is not None}
-    if run_id is not None:
+    if run_id is not None and progress:
         wanted |= {str(d["diff_id"]) for d in pairs[run_id]}
     reviews: dict[str, ViewReview] = {}
     for wanted_id in sorted(wanted):
@@ -805,7 +807,7 @@ def list_diff_overlays(
         "filter": {"verdict": verdict, "run_id": run_id, "anchor_kind": "diff_subject"},
         "note": _LIST_NOTE,
     }
-    if run_id is not None:
+    if run_id is not None and progress:
         staleness: dict[str, Any] = {}
         runs = file_runs(atlas, run_id)
         if runs is not None and file_staleness is not None:

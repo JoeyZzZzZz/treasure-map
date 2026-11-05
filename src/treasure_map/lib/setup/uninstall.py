@@ -5,10 +5,12 @@
 Only two kinds of thing are removed: tmap's own entries in the agents' configurations (with the
 backup tmap made of such a file, and a file tmap's entry was all that held), and the paths the
 install ledger records (the downloaded toolchain, BinExport, the completion script and
-its rc block). A path the ledger does not record is never removed — not the user's own JDK,
-Ghidra or BinDiff, even when config.yaml points at them. Before a recorded path is deleted it must
-still be what tmap put there: under ``~/.treasure-map/toolchain``, or (BinExport in a user's
-Ghidra) a ``BinExport`` directory whose jars still hash to what tmap installed.
+its rc block, the diff-review skill). A path the ledger does not record is never removed — not the
+user's own JDK, Ghidra or BinDiff, even when config.yaml points at them. Before a recorded path is
+deleted it must still be what tmap put there: under ``~/.treasure-map/toolchain``, or (BinExport
+in a user's Ghidra) a ``BinExport`` directory whose jars still hash to what tmap installed, or (the
+skill) a ``tmap-diff-review/SKILL.md`` in one of tmap's skills directories that still hashes to
+what tmap wrote.
 
 The data stays unless ``--purge-data`` is given AND the user types the confirmation phrase;
 ``--yes`` does not stand in for it. Even then only what is provably tmap's goes (``purge_plan``):
@@ -32,6 +34,7 @@ import yaml
 from treasure_map.lib.config.config import resolve_relative_paths
 from treasure_map.lib.diff.toolchain import binexport_lib_digest
 from treasure_map.lib.setup import clients as cl
+from treasure_map.lib.setup import skills as sk
 from treasure_map.lib.setup.completion import _MARK_END, _MARK_START, target_path
 from treasure_map.lib.setup.discover import Runner
 from treasure_map.lib.setup.ledger import (
@@ -80,6 +83,8 @@ def safe_to_remove(entry: Entry, *, toolchain_dir: Path, home: Path) -> str | No
         if os.path.realpath(path) in _completion_paths(home):
             return None
         return f"{path} is not where tmap installs completion"
+    if entry.id.startswith(sk.ID_PREFIX):
+        return sk.removable(path, entry.extra.get("sha256"), home)
     if entry.kind == "edit":
         return None  # restored, never deleted; checked in _restore_edit
     if strictly_under(path, toolchain_dir):
@@ -213,6 +218,12 @@ def uninstall(
                 _remove_path(path)
                 report.removed.append(f"removed {path}")
                 removed_paths.append(path)
+            if e.id.startswith(sk.ID_PREFIX) and path.parent.is_dir():
+                try:
+                    path.parent.rmdir()  # only when nothing else is left in it
+                    report.removed.append(f"removed {path.parent}")
+                except OSError:
+                    pass
         except OSError as exc:  # this entry only: it stays in the ledger for a later run
             verb = "restore" if e.kind == "edit" else "remove"
             report.manual.append(f"could not {verb} {path}: {exc}; run tmap uninstall again")

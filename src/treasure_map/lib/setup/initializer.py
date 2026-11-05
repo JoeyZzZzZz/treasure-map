@@ -651,6 +651,7 @@ def run_init(
     from treasure_map.lib.diff import toolchain as _toolchain
     from treasure_map.lib.diff.toolchain import binexport_lib_digest
     from treasure_map.lib.setup import clients as cl
+    from treasure_map.lib.setup import skills as sk
     from treasure_map.lib.setup.discover import current_host, discover_binexport
     from treasure_map.lib.setup.doctor import DoctorInputs, run_doctor
     from treasure_map.lib.setup.fetch import (
@@ -755,6 +756,8 @@ def run_init(
             want = e.extra.get("line_after") if e is not None else None
             return None if want is not None and override_line(p) == want else "not applied"
 
+        for line in sk.recover(ledger):
+            echo(f"  {line}")
         for line in recover_pending(
             ledger,
             {
@@ -1016,6 +1019,29 @@ def run_init(
         if st.state != "aligned":  # a working entry noted where it lives is not a to-do
             for r in st.reported:
                 plan.needs_you.append(f"{label}: {r}")
+    # the diff-review skill: each skills directory the chosen agents read, once
+    skill_bytes = sk.shipped_bytes()
+    for root in sk.target_roots(selected, chost.home):
+        sst = sk.classify(root, ledger, skill_bytes)
+        if sst.state in ("missing", "stale", "legacy"):
+            plan.add(
+                Action(
+                    "install_skill",
+                    f"install the diff-review skill in {root}",
+                    target=sst.path,
+                    lines=[] if sst.state == "missing" else [f"replaces: {sst.detail}"],
+                )
+            )
+        elif sst.state == "foreign":
+            plan.needs_you.append(
+                f"skill {sst.path}: {sst.detail}; not modified — to replace it: "
+                + sk.replace_command(root)
+            )
+        elif sst.state == "invalid":
+            plan.needs_you.append(f"skill {sst.path}: {sst.detail}; not modified")
+    for cid in selected:
+        if cid in sk.MANUAL:  # a note, not a to-do: it would repeat on every run
+            echo(f"  Skill: {sk.MANUAL[cid]}")
 
     # 4. confirm
     echo("")
@@ -1142,6 +1168,14 @@ def run_init(
             echo(f"  {'✓' if out.ok else '✗'} {out.message}")
             if not out.ok and out.manual:
                 needs_you.append(f"{out.message}; run: {out.manual}")
+        elif a.kind == "install_skill" and a.target is not None:
+            try:
+                sk.install(a.target, skill_bytes, ledger)
+            except OSError as exc:  # this directory only, reported
+                echo(f"  ✗ skill: {exc}")
+                needs_you.append(f"write the diff-review skill at {a.target}: {exc}")
+                continue
+            echo(f"  ✓ skill: wrote {a.target}")
 
     script, rc, rc_created = _configure_completion(
         non_interactive=(mode != "interactive"), prompt=prompt, echo=echo

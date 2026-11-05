@@ -5,14 +5,17 @@ of the writing server's session — recorded with the write in overlay_history a
 
 ``basis`` is one of:
 
-* ``unit_delivered`` — the write names its work unit, and this session was handed that unit's
-  material (by start_diff_review) before it; when that material was cut, something of the unit was
-  also fetched after it.
+* ``unit_delivered`` — this session was handed the unit's material before the write (by
+  start_diff_review, or a write's answer naming the next unit with it; a unit named without its
+  material is not handed out); when that material was cut, something of the unit was also fetched
+  after it. The unit is the one the write names; a write that names none is read against the
+  units this session was handed that hold its subject, and then carries ``unit_inferred``.
 * ``fetched`` — this session read the subject itself before the write: the entry in full
   (get_diff_patch_view with its entry_id), a side's pseudocode, disassembly or callees, a file's
   difference (get_file_diff with its path).
 * ``none`` — the log holds nothing of the kind. On a must-read subject the caller marks it
-  ``unread_before_verdict``, which opens an audit.
+  ``unread_before_verdict``: the subject reads needs_recheck (not disposed) until a judgement
+  written after reading it.
 * ``unknown`` — there is no log, or no session to read it by: nothing can be said either way.
 
 LIMIT, stated wherever this is reported: a subagent shares its parent's MCP connection, so in
@@ -30,13 +33,15 @@ from typing import Any
 
 from treasure_map.lib import tool_call_log as tcl
 
-# Blind-read whitelist (G): the ONLY tools whose answer is proven free of any judgement — no
-# verdict, review_state, verdict_shape or annotation block — so having called one keeps a shadow
-# judgement blind. FAIL-CLOSED: every other tool, including list_overlays, the verdict-carrying
-# views (get_diff_patch_view, get_diff_sink_overlay, list_diffs), start_diff_review's pair overview,
-# and any tool not listed here (new ones included), makes a shadow NOT blind. A blocklist could not
-# say this and could not tell apart the two calls below, which turn on a parameter. The members are
-# proven leak-free by tests/unit/lib/test_read_basis.py; adding one without that proof is a bug.
+# Blind-read whitelist (G): the ONLY tools whose answer does not change with the verdicts recorded
+# — no verdict, review_state, verdict_shape or annotation block; a count of what is judged or not
+# is allowed — so having called one keeps a shadow judgement blind. FAIL-CLOSED: every other tool,
+# including list_overlays, list_candidates (even with overlay off it carries coverage,
+# in_exploit_ledger and verdict_shape), the verdict-carrying views (get_diff_patch_view,
+# get_diff_sink_overlay, list_diffs), start_diff_review except reading the audit unit itself, and
+# any tool not listed here (new ones included), makes a shadow NOT blind. The members are proven
+# by tests/unit/lib/test_blind_whitelist.py: each one's answer is the same, byte for byte, in two
+# worlds that differ only in the verdicts; adding one without a call there fails that test.
 BLIND_SAFE_TOOLS = frozenset(
     {
         "get_pseudocode",
@@ -66,21 +71,21 @@ BLIND_SAFE_TOOLS = frozenset(
         "get_tool_reference",
     }
 )
-# Kept for callers that still name it (the blocklist is now the whitelist's complement).
-VERDICT_READERS = frozenset({"list_overlays"})
 
 
-def _blind_safe(line: dict[str, Any]) -> bool:
-    """Whether one logged call keeps a shadow blind. Two tools turn on a parameter:
-    start_diff_review is safe only when it names a ``unit`` (that unit's material, the verdict
-    hidden) and not for the pair overview (which carries review_state and the annotation block);
-    list_candidates is never safe with ``overlay`` true (it then shows the scan's own verdicts)."""
+def _blind_safe(line: dict[str, Any], audit_unit: str | None) -> bool:
+    """Whether one logged call keeps a shadow blind. start_diff_review turns on what it read: only
+    a call naming ``audit_unit`` itself (that unit's material, the verdict hidden), whose answer
+    handed that same unit out, is safe — any other unit, or the pair overview, carries
+    review_state and the annotation block."""
     tool = line.get("tool")
-    params = line.get("params") or {}
     if tool == "start_diff_review":
-        return params.get("unit") is not None
-    if tool == "list_candidates":
-        return not params.get("overlay")
+        params = line.get("params") or {}
+        return (
+            audit_unit is not None
+            and params.get("unit") == audit_unit
+            and line.get("unit") == audit_unit
+        )
     return tool in BLIND_SAFE_TOOLS
 
 
@@ -155,15 +160,23 @@ def infer(
 
 
 def blind(
-    lines: list[dict[str, Any]] | None, write_session: str | None, session: str | None
+    lines: list[dict[str, Any]] | None,
+    write_session: str | None,
+    session: str | None,
+    audit_unit: str | None,
 ) -> bool:
-    """Whether a shadow judgement written now is blind: its session wrote neither the judgement it
-    audits nor read anything that carries a verdict before. Without a log it cannot be shown blind.
-    FAIL-CLOSED: blind only when EVERY call the session made is on the blind-read whitelist
-    (:func:`_blind_safe`); one call to anything else — list_overlays, a verdict-carrying view, or
-    any unlisted tool — makes it not blind."""
-    if lines is None or session is None:
+    """Whether a shadow judgement on ``audit_unit`` written now is blind: its session wrote
+    neither the judgement it audits nor read anything that carries a verdict before. Without a log
+    it cannot be shown blind, nor when the log holds no delivery of ``audit_unit`` (the shadow
+    then rests on nothing read blind). FAIL-CLOSED: blind only when EVERY call the session made is
+    on the blind-read whitelist (:func:`_blind_safe`); one call to anything else — list_overlays,
+    a verdict-carrying view, another unit, or any unlisted tool — makes it not blind."""
+    if lines is None or session is None or audit_unit is None:
         return False
     if write_session is not None and write_session == session:
         return False
-    return all(_blind_safe(ln) for ln in lines)
+    if not any(
+        ln.get("tool") == "start_diff_review" and ln.get("unit") == audit_unit for ln in lines
+    ):
+        return False
+    return all(_blind_safe(ln, audit_unit) for ln in lines)

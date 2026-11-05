@@ -694,7 +694,7 @@ def test_judged_unread_is_needs_recheck(world: World) -> None:
 def test_the_report_says_audits_off_while_blind_auditing_is_sealed(world: World) -> None:
     """★ A-3: with blind auditing sealed (the default), audits.open is null with status
     'audits off' (not 0, which would read as 'audited, none open'); the coverage statement says
-    'open audits off' and carries the real needs-recheck count.
+    'open audits off' and carries the real count of subjects judged unread.
 
     MUTATION (verified RED): report len(audits.open) while sealed -> open is 0 not null -> RED;
     leave the statement saying 'open audits 0' -> RED."""
@@ -702,7 +702,7 @@ def test_the_report_says_audits_off_while_blind_auditing_is_sealed(world: World)
     assert r.report["audits"]["open"] is None
     assert r.report["audits"]["status"] == "audits off"
     assert "open audits off" in r.report["coverage_statement"]
-    assert "needs recheck 0" in r.report["coverage_statement"]
+    assert "judged unread 0" in r.report["coverage_statement"]
 
 
 def test_the_blind_read_whitelist_excludes_views_that_carry_a_verdict(world: World) -> None:
@@ -715,9 +715,9 @@ def test_the_blind_read_whitelist_excludes_views_that_carry_a_verdict(world: Wor
     world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
     view = json.dumps(world.view(DX))
     assert "review_state" in view and "no_real_change" in view  # it really leaks a verdict
-    assert rb._blind_safe({"tool": "get_diff_patch_view", "params": {}}) is False
+    assert rb._blind_safe({"tool": "get_diff_patch_view", "params": {}}, "au1") is False
     assert "get_diff_patch_view" not in rb.BLIND_SAFE_TOOLS
-    assert rb._blind_safe({"tool": "get_diff_meta", "params": {}}) is True
+    assert rb._blind_safe({"tool": "get_diff_meta", "params": {}}, "au1") is True
 
 
 def test_blind_audit_is_sealed_off_by_default(
@@ -1096,3 +1096,642 @@ def test_a_batch_naming_its_unit_records_it_and_hands_on_the_next(world: World) 
     stray = dict(item, anchor_ref=other.anchor_ref)
     bad = tool([stray], diff_id=unit.stream, unit_id=unit.unit_id)
     assert bad.get("written") is False
+
+
+# ── the whole-pair loop as the server's own words teach it ───────────────────────────────────
+
+
+def _diff_of(anchor: str) -> str:
+    """The diff of a World entry anchor (``…#function_pair#libx::…`` is DX)."""
+    return DY if "#liby::" in anchor else DX
+
+
+def _judge_args(member: dict[str, Any], unit_id: str | None) -> dict[str, Any]:
+    args: dict[str, Any] = {
+        "anchor_ref": member["anchor_ref"],
+        "verdict": "changed_real",
+        "rationale": "r",
+        "diff_id": _diff_of(member["anchor_ref"]),
+    }
+    if unit_id is not None:
+        args["unit_id"] = unit_id
+    return args
+
+
+def _history_basis(w: World, anchor: str) -> dict[str, Any]:
+    row = w.atlas.execute(
+        "SELECT read_basis FROM overlay_history WHERE anchor_ref = ? ORDER BY id DESC LIMIT 1",
+        (anchor,),
+    ).fetchone()
+    assert row is not None, anchor
+    got: dict[str, Any] = json.loads(row[0] or "{}")
+    return got
+
+
+@pytest.mark.parametrize("name_unit", [True, False], ids=["with_unit_id", "without_unit_id"])
+def test_the_pair_loop_as_the_workflow_says_it_completes(world: World, name_unit: bool) -> None:
+    """★ C-1 / F-1 / F-2: follow PAIR_WORKFLOW literally — judge each member of next_unit, call
+    start_diff_review(run_pair) again — and the review completes within 30 rounds: next_unit
+    null, must_read_complete true, every write read as ``unit_delivered``. Naming the unit
+    (``unit_id``, as the text now says) is the way taught; a write that leaves it out is still
+    read against the unit this session was handed (``unit_inferred``), so it is not dead-ended.
+
+    MUTATION (verified RED, 1 failed): drop the server's inference (``handed`` always empty) ->
+    without_unit_id: every write basis none, disposed 0 -> RED. MUTATION (verified RED, 1
+    failed): drop ``unit_id=...`` from PAIR_WORKFLOW -> the text test in test_diff_workflow RED
+    (this loop passes it explicitly)."""
+    server = mcp_app.build_server(world.path)
+    out = _server_call(server, "start_diff_review", {"run_pair": PAIR})
+    bases: list[dict[str, Any]] = []
+    for _ in range(30):
+        nu = out.get("next_unit")
+        if not nu:
+            break
+        for m in nu["members"]:
+            r = _server_call(
+                server, "annotate_diff", _judge_args(m, nu["unit_id"] if name_unit else None)
+            )
+            assert r.get("written") is True, r
+            bases.append(r["read_basis"])
+        out = _server_call(server, "start_diff_review", {"run_pair": PAIR})
+    assert bases, "the loop judged nothing"
+    assert out.get("next_unit") is None, out.get("next_unit")
+    assert out["report"]["must_read_complete"] is True, out["report"]["coverage_statement"]
+    want = {"basis": "unit_delivered", "material_cut": False}
+    if not name_unit:
+        want["unit_inferred"] = True
+    assert bases == [want] * len(bases)
+
+
+def test_a_batch_naming_no_unit_is_read_against_the_unit_it_was_handed(world: World) -> None:
+    """★ F-2 (batch): the same loop with annotate_diff_batch and no unit_id — every item's history
+    records ``unit_delivered`` with ``unit_inferred``, and the review completes.
+
+    MUTATION (verified RED, 1 failed): drop the inference -> basis none -> RED."""
+    server = mcp_app.build_server(world.path)
+    out = _server_call(server, "start_diff_review", {"run_pair": PAIR})
+    judged: list[str] = []
+    for _ in range(30):
+        nu = out.get("next_unit")
+        if not nu:
+            break
+        by_diff: dict[str, list[dict[str, Any]]] = {}
+        for m in nu["members"]:
+            item = {"anchor_ref": m["anchor_ref"], "verdict": "changed_real", "rationale": "r"}
+            by_diff.setdefault(_diff_of(m["anchor_ref"]), []).append(item)
+        for diff_id, items in by_diff.items():
+            r = _server_call(
+                server, "annotate_diff_batch", {"annotations": items, "diff_id": diff_id}
+            )
+            assert r.get("written") is True, r
+            judged += [i["anchor_ref"] for i in items]
+        out = _server_call(server, "start_diff_review", {"run_pair": PAIR})
+    assert judged and out.get("next_unit") is None
+    assert out["report"]["must_read_complete"] is True, out["report"]["coverage_statement"]
+    for anchor in judged:
+        got = _history_basis(world, anchor)
+        assert got.get("basis") == "unit_delivered" and got.get("unit_inferred") is True, anchor
+
+
+def test_a_write_naming_no_unit_is_not_read_against_a_unit_that_does_not_hold_it(
+    world: World,
+) -> None:
+    """★ F-2 honesty: the inference only stands in a handed unit that HOLDS the written subject. A
+    must-read subject outside every unit handed out, judged before anything of it was read, stays
+    ``none`` + unread_before_verdict and reads NEEDS_RECHECK.
+
+    MUTATION (verified RED, 1 failed): infer from any handed unit, holding the anchor or not ->
+    the write reads unit_delivered -> RED."""
+    server = mcp_app.build_server(world.path)
+    head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
+    handed = {m["anchor_ref"] for m in head["next_unit"]["members"]}
+    p_entry = f"{PAIR}#function_presence#libx::b:00004000"
+    assert p_entry not in handed  # the precondition: no handed unit holds it
+    must = {m.anchor_ref for u in _review(world, k=0).units if u.must_read for m in u.members}
+    assert p_entry in must
+    out = _server_call(
+        server,
+        "annotate_diff",
+        {"anchor_ref": p_entry, "verdict": "changed_real", "rationale": "r", "diff_id": DX},
+    )
+    assert out["read_basis"] == {"basis": "none", "unread_before_verdict": True}
+    assert p_entry in _review(world, k=0).audits.needs_recheck
+
+
+def test_an_inferred_unit_whose_material_was_cut_counts_only_once_something_is_fetched(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ F-2: a handed unit whose material was cut stands in for an unnamed write only once
+    something of the unit was fetched after it (as for a named one): straight after the cut
+    delivery the write reads ``none``; after get_diff_patch_view of the entry it counts.
+
+    MUTATION (verified RED, 1 failed): read a cut delivery as whole (``always_cut`` False) -> the
+    first write reads unit_delivered -> RED."""
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 2_500)
+    server = mcp_app.build_server(world.path)
+    head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
+    nu = head["next_unit"]
+    assert nu["material_cut"] is True  # the precondition: the delivery was cut
+    member = nu["members"][0]
+    first = _server_call(server, "annotate_diff", _judge_args(member, None))
+    assert first["read_basis"].get("basis") == "none", first["read_basis"]
+    entry_id = member["entry_id"]
+    seen = _server_call(
+        server,
+        "get_diff_patch_view",
+        {"diff_id": _diff_of(member["anchor_ref"]), "entry_id": entry_id},
+    )
+    assert "error" not in seen, seen
+    again = _server_call(server, "annotate_diff", _judge_args(member, None))
+    assert again["read_basis"].get("basis") in ("unit_delivered", "fetched"), again["read_basis"]
+
+
+def test_the_next_unit_a_write_hands_back_carries_its_material(world: World) -> None:
+    """★ C-2: the next unit in a write's answer comes WITH its material, within the response
+    budget, so judging its members at once with its unit_id is a read (``unit_delivered``) — the
+    log records a unit as handed out only with its material (see test_tool_call_log).
+
+    MUTATION (verified RED, 1 failed): leave the material out of _after_unit_write's next unit ->
+    no material, nothing recorded as handed out -> the next write reads none -> RED."""
+    server = mcp_app.build_server(world.path)
+    head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
+    u1 = head["next_unit"]
+    out: dict[str, Any] = {}
+    for m in u1["members"]:
+        out = _server_call(server, "annotate_diff", _judge_args(m, u1["unit_id"]))
+    u2 = out["next_unit"]
+    assert isinstance(u2.get("material"), dict) and "error" not in u2["material"], u2
+    assert len(json.dumps(out)) <= mcp_app._RESPONSE_BYTE_BUDGET
+    o2 = _server_call(server, "annotate_diff", _judge_args(u2["members"][0], u2["unit_id"]))
+    assert o2["read_basis"].get("basis") == "unit_delivered", o2["read_basis"]
+    assert "unit_inferred" not in o2["read_basis"]
+
+
+# ── needs_recheck: what sets it and what clears it ───────────────────────────────────────────
+
+UNREAD = overlay.WriteContext(
+    channel="mcp", session="w", read_basis={"basis": "none", "unread_before_verdict": True}
+)
+NONE_NOFLAG = overlay.WriteContext(
+    channel="mcp", session="w2", read_basis={"basis": "none", "unread_before_verdict": False}
+)
+
+
+def _read(session: str) -> Any:
+    return overlay.WriteContext(channel="mcp", session=session, read_basis={"basis": "fetched"})
+
+
+def _must_at(w: World, k: int) -> set[str]:
+    return {
+        m.anchor_ref
+        for u in _review(w, k=k).units
+        if u.must_read and u.kind not in (ru.AUDIT, ru.REDUCE)
+        for m in u.members
+    }
+
+
+def _read_unit(server: Any, unit_id: str, k: int | None) -> dict[str, Any]:
+    """Read a unit's material (start_diff_review(run_pair, unit=...)) before judging it."""
+    args: dict[str, Any] = {"run_pair": PAIR, "unit": unit_id}
+    if k is not None:
+        args["k"] = k
+    got = _server_call(server, "start_diff_review", args)
+    assert "error" not in got, got
+    return got
+
+
+def test_a_newer_unread_write_without_the_flag_does_not_clear_it(world: World) -> None:
+    """★ C-3 (X1): only a newer write whose read basis is not ``none`` clears needs_recheck; a
+    basis-none write carrying no flag (not must-read at its writer's k) changes nothing.
+
+    MUTATION (verified RED, 1 failed): read the flag off the latest write only (the old rule) ->
+    RED."""
+    world.judge(DX, A1, "changed_real", ctx=UNREAD)
+    assert A1 in _review(world, k=0).audits.needs_recheck
+    world.judge(DX, A1, "changed_real", ctx=NONE_NOFLAG)
+    assert A1 in _review(world, k=0).audits.needs_recheck
+
+
+def test_a_second_session_at_the_default_k_does_not_clear_a_k8_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ C-3 (X1m): a k=8 session judges a k=8-only subject unread; a second session that never
+    asked k=8 rewrites it, still unread -> the k=8 report keeps it needs_recheck (its own k makes it
+    must-read and the latest write read nothing).
+
+    MUTATION (verified RED, 1 failed): go back to reading the flag off the latest write alone (no
+    walk of the history, no report-k layer) -> RED."""
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    target = sorted(_must_at(w, 8) - _must_at(w, 4))[0]
+    s1 = mcp_app.build_server(w.path)
+    _server_call(s1, "start_diff_review", {"run_pair": PAIR, "k": 8})
+    o1 = _server_call(
+        s1,
+        "annotate_diff",
+        {"anchor_ref": target, "verdict": "changed_real", "rationale": "r", "diff_id": DX},
+    )
+    assert o1["read_basis"] == {"basis": "none", "unread_before_verdict": True}
+    s2 = mcp_app.build_server(w.path)
+    _server_call(s2, "list_runs", {})  # a log for this session, so its basis is none, not unknown
+    o2 = _server_call(
+        s2,
+        "annotate_diff",
+        {"anchor_ref": target, "verdict": "changed_real", "rationale": "r2", "diff_id": DX},
+    )
+    assert o2.get("written") is True and o2["read_basis"]["basis"] == "none", o2
+    assert target in _review(w, k=8).audits.needs_recheck
+
+
+def test_a_subject_judged_unread_at_a_smaller_k_reads_needs_recheck_at_a_larger_k(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ C-3, the report-k layer: a k=4 session judges unread a subject must-read only at k=8 —
+    no flag (not must-read at its writer's k) — yet the k=8 report reads it needs_recheck: its
+    latest write read nothing and this report's k makes it must-read.
+
+    MUTATION (verified RED, 1 failed): drop the report-k layer -> RED."""
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    target = sorted(_must_at(w, 8) - _must_at(w, 4))[0]
+    w.judge(DX, target, "changed_real", ctx=NONE_NOFLAG)
+    assert target not in _review(w, k=4).audits.needs_recheck
+    assert target in _review(w, k=8).audits.needs_recheck
+
+
+def test_a_subject_judged_unread_at_a_larger_k_holds_the_smaller_k_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-m1 (fail-closed, owner's decision): a k=8 session judges unread a subject that is
+    must-read only at k=8; the k=4 report — every one of ITS must-read subjects then read and
+    judged — still says must_read_complete false: a subject judged unread holds it whether or not
+    it is in this report's must-read set.
+
+    MUTATION (verified RED, 1 failed): drop ``not audits.needs_recheck`` from must_read_complete
+    -> RED."""
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    target = sorted(_must_at(w, 8) - _must_at(w, 4))[0]
+    w.judge(DX, target, "changed_real", ctx=UNREAD)
+    for anchor in _must_at(w, 4):
+        w.judge(DX, anchor, "changed_real", ctx=_read("s4"))
+    r = _review(w, k=4)
+    assert target not in _must_at(w, 4) and target in r.audits.needs_recheck
+    assert r.report["must_read"]["members_disposed"] == r.report["must_read"]["members"]
+    assert r.report["must_read_complete"] is False
+
+
+def test_reading_after_an_unread_write_without_judging_again_keeps_it(world: World) -> None:
+    """★ C-5 (X4): reading the subject after an unread write is not enough — no new write, still
+    needs_recheck.
+
+    MUTATION (verified RED, 1 failed): clear the flag on any fetch of the subject in the log
+    after the write -> RED."""
+    server = mcp_app.build_server(world.path)
+    p_entry = f"{PAIR}#function_presence#libx::b:00004000"
+    _server_call(server, "list_runs", {})  # the session's log exists (else basis is unknown)
+    o = _server_call(
+        server,
+        "annotate_diff",
+        {"anchor_ref": p_entry, "verdict": "changed_real", "rationale": "r", "diff_id": DX},
+    )
+    assert o["read_basis"] == {"basis": "none", "unread_before_verdict": True}
+    v = _server_call(server, "get_diff_patch_view", {"diff_id": DX, "entry_id": "b:00004000"})
+    assert "error" not in v, v
+    assert p_entry in _review(world, k=0).audits.needs_recheck
+
+
+def test_an_overwrite_by_another_session_alone_holds_must_read_complete(world: World) -> None:
+    """★ C-5 (X5): every must-read member disposed, the only thing left a cross-session overwrite
+    with another verdict -> must_read_complete false, with blind auditing sealed.
+
+    MUTATION (verified RED, 1 failed): drop disagreements from must_read_complete -> RED."""
+    for anchor in sorted(_must_at(world, 0)):
+        world.judge(_diff_of(anchor), anchor, "changed_real", ctx=_read("s1"))
+    assert _review(world, k=0).report["must_read_complete"] is True
+    world.judge(DX, A1, "change_inconclusive", ctx=_read("s2"))
+    r = _review(world, k=0)
+    assert [d["why"] for d in r.audits.disagreements] == ["overwritten_by_another_session"]
+    assert r.report["must_read_complete"] is False
+
+
+def test_the_coverage_statement_counts_the_subjects_judged_unread(world: World) -> None:
+    """★ C-5 (X6) / owner's decision: the coverage statement's ``judged unread N`` is the real
+    count of subjects judged before they were read.
+
+    MUTATION (verified RED, 1 failed): print len(audits.open) there instead -> RED."""
+    world.judge(DX, A1, "changed_real", ctx=UNREAD)
+    st = _review(world, k=0).report["coverage_statement"]
+    assert "judged unread 1;" in st, st
+
+
+def _walk_pair(server: Any, k: int | None, batch: bool = False) -> dict[str, Any]:
+    """Read each unit then judge it with its unit_id, until no unit is left; the last answer."""
+    args: dict[str, Any] = {"run_pair": PAIR}
+    if k is not None:
+        args["k"] = k
+    nxt = _server_call(server, "start_diff_review", args)["next_unit"]
+    out: dict[str, Any] = {}
+    for _ in range(60):
+        if nxt is None:
+            return out
+        _read_unit(server, nxt["unit_id"], k)
+        if batch:
+            items = [
+                {"anchor_ref": m["anchor_ref"], "verdict": "changed_real", "rationale": "r"}
+                for m in nxt["members"]
+            ]
+            out = _server_call(
+                server,
+                "annotate_diff_batch",
+                {"annotations": items, "diff_id": DX, "unit_id": nxt["unit_id"]},
+            )
+        else:
+            for m in nxt["members"]:
+                out = _server_call(server, "annotate_diff", _judge_args(m, nxt["unit_id"]))
+        assert out.get("written") is True, out
+        nxt = out.get("next_unit")
+    raise AssertionError("the pair did not finish in 60 units")
+
+
+def test_a_k8_session_ends_with_coverage_at_k8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ C-5 (X7): the last write of a k=8 session answers the coverage statement at (k=8).
+
+    MUTATION (verified RED, 1 failed): read the coverage at DEFAULT_K in _after_unit_write ->
+    RED."""
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    out = _walk_pair(mcp_app.build_server(w.path), 8)
+    assert out.get("next_unit", "absent") is None
+    assert "(k=8)" in out["coverage_statement"], out["coverage_statement"]
+
+
+def test_a_k0_session_ends_with_coverage_at_k0(world: World) -> None:
+    """★ C-4 (X2): the session's k is the k its start_diff_review calls asked for, not always at
+    least the default: a k=0 session's coverage comes back at (k=0).
+
+    MUTATION (verified RED, 1 failed): keep DEFAULT_K always in the session's ks -> (k=4) -> RED."""
+    out = _walk_pair(mcp_app.build_server(world.path), 0)
+    assert "(k=0)" in out["coverage_statement"], out["coverage_statement"]
+
+
+def test_a_refused_k_is_not_the_sessions_k(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """★ C-4 (X3): a start_diff_review the server refused (k=201, out of range) sets nothing: the
+    session works at the default k, so after its four must-read entries the next unit is the
+    second tier.
+
+    MUTATION (verified RED, 1 failed): take k from refused calls too -> read at k=201 -> the next
+    unit is still an entry -> RED."""
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    server = mcp_app.build_server(w.path)
+    bad = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 201})
+    assert "error" in bad, bad
+    nxt = _server_call(server, "start_diff_review", {"run_pair": PAIR})["next_unit"]
+    for _ in range(4):
+        assert nxt is not None and nxt["kind"] == "entry"
+        _read_unit(server, nxt["unit_id"], None)
+        out = _server_call(server, "annotate_diff", _judge_args(nxt["members"][0], nxt["unit_id"]))
+        assert out.get("written") is True, out
+        nxt = out["next_unit"]
+    assert nxt is not None and nxt["kind"] == "second_tier_batch"
+
+
+def test_the_read_with_of_a_k8_next_unit_reads_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ C-4 (X10): the next unit a k=8 write hands back exists only at k=8; its ``read_with``
+    names k=8, so calling it as written reads the unit.
+
+    MUTATION (verified RED, 1 failed): leave k out of read_with -> 'no unit … k=4' -> RED."""
+    import ast
+
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    server = mcp_app.build_server(w.path)
+    nxt = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 8})["next_unit"]
+    seen: list[str] = []
+    for _ in range(4):
+        _read_unit(server, nxt["unit_id"], 8)
+        seen.append(nxt["unit_id"])
+        out = _server_call(server, "annotate_diff", _judge_args(nxt["members"][0], nxt["unit_id"]))
+        nxt = out["next_unit"]
+    assert nxt["unit_id"] not in seen and nxt["unit_id"] not in {
+        u.unit_id for u in _review(w).units
+    }
+    call = ast.parse(nxt["read_with"], mode="eval").body
+    assert isinstance(call, ast.Call)
+    kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+    got = _server_call(server, "start_diff_review", kwargs)
+    assert "error" not in got, got
+
+
+def test_a_batch_write_hands_back_the_next_unit_at_the_sessions_k(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ C-6 (X8): annotate_diff_batch reads the next unit at the session's k too (k=8: after four
+    entries, still an entry, none repeated).
+
+    MUTATION (verified RED, 1 failed): pass DEFAULT_K to _after_unit_write from the batch ->
+    RED."""
+    w = _wide_world(tmp_path, monkeypatch, 8)
+    server = mcp_app.build_server(w.path)
+    nxt = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 8})["next_unit"]
+    seen: list[str] = []
+    for _ in range(4):
+        assert nxt is not None and nxt["kind"] == "entry"
+        _read_unit(server, nxt["unit_id"], 8)
+        seen.append(nxt["unit_id"])
+        item = {
+            "anchor_ref": nxt["members"][0]["anchor_ref"],
+            "verdict": "changed_real",
+            "rationale": "r",
+        }
+        out = _server_call(
+            server,
+            "annotate_diff_batch",
+            {"annotations": [item], "diff_id": DX, "unit_id": nxt["unit_id"]},
+        )
+        assert out.get("written") is True, out
+        nxt = out["next_unit"]
+    assert len(set(seen)) == 4
+    assert nxt is not None and nxt["kind"] == "entry"
+
+
+def test_the_probe_fails_when_only_the_blind_launch_misses_tmap(tmp_path: Path) -> None:
+    """★ C-6 (X9): a preset with blind_argv is probed twice; when the blind launch does not reach
+    tmap (its argv swallowed the prompt), the probe fails — the plain launch reaching it is not
+    enough.
+
+    MUTATION (verified RED, 1 failed): ignore the blind launch's result -> ok -> RED."""
+    from treasure_map.lib import review_driver as rd
+    from treasure_map.lib import tool_call_log as tcl
+
+    atlas = tmp_path / "atlas.db"
+    preset = rd.Preset("test", ("agent", "{unit_id}", "{prompt}"), blind_argv=("--deny", "list"))
+
+    def agent(argv: list[str], *, cwd: Path, timeout: float) -> rd.Launch:
+        if "--deny" not in argv:
+            tcl.ToolCallLog(tcl.log_path_for(atlas)).record("list_runs", {}, {"runs": []})
+        return rd.Launch(0, 0.0, False)
+
+    got = rd.probe(preset, atlas_path=atlas, workdir=tmp_path, timeout=5, runner=agent)
+    assert got.ok is False and got.tmap_reached is False
+
+
+# ── write answers: where to go next, and judged-unread said on the answer ────────────────────
+
+
+def test_a_write_naming_no_unit_points_at_the_whole_pair(world: World) -> None:
+    """★ F-6: annotate_diff / annotate_diff_batch without unit_id answer with the whole pair's
+    calls, filled in (not list_overlays); a write made before anything was read says so on the
+    answer (``needs_recheck``) — per result in a batch, the note only counting them.
+
+    MUTATION (verified RED, 1 failed): keep the list_overlays note -> RED; MUTATION (verified
+    RED, 1 failed): leave needs_recheck off the single answer -> RED; MUTATION (verified RED, 1
+    failed): leave it off the batch results -> RED."""
+    server = mcp_app.build_server(world.path)
+    _server_call(server, "list_runs", {})
+    p_entry = f"{PAIR}#function_presence#libx::b:00004000"
+    one = _server_call(
+        server,
+        "annotate_diff",
+        {"anchor_ref": p_entry, "verdict": "changed_real", "rationale": "r", "diff_id": DX},
+    )
+    assert one.get("written") is True, one
+    for out in (one,):
+        assert "start_diff_review(run_pair='runA::runB')" in out["note"]
+        assert "get_diff_handoff(run_pair='runA::runB')" in out["note"]
+        assert "list_overlays" not in out["note"]
+    assert "needs_recheck" in one.get("needs_recheck", ""), one
+    items = [
+        {"anchor_ref": A1, "verdict": "changed_real", "rationale": "r"},
+        {"anchor_ref": p_entry, "verdict": "changed_real", "rationale": "r"},
+    ]
+    many = _server_call(server, "annotate_diff_batch", {"annotations": items, "diff_id": DX})
+    assert many.get("written") is True, many
+    assert "start_diff_review(run_pair='runA::runB')" in many["note"]
+    assert "list_overlays" not in many["note"]
+    flagged = {r["anchor_ref"] for r in many["results"] if "needs_recheck" in r}
+    assert flagged == {A1, p_entry}
+    assert "2 of them written before their subject was read" in many["note"]
+
+
+def test_a_write_naming_its_unit_keeps_its_answer_and_needs_no_pair_pointer(world: World) -> None:
+    """F-6: with unit_id the answer already carries the next unit: no whole-pair pointer."""
+    server = mcp_app.build_server(world.path)
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    out = _server_call(server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"]))
+    assert out.get("written") is True and "whole pair:" not in out["note"]
+    assert "needs_recheck" not in out
+
+
+def test_list_diffs_leads_with_one_review_call_per_run_pair(world: World) -> None:
+    """★ F-5: list_diffs' first key is ``review_pairs``: one row per run pair of the answer —
+    a pair with a single diff too — with its diff count and its start_diff_review call.
+
+    MUTATION (verified RED, 1 failed): put review_pairs after the rest -> RED; MUTATION (verified
+    RED, 1 failed): list only pairs with more than one diff -> RED."""
+    world.atlas.execute(
+        "INSERT INTO diff_meta (diff_id, run_a_id, run_b_id, binary_a, binary_b, sha256_a, "
+        "sha256_b, diff_ok, version_skew) VALUES ('runA::runC::libz', 'runA', 'runC', 'libz', "
+        "'libz', '0a1b', '0a1c', 1, 0)"
+    )
+    world.atlas.commit()
+    out = mcp_app.make_tools(world.path)["list_diffs"]()
+    assert next(iter(out)) == "review_pairs"
+    assert out["review_pairs"] == [
+        {"run_pair": "runA::runB", "diffs": 2, "call": "start_diff_review(run_pair='runA::runB')"},
+        {"run_pair": "runA::runC", "diffs": 1, "call": "start_diff_review(run_pair='runA::runC')"},
+    ]
+    pairs = {f"{d['run_a_id']}::{d['run_b_id']}" for d in out["diffs"]}
+    assert len(out["review_pairs"]) == len(pairs)
+
+
+# ── the blind read (gated): what a shadow judgement counts as having read ────────────────────
+
+
+def _audit_world(world: World, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Blind auditing on, A1 judged no_real_change by another session: its audit unit's id."""
+    monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
+    world.judge(DX, A1, "no_real_change", verdict_basis=_nrc(A1), ctx=_ctx("writer"))
+    opened = _review(world, k=0).audits.open
+    assert len(opened) == 1
+    return opened[0].unit.unit_id
+
+
+def _shadow(server: Any, uid: str) -> dict[str, Any]:
+    out = _server_call(
+        server,
+        "annotate_diff",
+        {
+            "anchor_ref": A1,
+            "verdict": "no_real_change",
+            "checked": [A1],
+            "why_unchanged": "same",
+            "diff_id": DX,
+            "unit_id": uid,
+        },
+    )
+    assert out.get("written") is True and "SHADOW" in out["note"], out
+    return out
+
+
+def test_a_shadow_after_reading_only_its_audit_unit_is_blind_and_closes_it(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ C-8 (E0): a session that read only the audit unit writes a blind shadow; the audit
+    closes. Through the real server and its real log."""
+    uid = _audit_world(world, monkeypatch)
+    server = mcp_app.build_server(world.path)
+    _read_unit(server, uid, 0)
+    out = _shadow(server, uid)
+    assert out["read_basis"].get("non_blind") is False
+    assert _review(world, k=0).audits.open == []
+
+
+def test_a_shadow_after_reading_another_unit_is_not_blind(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ C-8 (E1): reading the ordinary unit that holds the audited subject (its material carries
+    review_state, the verdict under audit) before the audit unit makes the shadow NOT blind; the
+    audit stays open.
+
+    MUTATION (verified RED, 1 failed): treat start_diff_review as safe for any unit
+    (``params.get("unit") is not None``) -> blind -> RED."""
+    uid = _audit_world(world, monkeypatch)
+    plain = next(
+        u.unit_id
+        for u in _review(world, k=0).units
+        if u.kind == ru.ENTRY and any(m.anchor_ref == A1 for m in u.members)
+    )
+    server = mcp_app.build_server(world.path)
+    _read_unit(server, plain, 0)
+    _read_unit(server, uid, 0)
+    out = _shadow(server, uid)
+    assert out["read_basis"].get("non_blind") is True
+    assert len(_review(world, k=0).audits.open) == 1
+
+
+@pytest.mark.parametrize("overlay_arg", [None, True], ids=["overlay_off", "overlay_on"])
+def test_list_candidates_before_a_shadow_makes_it_not_blind(
+    world: World, monkeypatch: pytest.MonkeyPatch, overlay_arg: bool | None
+) -> None:
+    """★ C-7: list_candidates carries judgements even with overlay off (coverage,
+    in_exploit_ledger, verdict_shape), so calling it before a shadow — either way — makes the
+    shadow not blind; the call's ``overlay`` is in the log.
+
+    MUTATION (verified RED, 1 failed): put back the overlay-off exemption -> overlay_off blind ->
+    RED; MUTATION (verified RED, 1 failed): drop "overlay" from KEY_PARAMS with the exemption back
+    -> overlay_on blind -> RED."""
+    from treasure_map.lib import tool_call_log as tcl
+
+    uid = _audit_world(world, monkeypatch)
+    server = mcp_app.build_server(world.path)
+    args: dict[str, Any] = {"run_id": "runB"}
+    if overlay_arg is not None:
+        args["overlay"] = overlay_arg
+    _server_call(server, "list_candidates", args)
+    _read_unit(server, uid, 0)
+    out = _shadow(server, uid)
+    assert out["read_basis"].get("non_blind") is True
+    assert len(_review(world, k=0).audits.open) == 1
+    lines = tcl.read_lines(tcl.log_path_for(world.path)) or []
+    logged = [ln["params"] for ln in lines if ln.get("tool") == "list_candidates"]
+    assert logged and logged[0].get("overlay") is bool(overlay_arg)

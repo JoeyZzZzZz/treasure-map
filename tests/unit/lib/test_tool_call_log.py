@@ -153,3 +153,33 @@ def test_a_long_log_is_moved_aside_before_a_write(
     aside = log.path.with_name(log.path.name + ".1")
     assert aside.is_file() and "first" in aside.read_text()
     assert "first" not in log.path.read_text() and "second" in log.path.read_text()
+
+
+@pytest.mark.parametrize(
+    ("result", "recorded"),
+    [
+        ({"next_unit": {"unit_id": "u1", "material": {"entry": {}}}}, True),
+        # a write's answer naming the next unit without its material: not handed out
+        ({"next_unit": {"unit_id": "u1", "read_with": "start_diff_review(...)"}}, False),
+        # a material that is only an error carries nothing to read
+        ({"next_unit": {"unit_id": "u1", "material": {"error": "gone"}}}, False),
+        # start_diff_review(run_pair, unit=...): the unit's head, its material beside it
+        ({"unit": {"unit_id": "u1"}, "material": {"entry": {}}}, True),
+        ({"unit": {"unit_id": "u1"}}, False),
+    ],
+    ids=["with_material", "head_only", "error_material", "unit_read", "unit_head_only"],
+)
+def test_a_unit_counts_as_handed_out_only_with_its_material(
+    result: dict[str, Any], recorded: bool
+) -> None:
+    """★ C-2: the log records a unit as handed out (what a later write's ``unit_delivered`` is
+    read from) only when the answer carried its material — a unit named without it was not read.
+
+    MUTATION (verified RED, 3 failed): record any answer naming a unit (the old rule) -> head_only,
+    error_material and unit_head_only RED."""
+    from treasure_map.lib.query import read_basis as rb
+
+    line = tcl.build_line(tcl.Session(), "annotate_diff", {}, result)
+    assert ("unit" in line) is recorded
+    basis = rb.infer([line], anchor_ref="x", unit_id="u1")["basis"]
+    assert (basis == "unit_delivered") is recorded

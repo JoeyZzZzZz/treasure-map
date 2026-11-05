@@ -9,6 +9,7 @@ Read-only.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -111,20 +112,15 @@ def report(
         run_a, run_b = runs
         if as_handoff:
             assert output is not None
-            from treasure_map.lib import rescan_version
-            from treasure_map.lib.analyze.ghidra_runner import current_pass_version
-            from treasure_map.lib.config.config import load_config
-
-            # The same staleness context the MCP get_diff_handoff builds (installed_commit for the
-            # same commit), so the file and the tool's pages are the same text (B-4(d)).
-            stamp = rr.HandoffStamp(
-                build_hash=current_pass_version(),
-                current=rescan_version.current_code_stamp(load_config()),
-                commit=installed_commit(),
+            # The same staleness context and file-judgement reading the MCP get_diff_handoff
+            # builds, so the file and the tool's pages are the same text (B-4(d)).
+            stamp, file_staleness = rr.local_handoff_context(conn)
+            findings = rr.handoff_findings(conn, run_pair, file_staleness=file_staleness)
+            text = rr.handoff_header(run_pair, len(findings)) + "".join(
+                rr.handoff_blocks(conn, run_pair, findings, stamp=stamp)
             )
-            text = rr.handoff_document(conn, run_pair, stamp=stamp)
             Path(output).write_text(text, encoding="utf-8")
-            click.echo(f"wrote {output} ({len(rr.handoff_findings(conn, run_pair))} findings)")
+            click.echo(f"wrote {output} ({len(findings)} findings)")
             return
         staleness = ru.pair_staleness(conn, run_a, run_b)
         commit = installed_commit()
@@ -159,11 +155,23 @@ def report(
 SKILL_DIRNAME = "tmap-diff-review"
 
 
+SKILL_LOOP_MARKER = "{loop}"
+
+
 def skill_text() -> str:
-    """The diff-review skill shipped with tmap (markdown with its frontmatter)."""
+    """The diff-review skill shipped with tmap (markdown with its frontmatter): the template's
+    frontmatter and rules around ``## The loop``, which is the server's own two workflow sentences
+    (``DIFF_WORKFLOW`` and ``PAIR_WORKFLOW``) — quoted, never retyped, so the skill cannot drift
+    from what the server says."""
     from importlib.resources import files
 
-    return files("treasure_map.skills").joinpath("diff-review.md").read_text(encoding="utf-8")
+    from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW, PAIR_WORKFLOW
+
+    template = files("treasure_map.skills").joinpath("diff-review.md").read_text(encoding="utf-8")
+    if template.count(SKILL_LOOP_MARKER) != 1:
+        raise RuntimeError(f"the skill template must hold {SKILL_LOOP_MARKER} exactly once")
+    loop = f"## The loop\n\n{DIFF_WORKFLOW}\n\n{PAIR_WORKFLOW}"
+    return template.replace(SKILL_LOOP_MARKER, loop)
 
 
 @review.command(name="skill")
@@ -174,20 +182,48 @@ def skill_text() -> str:
     type=click.Path(file_okay=False),
     help=(
         "A skills directory to write it into, as <dir>/" + SKILL_DIRNAME + "/SKILL.md "
-        "(an existing file there is replaced)."
+        "(an earlier tmap's file there is replaced; any other file only with --force)."
     ),
 )
-def skill(install_dir: str | None) -> None:
+@click.option(
+    "--force", is_flag=True, help="With --install: replace a file there that is not tmap's."
+)
+def skill(install_dir: str | None, force: bool) -> None:
     """Print the agent skill for reviewing a run pair unit by unit, or write it into a skills
     directory."""
     text = skill_text()
     if install_dir is None:
         click.echo(text, nl=False)
         return
-    dest = Path(install_dir) / SKILL_DIRNAME / "SKILL.md"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(text, encoding="utf-8")
-    click.echo(f"wrote {dest}")
+    from treasure_map.lib.errors import ConfigError
+    from treasure_map.lib.setup import skills as sk
+    from treasure_map.lib.setup.ledger import LEDGER_NAME, Ledger
+
+    home = Path.home()
+    try:
+        ledger = Ledger.load(home / ".treasure-map" / "toolchain" / LEDGER_NAME)
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+    for line in sk.recover(ledger):
+        click.echo(line)
+    root = Path(install_dir)
+    data = text.encode("utf-8")
+    st = sk.classify(root, ledger, data)
+    if st.state == "aligned":
+        click.echo(f"{st.path} is already current")
+        return
+    if st.state in ("foreign", "invalid") and not force:
+        raise click.ClickException(f"{st.path}: {st.detail}; not replaced (--force replaces it)")
+    # Recorded only where tmap uninstall may take it away again.
+    recorded = os.path.realpath(root) in {os.path.realpath(r) for r in sk.known_roots(home)}
+    try:
+        if recorded:
+            sk.install(st.path, data, ledger)
+        else:
+            sk.write_plain(st.path, data)
+    except OSError as exc:
+        raise click.ClickException(f"could not write {st.path}: {exc}") from exc
+    click.echo(f"wrote {st.path}" + ("" if recorded else " (not in tmap's install ledger)"))
 
 
 # ── a person's judgements: judge (one) and the audit worksheet (many) ────────────────────────
@@ -665,7 +701,11 @@ def run(
                 timeout=deadline,
             )
             if ho["ok"]:
-                click.echo(f"wrote {ho['out_file']} ({ho['bytes']} bytes)")
+                gap = ho.get("nothing_written") or 0
+                click.echo(
+                    f"wrote {ho['out_file']} ({ho['bytes']} bytes, {ho.get('findings')} findings"
+                    + (f"; the agent wrote nothing for {gap} of them)" if gap else ")")
+                )
             else:
                 click.echo(f"hand-off failed: {ho['error']}")
     if result.failed:

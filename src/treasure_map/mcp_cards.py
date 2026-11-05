@@ -391,25 +391,25 @@ TOOL_CARDS: dict[str, ToolCard] = {
     "start_diff_review": ToolCard(
         any_of=(("diff_id",), ("run_pair",)),
         exactly_one=True,
-        example='start_diff_review(diff_id="<run_a>::<run_b>::<binary>")',
+        example='start_diff_review(run_pair="<run_a>::<run_b>")',
         boundary=(
             "START HERE for one diff",
             "nothing computed of its own",
             'UNREAD, which is not "nothing found"',
         ),
         summary=(
-            "START HERE for one diff: the entries to read first and the calls to read and judge "
-            "them, composed from get_diff_patch_view and get_diff_meta, nothing computed of its "
-            "own. diff_id = {run_a}::{run_b}::{binary} (list_diffs gives the ids). Returns "
-            "workflow, meta (with binary_presence: the binaries one run holds alone), headline "
-            "(the first entry in full), view (a summary page of up to limit entries, cut to fit "
-            "beside the rest), read_next and non_binary. An entry nobody judged is UNREAD, which "
-            'is not "nothing found": read the P entries, the entries with a '
-            "lift_basis, bucket S and each binary_presence binary too. A diff with a proven-stale "
-            "side is refused. run_pair instead: the whole pair cut into work units by the server "
-            "— report (coverage_statement, must-read units, must_read_complete) and next_unit "
-            "with its material; unit=<unit_id> reads one, worker/workers a shard, k the first "
-            "entries per diff that are must-read (default 4)."
+            "For a version diff, start with run_pair = {run_a}::{run_b}: the whole pair cut into "
+            "work units by the server — report (coverage_statement, must-read units, "
+            "must_read_complete) and next_unit with its material; judge each member with "
+            "annotate_diff(..., unit_id=<its unit_id>) and call again until next_unit is null; "
+            "unit=<unit_id> reads one, worker/workers a shard, k the first entries per diff that "
+            "are must-read (default 4). START HERE for one diff: diff_id = {run_a}::{run_b}::"
+            "{binary} (list_diffs gives the ids) — the entries to read first and the calls to read "
+            "and judge them, composed from get_diff_patch_view and get_diff_meta, nothing computed "
+            "of its own; returns workflow, meta (with binary_presence), headline, view, read_next "
+            'and non_binary. An entry nobody judged is UNREAD, which is not "nothing found": '
+            "read the P entries, the entries with a lift_basis, bucket S and each binary_presence "
+            "binary too. A pair or diff with a proven-stale side is refused."
         ),
     ),
     "get_diff_patch_view": ToolCard(
@@ -551,8 +551,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "it cannot read states its reason, never blank. Blocks are in a fixed order "
             "(anchor_ref); "
             "follow next_offset. The pages concatenated are the file tmap review report --handoff "
-            "writes; re-fetch from offset 0 if findings_digest changes. the status stays awaiting "
-            "human verification."
+            "writes; re-fetch from offset 0 if findings_digest changes. Throughout, the status "
+            "stays awaiting human verification."
         ),
     ),
     "get_function_alignment": ToolCard(

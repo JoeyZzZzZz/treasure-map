@@ -387,6 +387,44 @@ def _client_checks(inp: DoctorInputs) -> list[Check]:
     return out
 
 
+def _skill_checks(inp: DoctorInputs) -> list[Check]:
+    """One line per skills directory tmap writes the diff-review skill into."""
+    from treasure_map.lib.errors import ConfigError
+    from treasure_map.lib.setup import skills as sk
+    from treasure_map.lib.setup.ledger import LEDGER_NAME, Ledger
+
+    try:
+        ledger = Ledger.load(inp.host.toolchain_dir / LEDGER_NAME)
+    except ConfigError as exc:
+        return [check("skill", "unknown", f"cannot read the install ledger: {exc}")]
+    want = sk.shipped_bytes()
+    home = inp.client_host.home
+    requested = sk.target_roots(inp.requested_clients, home)
+    out = []
+    for root in sk.known_roots(home):
+        st = sk.classify(root, ledger, want)
+        name = f"skill.{root.relative_to(home).parts[0].lstrip('.')}"
+        if st.state == "aligned":
+            out.append(check(name, "ok", str(st.path)))
+        elif st.state == "missing":
+            state: State = "missing" if root in requested else "info"
+            out.append(check(name, state, f"{st.path}: not installed"))
+        elif st.state in ("stale", "legacy"):
+            out.append(check(name, "warn", f"{st.path}: {st.detail}; `tmap init` replaces it"))
+        elif st.state == "foreign":
+            out.append(
+                check(
+                    name,
+                    "warn",
+                    f"{st.path}: {st.detail} — not modified; to replace it: "
+                    + sk.replace_command(root),
+                )
+            )
+        else:
+            out.append(check(name, "wrong", f"{st.path}: {st.detail}"))
+    return out
+
+
 def _mcp_atlas_check(inp: DoctorInputs) -> Check:
     from treasure_map.lib.last_run import read_last_run
 
@@ -514,6 +552,7 @@ def run_doctor(inp: DoctorInputs) -> list[Check]:
     out.append(_diff_toolchain_check(inp, blockers))
     out += _dir_checks(inp)
     out += _client_checks(inp)
+    out += _skill_checks(inp)
     atlas = _mcp_atlas_check(inp)
     out.append(atlas)
     out.append(_mcp_live_check(inp, atlas.state))

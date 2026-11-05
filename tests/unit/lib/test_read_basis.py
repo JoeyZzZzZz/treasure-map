@@ -94,36 +94,65 @@ def _call(tool: str, **params: Any) -> dict[str, Any]:
     return {"tool": tool, "params": params}
 
 
+AU = "au1"  # the audit unit a shadow judgement is written on
+
+
+def _delivered(unit: str = AU, **params: Any) -> dict[str, Any]:
+    """start_diff_review(run_pair, unit=...) as logged when its answer handed that unit out."""
+    return {**_call("start_diff_review", run_pair="a::b", unit=unit, **params), "unit": unit}
+
+
 @pytest.mark.parametrize(
     ("lines", "write_session", "session", "want"),
     [
-        ([], "w", "auditor", True),
-        ([], "auditor", "auditor", False),  # it wrote the judgement it audits
+        ([_delivered()], "w", "auditor", True),
+        # nothing of the audit unit was read: the shadow rests on nothing read blind
+        ([], "w", "auditor", False),
+        ([_delivered()], "auditor", "auditor", False),  # it wrote the judgement it audits
         (None, "w", "auditor", False),  # no log: cannot be shown blind
-        ([], "w", None, False),
+        ([_delivered()], "w", None, False),
         # fail-closed whitelist (G): only a proven-safe fact tool keeps it blind
-        ([_call("list_overlays")], "w", "auditor", False),  # reads the verdicts
-        ([_call("get_pseudocode", run_id="a", function="0x4000")], "w", "auditor", True),
-        ([_call("get_diff_meta", diff_id="d")], "w", "auditor", True),
+        ([_delivered(), _call("list_overlays")], "w", "auditor", False),  # reads the verdicts
+        (
+            [_delivered(), _call("get_pseudocode", run_id="a", function="0x4000")],
+            "w",
+            "auditor",
+            True,
+        ),
+        ([_delivered(), _call("get_diff_meta", diff_id="d")], "w", "auditor", True),
         # get_diff_patch_view carries review_state: NOT blind-safe (add it to the whitelist -> RED)
-        ([_call("get_diff_patch_view", diff_id="d", entry_id="e")], "w", "auditor", False),
-        # start_diff_review turns on the unit param: the unit's material is safe, overview is not
-        ([_call("start_diff_review", run_pair="a::b", unit="u1")], "w", "auditor", True),
-        ([_call("start_diff_review", run_pair="a::b")], "w", "auditor", False),
-        # list_candidates turns on overlay: overlay=true shows the scan's own verdicts
-        ([_call("list_candidates", run_id="a")], "w", "auditor", True),
-        ([_call("list_candidates", run_id="a", overlay=True)], "w", "auditor", False),
+        (
+            [_delivered(), _call("get_diff_patch_view", diff_id="d", entry_id="e")],
+            "w",
+            "auditor",
+            False,
+        ),
+        # start_diff_review is safe only for the audit unit itself: another unit's material
+        # carries review_state, and so does the pair overview
+        ([_delivered(), _delivered("u2")], "w", "auditor", False),
+        ([_delivered(), _call("start_diff_review", run_pair="a::b")], "w", "auditor", False),
+        # the audit unit named, but its answer handed nothing out: no delivery
+        ([_call("start_diff_review", run_pair="a::b", unit=AU)], "w", "auditor", False),
+        # list_candidates is never safe: even with overlay off it carries coverage,
+        # in_exploit_ledger and verdict_shape
+        ([_delivered(), _call("list_candidates", run_id="a")], "w", "auditor", False),
+        ([_delivered(), _call("list_candidates", run_id="a", overlay=True)], "w", "auditor", False),
         # an unlisted / new tool is not blind-safe (fail-closed)
-        ([_call("some_new_tool")], "w", "auditor", False),
+        ([_delivered(), _call("some_new_tool")], "w", "auditor", False),
         # one unsafe call among safe ones is enough
         (
-            [_call("get_pseudocode", run_id="a", function="0x4000"), _call("list_overlays")],
+            [
+                _delivered(),
+                _call("get_pseudocode", run_id="a", function="0x4000"),
+                _call("list_overlays"),
+            ],
             "w",
             "auditor",
             False,
         ),
     ],
     ids=[
+        "blind_audit_unit_only",
         "blind_empty",
         "own_write",
         "no_log",
@@ -132,9 +161,10 @@ def _call(tool: str, **params: Any) -> dict[str, Any]:
         "safe_pseudocode",
         "safe_diff_meta",
         "patch_view_not_safe",
-        "unit_material_safe",
+        "other_unit_not_safe",
         "overview_not_safe",
-        "list_candidates_safe",
+        "audit_unit_not_delivered",
+        "list_candidates_not_safe",
         "list_candidates_overlay_not_safe",
         "unlisted_tool_not_safe",
         "one_unsafe_call",
@@ -143,14 +173,16 @@ def _call(tool: str, **params: Any) -> dict[str, Any]:
 def test_a_shadow_is_blind_only_when_every_call_is_whitelisted(
     lines: list[dict[str, Any]] | None, write_session: str, session: str | None, want: bool
 ) -> None:
-    """★ G fail-closed whitelist: a shadow is blind only when its session neither wrote the audited
-    judgement nor made any call that is not blind-read-safe — and that can be shown (a log, a
-    session). Only the proven-safe fact tools keep it blind; list_overlays, a verdict-carrying view
-    (get_diff_patch_view), the pair overview, list_candidates(overlay=true) and any unlisted tool
-    do not. Two tools turn on a parameter (start_diff_review's unit, list_candidates' overlay).
+    """★ G fail-closed whitelist: a shadow on audit unit AU is blind only when its session read AU
+    (a logged delivery of it), neither wrote the audited judgement nor made any call that is not
+    blind-read-safe — and that can be shown (a log, a session). Only the proven-safe fact tools
+    keep it blind; list_overlays, a verdict-carrying view (get_diff_patch_view), another unit or
+    the pair overview, list_candidates (overlay or not) and any unlisted tool do not.
 
     MUTATION (verified RED): ignore the writing session -> own_write -> RED; put get_diff_patch_view
     in the whitelist -> patch_view_not_safe -> RED; treat an unlisted tool as safe (blocklist, not
-    whitelist) -> unlisted_tool_not_safe -> RED; ignore start_diff_review's unit param ->
-    overview_not_safe or unit_material_safe -> RED."""
-    assert rb.blind(lines, write_session, session) is want
+    whitelist) -> unlisted_tool_not_safe -> RED; start_diff_review safe for any unit
+    (``params.get("unit") is not None``) -> other_unit_not_safe -> RED; judge an empty log blind
+    (drop the delivery check) -> blind_empty -> RED; put back list_candidates' overlay-off
+    exemption -> list_candidates_not_safe -> RED."""
+    assert rb.blind(lines, write_session, session, AU) is want
