@@ -534,3 +534,53 @@ def test_a_risk_line_in_an_assignment_names_the_command_its_substitution_runs(
 
     MUTATION (verified RED): keep launched_command's None as the row's command -> RED."""
     assert _all_rows(tmp_path, "X=$(eval $CMD)\n") == [(1, "eval", "inline", 1)]
+
+
+def test_a_risk_line_names_the_first_substitution_the_shell_runs(tmp_path: Path) -> None:
+    """The risk-line fallback names the substitution that runs first: by position, so the outer
+    one wins over one nested inside it, and never one inside single quotes, which the shell does
+    not expand (``awk '{print $(NF-1)}'`` runs no ``NF-1``). The launch reading skips the same ones.
+
+    MUTATION (verified RED, 1 failed): fallback takes the first of ``_substitutions`` unsorted and
+    unfiltered (all ``$(`` before any backquote, single quotes not excluded) -> RED (``NF-1``).
+    MUTATION (verified RED, 1 failed): substitutions not sorted by position (single quotes still
+    excluded) -> RED (``echo`` for the backquoted ``printf``)."""
+    text = "v=`echo $x | awk '{print $(NF-1)}'`\n"
+    assert _all_rows(tmp_path, text) == [(1, "echo", "inline", 1)]
+    text = "t=`printf '%x' $(echo $y)`\n"
+    assert _all_rows(tmp_path, text) == [(1, "printf", "inline", 1)]
+
+
+def test_a_backquoted_substitution_continued_on_the_next_line_names_its_command(
+    tmp_path: Path,
+) -> None:
+    """A backquote left open at a line's end (continued with ``\\``) runs to the end of that line,
+    as an open ``$(`` does: the command it starts is read, and launches a binary of the firmware.
+
+    MUTATION (verified RED, 1 failed): only paired backquotes read -> RED (no launch row)."""
+    where = tmp_path / "db"
+    where.mkdir()
+    conn = _db(where, ("foo",))
+    try:
+        _ingest(conn, "X=`/usr/sbin/foo get a \\\n | cut -f1`\n")
+        launches = [r for r in _rows(conn) if r[1] and r[1].rsplit("/", 1)[-1] == "foo"]
+    finally:
+        conn.close()
+    assert launches == [(1, "/usr/sbin/foo", "inline", 1)]
+
+
+def test_a_declared_or_spaced_substitution_assignment_names_the_substituted_command(
+    tmp_path: Path,
+) -> None:
+    """``local x=$(cat f)`` and ``x=$( cat f )`` run ``cat`` in a substitution: the line names no
+    command of its own (not ``local``, not the assignment), and the risk row names ``cat`` inline.
+
+    MUTATION (verified RED, 1 failed): declaration keyword not passed over -> RED (``local``,
+    literal). MUTATION (verified RED, 1 failed): old assignment pattern requiring a non-space
+    right after ``$(`` -> RED (``$( cat f )`` reads as a literal line)."""
+    assert launched_command("local x=$(cat f)") is None
+    assert launched_command("export x=`cat f`") is None
+    assert launched_command("x=$( cat f )") is None
+    assert launched_command("local x") == "local"  # a bare declaration is still the builtin
+    assert _all_rows(tmp_path, "local x=$(cat f)\n") == [(1, "cat", "inline", 1)]
+    assert _all_rows(tmp_path, "x=$( cat f )\n") == [(1, "cat", "inline", 1)]

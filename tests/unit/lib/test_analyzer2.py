@@ -1040,10 +1040,12 @@ def test_string_keyed_edges_query_by_callee_and_by_run(tmp_path: Path) -> None:
 
 def _fat_handler_fw() -> list[dict[str, object]]:
     """The flagship shape: a strcmp ladder dispatches key -> handler; the handler is FAT (it builds
-    a command and calls TWO sinks). Each sink is one hop below the edge callee."""
+    a command and calls TWO sinks). Each sink is one hop below the edge callee. The binary has a
+    recorded path, as every scanned binary does, so the edge callee is located by path + address."""
     return [
         {
             "name": "rc",
+            "path": "/sbin/rc",
             "funcs": [
                 _ske_fn(
                     "handle_notifications",
@@ -1143,6 +1145,166 @@ def test_one_hop_leads_are_pure_annotation(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert statuses["run_cmd"] == "unknown"
+
+
+def _lead_func(
+    fid: int, path: str | None, name: str, address: str, callees: list[str]
+) -> analyzer2_mod.FuncRow:
+    return analyzer2_mod.FuncRow(
+        func_id=fid,
+        binary_id=1 if path is None or path.startswith("/lib/") else 2,
+        binary_name="libx.so",
+        binary_path=path,
+        binary_sha256=None,
+        name=name,
+        address=address,
+        pseudocode=None,
+        pseudocode_hash=None,
+        callees=json.dumps(callees),
+    )
+
+
+def _lead_edge(
+    key: str, callee: str, addr: str | None, path: str | None, mechanism: str = "strcmp_gate"
+) -> analyzer2_mod.StringKeyedEdgeRow:
+    return analyzer2_mod.StringKeyedEdgeRow(
+        source_run_id="runA",
+        binary="libx.so",
+        from_function="dispatch",
+        key=key,
+        mechanism=mechanism,
+        callee_name=callee,
+        callee_addr=addr,
+        binary_path=path,
+    )
+
+
+def _two_libx_funcs() -> list[analyzer2_mod.FuncRow]:
+    """Two binaries share the short name libx.so at different paths. A holds two functions named
+    ``_List``: an empty one at 0x100 (the edge's callee) and one at 0x200 that calls ``copy``. B
+    holds a ``_List`` at 0x200 that calls ``copy`` too. Both hold a ``copy``."""
+    return [
+        _lead_func(1, "/lib/libx.so", "_List", "00000100", []),
+        _lead_func(2, "/lib/libx.so", "_List", "00000200", ["copy"]),
+        _lead_func(3, "/lib/libx.so", "copy", "00000300", []),
+        _lead_func(4, "/opt/lib/libx.so", "_List", "00000200", ["copy"]),
+        _lead_func(5, "/opt/lib/libx.so", "copy", "00000300", []),
+    ]
+
+
+def test_one_hop_lead_follows_the_edge_callee_address_not_a_same_named_function() -> None:
+    """The edge names the empty ``_List`` at 0x100 in A. Nothing sits one call below it, so no
+    ``copy`` in either binary may carry the key — a join on (short name, function name) walked down
+    from whichever same-named ``_List`` was read last and handed ``copy`` a lead it does not have.
+
+    MUTATION (verified RED, 1 failed): edge callee looked up by (short binary name, callee name)
+    instead of (binary path, callee address) -> RED (``copy`` in /opt/lib/libx.so got the lead)."""
+    edges = [_lead_edge(".", "_List", "0x100", "/lib/libx.so")]
+    out = analyzer2_mod._one_hop_edge_leads(_two_libx_funcs(), edges)
+    copy_leads = {k: v for k, v in out.items() if k[1] == "copy"}
+    assert copy_leads == {}
+    # the same edge at 0x200 in A reaches A's copy only, located by path + address (no basis mark)
+    out = analyzer2_mod._one_hop_edge_leads(
+        _two_libx_funcs(), [_lead_edge(".", "_List", "0x200", "/lib/libx.so")]
+    )
+    assert out == {
+        (("path", "/lib/libx.so"), "copy"): [
+            {
+                "via": "string_keyed_edge",
+                "key": ".",
+                "hops": 1,
+                "through": "_List",
+                "mechanism": "strcmp_gate",
+            }
+        ]
+    }
+    ev: dict[str, object] = {}
+    analyzer2_mod._attach_edge_leads(ev, out, "/opt/lib/libx.so", "libx.so", "copy")
+    assert "reachability_leads" not in ev  # B's copy does not borrow A's lead
+    analyzer2_mod._attach_edge_leads(ev, out, "/lib/libx.so", "libx.so", "copy")
+    assert ev["reachability_leads"] == out[(("path", "/lib/libx.so"), "copy")]
+
+
+def test_one_hop_leads_do_not_depend_on_the_order_rows_were_read_in() -> None:
+    """Shuffling the function rows and the edge rows (what a re-scan's new ingest order does) must
+    leave the output identical, the order of each function's leads included.
+
+    MUTATION (verified RED, 1 failed): per-function lead sort removed -> RED (the reversed edge
+    list reverses ``copy``'s leads). MUTATION (verified RED, 1 failed): mechanism dropped from the
+    dedup signature -> RED (which ``alpha`` lead survives follows the edge order). MUTATION
+    (verified RED, 1 failed): edge callee looked up by (short binary name, callee name) -> RED (the
+    reversed function list walks down from the other ``_List``)."""
+    import random
+
+    funcs = _two_libx_funcs()
+    edges = [
+        _lead_edge("zeta", "_List", "0x200", "/opt/lib/libx.so"),
+        _lead_edge("alpha", "_List", "0x200", "/opt/lib/libx.so", mechanism="static_string_table"),
+        _lead_edge("alpha", "_List", "0x200", "/opt/lib/libx.so"),
+        _lead_edge(".", "_List", "0x100", "/lib/libx.so"),
+    ]
+    base = analyzer2_mod._one_hop_edge_leads(funcs, edges)
+    orders = [
+        (list(reversed(funcs)), list(edges)),
+        (list(funcs), list(reversed(edges))),
+        (list(reversed(funcs)), list(reversed(edges))),
+    ]
+    rng = random.Random(7)
+    for _ in range(8):
+        f, e = list(funcs), list(edges)
+        rng.shuffle(f)
+        rng.shuffle(e)
+        orders.append((f, e))
+    for f, e in orders:
+        assert analyzer2_mod._one_hop_edge_leads(f, e) == base
+    # and the one output is the right one: B's copy holds the three leads in (key, mechanism) order
+    assert list(base) == [(("path", "/opt/lib/libx.so"), "copy")]
+    assert [(x["key"], x["mechanism"]) for x in base[(("path", "/opt/lib/libx.so"), "copy")]] == [
+        ("alpha", "static_string_table"),
+        ("alpha", "strcmp_gate"),
+        ("zeta", "strcmp_gate"),
+    ]
+
+
+def test_one_hop_lead_from_a_pathless_edge_is_marked_and_never_guessed() -> None:
+    """An edge row with no binary path (or no usable callee address) falls back to the names: the
+    lead says so with ``match_basis: "name"``, and a name several functions answer to yields no lead
+    at all rather than whichever was read last.
+
+    MUTATION (verified RED, 1 failed): ``match_basis`` mark dropped -> RED. MUTATION (verified RED,
+    1 failed): ambiguous name fallback takes the first match instead of none -> RED."""
+    funcs = [
+        _lead_func(1, None, "handler", "00000100", ["copy"]),
+        _lead_func(2, None, "copy", "00000200", []),
+    ]
+    out = analyzer2_mod._one_hop_edge_leads(funcs, [_lead_edge("k", "handler", "0x100", None)])
+    assert out[(("name", "libx.so"), "copy")][0].get("match_basis") == "name"
+    # no callee address -> the name alone, still marked
+    out = analyzer2_mod._one_hop_edge_leads(funcs, [_lead_edge("k", "handler", None, None)])
+    assert out[(("name", "libx.so"), "copy")][0].get("match_basis") == "name"
+    # a pathless edge to (libx.so, _List) at 0x200: both binaries hold one -> no lead
+    out = analyzer2_mod._one_hop_edge_leads(
+        _two_libx_funcs(), [_lead_edge(".", "_List", "0x200", None)]
+    )
+    assert out == {}
+
+
+def test_wrapper_edge_binds_to_the_wrapper_in_the_callers_own_binary_path() -> None:
+    """A thin nvram wrapper in one libx.so must not turn a call to a same-named non-wrapper in the
+    other libx.so (a different path) into an indirect key edge.
+
+    MUTATION (verified RED, 1 failed): wrapper index keyed by (short binary name, name) instead of
+    (binary path, name) -> RED (the caller in /opt/lib/libx.so got a via_wrapper edge)."""
+    funcs = [
+        _lead_func(1, "/lib/libx.so", "get_cfg", "00000100", ["nvram_get"]),
+        _lead_func(2, "/opt/lib/libx.so", "get_cfg", "00000100", []),
+        _lead_func(3, "/opt/lib/libx.so", "caller", "00000200", ["get_cfg"]),
+        _lead_func(4, "/lib/libx.so", "caller", "00000200", ["get_cfg"]),
+    ]
+    wrappers = {1: {"op": "read", "api": "nvram_get"}}
+    call = [{"callee": "get_cfg", "key": "lan_ipaddr", "key_kind": "constant"}]
+    rows = analyzer2_mod._flatten_wrapper_edges(funcs, wrappers, {3: call, 4: call}, "runA")
+    assert [(r.func, r.binary_path) for r in rows] == [("caller", "/lib/libx.so")]
 
 
 # ── detector A: static {string -> funcptr} dispatch tables (same atlas edge table) ───

@@ -69,7 +69,10 @@ def _detect_shell(f: NonBinaryFile) -> str | None:
 # Words that run the command after them rather than being it.
 _WRAPPERS = frozenset({"nohup", "exec", "setsid", "nice", "env", "time", "chrt", "taskset"})
 _ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
-_SUBST_RE = re.compile(r"^[A-Za-z_]\w*=(?:\$\(|`)(\S+)")
+# NAME=$( … or NAME=` … — quoted or not, and with or without a space before the command.
+_SUBST_RE = re.compile(r"^[A-Za-z_]\w*=[\"']?(?:\$\(|`)")
+# Builtins that only declare the assignments after them: ``local X=$(cmd)`` runs cmd, not ``local``.
+_DECLARATIONS = frozenset({"local", "export", "readonly"})
 
 
 def _split_respecting_quotes(line: str) -> list[str]:
@@ -88,9 +91,12 @@ def launched_command(line: str) -> str | None:
     ``exec``, ``nice -n 10`` …) and the ``-x``/``--exec``/``--startas`` of ``start-stop-daemon``.
     None when there is none to name — for a ``start-stop-daemon -K`` / ``--stop`` line, which names
     the binary it stops, and for a ``VAR=$(cmd …)`` assignment, whose cmd runs in a substitution
-    (named by the inline reading)."""
+    (named by the inline reading). A leading ``local`` / ``export`` / ``readonly`` before an
+    assignment only declares it, so it is passed over like the assignment itself."""
     tokens = _split_respecting_quotes(line)
     i = 0
+    if len(tokens) > 1 and tokens[0] in _DECLARATIONS and _ASSIGN_RE.match(tokens[1]):
+        i = 1
     while i < len(tokens):
         tok = tokens[i]
         if _SUBST_RE.match(tok):
@@ -284,7 +290,9 @@ class _Launch:
 
 def _substitutions(line: str) -> list[tuple[int, str]]:
     """(start, inner text) of every ``$( … )`` (paren-balanced; ``$((`` arithmetic skipped) and
-    every backquoted span on the line."""
+    every backquoted span on the line. An unclosed ``$(`` runs to the end of the line, and so does
+    an unclosed last backquote (less a trailing ``\\`` continuation): a substitution continued on
+    the next line still names its command here."""
     out: list[tuple[int, str]] = []
     i = 0
     while True:
@@ -307,7 +315,29 @@ def _substitutions(line: str) -> list[tuple[int, str]]:
         i += 2
     for m in re.finditer(r"`([^`]*)`", line):
         out.append((m.start(), m.group(1)))
+    if line.count("`") % 2:
+        last = line.rfind("`")
+        tail = line[last + 1 :].rstrip()
+        out.append((last, tail[:-1] if tail.endswith("\\") else tail))
     return out
+
+
+def _live_substitutions(line: str) -> list[tuple[int, str]]:
+    """The line's substitutions the shell actually runs, in order of position: one that starts
+    inside single quotes is literal text (``awk '{print $(NF-1)}'`` runs no ``NF-1``)."""
+    single = _single_quoted(line)
+    return [
+        (start, inner)
+        for start, inner in sorted(_substitutions(line))
+        if not any(a < start < b for a, b in single)
+    ]
+
+
+def _first_substitution_command(line: str) -> str | None:
+    """The command of the line's first live substitution that names one — the outer one when one
+    substitution holds another (a backquoted ``printf`` whose argument is a ``$(echo …)`` runs
+    ``printf`` first)."""
+    return next((c for _, sub in _live_substitutions(line) if (c := _subst_command(sub))), None)
 
 
 def _single_quoted(line: str) -> list[tuple[int, int]]:
@@ -383,10 +413,7 @@ def _launches_from_line(line: str, symtab: _SymbolTable, lineno: int) -> list[_L
     lit = launched_command(line)
     if lit:
         out.append(_Launch(lit, "literal", None))
-    single = _single_quoted(line)
-    for start, inner in _substitutions(line):
-        if any(a < start < b for a, b in single):
-            continue
+    for _, inner in _live_substitutions(line):
         command = _subst_command(inner)
         if command:
             out.append(_Launch(command, "inline", lineno))
@@ -562,10 +589,7 @@ def _ingest_shell(conn: sqlite3.Connection, file_id: int, f: NonBinaryFile) -> i
             # The line's own command; on a NAME=$(cmd) line, the command its substitution runs.
             command, via, via_line = launched_command(stripped), "literal", None
             if command is None:
-                inner = next(
-                    (c for _, sub in _substitutions(stripped) if (c := _subst_command(sub))),
-                    None,
-                )
+                inner = _first_substitution_command(stripped)
                 if inner is not None:
                     command, via, via_line = inner, "inline", lineno
             rows.append((file_id, command, raw, lineno, args_pattern, via, via_line))

@@ -92,6 +92,7 @@ from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
 from treasure_map.lib.hunt.fmt_provenance import constant_format_record, format_argument
 from treasure_map.lib.hunt.refs import (
     _WRAPPER_AXIS,
+    _addr_to_int,
     _norm_addr,
     build_evidence_ref,
     callsite_offset_suffix,
@@ -1050,11 +1051,23 @@ def _flatten_detector_status(
     ]
 
 
+_BinaryScope = tuple[str, str | None]
+
+
+def _binary_scope(binary_path: str | None, binary_name: str | None) -> _BinaryScope:
+    """Which binary a function or an edge belongs to: its recorded PATH, else its short name.
+
+    A short name is a label two files in one firmware can share (two copies of one library under
+    different directories), so the path is the identity; the name stands in only when no path was
+    recorded, and a match made through it is marked as the weaker claim it is."""
+    return ("path", binary_path) if binary_path else ("name", binary_name)
+
+
 def _one_hop_edge_leads(
     all_funcs: list[FuncRow],
     edge_rows: list[StringKeyedEdgeRow],
-) -> dict[tuple[str | None, str], list[dict[str, Any]]]:
-    """Map (binary, function) -> the string-key leads that structurally reach it in ONE hop.
+) -> dict[tuple[_BinaryScope, str], list[dict[str, Any]]]:
+    """Map (binary scope, function) -> the string-key leads that structurally reach it in ONE hop.
 
     DOWNWARD traversal — the same direction wrapper propagation reads: start at each edge's CALLEE
     and read ITS direct callees. One pass over the edge-callee set, so a fan-out handler naturally
@@ -1068,43 +1081,78 @@ def _one_hop_edge_leads(
     callee is often a fat handler that calls plenty of things unrelated to the key it matched. The
     lead says where to look; the note that carries it must say the data arrival is unproven.
 
+    ★ The edge callee is located by its binary PATH and its ADDRESS, never by short names: one
+    firmware can hold two binaries under one name, and one binary several functions under one name,
+    so a name join walks down from whichever same-named function was read last — the wrong function,
+    and a different one after a re-scan reorders the rows. An edge row with no recorded binary path
+    or no usable callee address falls back to the names, and only when exactly one function answers
+    to them (narrowed by the callee address when there is one); every lead it yields carries
+    ``match_basis: "name"`` (absent = located by path and address). Several answers -> no lead,
+    never a guess.
+
+    Each function's leads are deduplicated and sorted by (key, through, mechanism, basis), so the
+    output depends on the facts alone, not on the order the functions or edges were read in.
+
     Deliberately NO thinness gate. Wrapper propagation needs one because it CREATES candidates, and
     it must pass through a THIN forwarder. This only ANNOTATES an existing candidate, and the edge
     callees worth following are exactly the FAT handlers — a thinness filter would drop them.
     """
-    by_bin_name: dict[tuple[str | None, str], FuncRow] = {
-        (f.binary_name, f.name): f for f in all_funcs if f.name
-    }
-    out: dict[tuple[str | None, str], list[dict[str, Any]]] = {}
-    seen: set[tuple[str | None, str, str, str]] = set()
+    by_addr: dict[tuple[str, int], FuncRow] = {}
+    by_name: dict[tuple[_BinaryScope, str], list[FuncRow]] = {}
+    for f in all_funcs:
+        addr = _addr_to_int(f.address)
+        if f.binary_path and addr is not None:
+            by_addr[(f.binary_path, addr)] = f
+        if f.name:
+            by_name.setdefault((_binary_scope(f.binary_path, f.binary_name), f.name), []).append(f)
+            if f.binary_path:  # a pathless edge row names its binary by short name only
+                by_name.setdefault((("name", f.binary_name), f.name), []).append(f)
+    out: dict[tuple[_BinaryScope, str], list[dict[str, Any]]] = {}
+    seen: set[tuple[_BinaryScope, str, str, str, str, bool]] = set()
     for e in edge_rows:
         if not e.callee_name or not e.key:
             continue
-        callee_row = by_bin_name.get((e.binary, e.callee_name))
+        callee_addr = _addr_to_int(e.callee_addr)
+        callee_row: FuncRow | None
+        if e.binary_path and callee_addr is not None:
+            callee_row = by_addr.get((e.binary_path, callee_addr))
+            by_name_only = False
+        else:
+            by_name_only = True
+            named = by_name.get((_binary_scope(e.binary_path, e.binary), e.callee_name), [])
+            if callee_addr is not None:
+                named = [f for f in named if _addr_to_int(f.address) == callee_addr]
+            callee_row = named[0] if len(named) == 1 else None
         if callee_row is None:
             continue  # the edge callee is not a known function here -> nothing to walk down into
+        # The functions it calls live in the edge callee's own binary: that is their scope.
+        scope = _binary_scope(callee_row.binary_path, callee_row.binary_name)
         for callee in _parse_callees(callee_row.callees):
             if not callee or callee == e.callee_name:
                 continue
-            sig = (e.binary, callee, e.key, e.callee_name)
+            sig = (scope, callee, e.key, e.callee_name, e.mechanism, by_name_only)
             if sig in seen:
                 continue  # one function may be called several times / by several ladder arms
             seen.add(sig)
-            out.setdefault((e.binary, callee), []).append(
-                {
-                    "via": "string_keyed_edge",
-                    "key": e.key,
-                    "hops": 1,
-                    "through": e.callee_name,
-                    "mechanism": e.mechanism,
-                }
-            )
+            lead: dict[str, Any] = {
+                "via": "string_keyed_edge",
+                "key": e.key,
+                "hops": 1,
+                "through": e.callee_name,
+                "mechanism": e.mechanism,
+            }
+            if by_name_only:
+                lead["match_basis"] = "name"
+            out.setdefault((scope, callee), []).append(lead)
+    for leads in out.values():
+        leads.sort(key=lambda x: (x["key"], x["through"], x["mechanism"], "match_basis" in x))
     return out
 
 
 def _attach_edge_leads(
     ev: dict[str, Any],
-    edge_leads: dict[tuple[str | None, str], list[dict[str, Any]]],
+    edge_leads: dict[tuple[_BinaryScope, str], list[dict[str, Any]]],
+    binary_path: str | None,
     binary: str | None,
     func_name: str | None,
 ) -> None:
@@ -1112,11 +1160,13 @@ def _attach_edge_leads(
 
     A surfaced FACT only: nothing reads it back into recall, the grade, or the rank — it is an
     annotation the reachability layer renders, and the candidate's reachability stays unknown.
-    Absent when there are none (never an empty key), so old evidence reads identically.
+    Absent when there are none (never an empty key), so old evidence reads identically. Looked up
+    by the candidate's binary PATH (its short name only when no path was recorded), the scope the
+    leads were keyed on.
     """
     if not func_name:
         return
-    leads = edge_leads.get((binary, func_name))
+    leads = edge_leads.get((_binary_scope(binary_path, binary), func_name))
     if leads:
         ev["reachability_leads"] = leads
 
@@ -1169,14 +1219,21 @@ def _flatten_wrapper_edges(
     key through the wrapper — a real edge the direct graph missed. Marked ``via_wrapper`` so a
     consumer tells a one-hop indirect edge from a direct call. ONE hop only: only a literal at the
     immediate call site is resolved; a forwarded caller-param stays uncaptured (honesty > coverage,
-    never a fabricated edge). Wrapper identity is (binary, name) — a caller binds to its own binary.
+    never a fabricated edge). Wrapper identity is (binary PATH, name) — a caller binds to its own
+    binary, and a short name is a label two binaries in one firmware can share, so it scopes only a
+    binary with no recorded path. Two same-named wrappers in one binary that disagree on what they
+    forward resolve to nothing rather than to whichever was read last.
     """
     by_id = {f.func_id: f for f in all_funcs}
-    wrapper_by_bin_name: dict[tuple[str | None, str], dict[str, Any]] = {}
+    candidates: dict[tuple[_BinaryScope, str], dict[str, dict[str, Any]]] = {}
     for fid, w in wrappers_by_func_id.items():
         f = by_id.get(fid)
         if f is not None and f.name:
-            wrapper_by_bin_name[(f.binary_name, f.name)] = w
+            scope = _binary_scope(f.binary_path, f.binary_name)
+            candidates.setdefault((scope, f.name), {})[json.dumps(w, sort_keys=True)] = w
+    wrapper_by_bin_name: dict[tuple[_BinaryScope, str], dict[str, Any]] = {
+        k: next(iter(ws.values())) for k, ws in candidates.items() if len(ws) == 1
+    }
     rows: list[NvramFlowRow] = []
     for f in all_funcs:
         cas = call_args_by_func_id.get(f.func_id)
@@ -1188,7 +1245,7 @@ def _flatten_wrapper_edges(
             callee = ca.get("callee")
             if not isinstance(callee, str):
                 continue
-            wrap = wrapper_by_bin_name.get((f.binary_name, callee))
+            wrap = wrapper_by_bin_name.get((_binary_scope(f.binary_path, f.binary_name), callee))
             if wrap is None:
                 continue  # callee is not a recognized nvram wrapper -> not an indirect edge
             key = ca.get("key")
@@ -1684,7 +1741,9 @@ def run_analyzer2(
                     # value-origin facts ride alongside the text-level source_kind/flow_path. A
                     # value-origin facts. A surfaced fact only, never read into recall/score/grade.
                     ev["sink_arg_provenance"] = sink_prov_by_func.get(match.func_ref.func_id, [])
-                    _attach_edge_leads(ev, edge_leads, row.binary_name, match.func_ref.func_name)
+                    _attach_edge_leads(
+                        ev, edge_leads, row.binary_path, row.binary_name, match.func_ref.func_name
+                    )
                     flow_evidence = json.dumps(ev, sort_keys=True)
                 elif match.sink_class == "copy" and sink_name is not None:
                     # Copy candidates carry SIZE evidence (the danger axis): the length source
@@ -1702,7 +1761,11 @@ def run_analyzer2(
                         stub_names=stub_names,
                     )
                     _attach_edge_leads(
-                        size_ev, edge_leads, row.binary_name, match.func_ref.func_name
+                        size_ev,
+                        edge_leads,
+                        row.binary_path,
+                        row.binary_name,
+                        match.func_ref.func_name,
                     )
                     flow_evidence = json.dumps(size_ev, sort_keys=True)
                 elif match.sink_class == "format" and sink_name is not None:
@@ -1720,7 +1783,11 @@ def run_analyzer2(
                         stub_names=stub_names,
                     )
                     _attach_edge_leads(
-                        fmt_size_ev, edge_leads, row.binary_name, match.func_ref.func_name
+                        fmt_size_ev,
+                        edge_leads,
+                        row.binary_path,
+                        row.binary_name,
+                        match.func_ref.func_name,
                     )
                     flow_evidence = json.dumps(fmt_size_ev, sort_keys=True)
                 elif match.sink_class == "fmt_string" and sink_name is not None:
@@ -1741,7 +1808,11 @@ def run_analyzer2(
                         match.func_ref.func_id, []
                     )
                     _attach_edge_leads(
-                        fmt_ev, edge_leads, row.binary_name, match.func_ref.func_name
+                        fmt_ev,
+                        edge_leads,
+                        row.binary_path,
+                        row.binary_name,
+                        match.func_ref.func_name,
                     )
                     flow_evidence = json.dumps(fmt_ev, sort_keys=True)
                 elif match.sink_class == "path_sink" and sink_name is not None:
@@ -1765,7 +1836,11 @@ def run_analyzer2(
                     # stays not_traced (an honest '?', never sunk). Controllability comes from the
                     # text-level source_kind above.
                     _attach_edge_leads(
-                        path_ev, edge_leads, row.binary_name, match.func_ref.func_name
+                        path_ev,
+                        edge_leads,
+                        row.binary_path,
+                        row.binary_name,
+                        match.func_ref.func_name,
                     )
                     flow_evidence = json.dumps(path_ev, sort_keys=True)
 
