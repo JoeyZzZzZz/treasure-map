@@ -460,7 +460,8 @@ _PRESENCE_TOP = 20
 # A diff write made before anything of its subject was read: what that reads as, on its answer.
 _JUDGED_UNREAD = (
     "written before anything of its subject was read: it reads needs_recheck (not disposed) "
-    "until judged again after reading the subject (its unit's material, or the entry in full)"
+    "until judged again after reading the subject: the entry in full, or a unit material that "
+    "lists it"
 )
 _HEADLINE_WITHHELD = "diff_undetermined (meta.banners)"
 _HEADLINE_NONE = "no listed entry"
@@ -1026,6 +1027,28 @@ def make_tools(
     ws_root = Path(workspaces_root) if workspaces_root is not None else None
     _config = config if config is not None else load_config(None)
     _current = rescan_version.current_code_stamp(_config)
+    _disk_cache: dict[str, Any] = {}
+
+    def _disk_stamp() -> rescan_version.CodeStamp:
+        """The on-disk code stamp, recomputed only when a file of the package (path, mtime, size)
+        or the pyelftools version changed since the last call: hashing the code takes most of a
+        second, and start_diff_review asks on every call."""
+        pkg = rescan_version._PACKAGE
+        files = sorted(p for p in pkg.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+        sig = []
+        for p in files:
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            sig.append((p.relative_to(pkg).as_posix(), st.st_mtime_ns, st.st_size))
+        key = (tuple(sig), rescan_version._read_pyelftools())
+        if _disk_cache.get("key") != key:
+            _disk_cache["stamp"] = rescan_version.on_disk_code_stamp(_config)
+            _disk_cache["key"] = key
+        stamp: rescan_version.CodeStamp = _disk_cache["stamp"]
+        return stamp
+
     # D33: the server's own version fields, every one the IN-PROCESS loaded value, fixed once here
     # at startup (``_current`` is this process's code stamp; _current_pass_version and
     # _diff_code_version are cached on first call, so calling them here pins them). The one thing
@@ -1045,10 +1068,11 @@ def make_tools(
         disk — so a reader who runs a rescan and still sees the refusal knows why: the rescan used
         the newer on-disk code, but the server is still grading against the code it started with.
         Also the ``server`` block's ``code_moved_on_disk`` (D33: list_runs / start_diff_review /
-        get_diff_meta call it on every response, not only on a refusal). Recomputes the on-disk
-        stamp (uncached), so it is called at most once per tool call: a refusal on those three
+        get_diff_meta call it on every response, not only on a refusal). Reads the on-disk
+        stamp (rehashed only when a package file changed, ``_disk_stamp``), at most once per tool
+        call: a refusal on those three
         tools reuses the head's result (``_MOVED_UNSET``). None when they match."""
-        disk = rescan_version.on_disk_code_stamp(_config)
+        disk = _disk_stamp()
         if disk == _current:
             return None
         scans = "equal" if disk.scan == _current.scan else "differ"
@@ -2432,13 +2456,10 @@ def make_tools(
         if u.kind == _ru.REDUCE:
             return _reduce_material(review, u, budget)
         if u.kind in (_ru.S_BATCH, _ru.SECOND_TIER):
-            wanted = {m.entry_id for m in u.members}
-            page = _get_diff_patch_view(
-                atlas, u.stream, bucket=first.bucket or None, rows_limit=0, limit=2000
-            )
-            if "error" in page:
-                return {"error": page["error"]}
-            entries = [e for e in page.get("entries") or [] if e.get("entry_id") in wanted]
+            found = _member_entries(atlas, review, u, first.bucket or None)
+            if "error" in found:
+                return {"error": found["error"]}
+            entries = found["entries"]
             kept: list[dict[str, Any]] = []
             used = 0
             for e in entries:
@@ -2447,16 +2468,19 @@ def make_tools(
                     break
                 kept.append(e)
                 used += size
-            return {
+            out = {
                 "diff_id": u.stream,
                 "entries": kept,
-                "entries_total": len(entries),
-                "entries_truncated": len(kept) < len(entries),
+                "entries_total": len(u.members),
+                "entries_truncated": len(kept) < len(u.members),
                 "read_one": (
                     f"get_diff_patch_view(diff_id={json.dumps(u.stream)}, entry_id=<entry_id>)"
                 ),
                 "judge_with": f"annotate_diff_batch(diff_id={json.dumps(u.stream)}, ...)",
             }
+            if found["missing"]:
+                out["members_not_in_view"] = found["missing"]
+            return out
         if u.kind == _ru.PRESENCE:
             top = _presence_top(atlas, facts, first.anchor_ref)
             rows = top.get("top") or []
@@ -2470,17 +2494,22 @@ def make_tools(
                 one = _fd.file_diff(atlas, facts.run_a, facts.run_b, path=path, pf=facts.pair_files)
             except _fd.FileDiffError as exc:
                 return {"error": str(exc)}
-            one = {k: v for k, v in one.items() if k in ("run_pair", "entry", "next_hunk_offset")}
-            if len(json.dumps(one)) > budget:
-                one = {k: v for k, v in one.items() if k not in ("structured",)}
-                one["structured_withheld"] = "page_budget"
-            return {
-                **one,
-                "read_more": (
-                    f"get_file_diff(run_pair={json.dumps(facts.run_a + '::' + facts.run_b)}"
-                    f", path={json.dumps(path)}, hunk_offset=<next_hunk_offset>)"
-                ),
-            }
+            read_more = (
+                f"get_file_diff(run_pair={json.dumps(facts.run_a + '::' + facts.run_b)}"
+                f", path={json.dumps(path)}, hunk_offset=<next_hunk_offset>)"
+            )
+            # The file's line difference and structured lists live inside its entry: that is
+            # where the page budget withholds, first the structured lists, then the hunk.
+            entry = dict(one.get("entry") or {})
+            out = {"run_pair": one.get("run_pair"), "entry": entry, "read_more": read_more}
+            if len(json.dumps(out)) > budget and "structured" in entry:
+                entry.pop("structured")
+                entry["structured_withheld"] = "page_budget"
+            if len(json.dumps(out)) > budget:
+                for part in ("hunk", "hunk_shape"):
+                    if part in entry:
+                        entry[part] = {"withheld": "page_budget", "read_with": read_more}
+            return out
         return {"error": f"no material for unit kind {u.kind!r}"}
 
     def _side_code(run: str, function: str, binary: str | None, cap: int) -> dict[str, Any]:
@@ -2555,12 +2584,13 @@ def make_tools(
             ),
             "how": how,
         }
-        wanted = {m.entry_id for m in u.members}
-        page = _get_diff_patch_view(atlas, u.stream, rows_limit=0, limit=2000)
-        if "error" in page:
+        found = _member_entries(atlas, review, u, None)
+        if "error" in found:
             # No members to show is not an empty group: the material is the error (not handed out).
-            return {"error": page["error"]}
-        entries = [e for e in page.get("entries") or [] if e.get("entry_id") in wanted]
+            return {"error": found["error"]}
+        entries = found["entries"]
+        if found["missing"]:
+            out["members_not_in_view"] = found["missing"]
         room = budget - len(json.dumps(out))
         kept: list[dict[str, Any]] = []
         for e in entries:
@@ -2570,9 +2600,38 @@ def make_tools(
             kept.append(e)
             room -= size
         out["entries"] = kept
-        out["entries_total"] = len(entries)
-        out["entries_truncated"] = len(kept) < len(entries)
+        out["entries_total"] = len(u.members)
+        out["entries_truncated"] = len(kept) < len(u.members)
         return out
+
+    def _member_entries(
+        atlas: sqlite3.Connection, review: _ru.PairReview, u: _ru.Unit, bucket: str | None
+    ) -> dict[str, Any]:
+        """A batch's or group's members as the view lists them (each with its summary and
+        inline_hunk), read page by page until every member is found or the view ends: members
+        not yet disposed first, view order kept within each part, so a unit handed out again
+        after some were judged shows the ones still owed a reading. ``missing`` names members no
+        page lists. ``{"error": ...}`` when the view cannot be read."""
+        by_entry = {m.entry_id: m.anchor_ref for m in u.members if m.entry_id is not None}
+        wanted = set(by_entry)
+        found: list[dict[str, Any]] = []
+        offset: int | None = 0
+        while offset is not None and wanted:
+            page = _get_diff_patch_view(
+                atlas, u.stream, bucket=bucket, rows_limit=0, limit=2000, offset=offset
+            )
+            if "error" in page:
+                return {"error": page["error"]}
+            for e in page.get("entries") or []:
+                if e.get("entry_id") in wanted:
+                    wanted.discard(e["entry_id"])
+                    found.append(e)
+            nxt = page.get("next_offset")
+            offset = nxt if isinstance(nxt, int) and nxt > offset else None
+        states = review.progress.states
+        found.sort(key=lambda e: _ru.disposed(states.get(by_entry.get(str(e.get("entry_id")), ""))))
+        missing = [m.entry_id for m in u.members if m.entry_id in wanted]
+        return {"entries": found, "missing": missing}
 
     def _reduce_material(review: _ru.PairReview, u: _ru.Unit, budget: int) -> dict[str, Any]:
         """The reduce: the judgements still owed a group_ref, the groups, and where to look for
@@ -2619,9 +2678,20 @@ def make_tools(
                     "structured_withheld",
                 )
             )
-            or material.get("next_hunk_offset") is not None
             or (isinstance(entry, dict) and entry.get("rows_next_offset") is not None)
+            or (isinstance(entry, dict) and _file_entry_continues(entry))
         )
+
+    def _file_entry_continues(entry: dict[str, Any]) -> bool:
+        """A file's entry whose line difference (text or shape) or structured lists continue on
+        another page."""
+        for part in ("hunk", "hunk_shape"):
+            page = entry.get(part)
+            if isinstance(page, dict) and page.get("next_hunk_offset") is not None:
+                return True
+        block = entry.get("structured")
+        paging = block.get("lists_paging") if isinstance(block, dict) else None
+        return isinstance(paging, dict) and paging.get("next_offset") is not None
 
     def _fit_unit_material(
         atlas: sqlite3.Connection,
@@ -2682,6 +2752,13 @@ def make_tools(
                 out["unit"] = _unit_head(u, states)
                 out["members"] = _members_json(u, states)
                 room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
+                if room < 2_000 and len(out["members"]) > 20:
+                    # A full batch's member list alone fills the page: every member stays, each
+                    # with only what names and judges it, so the material still has room.
+                    keep = ("anchor_ref", "entry_id", "reasons", "review_state")
+                    out["members"] = [{k: m[k] for k in keep if k in m} for m in out["members"]]
+                    out["members_compact"] = "per member: " + ", ".join(keep)
+                    room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
                 _fit_unit_material(atlas, review, u, out, lambda: len(json.dumps(out)), room)
                 return out
             rep = review.report
@@ -2697,7 +2774,9 @@ def make_tools(
                     "must_read_complete",
                     "complete",
                     "not_seen",
+                    "judged_not_listed",
                 )
+                if key in rep
             }
             nr = rep["not_reachable"]
             out["report"]["not_reachable"] = {
@@ -2716,7 +2795,7 @@ def make_tools(
                 return out
             out["next_unit"] = {**_unit_head(nxt, states), "members": _members_json(nxt, states)}
             room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
-            if room < 2_000:
+            if room < 2_000 and len(out["next_unit"]["members"]) > 20:
                 # A batch's member list alone fills the page: the material is read by unit=.
                 out["next_unit"]["members"] = out["next_unit"]["members"][:20]
                 out["next_unit"]["members_truncated"] = True
@@ -5007,7 +5086,7 @@ def make_tools(
             ),
         }
         room = _RESPONSE_BYTE_BUDGET - used - len(json.dumps({"next_unit": head})) - 200
-        if room < 2_000:
+        if room < 2_000 and len(head["members"]) > 20:
             # A batch's member list alone fills the page: the material is read by read_with.
             head["members"] = head["members"][:20]
             head["members_truncated"] = True
@@ -5220,7 +5299,9 @@ def make_tools(
         the framework before this runs, so again nothing is written. On success each entry echoes
         ``{index, anchor_ref, action}`` (an overwrite adds ``overwrote``); an entry that leaned on
         a group carries its ``group_ref``, and each distinct group is echoed once under top-level
-        ``groups``. An item may carry ``change_kind`` (changed_real). ``unit_id`` / ``worker`` /
+        ``groups``. A batch whose echo would near the page keeps ``{index, action}`` per entry and
+        says the rest once: ``needs_recheck_indexes``, ``overwrote_by``. An item may carry
+        ``change_kind`` (changed_real). ``unit_id`` / ``worker`` /
         ``workers`` / ``attributed_to`` as in annotate_diff: every item must be a member of the
         unit, and the answer carries the next unit."""
         from treasure_map.lib.overlay import (
@@ -5443,10 +5524,29 @@ def make_tools(
                     ],
                 }
             pair = run_pair if meta is None else f"{meta['run_a_id']}::{meta['run_b_id']}"
+            unread_at = [r["index"] for r in results if "needs_recheck" in r]
+            extra: dict[str, Any] = {}
+            if len(json.dumps(results)) > _RESPONSE_BYTE_BUDGET - 8_000:
+                # A full batch's per-item echo alone nears the page: each result keeps its index
+                # (the item's place in the call) and action; what repeats is said once.
+                overwrote_by: dict[str, int] = {}
+                for r in results:
+                    if "overwrote" in r:
+                        who = str(r["overwrote"].get("attributed_to"))
+                        overwrote_by[who] = overwrote_by.get(who, 0) + 1
+                results = [
+                    {k: r[k] for k in ("index", "action", "group_ref") if k in r} for r in results
+                ]
+                if unread_at:
+                    extra["needs_recheck_indexes"] = unread_at
+                    extra["needs_recheck_means"] = _JUDGED_UNREAD
+                if overwrote_by:
+                    extra["overwrote_by"] = overwrote_by
             out: dict[str, Any] = {
                 "written": True,
                 "count": len(results),
                 "results": results,
+                **extra,
                 "note": "recorded on the diff layer (YOUR judgments). "
                 + (
                     f"list_overlays(anchor_kind='diff_subject', run_id='{pair}') resumes these."
@@ -5454,11 +5554,14 @@ def make_tools(
                     else _whole_pair_note(runs)
                 ),
             }
-            unread = sum(1 for r in results if "needs_recheck" in r)
-            if unread:
+            if unread_at:
+                where = (
+                    "needs_recheck_indexes"
+                    if "needs_recheck_indexes" in extra
+                    else "needs_recheck on those results"
+                )
                 out["note"] += (
-                    f" {unread} of them written before their subject was read: see needs_recheck "
-                    "on those results."
+                    f" {len(unread_at)} of them written before their subject was read: see {where}."
                 )
             if groups_echo:
                 out["groups"] = groups_echo

@@ -925,6 +925,64 @@ def test_a_repaired_pair_leaves_its_judgement_dangling(world: World) -> None:
     assert row["basis_state"] == dr.ANCHOR_UNRESOLVED
 
 
+def _unlist_and_repair(world: World) -> tuple[str, str]:
+    """Two undetermined pairs, each judged; then the first is aligned (identical, no candidate:
+    no longer listed, but its subject still resolves) and the second is paired with another
+    function (its subject is gone). Returns (the unlisted anchor, the dangling anchor)."""
+    world.pair(DX, "00001000", "00002000", conf=0.5, sim=1.0)
+    world.pair(DX, "00003000", "00004000", conf=0.5, sim=0.7)
+    unlisted = _pair_anchor(DX, "00001000", "00002000")
+    gone = _pair_anchor(DX, "00003000", "00004000")
+    listed = {e["anchor_ref"] for e in world.view()["entries"]}
+    assert {unlisted, gone} <= listed
+    world.judge(DX, unlisted, "changed_real")
+    world.judge(DX, gone, "change_inconclusive")
+    world.atlas.execute(
+        "UPDATE function_alignment SET alignment_confidence = 0.97, alignment_state = 'aligned' "
+        "WHERE addr_a = '00001000'"
+    )
+    world.atlas.execute(
+        "UPDATE function_alignment SET addr_b = '00004400' WHERE addr_a = '00003000'"
+    )
+    world.atlas.commit()
+    assert unlisted not in {e["anchor_ref"] for e in world.view()["entries"]}
+    return unlisted, gone
+
+
+def test_a_judgement_whose_subject_is_no_longer_listed_reads_subject_unlisted(
+    world: World,
+) -> None:
+    """★ A judged undetermined pair becomes aligned and identical: the view no longer lists it, and
+    a judgement on it cannot be written again. It reads ``subject_unlisted`` (not needs_recheck,
+    which nothing could clear), keeps what moved, and is counted under ``judged_not_listed`` with
+    the changed_real ones apart. A subject that no longer resolves (re-paired) stays dangling and
+    needs_recheck, and is NOT absorbed into judged_not_listed.
+
+    MUTATION (verified RED, 1 failed): ``unlisted_judgements`` returns nothing -> the row reads
+    needs_recheck and judged_not_listed counts 0 -> RED; drop the subject_unlisted state in
+    ``list_diff_overlays`` -> the row reads needs_recheck -> RED; let ``unlisted_judgements`` take
+    an anchor_unresolved one too -> the re-paired row reads subject_unlisted -> RED."""
+    unlisted, gone = _unlist_and_repair(world)
+    got = overlay.list_overlays(world.atlas, anchor_kind="diff_subject", run_id=PAIR)
+    rows = {r["anchor_ref"]: r for r in got["overlays"]}
+    assert rows[unlisted]["review_state"] == dr.SUBJECT_UNLISTED
+    assert rows[unlisted]["basis_state"] == dr.CHANGED and rows[unlisted]["basis_moved"]
+    assert rows[gone]["review_state"] == coverage.NEEDS_RECHECK
+    assert rows[gone]["basis_state"] == dr.ANCHOR_UNRESOLVED
+    assert got["counts_by_review_state"] == {dr.SUBJECT_UNLISTED: 1, coverage.NEEDS_RECHECK: 1}
+    progress = got["review_progress"]
+    assert progress["dangling_annotations"] == [gone]
+    jnl = progress["judged_not_listed"]
+    assert (jnl["count"], jnl["by_verdict"], jnl["anchors"]) == (
+        1,
+        {"changed_real": 1},
+        [unlisted],
+    )
+    assert jnl["changed_real"] == {"count": 1, "anchors": [unlisted]}
+    # Not a row state of the count: no listed entry carries it.
+    assert dr.SUBJECT_UNLISTED not in progress["states"]
+
+
 def test_a_rekeyed_candidate_moves_the_pair_and_strands_the_candidate_anchor(
     world: World,
 ) -> None:

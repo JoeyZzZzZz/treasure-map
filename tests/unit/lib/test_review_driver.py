@@ -9,6 +9,7 @@ Zero real data: the callee-group World of test_callee_groups; the agent is simul
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import time
@@ -286,3 +287,103 @@ def test_the_command_line_routes_a_run_pair_and_refuses_on_a_failed_probe(
     assert res.exit_code != 0
     assert "tmap reached False" in res.output and "probe failed" in res.output
     assert w.atlas.execute("SELECT COUNT(*) FROM overlay").fetchone()[0] == 0
+
+
+_VALUES = {
+    "prompt": "P",
+    "mcp_config": "/m.json",
+    "workdir": "/w",
+    "atlas": "/a",
+    "unit_id": "u",
+    "run_pair": "r",
+    "tmap": "tmap",
+}
+
+
+def test_the_handoff_launch_carries_the_findings_schema_and_no_unit_launch_does() -> None:
+    """★ The claude-code hand-off launch carries --json-schema with HANDOFF_SCHEMA — the value, read
+    back as JSON, is the module's constant (fixed keys: a findings list naming each anchor_ref) —
+    before the prompt, which stays the last argument. A unit's launch (plain or blind) carries none.
+
+    MUTATION (verified RED, ``1 failed``): fill placeholders in the hand-off argv too (its braces
+    read as placeholders) -> KeyError, caught -> RED; never add the hand-off argv -> RED."""
+    preset = rd.PRESETS["claude-code"]
+    why = ""
+    try:
+        argv: list[str] | None = rd.render(preset, _VALUES, handoff=True)
+    except (KeyError, IndexError, ValueError) as exc:  # a brace read as a placeholder
+        argv, why = None, repr(exc)
+    assert argv is not None, why
+    assert argv.count("--json-schema") == 1, argv
+    assert json.loads(argv[argv.index("--json-schema") + 1]) == rd.HANDOFF_SCHEMA
+    assert argv[-1] == "P"
+    items = rd.HANDOFF_SCHEMA["properties"]["findings"]["items"]
+    assert set(items["required"]) == {"anchor_ref", *rd.HANDOFF_FIELDS}
+    assert items["additionalProperties"] is False
+    for blind in (False, True):
+        assert "--json-schema" not in rd.render(preset, _VALUES, blind=blind)
+
+
+def test_a_units_launch_from_the_drive_carries_no_handoff_argv(tmp_path: Path) -> None:
+    """★ The drive's per-unit launches never carry the hand-off argv (the findings schema is for
+    the final hand-off launch only; a unit's agent ends with a judgement, not that JSON).
+
+    MUTATION (verified RED, ``1 failed``): render the drive's launches with handoff=True -> RED."""
+    w = _world(tmp_path)
+    preset = rd.Preset(
+        "test", PRESET.argv, blind_argv=PRESET.blind_argv, handoff_argv=("--schema", "S")
+    )
+    calls: list[list[str]] = []
+    rd.drive(
+        w.path,
+        "runA",
+        "runB",
+        preset,
+        workdir=tmp_path,
+        k=50,
+        max_units=3,
+        runner=_agent(w, "all", calls),
+        echo=lambda s: None,
+    )
+    assert calls and all("--schema" not in c for c in calls), calls
+
+
+def test_the_probe_tries_the_handoff_argv_when_the_handoff_will_run(tmp_path: Path) -> None:
+    """★ With handoff=True the probe launches once more with the preset's hand-off argv (the
+    findings schema), so an agent CLI that refuses it fails here, not after the whole review — and
+    the reason names the option. Without handoff, no such launch.
+
+    MUTATION (verified RED, ``1 failed``): never add the hand-off launch -> RED; drop the exit
+    check -> the reason does not name the option -> RED."""
+    atlas = tmp_path / "atlas.db"
+    preset = rd.Preset(
+        "test", PRESET.argv, blind_argv=PRESET.blind_argv, handoff_argv=("--schema", "{S}")
+    )
+    launches: list[list[str]] = []
+
+    def agent(old_cli: bool) -> Any:
+        def run(argv: list[str], *, cwd: Path, timeout: float) -> rd.Launch:
+            launches.append(list(argv))
+            if old_cli and "--schema" in argv:
+                return rd.Launch(2, 0.0, False, "error: unknown option '--schema'")
+            tcl.ToolCallLog(tcl.log_path_for(atlas)).record("list_runs", {}, {"runs": []})
+            return rd.Launch(0, 0.0, False)
+
+        return run
+
+    got = rd.probe(preset, atlas_path=atlas, workdir=tmp_path, timeout=5, runner=agent(False))
+    assert got.ok is True and len(launches) == 2
+    assert all("--schema" not in a for a in launches)
+    launches.clear()
+    got = rd.probe(
+        preset, atlas_path=atlas, workdir=tmp_path, timeout=5, runner=agent(False), handoff=True
+    )
+    assert got.ok is True and len(launches) == 3
+    (with_schema,) = [a for a in launches if "--schema" in a]
+    assert with_schema[-3:-1] == ["--schema", "{S}"] and "--deny" not in with_schema
+    launches.clear()
+    got = rd.probe(
+        preset, atlas_path=atlas, workdir=tmp_path, timeout=5, runner=agent(True), handoff=True
+    )
+    assert got.ok is False
+    assert "the launch with --schema exited 2" in got.why, got.why

@@ -15,6 +15,8 @@ states, made checkable, plus what it left out. An entry of a diff is must-read w
 * an aligned pair whose ``sink_callsite_counts`` shows fewer calls on the B side of a command sink
   (the command class, ``_eval`` or ``execvpe``) — ``command_calls_fewer`` (a side that cannot be
   counted is unknown, never fewer);
+* a bucket B entry of attention 0 or 1 whose subclass is ``sink_present_no_visible_delta`` or
+  ``instruction_unmatched`` — ``aligned_b_sink``;
 * among the first ``k`` entries of its diff in the default order — ``top_k``.
 
 Besides the entries, every binary one run of the pair holds alone (``binary_presence``) and every
@@ -52,7 +54,7 @@ from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, OPEN, UNSEEN
 
-PREDICATE_VERSION = "v0"
+PREDICATE_VERSION = "v1"
 DEFAULT_K = 4
 MAX_K = 200
 # A batch unit holds at most this many members: what one annotate_diff_batch call takes.
@@ -61,6 +63,12 @@ BATCH_MAX = 200
 # The sinks whose fewer calls on the B side make an aligned pair must-read: the command class (the
 # exec-path variant among it) and the argv-array runner the hunt does not recall.
 COMMAND_CALL_SINKS: frozenset[str] = frozenset(classes.CMD) | frozenset({"_eval", "execvpe"})
+# The B subclasses whose attention-0/1 entries are must-read (``aligned_b_sink``): a sink candidate
+# whose matched pair shows no visible delta at it, or whose sink instruction found no match on the
+# other side — a fix to a sink call can read as either, ranked past the first k.
+ALIGNED_B_SINK_SUBCLASSES: frozenset[str] = frozenset(
+    {"sink_present_no_visible_delta", "instruction_unmatched"}
+)
 
 REASONS = (
     "p_entry",
@@ -69,6 +77,7 @@ REASONS = (
     "bucket_s",
     "side_not_in_inventory",
     "command_calls_fewer",
+    "aligned_b_sink",
     "top_k",
     "binary_presence",
     "non_binary_file",
@@ -228,6 +237,8 @@ def entry_reasons(
         out.append("side_not_in_inventory")
     if _command_calls_fewer(e):
         out.append("command_calls_fewer")
+    if bucket == "B" and attention <= 1 and e.shown_subclass in ALIGNED_B_SINK_SUBCLASSES:
+        out.append("aligned_b_sink")
     if position < k:
         out.append("top_k")
     return tuple(out)
@@ -254,6 +265,9 @@ class DiffFacts:
     # The diff's callee groups (lib/query/callee_groups): ``{callee_b, callee_a, name, ref,
     # members (entry ids), members_possibly_incomplete}``, every member a listed paired entry.
     groups: list[dict[str, Any]] = field(default_factory=list)
+    # The anchors of the listed entries and of their candidate rows: a judgement whose subject is
+    # in ``subjects`` but not here reads subject_unlisted (diff_review.unlisted_judgements).
+    listed_anchors: frozenset[str] = frozenset()
 
 
 def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) -> DiffFacts | None:
@@ -289,10 +303,14 @@ def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) ->
             )
         )
     subjects: dict[str, dr.Subject] = {}
+    listed_anchors: frozenset[str] = frozenset()
     if d.binary and not listing.withheld:
         full = dr.subjects_of(listing.built.placed, d.run_a, d.run_b, d.binary)
         # Facts only: a judgement is read against its subject's facts (diff_review.judge).
         subjects = {a: dr.Subject(s.kind, s.facts) for a, s in full.items()}
+        listed_anchors = frozenset(
+            dr.anchors_of([o.entry for o in listing.entries], d.run_a, d.run_b, d.binary)
+        )
     groups: list[dict[str, Any]] = []
     if not listing.withheld:
         from treasure_map.lib.query.callee_groups import callee_groups
@@ -321,6 +339,7 @@ def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) ->
         run_a=d.run_a,
         run_b=d.run_b,
         groups=groups,
+        listed_anchors=listed_anchors,
     )
 
 
@@ -527,6 +546,8 @@ class Progress:
 
     states: dict[str, str] = field(default_factory=dict)
     dangling: list[str] = field(default_factory=list)
+    # The judgements read subject_unlisted: their subject resolves but is not listed.
+    unlisted: list[dr.DiffAnnotation] = field(default_factory=list)
 
 
 def read_progress(
@@ -567,6 +588,7 @@ def read_progress(
             group_review=_group if group_review is not None else None,
         )
         out.dangling += dangling
+        out.unlisted += dr.unlisted_judgements(judged, d.listed_anchors).values()
         for m in d.entries:
             out.states[m.anchor_ref] = dr.review_state(judged.get(m.anchor_ref))
     stale = pair_staleness.get("source_stale")
@@ -1065,6 +1087,8 @@ def report(
         },
         "not_seen": list(NOT_SEEN),
         "dangling_judgements": sorted(progress.dangling),
+        # Apart from the dangling ones: the subject resolves but is no longer listed.
+        "judged_not_listed": dr.judged_not_listed(progress.unlisted),
     }
 
 

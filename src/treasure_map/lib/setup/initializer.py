@@ -1040,14 +1040,14 @@ def run_init(
             )
         elif sst.state == "invalid":
             plan.needs_you.append(f"skill {sst.path}: {sst.detail}; not modified")
-    # A copy tmap wrote, still byte for byte, in a directory no agent chosen in this run reads is
-    # brought up to date too (an agent reading two directories would otherwise see two versions);
-    # nothing is created there.
+    # A copy tmap wrote, still byte for byte, or an earlier tmap's text installed by hand, in a
+    # directory no agent chosen in this run reads is brought up to date too (an agent reading two
+    # directories would otherwise see two versions); nothing is created there.
     for root in skill_known:
         if root in skill_targets:
             continue
         sst = sk.classify(root, ledger, skill_bytes, known=skill_known)
-        if sst.state == "stale":
+        if sst.state in ("stale", "legacy"):
             plan.add(
                 Action(
                     "install_skill",
@@ -1197,7 +1197,14 @@ def run_init(
                     needs_you.append(why)
                 continue
             try:
-                sk.install(a.target, skill_bytes, ledger)
+                sk.install(
+                    a.target,
+                    skill_bytes,
+                    ledger,
+                    claude_config_dir=sk.claude_config_dir_of(
+                        a.target.parent.parent, chost.home, chost.environ
+                    ),
+                )
             except OSError as exc:  # this directory only, reported
                 echo(f"  ✗ skill: {exc}")
                 needs_you.append(f"write the diff-review skill at {a.target}: {exc}")

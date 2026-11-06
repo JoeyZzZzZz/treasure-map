@@ -88,7 +88,13 @@ def safe_to_remove(
             return None
         return f"{path} is not where tmap installs completion"
     if entry.id.startswith(sk.ID_PREFIX):
-        return sk.removable(path, entry.extra.get("sha256"), home, environ)
+        return sk.removable(
+            path,
+            entry.extra.get("sha256"),
+            home,
+            environ,
+            claude_config_dir=entry.extra.get("claude_config_dir"),
+        )
     if entry.kind == "edit":
         return None  # restored, never deleted; checked in _restore_edit
     if strictly_under(path, toolchain_dir):
@@ -166,13 +172,6 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-class _Unsaved(Ledger):
-    """A copy of a ledger that is never written back (what the plan shows before any change)."""
-
-    def save(self) -> None:
-        pass
-
-
 def plan_lines(
     ledger: Ledger,
     survey: cl.Survey,
@@ -184,8 +183,7 @@ def plan_lines(
     lines: list[str] = []
     # as uninstall will see it: with an interrupted skill write settled (on a copy — the plan
     # changes nothing)
-    ledger = _Unsaved(ledger.path, [Entry.from_json(e.to_json()) for e in ledger.entries])
-    sk.recover(ledger)
+    ledger = sk.settled_copy(ledger)
     for cid in cl.CLIENT_IDS:
         st = survey.states[cid]
         if st.state in ("aligned", "stale", "shadowed", "unknown") and st.editable:

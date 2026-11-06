@@ -1156,6 +1156,59 @@ def test_a_stub_the_extractor_could_not_name_is_unresolved(world: World) -> None
     assert cs["unresolved_a"] == ["FUN_00042000"]
 
 
+def test_thunk_names_are_compared_through_their_targets_alignment(world: World) -> None:
+    """★ The only difference between the two callee lists is a ``thunk_FUN_<addr>`` name on each
+    side, and the two thunks' targets are one aligned pair: the same callee, so the sets are equal.
+
+    MUTATION (verified RED, with the next test 2 failed): compare thunk_FUN_ names as plain names
+    (drop the thunk match in ``_identities``) -> differs -> RED."""
+    world.pair("000d1000", "000d2000", 0.97, 0.6)
+    world.pair("000d3000", "000d4000", 0.97, 1.0)  # the thunks' targets, aligned
+    world.fn("a", "000d1000", ["memset", "thunk_FUN_000d3000"])
+    world.fn("b", "000d2000", ["memset", "thunk_FUN_000d4000"])
+    world.commit()
+    same = _entry(world, _pair_id("000d1000", "000d2000"))["callee_set"]
+    assert same == {"state": "equal", "callees_complete": True}
+
+
+def test_a_thunk_whose_target_is_not_aligned_leaves_the_set_undetermined(world: World) -> None:
+    """A thunk whose target has no aligned pair cannot be identified: undetermined
+    (``callee_identity_unresolved``), never differs.
+
+    MUTATION (verified RED, with the previous test 2 failed): compare thunk_FUN_ names as plain
+    names -> differs -> RED."""
+    world.pair("000d5000", "000d6000", 0.97, 0.6)
+    world.pair("000d7000", "000d8000", 0.5, 0.9)  # the thunks' targets, not aligned
+    world.fn("a", "000d5000", ["memset", "thunk_FUN_000d7000"])
+    world.fn("b", "000d6000", ["memset", "thunk_FUN_000d8000"])
+    world.commit()
+    cs = _entry(world, _pair_id("000d5000", "000d6000"))["callee_set"]
+    assert (cs["state"], cs.get("reason")) == ("undetermined", "callee_identity_unresolved")
+    assert (cs["unresolved_a"], cs["unresolved_b"]) == (
+        ["thunk_FUN_000d7000"],
+        ["thunk_FUN_000d8000"],
+    )
+
+
+def test_a_thunk_and_a_direct_call_to_one_target_stay_apart(world: World) -> None:
+    """A thunk to a function and a direct call of that function are told apart: a side that calls
+    the target through its thunk where the other calls it directly reads differs.
+
+    MUTATION (verified RED, 1 failed): key a thunk like the plain ``FUN_`` pair -> equal -> RED."""
+    world.pair("000d9000", "000da000", 0.97, 0.6)
+    world.pair("000db000", "000dc000", 0.97, 1.0)
+    world.fn("a", "000d9000", ["thunk_FUN_000db000"])
+    world.fn("b", "000da000", ["FUN_000dc000"])
+    world.commit()
+    cs = _entry(world, _pair_id("000d9000", "000da000"))["callee_set"]
+    assert cs == {
+        "state": "differs",
+        "only_in_a": ["thunk_FUN_000db000"],
+        "only_in_b": ["FUN_000dc000"],
+        "callees_complete": True,
+    }
+
+
 def test_a_truncated_list_is_undetermined(world: World) -> None:
     world.pair("00044000", "00045000", 0.97, 0.6)
     world.fn("a", "00044000", ["memset"], truncated=1)

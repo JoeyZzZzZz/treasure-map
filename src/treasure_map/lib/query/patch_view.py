@@ -206,6 +206,8 @@ SOURCE_GAP_PREFIXES: dict[str, tuple[str, ...]] = {"uci_ubus": ("uci_", "ubus_")
 _DIRECT_GRANULARITIES = ("callsite", "degraded_out_of_body", "function_fallback")
 _WRAPPER_FUNCTION_LEVEL = "wrapper"
 _FUN_RE = re.compile(r"FUN_([0-9a-fA-F]+)")
+# A thunk the decompiler named after the unnamed function it jumps to: identified by that target.
+_THUNK_FUN_RE = re.compile(r"thunk_FUN_([0-9a-fA-F]+)")
 _SPS = "sink_presence_signal"
 _REF_CHUNK = 500  # refs per IN (...) list, well under SQLite's bound-parameter limit
 
@@ -1980,13 +1982,16 @@ class _Builder:
     def _identities(self, side: str, fn: _Fn) -> tuple[dict[tuple[str, ...], str], set[str]]:
         """(identity -> the name as printed, the names that cannot be identified) of one function's
         callees. A ``FUN_<addr>`` name is the function at that address, identified by its aligned
-        pair; a stub the extractor could not name, or a function with no aligned pair, cannot be
-        identified. Every other name is itself."""
+        pair; a ``thunk_FUN_<addr>`` name is a thunk to the function at that address, identified
+        the same way by its target's aligned pair (its own key, so a thunk and a direct call to one
+        target stay apart); a stub the extractor could not name, or a target with no aligned pair,
+        cannot be identified. Every other name is itself."""
         pair_of = self.diff.pair_of_a if side == "a" else self.diff.pair_of_b
         idents: dict[tuple[str, ...], str] = {}
         unresolved: set[str] = set()
         for name in fn.callees or ():
-            m = _FUN_RE.fullmatch(name)
+            thunk = _THUNK_FUN_RE.fullmatch(name)
+            m = thunk or _FUN_RE.fullmatch(name)
             if m is None:
                 idents[("name", name)] = name
                 continue
@@ -1997,7 +2002,8 @@ class _Builder:
             elif pair is None or not pair.aligned:
                 unresolved.add(name)
             else:
-                idents[("pair", pair.addr_a, pair.addr_b)] = name
+                kind = "thunk" if thunk is not None else "pair"
+                idents[(kind, pair.addr_a, pair.addr_b)] = name
         return idents, unresolved
 
     def _one_hop(self, e: _Entry, names: list[str], side: str) -> None:
@@ -5727,9 +5733,10 @@ def get_diff_patch_view(
 
 class ViewReview:
     """The judgements on one built diff, read against it: each listed entry's anchor and review
-    state, the progress over a scope of entries, and the annotation block. ``listed`` is
-    listed_view's result when the caller holds it (read from its own readings); else it is asked
-    for here."""
+    state, the progress over a scope of entries, and the annotation block; beside them the
+    judgements whose subject is gone (``dangling``) and those whose subject resolves but is not
+    listed (``unlisted``, read subject_unlisted). ``listed`` is listed_view's result when the
+    caller holds it (read from its own readings); else it is asked for here."""
 
     def __init__(
         self, atlas: sqlite3.Connection, built: BuiltDiff, listed: ListedView | None = None
@@ -5772,6 +5779,12 @@ class ViewReview:
             group_review=_group_review,
         )
         entries = self.listed.entries
+        # A judgement whose subject resolves (it is in ``subjects``, built over every placed entry)
+        # but is not listed — read subject_unlisted, reported apart from dangling.
+        listed_anchors = (
+            diff_review.anchors_of(entries, d.run_a, d.run_b, d.binary) if d.binary else set()
+        )
+        self.unlisted = diff_review.unlisted_judgements(self.judged, listed_anchors)
         self.anchor: dict[str, str | None] = {
             e.entry_id: (
                 diff_review.entry_anchor(e, d.run_a, d.run_b, d.binary) if d.binary else None

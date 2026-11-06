@@ -753,6 +753,8 @@ _R5 = [
         'i = atoi(x);\n  b[0] = \'\\0\';\n  sprintf(b,"/proc/%d",i);\n  fopen(b,"r");',
         True,
     ),
+    ("converter copy", 'strcpy(b,(char *)atoi(x));\n  fopen(b,"r");', True),
+    ("inline-converter format", 'sprintf(b,"/proc/%d",atoi(x));\n  fopen(b,"r");', True),
     ("%s non-literal", 'i = atoi(x);\n  snprintf(b,0x40,"/x/%s-%d",g,i);\n  fopen(b,"w");', False),
     ("vararg count mismatch", 'i = atoi(x);\n  sprintf(b,"/x/%d/%s",i);\n  fopen(b,"r");', False),
     (
@@ -783,7 +785,11 @@ def test_numeric_sanitized_needs_every_buffer_write_safe(name: str, body: str, w
 
     MUTATION (verified RED): accept a %s with a non-literal vararg -> the ``%s non-literal`` case
     turns True; drop the escape/alias scan -> ``escape call`` / ``alias store`` turn True; drop F1
-    -> the global/parameter cases below turn True; drop F2 -> ``F2 not enclosing`` turns True."""
+    -> the global/parameter cases below turn True; drop F2 -> ``F2 not enclosing`` turns True.
+    MUTATION (verified RED, 1 failed each): refuse every converter copy, or let one pass the
+    position check without setting the format-or-converter flag -> ``converter copy`` turns
+    False; refuse a format write with an inline converter argument -> ``inline-converter format``
+    turns False."""
     assert (_num(body) == NUMERIC_SANITIZED) is want, name
 
 
@@ -1207,6 +1213,33 @@ def test_an_exempt_literal_format_write_is_never_the_numeric_write(
         sink_name="system",
         pseudocode=pc,
         callees=["atoi", "snprintf", "system"],
+        sink_arg="b",
+        sink_class="cmd",
+        sink_form="var",
+        occurrence=0,
+    )
+    assert got is None
+
+
+@pytest.mark.parametrize("write", ['strncpy(b,"reboot",n);', 'memcpy(b,"reboot",n);'])
+@pytest.mark.parametrize("enclosing", [True, False], ids=["encloses", "sibling"])
+def test_an_exempt_literal_copy_is_never_the_numeric_write(write: str, enclosing: bool) -> None:
+    """The same holds for a copy of a string literal: a copy is a builder of the dependency graph
+    too, so its size argument carries a converter result onto the buffer's path just as a format
+    write's does, while the only write is a constant. Wherever that exempt copy sits, it is not the
+    format/converter write the mark needs, and nothing marks the candidate.
+
+    MUTATION (verified RED, 4 failed): let the exempt literal copy set the format-or-converter flag
+    before it skips the position check -> all four read numeric_sanitized."""
+    body = f"  {write}\n" if enclosing else f"  if (y != 0) {{\n    {write}\n  }}\n"
+    pc = (
+        "void f(char *x,char *y)\n{\n  int n;\n  char b [64];\n  n = atoi(x);\n"
+        f"{body}  system(b);\n}}"
+    )
+    got = detect_form_signal(
+        sink_name="system",
+        pseudocode=pc,
+        callees=["atoi", "strncpy", "memcpy", "system"],
         sink_arg="b",
         sink_class="cmd",
         sink_form="var",

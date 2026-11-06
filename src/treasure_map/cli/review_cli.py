@@ -193,13 +193,20 @@ def skill(install_dir: str | None, force: bool) -> None:
     if st.state == "aligned":
         click.echo(f"{st.path} is already current")
         return
-    if st.state in ("foreign", "invalid") and not force:
+    if st.state == "foreign" and not force:
+        raise click.ClickException(f"{st.path}: {st.detail}; not replaced — {sk.next_step(st)}")
+    if st.state == "invalid" and not force:
         raise click.ClickException(f"{st.path}: {st.detail}; not replaced (--force replaces it)")
     # Recorded only where tmap uninstall may take it away again.
     recorded = sk.is_known(root, known)
     try:
         if recorded:
-            sk.install(st.path, data, ledger)
+            sk.install(
+                st.path,
+                data,
+                ledger,
+                claude_config_dir=sk.claude_config_dir_of(root, home, os.environ),
+            )
         else:
             sk.write_plain(st.path, data)
     except OSError as exc:
@@ -632,7 +639,13 @@ def run(
     workdir = Path(tempfile.mkdtemp(prefix="tmap-review-"))
     deadline = timeout or rd.DEFAULT_TIMEOUT
     click.echo(f"probing {preset.name} ({preset.note or 'preset'}) …")
-    pr = rd.probe(preset, atlas_path=Path(atlas), workdir=workdir, timeout=min(deadline, 300))
+    pr = rd.probe(
+        preset,
+        atlas_path=Path(atlas),
+        workdir=workdir,
+        timeout=min(deadline, 300),
+        handoff=handoff_out is not None,
+    )
     click.echo(
         f"probe: tmap reached {pr.tmap_reached}, built-in tools blocked {pr.builtin_blocked} — "
         f"{pr.why}"

@@ -43,7 +43,10 @@ candidate row; for a function with no counterpart its presence state, export gap
 candidate row its presence, reason, counterpart call and where it lands. A later read re-derives
 them: any that moved puts the judgement in ``needs_recheck``. An anchor whose subject is gone (the
 diff paired the functions differently, or a candidate was re-keyed) is not a row state; it is
-reported beside the counts as dangling.
+reported beside the counts as dangling, and reads ``needs_recheck``. An anchor whose subject still
+resolves but is no longer LISTED (the pair now reads identical) is not a row state either: it reads
+``subject_unlisted`` — neither needs_recheck (it cannot be judged again while unlisted) nor
+disposed — and is reported beside the counts as ``judged_not_listed``, apart from dangling.
 """
 
 from __future__ import annotations
@@ -51,7 +54,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -81,6 +84,19 @@ UNCHANGED = "unchanged"
 CHANGED = "changed"
 ANCHOR_UNRESOLVED = "anchor_unresolved"
 DIFF_WITHHELD = "diff_withheld"
+
+# Not a row state of the progress count (no listed entry is in it), like dangling: the review
+# state of a judgement whose subject still resolves but is no longer listed (unlisted_judgements).
+SUBJECT_UNLISTED = "subject_unlisted"
+JUDGED_NOT_LISTED_SHOWN = 20
+JUDGED_NOT_LISTED_MEANS = (
+    "judgments whose subject still resolves in its diff but is no longer listed (a pair now read "
+    "as identical, or a candidate row of such an entry): review_state 'subject_unlisted' — not "
+    "needs_recheck (it cannot be judged again while it is not listed), not disposed, and in no "
+    "count of listed entries. A changed_real among them is counted apart: a change a person "
+    "judged that the view now leaves out. A subject that no longer resolves at all (the functions "
+    "were paired differently) is not here: it is in dangling_annotations and reads needs_recheck."
+)
 
 # The one rule for a no_real_change's ``checked`` (and a changed_real's ``evidence``), said in one
 # place so the view's per-page hint, the write-time refusal and the MCP docstring cannot drift. A
@@ -245,6 +261,16 @@ def subjects_of(placed: list[_Entry], run_a: str, run_b: str, binary: str) -> di
             out[candidate_anchor(run_a, run_b, _subject_key(r))] = Subject(
                 "candidate", row_facts(v), e, v
             )
+    return out
+
+
+def anchors_of(entries: list[_Entry], run_a: str, run_b: str, binary: str) -> set[str]:
+    """The anchors ``subjects_of`` keys for these entries — each entry's and each of its candidate
+    rows' — without reading their facts."""
+    out: set[str] = set()
+    for e in entries:
+        out.add(entry_anchor(e, run_a, run_b, binary))
+        out.update(candidate_anchor(run_a, run_b, _subject_key(r)) for r in e.rows)
     return out
 
 
@@ -468,6 +494,44 @@ def judgements_for(
         )
     dangling = sorted(a for a, j in judged.items() if j.basis_state == ANCHOR_UNRESOLVED)
     return judged, dangling
+
+
+# ── a judgement whose subject resolves but is not listed ────────────────────────────────────
+
+
+def unlisted_judgements(
+    judged: dict[str, DiffAnnotation], listed_anchors: set[str] | frozenset[str]
+) -> dict[str, DiffAnnotation]:
+    """The judgements whose subject the view still places — the anchor resolves, so this is not
+    dangling — but no longer lists: a pair now read as identical, or a candidate row of an entry
+    that is not listed. Such a subject cannot be judged again (the write refuses an anchor the view
+    does not list), so it is not ``needs_recheck``; it is no listed entry either, so it is in no
+    count of the progress. It reads ``subject_unlisted``. ``listed_anchors`` are the anchors of the
+    listed entries and of their candidate rows (``subjects_of`` over the listed entries). A subject
+    that no longer resolves (``anchor_unresolved``) or a withheld diff never lands here."""
+    return {
+        a: j
+        for a, j in judged.items()
+        if j.basis_state not in (ANCHOR_UNRESOLVED, DIFF_WITHHELD) and a not in listed_anchors
+    }
+
+
+def judged_not_listed(annotations: Iterable[DiffAnnotation]) -> dict[str, Any]:
+    """The count of judgements read ``subject_unlisted``, by verdict, with their anchors (the
+    first JUDGED_NOT_LISTED_SHOWN) — and the changed_real ones apart: a person judged a change the
+    facts now read as unlisted, which is the one most worth a look."""
+    rows = sorted(annotations, key=lambda j: j.anchor_ref)
+    by_verdict: dict[str, int] = {}
+    for j in rows:
+        by_verdict[j.verdict] = by_verdict.get(j.verdict, 0) + 1
+    changed = [j.anchor_ref for j in rows if j.verdict == "changed_real"]
+    return {
+        "count": len(rows),
+        "by_verdict": dict(sorted(by_verdict.items())),
+        "anchors": [j.anchor_ref for j in rows[:JUDGED_NOT_LISTED_SHOWN]],
+        "changed_real": {"count": len(changed), "anchors": changed[:JUDGED_NOT_LISTED_SHOWN]},
+        "means": JUDGED_NOT_LISTED_MEANS,
+    }
 
 
 # ── band: the opt-in ordering by judgement ────────────────────────────────────────────────

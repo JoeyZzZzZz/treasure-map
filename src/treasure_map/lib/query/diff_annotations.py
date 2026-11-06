@@ -539,8 +539,11 @@ _LIST_NOTE = (
     "progress count: 'needs_recheck' when basis_state is not 'unchanged' (basis_moved names what "
     "moved; 'diff_withheld' = the diff is undetermined as a whole now) or when the diff is not "
     "current (source_stale not false). basis_state 'anchor_unresolved' = the subject is gone (the "
-    "functions were paired differently, or a candidate was re-keyed): the judgment is dangling. "
-    "Nothing is dropped."
+    "functions were paired differently, or a candidate was re-keyed): the judgment is dangling "
+    "and reads needs_recheck. review_state 'subject_unlisted' = the subject still resolves but is "
+    "no longer listed (the pair now reads identical): it cannot be judged again while unlisted, "
+    "so it is neither needs_recheck nor disposed, and review_progress counts it under "
+    "judged_not_listed. Nothing is dropped."
 )
 
 
@@ -772,6 +775,10 @@ def list_diff_overlays(
             )
         parts = r["anchor_ref"].split("#", 2)
         state = judged.state
+        if review is not None and r["anchor_ref"] in review.unlisted:
+            # Its subject resolves but is not listed: not needs_recheck (it cannot be judged
+            # again while unlisted); basis_state / basis_moved still say what moved.
+            state = dr.SUBJECT_UNLISTED
         row_out: dict[str, Any] = {
             "id": r["id"],
             "anchor_kind": r["anchor_kind"],
@@ -856,6 +863,7 @@ def pair_progress(
     items: list[dr.Item] = []
     withheld: list[dict[str, Any]] = []
     dangling: list[str] = []
+    unlisted: list[dr.DiffAnnotation] = []
     by_binary: dict[str, dict[str, int]] = {}
     for d in diffs:
         diff_id = str(d["diff_id"])
@@ -867,6 +875,7 @@ def pair_progress(
                 withheld.append({"diff_id": diff_id, "banners": list(review.built.banners)})
             continue
         dangling += review.dangling
+        unlisted += review.unlisted.values()
         mine = [
             replace(i, order=(0, diff_id, *i.order), diff_id=diff_id) for i in review.items.values()
         ]
@@ -927,6 +936,9 @@ def pair_progress(
         # per diff of the pair, by its binary (the diff_id is {run_pair}::{binary})
         "by_binary": by_binary,
         "dangling_annotations": sorted(dangling),
+        # judgments whose subject resolves but is no longer listed (subject_unlisted): in no count
+        # above, and apart from the dangling ones (whose subject is gone).
+        "judged_not_listed": dr.judged_not_listed(unlisted),
         # binaries byte-identical on both sides: no diff was warranted, so no blind spot — kept out
         # of 'complete' and apart from the genuine not-diffed binaries below.
         "identical_not_diffed_binaries": identical_not_diffed,

@@ -397,6 +397,9 @@ def _skill_checks(inp: DoctorInputs) -> list[Check]:
         ledger = Ledger.load(inp.host.toolchain_dir / LEDGER_NAME)
     except ConfigError as exc:
         return [check("skill", "unknown", f"cannot read the install ledger: {exc}")]
+    # as init and uninstall will see it: an interrupted skill write settled (on a copy; the
+    # doctor changes nothing)
+    ledger = sk.settled_copy(ledger)
     want = sk.shipped_bytes()
     home, environ = inp.client_host.home, inp.client_host.environ
     requested = sk.target_roots(inp.requested_clients, home, environ)
@@ -410,17 +413,8 @@ def _skill_checks(inp: DoctorInputs) -> list[Check]:
         elif st.state == "missing":
             state: State = "missing" if root in requested else "info"
             out.append(check(name, state, f"{st.path}: not installed"))
-        elif st.state == "stale":  # every run of init updates tmap's own unchanged copy
+        elif st.state in ("stale", "legacy"):  # every run of init replaces either, anywhere
             out.append(check(name, "warn", f"{st.path}: {st.detail}; `tmap init` replaces it"))
-        elif st.state == "legacy":  # only where an agent chosen in that run reads
-            out.append(
-                check(
-                    name,
-                    "warn",
-                    f"{st.path}: {st.detail}; `tmap init` replaces it when it sets up an agent "
-                    f"that reads {root}",
-                )
-            )
         elif st.state == "foreign":
             out.append(
                 check(

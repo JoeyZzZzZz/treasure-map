@@ -12,7 +12,8 @@ the chosen agents read it. A file there is in one of these states:
     wrote), an earlier text; it is replaced — in every directory tmap manages, not only the ones
     the agents chosen in a run read.
   * ``legacy``   — byte for byte a version an earlier tmap shipped before the ledger recorded
-    skills (installed by hand); it is replaced, and recorded from then on.
+    skills (installed by hand); it is replaced — in every directory tmap manages, like ``stale``
+    (nothing is created where it is missing) — and recorded from then on.
   * ``foreign``  — anything else (a file the ledger never recorded, a recorded file changed since
     tmap wrote it, an edited copy of an old version, a symbolic link); it is NEVER modified. Even
     ``--force`` replaces only the file itself (a link at ``SKILL.md`` included), never what a
@@ -23,12 +24,18 @@ A write is recorded ``pending`` (target path, sha256 and the directories it crea
 file moves into place, read back, and only then ``committed``. ``tmap uninstall`` removes a file
 only while it still holds the recorded bytes, and then the directories that write created, each
 only when empty.
+
+Claude Code's directory follows ``CLAUDE_CONFIG_DIR``; ``~/.claude/skills`` stays one of tmap's
+directories while that is set (tmap wrote there whenever it was not, and Cursor reads it), and a
+write into ``$CLAUDE_CONFIG_DIR/skills`` records the variable, so an uninstall run without it
+names the command that would take the file back.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -38,7 +45,7 @@ from typing import Literal
 from treasure_map.lib.query import diff_skill
 from treasure_map.lib.query.diff_skill import SKILL_DIRNAME
 from treasure_map.lib.setup.clients import claude_config_override
-from treasure_map.lib.setup.ledger import Ledger
+from treasure_map.lib.setup.ledger import Entry, Ledger
 
 SKILL_FILE = "SKILL.md"
 ID_PREFIX = "skill:"
@@ -70,10 +77,27 @@ def agents_root(home: Path) -> Path:
     return home / ".agents" / "skills"
 
 
+def default_claude_root(home: Path) -> Path:
+    """Claude Code's directory when ``CLAUDE_CONFIG_DIR`` is not set."""
+    return home / ".claude" / "skills"
+
+
+def cursor_roots(home: Path) -> tuple[Path, ...]:
+    """The personal skills directories Cursor reads (fixed paths; no environment variable moves
+    them)."""
+    return tuple(home / d / "skills" for d in (".agents", ".cursor", ".claude", ".codex"))
+
+
 def named_roots(home: Path, environ: Mapping[str, str]) -> tuple[tuple[str, Path], ...]:
     """Every directory tmap may write the skill into (and so ``tmap uninstall`` may remove it
-    from), each with the short name the doctor reports it under."""
-    return (("claude", claude_root(home, environ)), ("agents", agents_root(home)))
+    from), each with the short name the doctor reports it under. ``~/.claude/skills`` stays one
+    while CLAUDE_CONFIG_DIR moves Claude Code's: tmap wrote there whenever it was unset."""
+    claude = claude_root(home, environ)
+    out = [("claude", claude)]
+    if not is_known(default_claude_root(home), [claude]):
+        out.append(("claude.default", default_claude_root(home)))
+    out.append(("agents", agents_root(home)))
+    return tuple(out)
 
 
 def known_roots(home: Path, environ: Mapping[str, str]) -> tuple[Path, ...]:
@@ -87,15 +111,15 @@ def is_known(root: Path, known: Iterable[Path]) -> bool:
 
 def target_roots(selected: Iterable[str], home: Path, environ: Mapping[str, str]) -> list[Path]:
     """The skills directories to write for the agents chosen in THIS run, each once. Cursor reads
-    the Claude Code and Codex directories too, so it adds one only when neither of those agents was
-    chosen."""
+    the Codex directory and the default Claude Code one too, so it adds one only when no directory
+    already chosen is one Cursor reads (Claude Code's, moved by CLAUDE_CONFIG_DIR, is not)."""
     chosen = set(selected)
     out: list[Path] = []
     if "claude-code" in chosen:
         out.append(claude_root(home, environ))
     if "codex" in chosen:
         out.append(agents_root(home))
-    if "cursor" in chosen and not chosen & {"claude-code", "codex"}:
+    if "cursor" in chosen and not any(is_known(r, cursor_roots(home)) for r in out):
         out.append(agents_root(home))
     return list(dict.fromkeys(out))
 
@@ -254,10 +278,24 @@ def write_plain(path: Path, data: bytes) -> None:
         raise SkillWriteError(f"{path}: the file read back differs from what was written")
 
 
-def install(path: Path, data: bytes, ledger: Ledger) -> None:
+def claude_config_dir_of(root: Path, home: Path, environ: Mapping[str, str]) -> Path | None:
+    """``CLAUDE_CONFIG_DIR`` when it is set and ``root`` is the Claude Code directory it moved
+    (what a write there records, for an uninstall run without the variable)."""
+    base = claude_config_override(environ)
+    if base is None or not is_known(root, [claude_root(home, environ)]):
+        return None
+    if is_known(root, [default_claude_root(home)]):
+        return None  # the default directory: found without the variable
+    return base
+
+
+def install(
+    path: Path, data: bytes, ledger: Ledger, *, claude_config_dir: Path | None = None
+) -> None:
     """Write ``data`` at ``path`` through the ledger: pending (path, sha256, the directories this
-    write creates — kept from the earlier record on a replacement) -> write -> read back equal ->
-    committed. A failed read-back leaves the entry pending for the next run to settle."""
+    write creates — kept from the earlier record on a replacement — and the ``claude_config_dir``
+    it is written under, if any) -> write -> read back equal -> committed. A failed read-back
+    leaves the entry pending for the next run to settle."""
     _refuse_linked_dir(path)
     eid = entry_id(path)
     prior = ledger.committed(eid)
@@ -270,6 +308,8 @@ def install(path: Path, data: bytes, ledger: Ledger) -> None:
     created += [str(d) for d in _missing_dirs(path.parent) if str(d) not in created]
     if created:
         extra["created_dirs"] = created
+    if claude_config_dir is not None:
+        extra["claude_config_dir"] = str(claude_config_dir)
     ledger.add_pending(eid, "file", path, **extra)
     _write(path, data)
     if sha256_of(_read_back(path)) != extra["sha256"]:
@@ -280,10 +320,12 @@ def install(path: Path, data: bytes, ledger: Ledger) -> None:
     ledger.commit(eid)
 
 
-def recover(ledger: Ledger) -> list[str]:
+def recover(ledger: Ledger, *, prune: bool = True) -> list[str]:
     """Settle the skill entries an interrupted write left pending: the new file in place ->
     committed; the file it was replacing still there -> that one's record restored; anything else
-    -> the entry is dropped and the file left as it is."""
+    -> the entry is dropped and the file left as it is (when no file is there — a first write cut
+    off before it moved in — the directories that write created go too, each only when empty;
+    with ``prune`` false nothing on disk is touched)."""
     lines: list[str] = []
     for entry in [e for e in ledger.pending() if e.id.startswith(ID_PREFIX)]:
         path = Path(entry.path)
@@ -299,19 +341,52 @@ def recover(ledger: Ledger) -> list[str]:
             lines.append(f"kept the earlier skill at {path} (its replacement was interrupted)")
         else:
             ledger.remove(entry.id)
+            if prune and not path.exists() and not path.is_symlink():
+                prune_dirs(path, entry.extra.get("created_dirs"), parent=False)
             if path.exists():
                 lines.append(f"left {path} in place: an unfinished skill write tmap cannot prove")
     return lines
 
 
+class _Unsaved(Ledger):
+    """A copy of a ledger that is never written back."""
+
+    def save(self) -> None:
+        pass
+
+
+def settled_copy(ledger: Ledger) -> Ledger:
+    """The ledger as ``recover`` would leave it, on a copy that is never written back and with
+    nothing on disk changed (what the doctor and uninstall's plan read)."""
+    copy = _Unsaved(ledger.path, [Entry.from_json(e.to_json()) for e in ledger.entries])
+    recover(copy, prune=False)
+    return copy
+
+
 def removable(
-    path: Path, recorded_sha: object, home: Path, environ: Mapping[str, str]
+    path: Path,
+    recorded_sha: object,
+    home: Path,
+    environ: Mapping[str, str],
+    *,
+    claude_config_dir: object = None,
 ) -> str | None:
     """None when the recorded skill at ``path`` may be removed; else why not: only a
     ``tmap-diff-review/SKILL.md`` directly in one of tmap's skills directories, still holding what
-    tmap wrote."""
+    tmap wrote. One written under a ``claude_config_dir`` this run does not have is refused with
+    the command that runs under it."""
     in_known = is_known(path.parent.parent, known_roots(home, environ))
     if path.name != SKILL_FILE or path.parent.name != SKILL_DIRNAME or not in_known:
+        now = claude_config_override(environ)
+        if (
+            isinstance(claude_config_dir, str)
+            and claude_config_dir
+            and (now is None or os.path.realpath(now) != os.path.realpath(claude_config_dir))
+        ):
+            return (
+                f"{path} was installed while CLAUDE_CONFIG_DIR={claude_config_dir}; not removed — "
+                f"run `CLAUDE_CONFIG_DIR={shlex.quote(claude_config_dir)} tmap uninstall`"
+            )
         return f"{path} is not where tmap installs its skill; not removed"
     if path.is_symlink() or path.parent.is_symlink():
         return f"{path} is a symbolic link; not removed"
@@ -322,13 +397,13 @@ def removable(
     return None
 
 
-def prune_dirs(path: Path, created: object) -> list[Path]:
-    """After the skill at ``path`` is removed: its ``tmap-diff-review`` directory and the
-    directories above it that tmap's write created (the ledger's ``created_dirs``), deepest first,
-    each only when nothing is left in it. A recorded directory that is not one of ``path``'s
-    parents, or is a symbolic link, is left alone."""
+def prune_dirs(path: Path, created: object, *, parent: bool = True) -> list[Path]:
+    """After the skill at ``path`` is removed: its ``tmap-diff-review`` directory (unless
+    ``parent`` is false) and the directories above it that tmap's write created (the ledger's
+    ``created_dirs``), deepest first, each only when nothing is left in it. A recorded directory
+    that is not one of ``path``'s parents, or is a symbolic link, is left alone."""
     parents = set(path.parents)
-    dirs = {path.parent}
+    dirs = {path.parent} if parent else set()
     if isinstance(created, list):
         dirs |= {Path(d) for d in created if isinstance(d, str) and Path(d) in parents}
     removed: list[Path] = []

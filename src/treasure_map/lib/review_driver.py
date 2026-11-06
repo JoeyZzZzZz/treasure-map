@@ -51,15 +51,42 @@ _PARENT_AGENT_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
 @dataclass(frozen=True)
 class Preset:
     """An agent command line: argv with ``{prompt}`` / ``{mcp_config}`` / ``{workdir}`` /
-    ``{atlas}`` / ``{unit_id}`` / ``{run_pair}`` placeholders, and the argv added for a blind
-    (audit) launch. ``experimental``: not verified here — it runs only after its probe passes."""
+    ``{atlas}`` / ``{unit_id}`` / ``{run_pair}`` placeholders, the argv added for a blind (audit)
+    launch, and the argv added for the findings hand-off launch (taken as it is, no placeholder
+    filled). ``experimental``: not verified here — it runs only after its probe passes."""
 
     name: str
     argv: tuple[str, ...]
     blind_argv: tuple[str, ...] = ()
+    handoff_argv: tuple[str, ...] = ()
     experimental: bool = False
     note: str = ""
 
+
+# The shape the hand-off agent's final message must have, given to claude-code as --json-schema so
+# the CLI holds the agent to it (a sentence before the JSON is the failure it prevents): fixed keys,
+# a list of findings each naming its anchor_ref. A schema keyed by anchor_ref (an object of objects)
+# is not used — the structured output did not hold nested objects to it.
+HANDOFF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "anchor_ref": {"type": "string"},
+                    "hypotheses": {"type": "string"},
+                    "device_checks": {"type": "string"},
+                },
+                "required": ["anchor_ref", "hypotheses", "device_checks"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["findings"],
+    "additionalProperties": False,
+}
 
 PRESETS: dict[str, Preset] = {
     "claude-code": Preset(
@@ -87,6 +114,9 @@ PRESETS: dict[str, Preset] = {
         # swallows the prompt that follows it (A-4); ``--disallowedTools=mcp__…`` binds just the one
         # value and leaves the prompt a clean positional.
         blind_argv=(f"--disallowedTools=mcp__{SERVER_NAME}__list_overlays",),
+        # The hand-off launch only (never a unit's): its final message held to HANDOFF_SCHEMA.
+        # Added after the placeholders are filled, so the schema's braces are never read as one.
+        handoff_argv=("--json-schema", json.dumps(HANDOFF_SCHEMA, separators=(",", ":"))),
         note=(
             '--allowedTools only skips confirmation; --tools "" switches every built-in tool '
             'off and --setting-sources "" loads no user or project settings'
@@ -153,12 +183,16 @@ def write_mcp_config(path: Path, atlas: Path) -> Path:
     return path
 
 
-def render(preset: Preset, values: dict[str, str], *, blind: bool = False) -> list[str]:
-    """The argv of one launch: the preset's placeholders filled; a blind launch adds its argv
-    before the last argument (the prompt)."""
+def render(
+    preset: Preset, values: dict[str, str], *, blind: bool = False, handoff: bool = False
+) -> list[str]:
+    """The argv of one launch: the preset's placeholders filled; a blind launch adds its argv, and
+    the hand-off launch its own (unformatted), before the last argument (the prompt)."""
     argv = [a.format(**values) if "{" in a else a for a in preset.argv]
     if blind and preset.blind_argv:
         argv = [*argv[:-1], *preset.blind_argv, argv[-1]]
+    if handoff and preset.handoff_argv:
+        argv = [*argv[:-1], *preset.handoff_argv, argv[-1]]
     return argv
 
 
@@ -261,12 +295,16 @@ def probe(
     workdir: Path,
     timeout: float,
     runner: Callable[..., Launch] = run_agent,
+    handoff: bool = False,
 ) -> ProbeResult:
     """Each launch must reach a tmap tool (list_runs, seen in the tool-call log) and must fail to
     create a file with a built-in tool (the marker file must not exist after it). A preset with
     ``blind_argv`` is probed twice — once plain, once blind — so the blind argv is proven not to
-    swallow the prompt (A-4: the blind launch still reaches a tmap tool). The result combines both:
-    reached / blocked hold only when every launch did."""
+    swallow the prompt (A-4: the blind launch still reaches a tmap tool). With ``handoff`` (the
+    findings hand-off will be launched), a preset with ``handoff_argv`` is probed once more with
+    it, so an agent CLI that does not take it (an older one, without --json-schema) fails here,
+    not after the whole review. The result combines them: reached / blocked hold only when every
+    launch did."""
     marker = workdir / "probe_marker.txt"
     prompt = (
         "This is a check of your tool set, nothing else. Step 1: call the tmap tool list_runs. "
@@ -274,23 +312,32 @@ def probe(
         f"file {marker} containing the word probe; if you have none, say so. Then stop."
     )
     values = _values(preset, atlas_path, workdir, prompt, "probe", "probe")
-    blinds = [False, True] if preset.blind_argv else [False]
+    # (blind, hand-off) of each probe launch
+    variants = [(False, False), (True, False)] if preset.blind_argv else [(False, False)]
+    if handoff and preset.handoff_argv:
+        variants.append((False, True))
     reached = blocked = True
     why: list[str] = []
     launch: Launch | None = None
-    for blind in blinds:
+    for blind, ho in variants:
         marker.unlink(missing_ok=True)
         started = time.time()
-        launch = runner(render(preset, values, blind=blind), cwd=workdir, timeout=timeout)
+        argv = render(preset, values, blind=blind, handoff=ho)
+        launch = runner(argv, cwd=workdir, timeout=timeout)
         lines = tcl.read_lines(tcl.log_path_for(atlas_path)) or iter(())
         r = any(
             ln.get("tool") == "list_runs" and float(ln.get("ts") or 0) >= started for ln in lines
         )
         b = not marker.exists()
-        tag = " (blind)" if blind else ""
+        tag = " (blind)" if blind else f" (with {preset.handoff_argv[0]})" if ho else ""
         if not r:
             why.append(
                 f"the agent never reached a tmap tool{tag} (is the MCP server loaded and allowed?)"
+            )
+        if ho and launch.exit not in (0, None):
+            why.append(
+                f"the launch with {preset.handoff_argv[0]} exited {launch.exit}: this agent CLI "
+                "may not take it, and the findings hand-off needs it"
             )
         if not b:
             why.append(f"the agent created a file with a built-in tool{tag}: built-in tools are on")
@@ -462,7 +509,9 @@ def drive(
 # ── the findings hand-off launch (B-5) ──────────────────────────────────────────────────────────
 # A FINAL launch, run once the review is done (no unit left): one agent reads the whole findings
 # skeleton through the MCP tool get_diff_handoff and prints, as its final message, only its two
-# analysis texts per finding — a JSON object keyed by anchor_ref. The driver writes the document
+# analysis texts per finding — a JSON object listing the findings, each naming its anchor_ref, held
+# to HANDOFF_SCHEMA by the launch's own option (the preset's handoff_argv). The schema keeps the
+# message JSON; the parse is never loosened to dig JSON out of prose. The driver writes the document
 # itself: handoff_document (the CLI's function) with those texts under each block's placeholders,
 # so every fact line, the basis and the status are tmap's own text, never the agent's retyping. Its
 # full output is kept and read out of it — the agent, with every built-in tool off, cannot write a
@@ -484,9 +533,10 @@ def handoff_prompt(run_pair: str) -> str:
         "2. It has one block per finding, headed by its anchor_ref (the text inside ## `...`), "
         "each with tmap's facts and two analysis placeholders: 'agent analysis — unverified "
         "hypotheses' and 'to check on a device'. 3. Your final message is ONE JSON object and "
-        "nothing else: each key a block's anchor_ref exactly as written, each value "
-        '{"hypotheses": "<your unverified hypotheses>", "device_checks": "<concrete things a '
-        'person could verify on a device>"}. Do not repeat the facts — tmap writes the document '
+        'nothing else: {"findings": [...]}, one item per block you write for, each item '
+        '{"anchor_ref": "<the block\'s anchor_ref exactly as written>", "hypotheses": "<your '
+        'unverified hypotheses>", "device_checks": "<concrete things a person could verify on a '
+        'device>"}, each anchor_ref once. Do not repeat the facts — tmap writes the document '
         "and puts your two texts under each block's placeholders. " + _rr.HANDOFF_BOUNDARY
     )
 
@@ -499,16 +549,40 @@ def _strip_fence(text: str) -> str:
     return body
 
 
+def _findings_by_anchor(items: list[Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """HANDOFF_SCHEMA's findings list as ``{anchor_ref: {the item's other keys}}``, or ``(None,
+    error)``: an item that is not an object, one with no anchor_ref text, or an anchor_ref named
+    twice."""
+    out: dict[str, Any] = {}
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            return None, f"findings item {i} is not an object"
+        anchor = item.get("anchor_ref")
+        if not isinstance(anchor, str):
+            return None, f"findings item {i} has no anchor_ref text"
+        if anchor in out:
+            return None, f"the findings name {anchor[:120]!r} twice"
+        out[anchor] = {k: v for k, v in item.items() if k != "anchor_ref"}
+    return out, None
+
+
 def parse_handoff_analysis(text: str) -> tuple[dict[str, dict[str, str]] | None, str | None]:
-    """The agent's ``{anchor_ref: {"hypotheses": …, "device_checks": …}}`` from its final message,
-    or ``(None, error)``: not JSON, not an object, a value not an object, a field that is not text
-    or a key that is neither field — each refused, never half-read."""
+    """The agent's texts per anchor_ref from its final message — ``{"findings": [{"anchor_ref":
+    …, "hypotheses": …, "device_checks": …}, …]}`` (HANDOFF_SCHEMA), or the older object keyed by
+    anchor_ref — or ``(None, error)``: not JSON (prose around it included), not an object, an
+    anchor_ref named twice, a value not an object, a field that is not text or a key that is
+    neither field — each refused, never half-read."""
     try:
         data = json.loads(_strip_fence(text))
     except ValueError as exc:
         return None, f"the agent's final message is not the JSON object asked for ({exc})"
     if not isinstance(data, dict):
         return None, "the agent's final message is JSON but not an object keyed by anchor_ref"
+    if set(data) == {"findings"} and isinstance(data["findings"], list):
+        listed, err = _findings_by_anchor(data["findings"])
+        if listed is None:
+            return None, err
+        data = listed
     out: dict[str, dict[str, str]] = {}
     for anchor, value in data.items():
         if not isinstance(value, dict):
@@ -583,14 +657,19 @@ def _launch_result(launch: Launch) -> str | None:
 def _refused(launch: Launch, out_file: Path, error: str) -> dict[str, Any]:
     """A refused hand-off: nothing is written to ``out_file``; the agent's final message, when the
     launch printed one, is kept beside it (agent_result_path), headed as not a hand-off document, so
-    a long analysis is not lost to one wrong anchor."""
+    a long analysis is not lost to one wrong anchor. When it cannot be kept (its directory is not
+    there), the error says so and the refusal is returned all the same."""
     out: dict[str, Any] = {"ok": False, "error": error}
     result = _launch_result(launch)
     if result is not None:
         kept = agent_result_path(out_file)
-        kept.write_text(
-            HANDOFF_AGENT_RESULT_HEAD.format(why=error) + "\n\n" + result, encoding="utf-8"
-        )
+        try:
+            kept.write_text(
+                HANDOFF_AGENT_RESULT_HEAD.format(why=error) + "\n\n" + result, encoding="utf-8"
+            )
+        except OSError as exc:  # the refusal is still the answer, never lost to a write error
+            out["error"] = f"{error}; the agent's final message could not be kept ({exc})"
+            return out
         out["agent_result_file"] = str(kept)
         out["error"] = f"{error}; the agent's final message is kept in {kept}"
     return out
@@ -609,16 +688,18 @@ def run_handoff(
     """Launch the hand-off agent, then write the document to ``out_file``: handoff_document (the
     CLI's function) with the agent's texts under each block's placeholders — a finding it wrote
     nothing for says so. Nothing is written when the launch failed or reported an error, or when
-    its texts name an anchor the hand-off does not hold; the agent's final message, when there is
-    one, is then kept beside it (agent_result_path) — headed as not a hand-off document — and the
-    hand-off file is still not written. An experimental preset is refused before the launch
-    (B-5)."""
+    its texts name an anchor the hand-off does not hold (an anchor is named as it is, or as its
+    block's heading writes it); the agent's final message, when there is one, is then kept beside
+    it (agent_result_path) — headed as not a hand-off document — and the hand-off file is still not
+    written. The launch carries the preset's handoff_argv (claude-code: --json-schema with
+    HANDOFF_SCHEMA). An experimental preset is refused before the launch (B-5)."""
     from treasure_map.lib.atlas.connection import open_atlas
 
     if preset.name not in HANDOFF_PRESETS:
         return {"ok": False, "error": extract_handoff(preset, Launch(0, 0.0, False))[1]}
     values = _values(preset, atlas_path, workdir, handoff_prompt(run_pair), "handoff", run_pair)
-    launch = runner(render(preset, values), cwd=workdir, timeout=timeout, keep_full=True)
+    argv = render(preset, values, handoff=True)
+    launch = runner(argv, cwd=workdir, timeout=timeout, keep_full=True)
     if launch.timed_out:
         return {
             "ok": False,
@@ -633,7 +714,23 @@ def run_handoff(
         stamp, file_staleness = _rr.local_handoff_context(atlas)
         findings = _rr.handoff_findings(atlas, run_pair, file_staleness=file_staleness)
         known = {str(f["anchor_ref"]) for f in findings}
-        extra = sorted(set(analysis) - known)
+        # An agent names a block by its heading's text, whose line breaks are escaped.
+        headed = {_rr.handoff_anchor_text(a): a for a in known}
+        named: dict[str, dict[str, str]] = {}
+        extra: list[str] = []
+        for key, texts in analysis.items():
+            anchor = key if key in known else headed.get(key)
+            if anchor is None:
+                extra.append(key)
+            elif anchor in named:
+                return _refused(
+                    launch,
+                    out_file,
+                    f"the agent wrote twice for {anchor[:200]!r}; nothing was written",
+                )
+            else:
+                named[anchor] = texts
+        extra.sort()
         if extra:
             return _refused(
                 launch,
@@ -642,7 +739,7 @@ def run_handoff(
                 f"(first: {extra[0][:200]!r}); nothing was written",
             )
         document = _rr.handoff_header(run_pair, len(findings)) + "".join(
-            _rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=analysis)
+            _rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=named)
         )
     finally:
         atlas.close()
@@ -652,5 +749,5 @@ def run_handoff(
         "out_file": str(out_file),
         "bytes": len(document),
         "findings": len(findings),
-        "nothing_written": len(known - set(analysis)),
+        "nothing_written": len(known - set(named)),
     }

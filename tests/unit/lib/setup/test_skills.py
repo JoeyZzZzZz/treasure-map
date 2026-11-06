@@ -6,7 +6,8 @@ ever rewritten, every write goes through the ledger, and uninstall takes back ex
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+import os
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -46,14 +47,19 @@ def _ledger(home: Path) -> Ledger:
     return Ledger.load(home / ".treasure-map" / "toolchain" / LEDGER_NAME)
 
 
-def _init(home: Path, clients: Sequence[str], echo: list[str] | None = None) -> InitResult:
+def _init(
+    home: Path,
+    clients: Sequence[str],
+    echo: list[str] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> InitResult:
     return run_init(
         non_interactive=True,
         clients=clients,
         prompt=lambda _m: "",
         echo=(echo.append if echo is not None else lambda _m: None),
         platform=fakes.linux(),
-        host=fakes.make_host(home),
+        host=fakes.make_host(home, environ=environ),
         tmap=None,
     )
 
@@ -62,23 +68,27 @@ def _skill_files(home: Path) -> set[Path]:
     return {p for p in home.rglob(sk.SKILL_FILE) if ".treasure-map" not in p.parts}
 
 
-def _uninstall(home: Path) -> un.UninstallReport:
+def _uninstall(home: Path, environ: Mapping[str, str] | None = None) -> un.UninstallReport:
     tm = home / ".treasure-map"
+    env = dict(environ or {})
     return un.uninstall(
         home=home,
         tm_home=tm,
-        client_host=cl.ClientHost(home, {}, fakes.linux(), lambda _n: None, fakes.fake_run()),
+        client_host=cl.ClientHost(home, env, fakes.linux(), lambda _n: None, fakes.fake_run()),
         tmap=None,
         config_path=tm / "config.yaml",
         echo=lambda _m: None,
     )
 
 
-def _doctor(home: Path, requested: Sequence[str] = ()) -> dict[str, tuple[str, str]]:
+def _doctor(
+    home: Path, requested: Sequence[str] = (), environ: Mapping[str, str] | None = None
+) -> dict[str, tuple[str, str]]:
+    env = dict(environ or {})
     inp = DoctorInputs(
         platform=fakes.linux(),
-        host=fakes.make_host(home),
-        client_host=cl.ClientHost(home, {}, fakes.linux(), lambda _n: None, fakes.fake_run()),
+        host=fakes.make_host(home, environ=env),
+        client_host=cl.ClientHost(home, env, fakes.linux(), lambda _n: None, fakes.fake_run()),
         cfg=None,
         lock=load_lock(),
         tmap=None,
@@ -106,9 +116,10 @@ def test_each_shared_skills_directory_is_written_once(
     tmp_path: Path, clients: tuple[str, ...], roots: tuple[str, ...]
 ) -> None:
     """★ The directories come from the agents chosen in this run, each once: Cursor reads the
-    Claude Code and Codex directories, so it adds one only when neither was chosen.
+    default Claude Code directory and the Codex one, so it adds one only when no directory already
+    chosen is one it reads.
 
-    MUTATION: drop Cursor's "neither was chosen" test -> cc_cursor writes two -> RED; Codex into
+    MUTATION: always add Cursor's directory -> cc_cursor writes two -> RED; Codex into
     ~/.codex/skills -> RED."""
     home = tmp_path / "h"
     _init(home, clients)
@@ -741,3 +752,233 @@ def test_uninstall_settles_an_interrupted_replacement_first(tmp_path: Path) -> N
     report = _uninstall(home)
     assert not report.refused, report.refused
     assert not path.exists()
+
+
+# ── CLAUDE_CONFIG_DIR, interrupted writes, the copies outside this run's directories ─────────
+
+
+def test_cursor_still_gets_the_skill_when_claude_config_dir_is_set(tmp_path: Path) -> None:
+    """★ CLAUDE_CONFIG_DIR moves Claude Code's directory to one Cursor does not read (Cursor reads
+    only fixed paths under the home). Chosen together, both still get the skill: one in
+    $CLAUDE_CONFIG_DIR/skills, one in ~/.agents/skills.
+
+    MUTATION (verified RED, 1 failed): skip Cursor's directory whenever Claude Code or Codex is
+    chosen (the old test) -> only $CLAUDE_CONFIG_DIR/skills is written -> RED."""
+    home = Path.home()
+    cfg = tmp_path / "cfg"
+    _init(home, ("claude-code", "cursor"), environ={"CLAUDE_CONFIG_DIR": str(cfg)})
+    assert sk.skill_path(cfg / "skills").read_bytes() == _shipped()
+    cursor_reads = [home / d / "skills" for d in (".agents", ".cursor", ".claude", ".codex")]
+    assert any(sk.skill_path(r).is_file() for r in cursor_reads)
+    assert _skill_files(home) == {sk.skill_path(sk.agents_root(home))}
+
+
+def test_a_copy_in_the_default_claude_directory_stays_tmaps_under_claude_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Installed for Claude Code with CLAUDE_CONFIG_DIR unset (~/.claude/skills), then the
+    variable is set. The earlier copy is still one of tmap's: init brings it up to date, the doctor
+    reports it on a line of its own, and uninstall takes it back.
+
+    MUTATION (verified RED, 1 failed): drop the default Claude Code directory from named_roots
+    while the variable is set -> the copy is neither refreshed nor removable -> RED."""
+    home = Path.home()
+    _init(home, ("claude-code",))
+    default = sk.skill_path(home / ".claude" / "skills")
+    assert default.read_bytes() == _shipped()
+    env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "cfg")}
+    changed = diff_skill.skill_text() + "\nchanged\n"
+    monkeypatch.setattr(diff_skill, "skill_text", lambda: changed)
+    _init(home, ("claude-code",), environ=env)
+    assert default.read_bytes() == changed.encode("utf-8")
+    assert _doctor(home, environ=env)["skill.claude.default"] == ("ok", str(default))
+    assert set(_doctor(home)) == {"skill.claude", "skill.agents"}  # unset: two lines, as before
+    report = _uninstall(home, env)
+    assert not report.refused, report.refused
+    assert not default.exists()
+
+
+def test_uninstall_without_claude_config_dir_names_the_command_for_a_copy_written_under_it(
+    tmp_path: Path,
+) -> None:
+    """★ Installed with CLAUDE_CONFIG_DIR set, uninstalled without it: $CLAUDE_CONFIG_DIR/skills
+    is not one of this run's directories, so the file is kept — and the refusal names the command
+    that removes it. Run that way, it is removed.
+
+    MUTATION (verified RED, 1 failed): record no claude_config_dir at install -> RED; give the
+    bare "not where tmap installs its skill" refusal even so -> RED (1 failed)."""
+    home = Path.home()
+    cfg = tmp_path / "cfg"
+    env = {"CLAUDE_CONFIG_DIR": str(cfg)}
+    _init(home, ("claude-code",), environ=env)
+    path = sk.skill_path(cfg / "skills")
+    entry = _ledger(home).committed(sk.entry_id(path))
+    assert entry is not None and entry.extra.get("claude_config_dir") == str(cfg)
+    report = _uninstall(home)
+    assert path.read_bytes() == _shipped()
+    assert any(
+        f"was installed while CLAUDE_CONFIG_DIR={cfg}" in r
+        and f"`CLAUDE_CONFIG_DIR={cfg} tmap uninstall`" in r
+        for r in report.refused
+    ), report.refused
+    report = _uninstall(home, env)
+    assert not report.refused, report.refused
+    assert not path.exists()
+
+
+def test_the_doctor_settles_an_interrupted_replacement_as_uninstall_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A replacement cut off before the new file moved in leaves a pending entry. The doctor
+    reads it settled (the earlier file is still tmap's, so: an earlier version), not as a file
+    tmap did not install with a --force command — and writes nothing to the ledger.
+
+    MUTATION (verified RED, 1 failed): drop the settled copy from the doctor's skill checks ->
+    "tmap did not install it ... --force" -> RED."""
+    home = Path.home()
+    _init(home, ("claude-code",))
+    path = sk.skill_path(sk.claude_root(home, {}))
+    old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    changed = diff_skill.skill_text() + "\nchanged\n"
+    monkeypatch.setattr(diff_skill, "skill_text", lambda: changed)
+    ledger = _ledger(home)
+    new_sha = hashlib.sha256(changed.encode("utf-8")).hexdigest()
+    ledger.add_pending(sk.entry_id(path), "file", path, sha256=new_sha, prior_sha256=old_sha)
+    before = ledger.path.read_bytes()
+    state, detail = _doctor(home)["skill.claude"]
+    assert "tmap did not install it" not in detail and "--force" not in detail
+    assert state == "warn" and "earlier version" in detail
+    assert ledger.path.read_bytes() == before
+
+
+def test_an_earlier_version_outside_this_runs_directories_is_replaced_too(
+    tmp_path: Path, newer: bytes
+) -> None:
+    """★ An earlier tmap's text, installed by hand in ~/.agents/skills; init then runs for Claude
+    Code and Cursor, which writes ~/.claude/skills only (Cursor reads it). The copy in ~/.agents —
+    which Cursor reads too — is replaced and recorded, as the doctor said it would be.
+
+    MUTATION (verified RED, 1 failed): replace only stale copies outside this run's directories
+    (not earlier versions) -> the ~/.agents copy keeps the old text -> RED."""
+    home = tmp_path / "h"
+    agents = sk.skill_path(sk.agents_root(home))
+    agents.parent.mkdir(parents=True)
+    agents.write_bytes(_LEGACY.read_bytes())
+    state, detail = _doctor(home)["skill.agents"]
+    assert state == "warn" and detail.endswith("; `tmap init` replaces it")
+    _init(home, ("claude-code", "cursor"))
+    assert agents.read_bytes() == newer
+    assert _ledger(home).committed(sk.entry_id(agents)) is not None
+    missing = sk.skill_path(sk.agents_root(tmp_path / "h2"))
+    _init(tmp_path / "h2", ("claude-code",))
+    assert not missing.parent.exists()  # nothing is created where there was no copy
+
+
+def test_an_interrupted_first_install_leaves_no_empty_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The first write for Codex is cut off after it made ~/.agents/skills/tmap-diff-review but
+    before the file moved in. The pending entry records those directories; once it is settled
+    (here by uninstall) they go, each only because it is empty. The doctor, reading the settled
+    state on a copy, removes nothing.
+
+    MUTATION (verified RED, 1 failed): drop the directory pruning from recover's discard branch ->
+    ~/.agents stays -> RED. MUTATION (verified RED, 1 failed): let the doctor's settled copy prune
+    -> the directories vanish at the doctor -> RED."""
+    home = Path.home()
+
+    class _Os:  # os as skills.py sees it, its replace cut off (the ledger's own save untouched)
+        def __getattr__(self, name: str) -> object:
+            return getattr(os, name)
+
+        def replace(self, _a: object, _b: object) -> None:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sk, "os", _Os())
+    with pytest.raises(KeyboardInterrupt):
+        _init(home, ("codex",))
+    monkeypatch.undo()
+    path = sk.skill_path(sk.agents_root(home))
+    assert path.parent.is_dir() and not path.exists()
+    _doctor(home)
+    assert path.parent.is_dir()  # the doctor changes nothing on disk
+    report = _uninstall(home)
+    assert not report.refused, report.refused
+    assert not (home / ".agents").exists()
+
+
+def test_review_skill_install_does_not_offer_force_for_a_linked_directory(tmp_path: Path) -> None:
+    """★ Without --force, a ``tmap-diff-review`` directory that is a link is refused with the step
+    that works (change the link) — not "--force replaces it", which --force would refuse too.
+
+    MUTATION (verified RED, 1 failed): give the foreign refusal "(--force replaces it)" again ->
+    RED."""
+    root = sk.claude_root(Path.home(), {})
+    theirs = tmp_path / "dot" / sk.SKILL_DIRNAME
+    theirs.mkdir(parents=True)
+    (theirs / sk.SKILL_FILE).write_bytes(b"mine\n")
+    root.mkdir(parents=True)
+    (root / sk.SKILL_DIRNAME).symlink_to(theirs, target_is_directory=True)
+    res = _install_r(root)
+    assert res.exit_code != 0
+    assert "--force replaces it" not in res.output, res.output
+    assert f"{root / sk.SKILL_DIRNAME} is a link; remove or replace it first" in res.output
+    assert (theirs / sk.SKILL_FILE).read_bytes() == b"mine\n"
+
+
+def test_force_into_an_unmanaged_directory_does_not_write_through_a_link(tmp_path: Path) -> None:
+    """A directory tmap does not manage (written unrecorded) whose ``tmap-diff-review`` is a link:
+    --force refuses, naming where the link points, and the file there is untouched.
+
+    MUTATION (verified RED, 1 failed): drop the linked-directory refusal from write_plain -> the
+    user's file is overwritten -> RED."""
+    root = tmp_path / "custom"
+    theirs = tmp_path / "dot" / sk.SKILL_DIRNAME
+    theirs.mkdir(parents=True)
+    (theirs / sk.SKILL_FILE).write_bytes(b"mine\n")
+    root.mkdir()
+    (root / sk.SKILL_DIRNAME).symlink_to(theirs, target_is_directory=True)
+    res = _install_r(root, "--force")
+    assert res.exit_code != 0 and f"symbolic link to {theirs}" in res.output
+    assert (theirs / sk.SKILL_FILE).read_bytes() == b"mine\n"
+
+
+def test_a_recorded_directory_that_is_not_above_the_skill_is_never_removed(
+    tmp_path: Path,
+) -> None:
+    """A ``created_dirs`` entry that is not one of the skill file's parents (an empty directory of
+    the user's) is ignored by uninstall.
+
+    MUTATION (verified RED, 1 failed): take every recorded directory, parent or not -> the user's
+    empty directory is removed -> RED."""
+    home = Path.home()
+    _init(home, ("codex",))
+    unrelated = home / "empty-but-mine"
+    unrelated.mkdir()
+    ledger = _ledger(home)
+    entry = ledger.find(sk.entry_id(sk.skill_path(sk.agents_root(home))))
+    assert entry is not None
+    entry.extra["created_dirs"] = [*entry.extra["created_dirs"], str(unrelated)]
+    ledger.save()
+    report = _uninstall(home)
+    assert not report.refused, report.refused
+    assert unrelated.is_dir()
+
+
+def test_the_created_directories_survive_a_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directories the first write created are kept in the record when a later init replaces
+    the file (that write creates none), so uninstall still takes them away.
+
+    MUTATION (verified RED, 1 failed): record only the directories the latest write created ->
+    ~/.agents stays after uninstall -> RED."""
+    home = Path.home()
+    _init(home, ("codex",))
+    changed = diff_skill.skill_text() + "\nchanged\n"
+    monkeypatch.setattr(diff_skill, "skill_text", lambda: changed)
+    _init(home, ("codex",))
+    assert sk.skill_path(sk.agents_root(home)).read_bytes() == changed.encode("utf-8")
+    report = _uninstall(home)
+    assert not report.refused, report.refused
+    assert not (home / ".agents").exists()

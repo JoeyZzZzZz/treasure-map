@@ -171,14 +171,20 @@ def test_a_refusal_omits_the_restart_when_the_on_disk_code_matches(
 def test_the_restart_hint_is_recomputed_on_every_refusal_not_cached(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ The hint is recomputed each refusal, not cached in the server closure: the code can be
-    edited (then restored) under a long-lived server between two calls, and each refusal must report
-    the on-disk state AT THAT MOMENT. One ``make_tools``, two refusals: on-disk matches first (no
-    hint), then has moved (hint must appear).
+    """★ The hint follows the disk at each refusal: the code can be edited (then restored) under a
+    long-lived server between two calls, and each refusal must report the on-disk state AT THAT
+    MOMENT. One ``make_tools``, two refusals: on-disk matches first (no hint), then a file of the
+    package was edited (hint must appear). The on-disk stamp is rehashed only when a package file
+    changed, so an edit is what moves it.
 
-    MUTATION (audit G04): cache the first ``_server_code_moved`` result in the closure -> the second
-    refusal keeps the first "no hint" answer and this goes RED.
+    MUTATION (verified RED, 1 failed): keep the first on-disk stamp whatever the files -> the
+    second refusal keeps the first "no hint" answer and this goes RED.
     """
+    import shutil
+
+    pkg = tmp_path / "pkg"
+    shutil.copytree(rescan_version._PACKAGE, pkg, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(rescan_version, "_PACKAGE", pkg)
     _mk_analysis(tmp_path)
     atlas = _atlas(
         tmp_path,
@@ -187,13 +193,11 @@ def test_the_restart_hint_is_recomputed_on_every_refusal_not_cached(
     )
     tools = mcp_app.make_tools(atlas, config=Config())
 
-    same = rescan_version.current_code_stamp(Config())
-    monkeypatch.setattr(rescan_version, "on_disk_code_stamp", lambda _cfg: same)
     first = tools["get_pseudocode"]("handle_req", run_id="run_m")
     assert first.get("found") is False and "Restart the MCP server" not in first["remedy"]
 
-    moved = CodeStamp(hunt="src-f6f6f6f6f6f6f6f6", scan=rescan_version.scan_stamp_for(Config()))
-    monkeypatch.setattr(rescan_version, "on_disk_code_stamp", lambda _cfg: moved)
+    target = pkg / "lib" / "hunt" / "analyzer2.py"
+    target.write_text(target.read_text() + "\n_MOVED_ON_DISK = 1\n")
     second = tools["get_pseudocode"]("handle_req", run_id="run_m")
     assert second.get("found") is False and "Restart the MCP server" in second["remedy"]
 

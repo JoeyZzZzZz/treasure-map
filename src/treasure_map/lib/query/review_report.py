@@ -191,6 +191,18 @@ def markdown(review: ru.PairReview, *, header: dict[str, Any] | None = None) -> 
     if rep["dangling_judgements"]:
         out += ["", "## Judgements whose subject is gone", ""]
         out += [f"- `{_md_cell(a)}`" for a in rep["dangling_judgements"]]
+    jnl = rep.get("judged_not_listed") or {}
+    if jnl.get("count"):
+        by = ", ".join(f"{v} {n}" for v, n in jnl["by_verdict"].items())
+        out += ["", "## Judgements whose subject is no longer listed", "", f"_{jnl['means']}_", ""]
+        out.append(
+            f"- {jnl['count']} ({_md_cell(by)}); changed_real {jnl['changed_real']['count']}"
+        )
+        out += [f"  - changed_real: `{_md_cell(a)}`" for a in jnl["changed_real"]["anchors"]]
+        apart = set(jnl["changed_real"]["anchors"])
+        out += [f"  - `{_md_cell(a)}`" for a in jnl["anchors"] if a not in apart]
+        if jnl["count"] > len(jnl["anchors"]):
+            out.append(f"  - … {jnl['count'] - len(jnl['anchors'])} more")
     out += ["", "## Units in hand-out order", ""]
     for u in review.units:
         done = sum(1 for m in u.members if ru.disposed(states.get(m.anchor_ref)))
@@ -298,6 +310,10 @@ def html_page(review: ru.PairReview, *, header: dict[str, Any] | None = None) ->
 #
 # Every fact is read through the lib call its MCP tool makes (get_diff_patch_view, get_xrefs,
 # get_file_diff, same_shape_siblings), so a cell states what that tool would answer.
+#
+# Text tmap did not write never reads as one of a block's own lines: a multi-line text (a rationale,
+# an agent's text, a hunk) is fenced, and a firmware value on one of the block's own lines (a size
+# expression, a caller's name, a path) is inline code with its line breaks escaped.
 
 # Neutral section titles (B-6): the analysis a person fills, never a verdict in a tmap string.
 HANDOFF_HYPOTHESES_TITLE = "agent analysis — unverified hypotheses"
@@ -412,6 +428,41 @@ def _short_error(text: Any, limit: int = 300) -> str:
 
 
 _BACKTICKS = re.compile(r"`+")
+# What a markdown reader can take as a line break: the C0 controls, NEL and the two Unicode
+# separators. A value tmap did not write, put on one of the block's own lines, has them escaped
+# (``\xNN`` / ``\uNNNN``), so it cannot start a line of its own (a status, a heading).
+_LINE_BREAKERS = re.compile("[\x00-\x1f\x85\u2028\u2029]")
+
+
+def _escape_controls(text: str) -> str:
+    """``text`` with every line-breaking character (_LINE_BREAKERS) escaped."""
+
+    def esc(m: re.Match[str]) -> str:
+        c = ord(m.group())
+        return f"\\x{c:02x}" if c < 0x100 else f"\\u{c:04x}"
+
+    return _LINE_BREAKERS.sub(esc, text)
+
+
+def _inline(value: Any) -> str:
+    """A firmware value (a name, a path, an expression) written inside one of the block's own
+    lines: a code span — a backtick run longer than any the value holds, so no backtick in it can
+    close the span, and no markup in it (HTML, emphasis) is read as markup — with its line-breaking
+    characters escaped."""
+    text = _escape_controls(str(value))
+    if not text:
+        return "` `"
+    ticks = "`" * (max((len(m) for m in _BACKTICKS.findall(text)), default=0) + 1)
+    # A span whose text starts or ends with a backtick or a space is padded with one space each
+    # side; a markdown reader strips exactly that padding, so the value reads as it is.
+    pad = " " if text[0] in "` " or text[-1] in "` " else ""
+    return f"{ticks}{pad}{text}{pad}{ticks}"
+
+
+def handoff_anchor_text(anchor: str) -> str:
+    """A finding's anchor_ref as its block's heading writes it (inside ``## `...` ``): line-breaking
+    characters escaped, nothing else changed — the text an agent copies back to name the block."""
+    return _escape_controls(anchor)
 
 
 def _fenced(lines: list[str]) -> list[str]:
@@ -530,9 +581,19 @@ def _change_lines(entry: dict[str, Any]) -> list[str]:
     return [_cell(_CHANGE, _unavailable(why))]
 
 
+# The sink-axis fields whose value is firmware text (an expression or a name from the code), written
+# inline as code; the other fields are tmap's own kinds.
+_FIRMWARE_AXIS_FIELDS = frozenset({"size_arg", "size_var"})
+
+
+def _axis_value(value: dict[str, Any], name: str) -> str:
+    v = value.get(name)
+    return _inline(v) if v is not None and name in _FIRMWARE_AXIS_FIELDS else _val(v)
+
+
 def _axis_text(axes: Any, axis: str, fields: tuple[str, ...]) -> str:
-    """One axis of a row's sink_axes, per side the row has: the fields' values, or the reason the
-    view gives for not giving the axis."""
+    """One axis of a row's sink_axes, per side the row has: the fields' values (a firmware one
+    inline as code), or the reason the view gives for not giving the axis."""
     if not isinstance(axes, dict):
         return "not given (no sink_axes on the row)"
     parts: list[str] = []
@@ -542,7 +603,7 @@ def _axis_text(axes: Any, axis: str, fields: tuple[str, ...]) -> str:
             continue
         value = sa.get(axis)
         if isinstance(value, dict):
-            parts.append(f"{side} {','.join(_val(value.get(f)) for f in fields)}")
+            parts.append(f"{side} {','.join(_axis_value(value, f) for f in fields)}")
             continue
         why = next(
             (r for r, names in (sa.get("unavailable") or {}).items() if axis in (names or [])),
@@ -648,7 +709,8 @@ def _callers_cell(atlas: Any, diff_id: str, side: str, addr: Any) -> str:
     for e in edges:
         a = e.get("anchor") or {}
         name = a.get("function") or a.get("address") or a.get("binary")
-        names.append(f"{_val(name)} (library-level)" if e.get("library_level") else _val(name))
+        shown = _val(name) if name is None else _inline(name)
+        names.append(f"{shown} (library-level)" if e.get("library_level") else shown)
     body = f"{len(edges)} caller(s) on side {side}"
     if names:
         body += ": " + ", ".join(names[:HANDOFF_LIST_ITEMS])
@@ -792,7 +854,10 @@ def _handoff_file_facts(atlas: Any, run_a: str, run_b: str, path: str) -> list[s
         parts.append(f"structured counts {json.dumps(counts, sort_keys=True)}")
     out = [_cell(_FILE, ", ".join(parts))]
     shape, hunk = full.get("hunk_shape"), full.get("hunk")
-    more = f'get_file_diff(run_pair="{pair}", path="{path}", hunk_offset='
+
+    def more(offset: int) -> str:
+        return _inline(f'get_file_diff(run_pair="{pair}", path="{path}", hunk_offset={offset})')
+
     if isinstance(shape, dict):
         segments = shape.get("segments") or []
         out.append(
@@ -810,7 +875,7 @@ def _handoff_file_facts(atlas: Any, run_a: str, run_b: str, path: str) -> list[s
         total = shape.get("total_segments")
         if isinstance(total, int) and total > min(len(segments), HANDOFF_LIST_ITEMS):
             shown = min(len(segments), HANDOFF_LIST_ITEMS)
-            out.append(f"  - segments shown {shown} of {total} — rest: {more}{shown})")
+            out.append(f"  - segments shown {shown} of {total} — rest: {more(shown)}")
     elif isinstance(hunk, dict):
         lines = [str(x) for x in hunk.get("lines") or []]
         kept: list[str] = []
@@ -825,7 +890,7 @@ def _handoff_file_facts(atlas: Any, run_a: str, run_b: str, path: str) -> list[s
         total = hunk.get("total_pieces")
         total = len(lines) if not isinstance(total, int) else total
         if len(kept) < total:
-            out.append(f"  - hunk shown {len(kept)} of {total} piece(s) — rest: {more}{len(kept)})")
+            out.append(f"  - hunk shown {len(kept)} of {total} piece(s) — rest: {more(len(kept))}")
     return out + tail
 
 
@@ -833,7 +898,9 @@ def _handoff_binary_facts(side_path: str) -> list[str]:
     """A binary present in one run of the pair only: a whole-binary add or remove, so the function
     facts do not apply."""
     return [
-        _cell("whole-binary presence (tmap facts)", f"present on one side only: {side_path}"),
+        _cell(
+            "whole-binary presence (tmap facts)", f"present on one side only: {_inline(side_path)}"
+        ),
         _cell(_CHANGE, "not applicable (whole-binary add / remove)"),
         _cell(_SHAPE, "not applicable (whole-binary add / remove)"),
         _cell(_SIBLINGS, "not applicable (whole-binary add / remove)"),
@@ -868,12 +935,14 @@ def _finding_basis_line(finding: dict[str, Any]) -> str:
 
 
 def _read_more(kind: str, run_pair: str, diff_id: Any, anchor: str) -> str:
-    """The call that reads a block's whole facts, named in a cut block's note."""
+    """The call that reads a block's whole facts, named in a cut block's note — inline as code, as
+    it carries firmware text (a path, a binary name)."""
     if kind in ("function_pair", "function_presence") and isinstance(diff_id, str):
-        return f'get_diff_patch_view(diff_id="{diff_id}", entry_id="{anchor}")'
+        return _inline(f'get_diff_patch_view(diff_id="{diff_id}", entry_id="{anchor}")')
     if kind == "non_binary" and "#non_binary#" in anchor:
-        return f'get_file_diff(run_pair="{run_pair}", path="{anchor.split("#non_binary#", 1)[1]}")'
-    return f'list_overlays(anchor_kind="diff_subject", run_id="{run_pair}")'
+        path = anchor.split("#non_binary#", 1)[1]
+        return _inline(f'get_file_diff(run_pair="{run_pair}", path="{path}")')
+    return _inline(f'list_overlays(anchor_kind="diff_subject", run_id="{run_pair}")')
 
 
 def _cap_lines(lines: list[str], room: int, more: str) -> list[str]:
@@ -912,6 +981,25 @@ def _analysis_lines(text: str | None) -> list[str]:
     return [*_fenced(body.splitlines()), ""]
 
 
+def _handoff_tail(analysis: dict[str, str] | None) -> list[str]:
+    """A block's two analysis sections and its status: the placeholders, filled with the agent's
+    texts in the driver's document (``analysis``), left for a person in the skeleton (None)."""
+    filled = analysis is not None
+    return [
+        "",
+        f"### {HANDOFF_HYPOTHESES_TITLE}",
+        f"_{HANDOFF_BOUNDARY}_",
+        "",
+        *_analysis_lines((analysis or {}).get("hypotheses", "") if filled else None),
+        f"### {HANDOFF_DEVICE_TITLE}",
+        f"_{HANDOFF_BOUNDARY}_",
+        "",
+        *_analysis_lines((analysis or {}).get("device_checks", "") if filled else None),
+        _cell("status", HANDOFF_STATUS),
+        "",
+    ]
+
+
 def handoff_chunk(
     atlas: Any,
     run_pair: str,
@@ -933,8 +1021,11 @@ def handoff_chunk(
     the basis line comes before the recorded rationale, so a long rationale never cuts it.
     ``analysis`` (the driver's document) fills the two placeholders with an agent's
     ``hypotheses`` / ``device_checks`` — a missing or blank one says the agent wrote nothing; the
-    skeleton (None) leaves them for a person. Text tmap did not write (the rationale, the agent's
-    texts) is fenced, so none of its lines can read as the block's own basis or status line.
+    skeleton (None) leaves them for a person. The agent's texts do not count against ``cap``: the
+    facts are cut where the skeleton cuts them, and the texts follow whole. Text tmap did not write
+    (the rationale, the agent's texts) is fenced, and a firmware value on one of the block's own
+    lines is inline code, so none of it can read as the block's own basis or status line; the
+    heading's anchor_ref has its line breaks escaped (handoff_anchor_text).
     ``reads`` (same_shape_siblings.SameShapeReads) is the caller's holder for one pass over many
     blocks; handoff_blocks passes one."""
     from treasure_map.lib.query import file_diff as _fd
@@ -943,7 +1034,7 @@ def handoff_chunk(
     kind = finding.get("subject_kind") or ""
     diff_id = finding.get("diff_id")
     lines = [
-        f"## `{anchor}`",
+        f"## `{handoff_anchor_text(anchor)}`",
         "",
         _cell("subject", kind or "unknown"),
         _cell("recorded verdict", str(finding.get("verdict") or "")),
@@ -977,21 +1068,14 @@ def handoff_chunk(
         lines.append(_cell(_CHANGE, _unavailable(why)))
         lines.append(_cell(_SHAPE, _unavailable(why)))
         lines.append(_cell(_SIBLINGS, _unavailable(why)))
-    filled = analysis is not None
-    tail = [
-        "",
-        f"### {HANDOFF_HYPOTHESES_TITLE}",
-        f"_{HANDOFF_BOUNDARY}_",
-        "",
-        *_analysis_lines((analysis or {}).get("hypotheses", "") if filled else None),
-        f"### {HANDOFF_DEVICE_TITLE}",
-        f"_{HANDOFF_BOUNDARY}_",
-        "",
-        *_analysis_lines((analysis or {}).get("device_checks", "") if filled else None),
-        _cell("status", HANDOFF_STATUS),
-        "",
-    ]
-    room = (HANDOFF_BLOCK_CAP if cap is None else cap) - sum(_json_len(x + "\n") for x in tail)
+    tail = _handoff_tail(analysis)
+    # The room is the skeleton's: the agent's texts (the driver's document, written whole to a file,
+    # never paged) do not count against the cap, so however long they are, the facts — the heading,
+    # the subject, the basis — are cut exactly where the skeleton cuts them.
+    skeleton_tail = tail if analysis is None else _handoff_tail(None)
+    room = (HANDOFF_BLOCK_CAP if cap is None else cap) - sum(
+        _json_len(x + "\n") for x in skeleton_tail
+    )
     lines = _cap_lines(lines, room, _read_more(kind, run_pair, diff_id, anchor))
     return "\n".join(lines + tail) + "\n"
 

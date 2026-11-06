@@ -59,18 +59,29 @@ def test_all_three_tools_share_one_assembler(tmp_path: Path) -> None:
 def test_code_moved_on_disk_tracks_the_disk_but_fields_do_not(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``code_moved_on_disk`` follows the disk; the version fields stay the loaded values."""
+    """``code_moved_on_disk`` follows the disk — a file of the package edited under the running
+    server — while the version fields stay the loaded values."""
+    pkg = _package_copy(tmp_path, monkeypatch)
     t = make_tools(_world(tmp_path).path)  # pins _server_base at startup
     before = t["list_runs"]()["server"]
     assert before["code_moved_on_disk"] is False
-    monkeypatch.setattr(
-        rescan_version, "on_disk_code_stamp", lambda cfg: rescan_version.CodeStamp("src-X", "{}")
-    )
+    target = pkg / "lib" / "hunt" / "analyzer2.py"
+    target.write_text(target.read_text() + "\n_MOVED_ON_DISK = 1\n")
     after = t["list_runs"]()["server"]
     assert after["code_moved_on_disk"] is True
     for k in ("commit", "version", "hunt_code", "scan_code", "pass_version", "diff_code_version"):
         assert after[k] == before[k]  # in-process loaded value, never re-read from disk
-    assert after["hunt_code"] != "src-X"
+
+
+def _package_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A copy of the package the on-disk stamp reads instead of the installed one, so a test can
+    edit "the code on disk" under a running server."""
+    import shutil
+
+    pkg = tmp_path / "pkg"
+    shutil.copytree(rescan_version._PACKAGE, pkg, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(rescan_version, "_PACKAGE", pkg)
+    return pkg
 
 
 def test_diff_code_version_is_fixed_at_startup(tmp_path: Path) -> None:
