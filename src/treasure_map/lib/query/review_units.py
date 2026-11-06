@@ -19,11 +19,14 @@ states, made checkable, plus what it left out. An entry of a diff is must-read w
   ``instruction_unmatched`` — ``aligned_b_sink``;
 * among the first ``k`` entries of its diff in the default order — ``top_k``.
 
-Besides the entries, every binary one run of the pair holds alone (``binary_presence``) and every
-changed non-binary file of the pair is a must-read unit of its own. Every candidate row of a
-must-read entry is read with it (its unit's material). The listed entries outside the set are the
-second tier, handed out in batches per diff and bucket: the set orders what is read first and says
-when the must-read part is done; it is not a part that may be skipped.
+Besides the entries, every changed non-binary file of the pair is a must-read unit of its own, and
+so are the binaries one run of the pair holds alone (``binary_presence``): each function of such a
+binary holding a candidate is a must-read member (a binary holding none is one member on its own
+anchor), handed out per binary in batches. Such a member is disposed only when its judgement, of
+whatever verdict, cites every candidate of its subject (``presence_citations_short``). Every
+candidate row of a must-read entry is read with it (its unit's material). The listed entries
+outside the set are the second tier, handed out in batches per diff and bucket: the set orders
+what is read first and says when the must-read part is done; it is not a part that may be skipped.
 
 Order (dispatch): round robin by position. Each diff is a stream of its entries in its own default
 (significance) order; the binary_presence binaries and the changed files are two more streams.
@@ -54,11 +57,15 @@ from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, OPEN, UNSEEN
 
-PREDICATE_VERSION = "v1"
+PREDICATE_VERSION = "v2"
 DEFAULT_K = 4
 MAX_K = 200
-# A batch unit holds at most this many members: what one annotate_diff_batch call takes.
+# At most this many items in one annotate_diff_batch call.
 BATCH_MAX = 200
+# A batch unit (bucket S, second tier) holds at most this many members: about what one page's
+# material shows (an entry's scan runs ~2 KB, ~3.5 KB at the 90th percentile), so a unit is read
+# and judged from the page it is handed out on.
+BATCH_UNIT_MAX = 16
 
 # The sinks whose fewer calls on the B side make an aligned pair must-read: the command class (the
 # exec-path variant among it) and the argv-array runner the hunt does not recall.
@@ -98,9 +105,6 @@ UNIT_KINDS = (ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE)
 # Where a unit of a kind sorts among the units at the same place: a group first (its members read
 # together), an audit after the unit its member came from.
 _KIND_RANK = {GROUP: -1, AUDIT: 1}
-# How many of a binary_presence binary's candidates (its first, in the triage order) its judgement
-# must cite before the binary counts as disposed.
-PRESENCE_TOP = 20
 # How many disagreements the report lists (the count is always exact).
 DISAGREEMENTS_SHOWN = 20
 # The judgements an audit reads blind: why one is opened. ``unread_before_verdict`` is NOT here any
@@ -145,7 +149,8 @@ NOT_SEEN = (
 
 @dataclass(frozen=True)
 class Member:
-    """One subject of a unit: a diff entry, a binary_presence binary or a changed file."""
+    """One subject of a unit: a diff entry, a binary_presence subject (a function of a one-sided
+    binary, or such a binary) or a changed file."""
 
     anchor_ref: str
     kind: str  # "entry" | "binary_presence" | "non_binary_file"
@@ -397,16 +402,16 @@ def pair_facts(
     presence = bp.find_presence(atlas, run_a, run_b, groups)
     presence_members = [
         Member(
-            anchor_ref=presence.anchor(b),
+            anchor_ref=s.anchor,
             kind="binary_presence",
             stream=PRESENCE_STREAM,
             position=i,
             bucket="binary_presence",
-            subclass=b.tag,
-            rows=b.candidates,
+            subclass=s.binary.tag,
+            rows=len(s.refs),
             reasons=("binary_presence",),
         )
-        for i, b in enumerate(sorted(presence.items, key=lambda b: (b.tag, b.rel_path)))
+        for i, s in enumerate(bp.review_subjects(presence))
     ]
     files_unavailable: str | None = None
     pf = None
@@ -453,7 +458,7 @@ def _with_top_k(m: Member, k: int) -> Member:
 
 
 def _chunks(members: list[Member]) -> list[list[Member]]:
-    return [members[i : i + BATCH_MAX] for i in range(0, len(members), BATCH_MAX)]
+    return [members[i : i + BATCH_UNIT_MAX] for i in range(0, len(members), BATCH_UNIT_MAX)]
 
 
 def _assign_groups(d: DiffFacts, k: int) -> dict[str, tuple[dict[str, Any], list[Member]]]:
@@ -529,8 +534,14 @@ def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
         for bucket in sorted(second):
             for chunk in _chunks(second[bucket]):
                 add(SECOND_TIER, chunk, False)
+    # A one-sided binary's subjects (its functions) are handed out together, in batches.
+    by_binary: dict[str, list[Member]] = {}
     for m in facts.presence_members:
-        add(PRESENCE, [m], True)
+        fn = dr.split_presence_function(m.anchor_ref)
+        by_binary.setdefault(fn[0] if fn is not None else m.anchor_ref, []).append(m)
+    for members in by_binary.values():
+        for chunk in _chunks(members):
+            add(PRESENCE, chunk, True)
     for m in facts.file_members:
         add(FILE, [m], True)
     units.sort(key=lambda u: u.order)
@@ -546,6 +557,8 @@ class Progress:
 
     states: dict[str, str] = field(default_factory=dict)
     dangling: list[str] = field(default_factory=list)
+    # The dangling judgements themselves (their subject no longer resolves), for their verdicts.
+    dangling_judged: list[dr.DiffAnnotation] = field(default_factory=list)
     # The judgements read subject_unlisted: their subject resolves but is not listed.
     unlisted: list[dr.DiffAnnotation] = field(default_factory=list)
 
@@ -588,6 +601,7 @@ def read_progress(
             group_review=_group if group_review is not None else None,
         )
         out.dangling += dangling
+        out.dangling_judged += [judged[a] for a in dangling if a in judged]
         out.unlisted += dr.unlisted_judgements(judged, d.listed_anchors).values()
         for m in d.entries:
             out.states[m.anchor_ref] = dr.review_state(judged.get(m.anchor_ref))
@@ -612,9 +626,7 @@ def read_progress(
     return out
 
 
-# ── the binary_presence binaries: their first candidates, and whether a judgement cites them ─
-
-_PRESENCE_TOP_CACHE: dict[tuple[str, ...], list[str]] = {}
+# ── the binary_presence subjects: their candidates, and whether a judgement cites them ───────
 
 
 def presence_ranked(atlas: sqlite3.Connection, run_id: str, binary_path: str) -> list[Any]:
@@ -625,70 +637,31 @@ def presence_ranked(atlas: sqlite3.Connection, run_id: str, binary_path: str) ->
     return list(apply_view(ranked, view=None, sort_by=None, dim_filters=[], only_filters=[]))
 
 
-def presence_top_refs(
-    atlas: sqlite3.Connection, run_id: str, binary_path: str, k: int = PRESENCE_TOP
-) -> list[str]:
-    """The evidence_refs of the binary's first ``k`` candidates (``presence_ranked``), cached by
-    the run's stamps (a re-hunt or a re-scan reads them again)."""
-    from treasure_map.lib.query.patch_view import _run_key
-
-    key = (*_run_key(atlas, run_id), binary_path, str(k))
-    hit = _PRESENCE_TOP_CACHE.get(key)
-    if hit is None:
-        hit = [c.evidence_ref for c in presence_ranked(atlas, run_id, binary_path)[:k]]
-        _PRESENCE_TOP_CACHE[key] = hit
-    return hit
-
-
-def _cited(verdict_basis: Any) -> set[str]:
-    try:
-        vb = json.loads(verdict_basis) if verdict_basis else {}
-    except (TypeError, ValueError):
-        return set()
-    if not isinstance(vb, dict):
-        return set()
-    out: set[str] = set()
-    for key in ("checked", "evidence"):
-        items = vb.get(key)
-        if isinstance(items, list):
-            out |= {str(x).strip() for x in items}
-    return out
-
-
 def presence_citations_short(
     atlas: sqlite3.Connection, facts: PairFacts, states: dict[str, str]
 ) -> dict[str, dict[str, Any]]:
     """The disposed binary_presence judgements whose ``checked`` / ``evidence`` do not cite every
-    one of the binary's first PRESENCE_TOP candidates (all of them, when it has fewer) — anchor ->
-    what is missing. A change_inconclusive carries no basis and is held to its audit instead."""
+    candidate of their subject (binary_presence.required_citations: a function's candidates) —
+    anchor -> what is missing (``required`` / ``cited`` / ``missing_sample``). Every verdict is
+    held to it, change_inconclusive included."""
+    from treasure_map.lib.query import binary_presence as bp
+
     out: dict[str, dict[str, Any]] = {}
     pair = dr.run_pair(facts.run_a, facts.run_b)
     rows = {
-        r[0]: (r[1], r[2])
+        r[0]: r[1]
         for r in atlas.execute(
-            "SELECT anchor_ref, verdict, verdict_basis FROM overlay "
+            "SELECT anchor_ref, verdict_basis FROM overlay "
             "WHERE anchor_kind = 'diff_subject' AND run_id = ?",
             (pair,),
         )
     }
-    by_anchor = {facts.presence.anchor(b): b for b in facts.presence.items}
     for m in facts.presence_members:
         if not disposed(states.get(m.anchor_ref)) or m.anchor_ref not in rows:
             continue
-        verdict, basis = rows[m.anchor_ref]
-        if verdict == "change_inconclusive":
-            continue
-        b = by_anchor.get(m.anchor_ref)
-        if b is None:
-            continue
-        top = presence_top_refs(atlas, b.run, b.path)
-        missing = [r for r in top if r not in _cited(basis)]
-        if missing:
-            out[m.anchor_ref] = {
-                "required": len(top),
-                "cited": len(top) - len(missing),
-                "missing_sample": missing[:5],
-            }
+        gap = bp.citation_gap(facts.presence, m.anchor_ref, rows[m.anchor_ref])
+        if gap is not None and gap["cited"] < gap["required"]:
+            out[m.anchor_ref] = gap
     return out
 
 
@@ -760,6 +733,10 @@ class Audits:
     # report's own k makes must-read. Always computed, independent of ``BLIND_AUDIT_ENABLED``; the
     # caller sets each to NEEDS_RECHECK (not disposed).
     needs_recheck: list[str] = field(default_factory=list)
+    # Subjects whose current judgement reads disposed although its latest write read nothing of the
+    # subject whole (basis ``none``: a member its unit's material did not show whole, or a material
+    # cut and not read on). Not must-read at the report's k, so not judged unread; counted apart.
+    basis_incomplete: list[str] = field(default_factory=list)
 
 
 def _json(raw: Any) -> dict[str, Any]:
@@ -887,6 +864,8 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
                 and m.anchor_ref in must_now
             ):
                 out.needs_recheck.append(m.anchor_ref)
+            elif last is not None and last["read_basis"].get("basis") == "none":
+                out.basis_incomplete.append(m.anchor_ref)
             # Below: the blind audit unit. Sealed off by default (A-1); produced only when the
             # sealed section is satisfied and the flag is flipped back on.
             if not BLIND_AUDIT_ENABLED:
@@ -1018,12 +997,31 @@ def report(
         "why": "judged before anything of the subject was read",
         "cleared_by": "a later judgement written after reading the subject",
     }
+    basis_incomplete = {
+        "count": len(audits.basis_incomplete),
+        "subjects": sorted(audits.basis_incomplete)[:DISAGREEMENTS_SHOWN],
+        "why": (
+            "disposed, but written before the subject was read whole: its unit's material did not "
+            "show it whole (not listed, or a part withheld or cut) and it was not read on"
+        ),
+        "cleared_by": "a later judgement written after reading the subject in full",
+    }
+    dangling = dr.judged_not_listed(progress.dangling_judged)
+    dangling["means"] = (
+        "judgements whose subject no longer resolves in the current facts (anchor_unresolved: "
+        "the pairing or the subject moved); they stay needs_recheck and no unit hands them out"
+    )
+    not_listed = dr.judged_not_listed(progress.unlisted)
     statement = (
         f"must-read {len(must_members)} / disposed {must_done}; "
         f"all subjects {len(all_members)} / disposed {all_done}; "
         f"open audits {open_text}; judged unread {judged_unread['count']}; "
         f"disagreements {len(audits.disagreements)}; "
         f"{'reduce done' if not reduce_owed else f'reduce owed {len(reduce_owed)}'}; "
+        f"presence citations short {len(presence_short)}; "
+        f"basis incomplete {basis_incomplete['count']}; "
+        f"dangling {dangling['count']} (changed_real {dangling['changed_real']['count']}); "
+        f"not listed {not_listed['count']}; "
         f"predicate {PREDICATE_VERSION} (k={k}); server {server}"
     )
     group_units = [u for u in units if u.kind == GROUP]
@@ -1087,8 +1085,11 @@ def report(
         },
         "not_seen": list(NOT_SEEN),
         "dangling_judgements": sorted(progress.dangling),
+        # The same judgements by verdict, changed_real apart: no unit hands them out.
+        "dangling": dangling,
         # Apart from the dangling ones: the subject resolves but is no longer listed.
-        "judged_not_listed": dr.judged_not_listed(progress.unlisted),
+        "judged_not_listed": not_listed,
+        "basis_incomplete": basis_incomplete,
     }
 
 
@@ -1228,7 +1229,7 @@ def review_pair(
     )
     short = presence_citations_short(atlas, facts, progress.states)
     for anchor in short:
-        # Judged without citing the binary's first candidates: read again, not disposed.
+        # Judged without citing every candidate of its subject: read again, not disposed.
         progress.states[anchor] = NEEDS_RECHECK
     audits = read_audits(atlas, facts, units)
     for anchor in audits.needs_recheck:

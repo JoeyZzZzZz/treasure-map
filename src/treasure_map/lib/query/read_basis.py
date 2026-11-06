@@ -8,8 +8,8 @@ of the writing server's session — recorded with the write in overlay_history a
 * ``unit_delivered`` — this session was handed the unit's material before the write (by
   start_diff_review, or a write's answer naming the next unit with it; a unit named without its
   material is not handed out) and that material showed the written subject whole: a material that
-  lists members (a batch, a callee group, a reduce) shows only the members it kept, a one-subject
-  material (an entry, a binary's first candidates, a file) shows its subject unless it was cut.
+  lists members (a batch, a callee group, a reduce, a one-sided binary's functions) shows only the
+  members it kept, a one-subject material (an entry, a file) shows its subject unless it was cut.
   Otherwise the delivery counts only once the subject ITSELF was fetched after it (then
   ``material_cut``); fetching another member does not read this one. The unit is the one the write
   names; a write that names none is read against the units this session was handed that hold its

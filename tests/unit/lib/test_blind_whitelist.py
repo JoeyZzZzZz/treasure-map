@@ -317,7 +317,8 @@ def _pres_world(tmp: Path, mp: pytest.MonkeyPatch, which: str) -> Path:
         verdict = _verdict(which, x)
         if verdict is None:
             continue
-        anchor = presence.anchor(b)
+        # its first review subject: a function holding a candidate
+        anchor = next(s.anchor for s in tbp.bp.review_subjects(presence) if s.binary is b)
         overlay.annotate_diff(
             w.atlas,
             run_pair=tbp.PAIR,

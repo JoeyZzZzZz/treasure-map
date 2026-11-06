@@ -20,6 +20,7 @@ ANCHORS. A judgement is keyed by an anchor that names its subject, not its posit
     {run_a}::{run_b}#candidate#{subject_key}
     {run_a}::{run_b}#non_binary#{path}
     {run_a}::{run_b}#binary_presence#{a_only|b_only}:{path}
+    {run_a}::{run_b}#binary_presence#{a_only|b_only}:{path}::{addr}
 
 ``binary`` is the diff's short binary name (diff_meta.binary_a): two binaries of one run pair can
 hold a function at the same address, and without it their entries would share one judgement. A
@@ -35,7 +36,10 @@ it, and it is read on its own path (file_diff.file_review) against the pair's fi
 A ``binary_presence`` anchor names a binary held by one run of the pair only — in neither the other
 run's binaries, nor its non-binary files, nor its symlinks — by its side and its path under the
 firmware root (lib/query/binary_presence). Like a file, it belongs to no binary diff and is read
-on its own path (binary_presence.presence_review) against the pair.
+on its own path (binary_presence.presence_review) against the pair. A binary that holds candidates
+is judged function by function: its anchor then ``::`` and the address of a function holding one
+(``presence_function_anchor``) — the same subject kind, so every reader of a binary_presence
+anchor reads it alike.
 
 THE BASIS is the entry's own diff facts at write time — for a pair its alignment state,
 similarity, export gaps, bucket and the (a_ref, b_ref, presence, reason, counterpart call) of every
@@ -46,7 +50,9 @@ diff paired the functions differently, or a candidate was re-keyed) is not a row
 reported beside the counts as dangling, and reads ``needs_recheck``. An anchor whose subject still
 resolves but is no longer LISTED (the pair now reads identical) is not a row state either: it reads
 ``subject_unlisted`` — neither needs_recheck (it cannot be judged again while unlisted) nor
-disposed — and is reported beside the counts as ``judged_not_listed``, apart from dangling.
+disposed — and is reported beside the counts as ``judged_not_listed``, apart from dangling. Only
+while its diff reads current (``source_stale`` false): on a diff that is not, the judgement keeps
+reading ``needs_recheck``.
 """
 
 from __future__ import annotations
@@ -111,6 +117,13 @@ CHECKED_RULE = (
 )
 
 
+def checked_example(field: str, items: list[str]) -> str:
+    """The copyable example a runtime ``checked`` / ``evidence`` refusal ends with: ``field``
+    filled with ``items``, the judged subject's own anchor_ref first. Only refusal texts carry it,
+    never ``CHECKED_RULE`` (that rule is quoted in a tool description)."""
+    return f"  example: {field}={json.dumps(items)}"
+
+
 # ── anchors ────────────────────────────────────────────────────────────────────────────────
 
 
@@ -138,6 +151,28 @@ def binary_presence_anchor(run_a: str, run_b: str, side: str, rel_path: str) -> 
     """The anchor of a binary held by one run of the pair only: ``side`` is ``a_only`` or
     ``b_only``, ``rel_path`` its path under that run's firmware root."""
     return f"{run_pair(run_a, run_b)}#binary_presence#{side}:{rel_path}"
+
+
+def presence_function_anchor(run_a: str, run_b: str, side: str, rel_path: str, addr: str) -> str:
+    """The anchor of one function (by its address) of a binary held by one run of the pair only:
+    the binary's anchor, then ``::`` and the address."""
+    return f"{binary_presence_anchor(run_a, run_b, side, rel_path)}::{addr}"
+
+
+def split_presence_function(anchor_ref: str) -> tuple[str, str] | None:
+    """``(binary anchor, address)`` of a binary_presence function anchor, else None (a binary's
+    own anchor included). Shape only: whether the address names a function of a listed binary is
+    read against the pair (lib/query/binary_presence)."""
+    base, sep, addr = anchor_ref.rpartition("::")
+    if not sep or not is_binary_presence_anchor(base) or not is_function_address(addr):
+        return None
+    return base, addr
+
+
+def is_function_address(text: str) -> bool:
+    """An evidence_ref's function address: lowercase hex, at least eight digits (the hunt pads to
+    eight, a wider address keeps its width)."""
+    return len(text) >= 8 and all(c in "0123456789abcdef" for c in text)
 
 
 def is_binary_presence_anchor(anchor_ref: str) -> bool:
@@ -508,11 +543,15 @@ def unlisted_judgements(
     does not list), so it is not ``needs_recheck``; it is no listed entry either, so it is in no
     count of the progress. It reads ``subject_unlisted``. ``listed_anchors`` are the anchors of the
     listed entries and of their candidate rows (``subjects_of`` over the listed entries). A subject
-    that no longer resolves (``anchor_unresolved``) or a withheld diff never lands here."""
+    that no longer resolves (``anchor_unresolved``), a withheld diff, or a diff that does not read
+    current (``source_stale`` anything but false — its judgement stays needs_recheck) never lands
+    here."""
     return {
         a: j
         for a, j in judged.items()
-        if j.basis_state not in (ANCHOR_UNRESOLVED, DIFF_WITHHELD) and a not in listed_anchors
+        if j.basis_state not in (ANCHOR_UNRESOLVED, DIFF_WITHHELD)
+        and j.source_stale is False
+        and a not in listed_anchors
     }
 
 

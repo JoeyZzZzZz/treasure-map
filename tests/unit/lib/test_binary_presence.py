@@ -11,6 +11,7 @@ firmware root.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -79,12 +80,22 @@ class World:
         )
         return path
 
-    def cand(self, side: str, rel: str, sha: str, sink_class: str = "cmd", n: int = 1) -> list[str]:
-        """``n`` candidates of a binary not diffed (it holds them; no diff names its hash)."""
+    def cand(
+        self,
+        side: str,
+        rel: str,
+        sha: str,
+        sink_class: str = "cmd",
+        n: int = 1,
+        addr: str | None = None,
+    ) -> list[str]:
+        """``n`` candidates of a binary not diffed (it holds them; no diff names its hash), each in
+        a function of its own — or all in the function at ``addr``."""
         refs = []
         for _ in range(n):
             self._n += 1
-            ref = f"{self.run[side]}#{sha[:8]}:{self._n:08x}@{sink_class}@0x10"
+            fn = addr if addr is not None else f"{self._n:08x}"
+            ref = f"{self.run[side]}#{sha[:8]}:{fn}@{sink_class}@0x{self._n:x}"
             self.atlas.execute(
                 "INSERT INTO instance (pattern_id, evidence_ref, source_run_id, "
                 "binary_content_hash, binary_path, sink_anchor) VALUES (?, ?, ?, ?, ?, 'x')",
@@ -220,6 +231,15 @@ def _by_rel(p: bp.Presence) -> dict[tuple[str, str], bp.PresentBinary]:
 
 def _anchor(tag: str, rel: str) -> str:
     return dr.binary_presence_anchor("runA", "runB", tag, rel)
+
+
+def _fn(w: World, tag: str, rel: str, i: int = 0) -> tuple[str, tuple[str, ...]]:
+    """The anchor of the ``i``-th function (by address) holding a candidate of that binary, and
+    the function's candidates."""
+    p = _presence(w)
+    b = _by_rel(p)[(tag, rel)]
+    addr, refs = b.functions[i]
+    return p.function_anchor(b, addr), refs
 
 
 def _fresh_files(run_a: str, run_b: str) -> dict[str, Any]:
@@ -411,13 +431,16 @@ def _progress(w: World, **kw: Any) -> dict[str, Any]:
 
 
 def _judge_all(w: World, tags: tuple[str, ...]) -> None:
-    for b in _presence(w).items:
-        if b.tag in tags:
+    """Judge every review subject of those sides (each function holding a candidate, or a binary
+    holding none), citing its own anchor and every one of its candidates."""
+    for s in bp.review_subjects(_presence(w)):
+        if s.binary.tag in tags:
             overlay.annotate_diff(
                 w.atlas,
-                anchor_ref=_presence(w).anchor(b),
+                anchor_ref=s.anchor,
                 verdict="change_inconclusive",
                 rationale="read its candidates; next: its callers",
+                verdict_basis={"checked": [s.anchor, *s.refs]},
                 run_pair=PAIR,
             )
 
@@ -512,13 +535,14 @@ def test_the_cli_prints_what_each_side_holds_alone(
 
 
 def test_a_judgement_is_written_on_the_run_pair_and_reads_back(world: World) -> None:
-    """★ A binary_presence judgement goes on the run pair (lib and the MCP batch alike) and reads
-    back on list_overlays against the pair — never as a gone diff or an unresolved anchor; with the
-    runs read current it is concluded.
+    """★ A binary_presence judgement — on a function of such a binary — goes on the run pair (lib
+    and the MCP batch alike) and reads back on list_overlays against the pair — never as a gone
+    diff or an unresolved anchor; with the runs read current it is concluded.
 
     MUTATION (verified RED, 1 failed each): read binary_presence rows through ``_diff_of`` ->
     source_diff_gone -> RED; drop the batch's presence branch -> the batch is refused -> RED."""
-    app = _anchor("a_only", "web/app/app.cgi")
+    app, _refs = _fn(world, "a_only", "web/app/app.cgi")
+    qctl, _refs = _fn(world, "b_only", "bin/qctl")
     res = overlay.annotate_diff(
         world.atlas,
         anchor_ref=app,
@@ -530,7 +554,7 @@ def test_a_judgement_is_written_on_the_run_pair_and_reads_back(world: World) -> 
     batch = mcp_app.make_tools(world.path)["annotate_diff_batch"](
         annotations=[
             {
-                "anchor_ref": _anchor("b_only", "bin/qctl"),
+                "anchor_ref": qctl,
                 "verdict": "change_inconclusive",
                 "rationale": "read; next: its script",
             }
@@ -542,7 +566,7 @@ def test_a_judgement_is_written_on_the_run_pair_and_reads_back(world: World) -> 
         world.atlas, anchor_kind="diff_subject", run_id=PAIR, file_staleness=_fresh_files
     )
     rows = {r["anchor_ref"]: r for r in out["overlays"]}
-    for anchor in (app, _anchor("b_only", "bin/qctl")):
+    for anchor in (app, qctl):
         r = rows[anchor]
         assert r["basis_state"] == "unchanged", r
         assert r["source_stale_reason"] != "source_diff_gone"
@@ -584,12 +608,15 @@ def test_a_judgement_with_a_diff_id_is_refused(world: World) -> None:
 
 
 def test_a_moved_basis_or_a_stale_run_reads_needs_recheck(world: World) -> None:
-    """The basis is the binary's facts: a candidate added moves it (needs_recheck); and with either
-    run read stale the judgement reads stale.
+    """The basis of a function's judgement is its binary's content hash and the function's own
+    candidates: a candidate added to another function leaves it as it was; one added to it moves
+    it (needs_recheck); and with either run read stale the judgement reads stale.
 
     MUTATION (verified RED, 1 failed each): leave the candidates out of the basis -> unchanged ->
-    RED; ignore the staleness reading -> concluded -> RED."""
-    app = _anchor("a_only", "web/app/app.cgi")
+    RED; ignore the staleness reading -> concluded -> RED; give each function every candidate of
+    its binary -> the other function's candidate moves it -> RED."""
+    app, _refs = _fn(world, "a_only", "web/app/app.cgi")
+    addr = app.rsplit("::", 1)[1]
     overlay.annotate_diff(
         world.atlas, anchor_ref=app, verdict="changed_real", rationale="x", run_pair=PAIR
     )
@@ -603,19 +630,25 @@ def test_a_moved_basis_or_a_stale_run_reads_needs_recheck(world: World) -> None:
     assert row()["review_state"] == "concluded"
     stale = row(lambda a, b: {"source_stale": True, "source_stale_reason": "stale_scan:runA"})
     assert (stale["review_state"], stale["source_stale"]) == ("needs_recheck", True)
-    world.cand("a", "web/app/app.cgi", _sha("3"), "format")
+    world.cand("a", "web/app/app.cgi", _sha("3"), "format")  # a function of its own
+    world.commit()
+    assert row()["review_state"] == "concluded"
+    world.cand("a", "web/app/app.cgi", _sha("3"), "format", addr=addr)  # in the judged function
     world.commit()
     moved = row()
     assert moved["review_state"] == "needs_recheck"
-    assert set(moved["basis_moved"]) == {"candidates", "candidates_by_sink_class"}
+    assert set(moved["basis_moved"]) == {"candidates"}
 
 
 def test_a_reference_added_moves_the_basis(world: World) -> None:
-    """The recorded references are part of the basis: a new call to the binary moves a judgement
-    on it to needs_recheck, naming referenced_by and nothing else.
+    """The recorded references are part of a binary's basis: a new call to a one-sided binary that
+    holds no candidate (judged on its own anchor) moves a judgement on it to needs_recheck,
+    naming referenced_by and nothing else.
 
     MUTATION (verified RED, 1 failed): leave referenced_by out of the basis -> unchanged -> RED."""
-    qctl = _anchor("b_only", "bin/qctl")
+    world.binary("b", "usr/bin/quiet", "f1" * 32)  # B only, no candidate
+    world.commit()
+    qctl = _anchor("b_only", "usr/bin/quiet")
     overlay.annotate_diff(
         world.atlas, anchor_ref=qctl, verdict="changed_real", rationale="x", run_pair=PAIR
     )
@@ -628,7 +661,7 @@ def test_a_reference_added_moves_the_basis(world: World) -> None:
 
     assert row()["review_state"] == "concluded"
     boot = world.file("b", "etc/boot.sh", "58" * 32)
-    world.call("b", boot, "qctl", 9)
+    world.call("b", boot, "quiet", 9)
     world.commit()
     moved = row()
     assert moved["review_state"] == "needs_recheck"
@@ -643,9 +676,11 @@ def test_list_diffs_and_list_overlays_read_one_state_for_a_judgement(world: Worl
     MUTATION (verified RED, 1 failed): coverage passes no staleness reading (both runs unread) ->
     list_diffs reads needs_recheck beside list_overlays' concluded -> RED."""
     app = _anchor("a_only", "web/app/app.cgi")
-    overlay.annotate_diff(
-        world.atlas, anchor_ref=app, verdict="changed_real", rationale="x", run_pair=PAIR
-    )
+    fns = [_fn(world, "a_only", "web/app/app.cgi", i)[0] for i in (0, 1)]
+    for fn in fns:  # the binary reads as its least done function: judge both
+        overlay.annotate_diff(
+            world.atlas, anchor_ref=fn, verdict="changed_real", rationale="x", run_pair=PAIR
+        )
     world.commit()
 
     def states() -> tuple[str, str]:
@@ -654,7 +689,7 @@ def test_list_diffs_and_list_overlays_read_one_state_for_a_judgement(world: Worl
         (in_cov,) = [b for b in cov["binary_presence"]["a_only"] if b["anchor_ref"] == app]
         # no run_id: list_overlays scoped to a pair with a stale run refuses outright
         rows = tools["list_overlays"](anchor_kind="diff_subject")["overlays"]
-        (in_ov,) = [r for r in rows if r["anchor_ref"] == app]
+        (in_ov,) = [r for r in rows if r["anchor_ref"] == fns[0]]
         return in_cov["review_state"], in_ov["review_state"]
 
     assert states() == ("concluded", "concluded")
@@ -664,15 +699,15 @@ def test_list_diffs_and_list_overlays_read_one_state_for_a_judgement(world: Worl
 
 
 def test_checked_cites_its_own_anchor_or_its_own_candidates(world: World) -> None:
-    """★ A no_real_change on such a binary cites its own anchor, or an evidence_ref of one of its
-    candidates in its own run; another binary's candidate is refused by name.
+    """★ A no_real_change on a function of such a binary cites its own anchor, or an evidence_ref
+    of one of the function's candidates in its own run; another binary's candidate, and another
+    function's of the same binary, are refused by name.
 
     MUTATION (verified RED, 1 failed each): accept any evidence_ref of the run -> the other
-    binary's candidate passes -> RED; refuse the binary's own candidate -> RED."""
-    app = _anchor("a_only", "web/app/app.cgi")
-    own = world.atlas.execute(
-        "SELECT evidence_ref FROM instance WHERE binary_path LIKE '%/app.cgi' LIMIT 1"
-    ).fetchone()[0]
+    binary's candidate passes -> RED; refuse the function's own candidate -> RED; accept any
+    candidate of the binary -> the other function's candidate passes -> RED."""
+    app, (own,) = _fn(world, "a_only", "web/app/app.cgi")
+    _other_fn, (sibling,) = _fn(world, "a_only", "web/app/app.cgi", 1)
     theirs = world.atlas.execute(
         "SELECT evidence_ref FROM instance WHERE binary_path LIKE '%/a/dup' LIMIT 1"
     ).fetchone()[0]
@@ -688,15 +723,16 @@ def test_checked_cites_its_own_anchor_or_its_own_candidates(world: World) -> Non
             )
         except ConfigError as exc:
             pytest.fail(f"{cited} was refused: {exc}")
-    with pytest.raises(ConfigError, match="not a candidate of app.cgi"):
-        overlay.annotate_diff(
-            world.atlas,
-            anchor_ref=app,
-            verdict="no_real_change",
-            rationale="x",
-            verdict_basis={"why_unchanged": "x", "checked": [theirs]},
-            run_pair=PAIR,
-        )
+    for cited in (theirs, sibling):
+        with pytest.raises(ConfigError, match="is not a candidate of function"):
+            overlay.annotate_diff(
+                world.atlas,
+                anchor_ref=app,
+                verdict="no_real_change",
+                rationale="x",
+                verdict_basis={"why_unchanged": "x", "checked": [cited]},
+                run_pair=PAIR,
+            )
     with pytest.raises(ConfigError, match="at least one item that resolves"):
         overlay.annotate_diff(
             world.atlas,
@@ -737,7 +773,7 @@ def test_a_non_binary_anchor_on_a_binary_is_refused_by_name(world: World) -> Non
 
     MUTATION (verified RED): leave non_binary out of _anchor_marker's closed set -> it is kept as
     a note and the write succeeds -> RED."""
-    app = _anchor("a_only", "web/app/app.cgi")
+    app, _refs = _fn(world, "a_only", "web/app/app.cgi")
     with pytest.raises(ConfigError, match="is a non_binary anchor"):
         overlay.annotate_diff(
             world.atlas,
@@ -749,24 +785,21 @@ def test_a_non_binary_anchor_on_a_binary_is_refused_by_name(world: World) -> Non
         )
 
 
-def test_a_presence_judgement_counts_only_when_it_cites_the_binarys_first_candidates(
+def test_a_presence_judgement_counts_only_when_it_cites_every_candidate_of_its_function(
     world: World,
 ) -> None:
-    """★ A binary_presence judgement that cites fewer than its binary's first candidates (all of
-    them, below 20) is not disposed — it reads needs_recheck in the pair review and the report
-    names it; citing every one disposes it.
+    """★ A judgement on a function of a one-sided binary that cites fewer than every one of the
+    function's candidates is not disposed — it reads needs_recheck in the pair review and the
+    report names it; citing every one disposes it.
 
     MUTATION (verified RED): skip the citation check -> the judgement citing its own anchor only
     is disposed -> RED."""
     from treasure_map.lib.query import review_units as ru
 
-    app = _anchor("a_only", "web/app/app.cgi")
-    refs = [
-        r[0]
-        for r in world.atlas.execute(
-            "SELECT evidence_ref FROM instance WHERE binary_path LIKE '%/app.cgi'"
-        )
-    ]
+    addr = _fn(world, "a_only", "web/app/app.cgi")[0].rsplit("::", 1)[1]
+    world.cand("a", "web/app/app.cgi", _sha("3"), "copy", addr=addr)  # a second one in it
+    world.commit()
+    app, refs = _fn(world, "a_only", "web/app/app.cgi")
     assert len(refs) == 2
 
     def judge(cited: list[str]) -> ru.PairReview:
@@ -792,3 +825,360 @@ def test_a_presence_judgement_counts_only_when_it_cites_the_binarys_first_candid
     whole = judge([app, *refs])
     assert ru.disposed(whole.progress.states.get(app))
     assert app not in whole.report["presence_citations_short"]
+
+
+# ── judged function by function; a binary holding no candidate listed too ─────────────────────
+
+
+def _refusal(call: Any) -> str:
+    """The text a call is refused with, or "" when it is not refused."""
+    try:
+        call()
+    except ConfigError as exc:
+        return str(exc)
+    return ""
+
+
+def _review(w: World) -> Any:
+    from treasure_map.lib.query import review_units as ru
+
+    return ru.review_pair(
+        w.atlas,
+        "runA",
+        "runB",
+        pair_staleness={"source_stale": False, "source_stale_reason": None},
+        server_commit=None,
+    )
+
+
+def test_each_function_holding_a_candidate_is_a_must_read_member(world: World) -> None:
+    """★ A one-sided binary is reviewed function by function: each function holding a candidate
+    is a must-read member of its own (25 functions, two candidates each: 50 rows, more than any
+    first-rows rule reaches), the binary's own anchor is not one, and the
+    binary's members are handed out together — every binary_presence unit holds the subjects of
+    one binary only.
+
+    MUTATION (verified RED, 1 failed each): one member per binary again (``presence.items``) ->
+    the functions are not members -> RED; cut every binary's subjects into one unit -> a unit
+    holds two binaries -> RED."""
+    from treasure_map.lib.query import review_units as ru
+
+    sha = "f2" * 32
+    world.binary("b", "usr/bin/many", sha)
+    for i in range(25):
+        world.cand("b", "usr/bin/many", sha, "cmd", n=2, addr=f"{0x400000 + 0x100 * i:08x}")
+    world.commit()
+    review = _review(world)
+    base = _anchor("b_only", "usr/bin/many")
+    mine = [m for m in review.facts.presence_members if m.anchor_ref.startswith(base)]
+    assert len(mine) == 25 and all(m.must_read and m.rows == 2 for m in mine)
+    assert base not in {m.anchor_ref for m in mine}
+    assert f"{base}::{0x400000 + 0x100 * 12:08x}" in {m.anchor_ref for m in mine}
+    units = [u for u in review.units if u.kind == ru.PRESENCE]
+    for u in units:
+        bases = {
+            (dr.split_presence_function(m.anchor_ref) or (m.anchor_ref,))[0] for m in u.members
+        }
+        assert len(bases) == 1, u
+    held = [m.anchor_ref for u in units for m in u.members if m.anchor_ref.startswith(base)]
+    assert sorted(held) == sorted(m.anchor_ref for m in mine)
+
+
+def test_a_change_inconclusive_counts_only_when_it_cites_its_functions_candidates(
+    world: World,
+) -> None:
+    """★ Every verdict on a one-sided binary's function is held to its citations, change_
+    inconclusive too: citing none of the function's candidates it is written but reads
+    needs_recheck, named in presence_citations_short and counted in the coverage statement;
+    citing every one disposes it. A change_inconclusive there may carry ``checked``.
+
+    MUTATION (verified RED, 1 failed each): skip change_inconclusive in the citation check ->
+    disposed citing nothing -> RED; refuse a change_inconclusive's basis again -> the citing write
+    is refused -> RED."""
+    fn, refs = _fn(world, "b_only", "bin/qctl")
+
+    def judge(basis: dict[str, Any] | None) -> Any:
+        refused = _refusal(
+            lambda: overlay.annotate_diff(
+                world.atlas,
+                anchor_ref=fn,
+                verdict="change_inconclusive",
+                rationale="read; next: its script",
+                verdict_basis=basis,
+                run_pair=PAIR,
+            )
+        )
+        assert refused == "", refused
+        return _review(world)
+
+    short = judge(None)
+    assert short.progress.states[fn] == "needs_recheck"
+    assert short.report["presence_citations_short"][fn] == {
+        "required": 1,
+        "cited": 0,
+        "missing_sample": list(refs),
+    }
+    assert "presence citations short 1;" in short.report["coverage_statement"]
+    whole = judge({"checked": [fn, *refs]})
+    assert whole.progress.states[fn] == "inconclusive"
+    assert fn not in whole.report["presence_citations_short"]
+    assert "presence citations short 0;" in whole.report["coverage_statement"]
+
+
+def test_a_change_inconclusive_carries_checked_on_a_one_sided_binary_only() -> None:
+    """change_inconclusive takes ``checked`` (only) on a binary one run holds alone, where it is
+    needed to count as disposed; on any other subject it carries no basis, as before.
+
+    MUTATION (verified RED, 1 failed each): let any change_inconclusive carry checked -> a
+    function pair's is accepted -> RED; refuse a change_inconclusive's basis everywhere again ->
+    the one-sided binary's is refused -> RED."""
+    fn = f"{_anchor('a_only', 'web/app/app.cgi')}::0000000a"
+    stored: list[str | None] = []
+
+    def validate(vb: dict[str, Any], anchor: str) -> Any:
+        return lambda: stored.append(
+            overlay._validate_diff_verdict_basis("change_inconclusive", vb, anchor)
+        )
+
+    assert _refusal(validate({"checked": [fn]}, fn)) == ""
+    assert stored and json.loads(stored[0] or "{}").get("checked") == [fn], stored
+    assert "takes checked only" in _refusal(validate({"checked": [fn], "why_unchanged": "x"}, fn))
+    pair = "runA::runB#function_pair#libx::00001000::00009000"
+    assert "no_real_change or changed_real only" in _refusal(validate({"checked": [pair]}, pair))
+
+
+def test_a_binary_holding_candidates_is_judged_by_its_functions_not_its_own_anchor(
+    world: World,
+) -> None:
+    """★ A judgement on the own anchor of a one-sided binary whose candidates all sit in functions
+    is refused, pointing at its function anchors; an address that holds none of its candidates
+    is refused by name; a binary holding no candidate is judged on its own anchor.
+
+    MUTATION (verified RED, 1 failed each): drop the refusal -> the binary-level write succeeds ->
+    RED; resolve any address of a listed binary -> the unknown function is refused as no binary
+    -> RED."""
+    app = _anchor("a_only", "web/app/app.cgi")
+
+    def write(anchor: str) -> Any:
+        return lambda: overlay.annotate_diff(
+            world.atlas, anchor_ref=anchor, verdict="changed_real", rationale="x", run_pair=PAIR
+        )
+
+    assert "its review subjects are its 2 function" in _refusal(write(app))
+    assert "names no function holding a candidate" in _refusal(write(f"{app}::deadbeef"))
+    world.binary("b", "usr/bin/quiet", "f1" * 32)
+    world.commit()
+    res = overlay.annotate_diff(
+        world.atlas,
+        anchor_ref=_anchor("b_only", "usr/bin/quiet"),
+        verdict="changed_real",
+        rationale="a tool only the newer build ships",
+        run_pair=PAIR,
+    )
+    assert res.action == "inserted"
+
+
+def test_a_binary_holding_no_candidate_is_listed_on_its_own_anchor(world: World) -> None:
+    """★ A binary of one run that holds no candidate is listed too when the other run holds
+    nothing like it and no diff of the pair names it — one must-read member on its own anchor,
+    with no candidate to cite, and out of every blind spot. One with a counterpart (by name), or
+    one side of a diff (renamed, so nothing else ties it to the other run), is not.
+
+    MUTATION (verified RED, 1 failed each): list no binary holding no candidate -> quiet is
+    missing -> RED; skip the diffed check -> the renamed diffed binary is listed -> RED."""
+    world.binary("b", "usr/bin/quiet", "f1" * 32)
+    world.binary("a", "lib/libold.so", "f3" * 32)
+    world.binary("b", "lib/libnew.so", "f4" * 32)
+    world.atlas.execute(
+        "INSERT INTO diff_meta (diff_id, run_a_id, run_b_id, binary_a, binary_b, sha256_a, "
+        "sha256_b, diff_ok, version_skew) VALUES ('runA::runB::libold.so', 'runA', 'runB', "
+        "'libold.so', 'libnew.so', ?, ?, 1, 0)",
+        ("f3" * 32, "f4" * 32),
+    )
+    world.commit()
+    by = _by_rel(_presence(world))
+    assert ("b_only", "usr/bin/quiet") in by, sorted(by)
+    quiet = by[("b_only", "usr/bin/quiet")]
+    assert (quiet.candidates, quiet.functions, quiet.by_class) == (0, (), {})
+    assert not {("a_only", "lib/libold.so"), ("b_only", "lib/libnew.so")} & set(by)
+    assert ("b_only", "usr/sbin/samename") not in by  # A holds a binary of that name
+    review = _review(world)
+    (m,) = [m for m in review.facts.presence_members if m.anchor_ref.endswith("usr/bin/quiet")]
+    assert (m.anchor_ref, m.rows, m.must_read) == (_anchor("b_only", "usr/bin/quiet"), 0, True)
+    blind, _same = da.split_not_diffed(
+        da.not_diffed_binaries(world.atlas, "runA", "runB", exclude=_presence(world).excluded)
+    )
+    assert blind["a"]["binary_not_diffed"]["names"] == ["blind.cgi", "linked", "samename"]
+    assert "b" not in blind
+
+
+def test_a_binary_holding_no_candidate_leaves_the_candidate_binaries_covered(
+    tmp_path: Path,
+) -> None:
+    """A one-sided binary holding no candidate is listed in coverage, but it is no candidate
+    binary: with nothing else uncovered, all_candidate_binaries_covered stays true.
+
+    MUTATION (verified RED, 1 failed): count every listed binary in the flag again -> false ->
+    RED."""
+    w = World(tmp_path)
+    w.binary("b", "usr/bin/quiet", "f1" * 32)
+    w.commit()
+    cov = da.list_diffs(w.atlas, "runA", "runB")["coverage"]
+    assert [b["rel_path"] for b in cov["binary_presence"]["b_only"]] == ["usr/bin/quiet"]
+    assert cov["all_candidate_binaries_covered"] is True
+
+
+def test_a_checked_refusal_on_a_one_sided_binary_ends_with_a_copyable_example(
+    world: World,
+) -> None:
+    """★ The refusals of a missing or non-resolving ``checked`` end with an example to copy: the
+    subject's own anchor_ref — and, for a function, every one of its candidates (what disposes
+    it).
+
+    MUTATION (verified RED, 1 failed each): drop the example from the presence rule -> RED; drop
+    it from the missing-checked refusal -> RED."""
+    fn, refs = _fn(world, "a_only", "web/app/app.cgi")
+
+    def write(basis: dict[str, Any]) -> Any:
+        return lambda: overlay.annotate_diff(
+            world.atlas,
+            anchor_ref=fn,
+            verdict="no_real_change",
+            rationale="x",
+            verdict_basis=basis,
+            run_pair=PAIR,
+        )
+
+    plain = _refusal(write({"why_unchanged": "x", "checked": ["read it by hand"]}))
+    assert "at least one item that resolves" in plain, plain
+    assert plain.endswith(f"  example: checked={json.dumps([fn, *refs])}"), plain
+    missing = _refusal(write({"why_unchanged": "x"}))
+    assert missing.endswith(f"  example: checked={json.dumps([fn])}"), missing
+
+
+def test_a_write_on_a_one_sided_binary_answers_with_its_citations(world: World) -> None:
+    """★ annotate_diff's answer on a one-sided binary's subject says at once how far it cites the
+    subject's candidates — ``citations`` in the report's presence_citations_short shape — and
+    what a short one reads as.
+
+    MUTATION (verified RED, 1 failed): leave the citations out of the answer -> RED."""
+    fn, refs = _fn(world, "b_only", "bin/qctl")
+    tools = mcp_app.make_tools(world.path)
+    short = tools["annotate_diff"](
+        anchor_ref=fn, verdict="change_inconclusive", rationale="r", run_pair=PAIR
+    )
+    assert short["written"] is True, short
+    assert short.get("citations") == {"required": 1, "cited": 0, "missing_sample": list(refs)}
+    assert "needs_recheck" in short["citations_short"]
+    whole = tools["annotate_diff"](
+        anchor_ref=fn,
+        verdict="change_inconclusive",
+        rationale="r",
+        run_pair=PAIR,
+        checked=[fn, *refs],
+    )
+    assert whole["citations"] == {"required": 1, "cited": 1, "missing_sample": []}
+    assert "citations_short" not in whole
+
+
+def _server(w: World) -> Any:
+    from tests.unit.test_tool_surface import _call
+
+    server = mcp_app.build_server(w.path)
+    return lambda name, args: _call(server, name, args)
+
+
+def test_a_one_sided_binarys_unit_lists_its_functions_with_their_candidates(
+    world: World,
+) -> None:
+    """★ A binary_presence unit's material lists each of its functions — anchor_ref, address,
+    candidates_total and the candidates as rows — the ones not yet disposed first; the tool-call
+    log reads the functions it listed as shown whole; the pair report carries
+    presence_citations_short.
+
+    MUTATION (verified RED, 1 failed each): list the functions in member order (disposed ones
+    first) -> RED; leave the functions out of the log's member lists -> RED; leave
+    presence_citations_short out of the report -> RED."""
+    from treasure_map.lib import tool_call_log as tcl
+    from treasure_map.lib.query import review_units as ru
+
+    (unit,) = [
+        u
+        for u in _review(world).units
+        if u.kind == ru.PRESENCE
+        and u.members[0].anchor_ref.startswith(_anchor("a_only", "web/app/app.cgi"))
+    ]
+    first, second = (m.anchor_ref for m in unit.members)
+    _ok, first_refs = _fn(world, "a_only", "web/app/app.cgi")
+    overlay.annotate_diff(
+        world.atlas,
+        anchor_ref=first,
+        verdict="change_inconclusive",
+        rationale="r",
+        verdict_basis={"checked": [first, *first_refs]},
+        run_pair=PAIR,
+    )
+    call = _server(world)
+    got = call("start_diff_review", {"run_pair": PAIR, "unit": unit.unit_id})
+    mat = got["material"]
+    assert [f["anchor_ref"] for f in mat["functions"]] == [second, first]
+    one = mat["functions"][0]
+    assert one["function"] == second.rsplit("::", 1)[1] and one["candidates_total"] == 1
+    assert [r["evidence_ref"] for r in one["rows"]] == list(
+        _fn(world, "a_only", "web/app/app.cgi", 1)[1]
+    )
+    assert (mat["functions_total"], mat["functions_truncated"]) == (2, False)
+    assert got["material_cut"] is False
+    assert tcl.shown_members(mat) == [second, first]
+    report = call("start_diff_review", {"run_pair": PAIR})["report"]
+    assert report.get("presence_citations_short") == {}, sorted(report)
+
+
+def test_a_function_finding_of_a_one_sided_binary_names_the_function_and_the_binary(
+    world: World,
+) -> None:
+    """The hand-off block of a finding on a function of a one-sided binary names the function
+    and the binary apart — the address never read into the binary's side or path.
+
+    MUTATION (verified RED, 1 failed): parse the anchor as a binary's again -> RED."""
+    from treasure_map.lib.query import review_report as rr
+
+    fn, _refs = _fn(world, "a_only", "web/app/app.cgi")
+    addr = fn.rsplit("::", 1)[1]
+    finding = {
+        "anchor_ref": fn,
+        "subject_kind": "binary_presence",
+        "verdict": "changed_real",
+        "review_state": "concluded",
+    }
+    block = rr.handoff_chunk(world.atlas, PAIR, finding)
+    assert f"function `{addr}` of one-sided binary `a_only:web/app/app.cgi`" in block, block
+
+
+def test_a_candidate_naming_no_function_address_is_judged_on_the_binarys_anchor(
+    world: World,
+) -> None:
+    """A wider address (nine hex digits) is a function like any other; a candidate whose
+    evidence_ref names its function by name, not address, is no function's: its binary is then
+    judged on its own anchor too, for those candidates — never left with nothing to cite.
+
+    MUTATION (verified RED, 1 failed each): take only eight-digit addresses -> the wide one is
+    unplaced -> RED; judge a binary on its own anchor only when it holds no function -> the named
+    candidate has no subject -> RED."""
+    sha = "f5" * 32
+    path = world.binary("b", "usr/bin/wide", sha)
+    (wide,) = world.cand("b", "usr/bin/wide", sha, addr="100004000")
+    named = f"runB#{sha[:8]}:main@cmd@0x10"
+    world.atlas.execute(
+        "INSERT INTO instance (pattern_id, evidence_ref, source_run_id, binary_content_hash, "
+        "binary_path, sink_anchor) VALUES (?, ?, 'runB', ?, ?, 'x')",
+        (world._pattern("cmd"), named, sha, path),
+    )
+    world.commit()
+    p = _presence(world)
+    b = _by_rel(p)[("b_only", "usr/bin/wide")]
+    assert (b.functions, b.unplaced) == ((("100004000", (wide,)),), (named,))
+    subjects = {s.anchor: s.refs for s in bp.review_subjects(p) if s.binary.name == "wide"}
+    base = _anchor("b_only", "usr/bin/wide")
+    assert subjects == {base: (named,), f"{base}::100004000": (wide,)}
+    assert bp.required_citations(p, base) == (named,)

@@ -266,10 +266,14 @@ def require_checked_anchor(
     side_meta: Any,
     items: list[str],
     field: str,
+    *,
+    anchor_ref: str | None = None,
 ) -> None:
     """Enforce the ``checked`` / ``evidence`` anchor rule: every item that LOOKS like an
     anchor must resolve in the view (else a named refusal), plain text is kept but does not count,
-    and at least one anchor must resolve. ``field`` is the key name, for the message wording."""
+    and at least one anchor must resolve. ``field`` is the key name, for the message wording;
+    ``anchor_ref`` (the judged subject) fills the copyable example a refusal for no resolving
+    anchor ends with."""
     run_a, run_b, binary = meta["run_a_id"], meta["run_b_id"], meta["binary_a"]
     entries = listed_view(atlas, built).entries
     subjects = dr.subjects_of(entries, run_a, run_b, binary)
@@ -301,7 +305,8 @@ def require_checked_anchor(
             )
         # a plain-text note: kept, but it does not count toward the anchor threshold
     if hits == 0:
-        raise ConfigError(_rule_for(field))
+        example = dr.checked_example(field, [anchor_ref]) if anchor_ref is not None else ""
+        raise ConfigError(_rule_for(field) + example)
 
 
 # ── a judgement on a non-binary file ─────────────────────────────────────────────────────────
@@ -777,7 +782,9 @@ def list_diff_overlays(
         state = judged.state
         if review is not None and r["anchor_ref"] in review.unlisted:
             # Its subject resolves but is not listed: not needs_recheck (it cannot be judged
-            # again while unlisted); basis_state / basis_moved still say what moved.
+            # again while unlisted); basis_state / basis_moved still say what moved. Only on a
+            # diff that reads current: review.unlisted (unlisted_judgements) holds no judgement of
+            # a stale diff, which keeps reading needs_recheck.
             state = dr.SUBJECT_UNLISTED
         row_out: dict[str, Any] = {
             "id": r["id"],

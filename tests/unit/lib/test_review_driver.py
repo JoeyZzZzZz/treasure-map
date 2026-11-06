@@ -28,11 +28,15 @@ PRESET = rd.Preset("test", ("agent", "{unit_id}", "{prompt}"), blind_argv=("--de
 
 
 def _units(w: Any) -> dict[str, ru.Unit]:
+    return _units_at(w, 50)
+
+
+def _units_at(w: Any, k: int) -> dict[str, ru.Unit]:
     r = ru.review_pair(
         w.atlas,
         "runA",
         "runB",
-        k=50,
+        k=k,
         pair_staleness={"source_stale": False, "source_stale_reason": None},
         server_commit=None,
     )
@@ -122,8 +126,9 @@ def test_a_launch_that_writes_nothing_fails_and_the_first_stops_the_loop(tmp_pat
 
 
 def test_a_unit_judged_in_part_is_not_done(tmp_path: Path) -> None:
-    """★ A launch that judges some members only does not complete the unit: it is retried, then
-    left as failed (named), and the loop goes on to the next.
+    """★ A launch that judges some members only does not complete the unit: it is handed out again,
+    and once a launch disposes no new member (this agent judges the first member again) it is
+    retried, then left as failed (named), and the loop goes on to the next.
 
     MUTATION (verified RED): count a unit done on any write naming it -> RED."""
     w = _world(tmp_path)
@@ -139,6 +144,143 @@ def test_a_unit_judged_in_part_is_not_done(tmp_path: Path) -> None:
     assert [f["unit_id"] for f in result.failed] == [group.unit_id]
     assert result.failed[0]["written"] == 1
     assert result.units_done == result.units_tried - 1
+
+
+def _one_listed_member_agent(w: Any, k: int, launches: dict[str, int]) -> Any:
+    """A simulated agent that goes through the MCP server as a launched one does: a fresh server
+    per launch, start_diff_review(unit=…) for the unit its prompt names, then ONE annotate_diff
+    with that unit_id, on the first member the page lists that is not judged yet — so the write
+    records the read basis the server gives it (unit_delivered)."""
+    from tests.unit.test_tool_surface import _call
+    from treasure_map import mcp_app
+
+    def run(argv: list[str], *, cwd: Path, timeout: float) -> rd.Launch:
+        uid = re.search(r'unit="([0-9a-f]{16})"', argv[-1])
+        assert uid is not None
+        launches[uid.group(1)] = launches.get(uid.group(1), 0) + 1
+        server = mcp_app.build_server(w.path)
+        page = _call(
+            server, "start_diff_review", {"run_pair": "runA::runB", "unit": uid.group(1), "k": k}
+        )
+        todo = [m for m in page["members"] if m.get("review_state") in (None, "none")]
+        assert todo, page
+        out = _call(
+            server,
+            "annotate_diff",
+            {
+                "anchor_ref": todo[0]["anchor_ref"],
+                "verdict": "changed_real",
+                "rationale": "r",
+                "diff_id": page["unit"]["stream"],
+                "unit_id": uid.group(1),
+            },
+        )
+        assert out.get("written") is True, out
+        return rd.Launch(0, 0.01, False)
+
+    return run
+
+
+def test_a_unit_judged_one_member_per_launch_is_handed_out_until_disposed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A launch that disposes one new member hands the same unit out again without spending a
+    retry: with retries=0, a six-member batch whose agent judges one listed member per launch
+    (through the server, so each write reads unit_delivered) is launched six times and completes;
+    nothing fails, and no member is judged twice.
+
+    MUTATION (verified RED, 1 failed): count a launch that disposes a new member but not all
+    against the retries (the old one-launch-per-unit loop) -> the batch fails after one launch ->
+    RED."""
+    from tests.unit.lib.test_review_units import _wide_world
+
+    w = _wide_world(tmp_path, monkeypatch, 6)
+    batch = next(u for u in _units_at(w, 0).values() if len(u.members) > 1)
+    assert len(batch.members) == 6 and all(m.kind == "entry" for m in batch.members)
+    launches: dict[str, int] = {}
+    result = rd.drive(
+        w.path,
+        "runA",
+        "runB",
+        PRESET,
+        workdir=tmp_path,
+        k=0,
+        retries=0,
+        runner=_one_listed_member_agent(w, 0, launches),
+        echo=lambda s: None,
+    )
+    assert result.failed == [] and result.stopped == "no unit left", result
+    assert launches[batch.unit_id] == len(batch.members)
+    assert result.units_done == result.units_tried == len(launches)
+    rows = w.atlas.execute(
+        "SELECT anchor_ref, COUNT(*), MAX(read_basis) FROM overlay_history WHERE unit_id = ? "
+        "GROUP BY anchor_ref",
+        (batch.unit_id,),
+    ).fetchall()
+    assert {r[0] for r in rows} == {m.anchor_ref for m in batch.members}
+    assert all(r[1] == 1 and json.loads(r[2]).get("basis") == "unit_delivered" for r in rows)
+
+
+def test_a_unit_written_but_read_as_needs_recheck_is_not_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Success is the unit disposed, not written: a launch that writes every member naming the
+    unit, each judged before anything was read (so the subject reads needs_recheck), leaves the
+    unit owed — the launch disposes nothing new, so it is retried and then left as failed.
+
+    MUTATION (verified RED, 1 failed): count a unit done when every member is written -> the
+    unit succeeds -> RED."""
+    from tests.unit.lib.test_review_units import _wide_world
+
+    w = _wide_world(tmp_path, monkeypatch, 3)
+    batch = next(u for u in _units_at(w, 0).values() if len(u.members) > 1)
+    calls: list[int] = []
+
+    def unread(argv: list[str], *, cwd: Path, timeout: float) -> rd.Launch:
+        calls.append(1)
+        for m in batch.members:
+            overlay.annotate_diff(
+                w.atlas,
+                anchor_ref=m.anchor_ref,
+                verdict="changed_real",
+                rationale="r",
+                diff_id=m.stream,
+                ctx=overlay.WriteContext(
+                    channel="mcp",
+                    unit_id=batch.unit_id,
+                    session="agent",
+                    read_basis={"basis": "none", "unread_before_verdict": True},
+                ),
+            )
+        return rd.Launch(0, 0.01, False)
+
+    result = rd.drive(
+        w.path,
+        "runA",
+        "runB",
+        PRESET,
+        workdir=tmp_path,
+        k=0,
+        retries=1,
+        runner=unread,
+        echo=lambda s: None,
+    )
+    assert result.units_done == 0 and len(calls) == 2
+    assert [f["unit_id"] for f in result.failed] == [batch.unit_id]
+    assert result.failed[0]["written"] == len(batch.members) and result.failed[0]["disposed"] == 0
+
+
+def test_the_unit_prompt_says_judge_the_listed_members_and_read_a_cut_page_first() -> None:
+    """★ The unit prompt names the members the page lists, says the unit comes back until all are
+    judged, and that a page with material_cut true is read to its end (read_more / read_one) before
+    judging.
+
+    MUTATION (verified RED, 1 failed): the old prompt text ('Judge EVERY member with …', 'Then
+    stop.') -> RED."""
+    text = rd.unit_prompt("a::b", ru.Unit("0" * 16, ru.S_BATCH, True, (), "s", 0, 0), 4)
+    assert "Judge EVERY member listed in members" in text
+    assert "the unit comes back until all its members are judged" in text
+    assert "material_cut is true, first read the rest with the read_more / read_one" in text
 
 
 def test_an_audit_unit_is_launched_blind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

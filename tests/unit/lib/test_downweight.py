@@ -754,6 +754,7 @@ _R5 = [
         True,
     ),
     ("converter copy", 'strcpy(b,(char *)atoi(x));\n  fopen(b,"r");', True),
+    ("converter copy then escape", 'strcpy(b,(char *)atoi(x));\n  g(b);\n  fopen(b,"r");', False),
     ("inline-converter format", 'sprintf(b,"/proc/%d",atoi(x));\n  fopen(b,"r");', True),
     ("%s non-literal", 'i = atoi(x);\n  snprintf(b,0x40,"/x/%s-%d",g,i);\n  fopen(b,"w");', False),
     ("vararg count mismatch", 'i = atoi(x);\n  sprintf(b,"/x/%d/%s",i);\n  fopen(b,"r");', False),
@@ -789,7 +790,9 @@ def test_numeric_sanitized_needs_every_buffer_write_safe(name: str, body: str, w
     MUTATION (verified RED, 1 failed each): refuse every converter copy, or let one pass the
     position check without setting the format-or-converter flag -> ``converter copy`` turns
     False; refuse a format write with an inline converter argument -> ``inline-converter format``
-    turns False."""
+    turns False. MUTATION (verified RED, 1 failed): a converter copy that passes the position check
+    returns safe at once instead of reading the writes after it -> ``converter copy then escape``
+    turns True."""
     assert (_num(body) == NUMERIC_SANITIZED) is want, name
 
 

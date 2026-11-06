@@ -983,6 +983,31 @@ def test_a_judgement_whose_subject_is_no_longer_listed_reads_subject_unlisted(
     assert dr.SUBJECT_UNLISTED not in progress["states"]
 
 
+def test_a_judgement_no_longer_listed_on_a_stale_diff_stays_needs_recheck(world: World) -> None:
+    """★ subject_unlisted holds only on a diff that reads current: when the diff is stale, the
+    judgement whose subject is no longer listed keeps reading needs_recheck in list_overlays, and
+    is not counted under judged_not_listed (in list_overlays' progress or the pair's review).
+
+    MUTATION (verified RED, 1 failed): ``unlisted_judgements`` takes a judgement whatever its
+    diff's source_stale -> the row reads subject_unlisted and judged_not_listed counts 1 -> RED."""
+    from treasure_map.lib.query import review_units as ru
+
+    unlisted, _gone = _unlist_and_repair(world)
+    world.stale[DX] = {"source_stale": True, "source_stale_reason": "diff_logic_changed"}
+    pv._clear_view_caches()
+    ru.DIFF_CACHE.clear()
+    got = overlay.list_overlays(world.atlas, anchor_kind="diff_subject", run_id=PAIR)
+    rows = {r["anchor_ref"]: r for r in got["overlays"]}
+    assert rows[unlisted]["review_state"] == coverage.NEEDS_RECHECK, rows[unlisted]
+    assert rows[unlisted]["source_stale"] is True
+    assert got["review_progress"]["judged_not_listed"]["count"] == 0
+    review = ru.review_pair(
+        world.atlas, "runA", "runB", pair_staleness={"source_stale": False}, server_commit=None
+    )
+    assert review.report["judged_not_listed"]["count"] == 0
+    assert review.progress.unlisted == []
+
+
 def test_a_rekeyed_candidate_moves_the_pair_and_strands_the_candidate_anchor(
     world: World,
 ) -> None:
@@ -1761,6 +1786,41 @@ def test_checked_rule_is_one_shared_constant(world: World) -> None:
     assert " ".join(dr.CHECKED_RULE.split()) in doc  # copied verbatim into the docstring (q-3)
 
 
+def test_a_checked_refusal_ends_with_a_copyable_example(world: World) -> None:
+    """★ A no_real_change whose ``checked`` resolves no anchor, or that has none, is refused with
+    the rule and then an example to copy: ``checked`` holding the entry's own anchor_ref. In a
+    batch the example names each item's own anchor through the placeholder, so the same refusal
+    of many items still merges into one.
+
+    MUTATION (verified RED, 1 failed each): drop the example from require_checked_anchor -> RED;
+    drop it from the missing-checked refusal -> RED; placeholder the prose form of the anchor
+    only -> the two items' refusals stay apart -> RED."""
+    tools, anchors = _batch_world(world, 2)
+    example = f"  example: checked={json.dumps([anchors[0]])}"
+    plain = tools["annotate_diff"](
+        anchor_ref=anchors[0],
+        verdict="no_real_change",
+        why_unchanged="x",
+        checked=["just a plain note"],
+        diff_id=DX,
+    )
+    assert plain["error"] == dr.CHECKED_RULE + example, plain
+    missing = tools["annotate_diff"](
+        anchor_ref=anchors[0], verdict="no_real_change", why_unchanged="x", diff_id=DX
+    )
+    assert missing["error"].endswith(example), missing
+    items = [
+        {"anchor_ref": a, "verdict": "no_real_change", "why_unchanged": "x", "checked": ["note"]}
+        for a in anchors
+    ]
+    batch = tools["annotate_diff_batch"](items, diff_id=DX)
+    assert batch["written"] is False
+    assert len(batch["errors"]) == 1, batch
+    (merged,) = batch["errors"]
+    assert merged["indexes"] == [0, 1], batch
+    assert merged["error"].endswith("""  example: checked=["<this item's anchor_ref>"]"""), merged
+
+
 def test_batch_rejects_a_non_object_item_without_writing(world: World) -> None:
     """P-4: a non-object annotation item is rejected by the framework before the tool runs, so the
     all-or-none guarantee holds — nothing is written, and the tool body never executes."""
@@ -2031,3 +2091,24 @@ def test_a_pair_subject_anchor_on_a_function_entry_is_refused_by_name(
     world.judge(DX, anchor, "no_real_change", verdict_basis=_nrc(anchor))
     assert dann._anchor_marker(anchor) == "anchor_ref"
     assert dann._anchor_marker("pair:00001000:00001000") == "entry_id"
+
+
+def test_a_candidate_row_judgement_on_a_listed_entry_is_not_unlisted(world: World) -> None:
+    """A judgement on a candidate row of an entry the view lists is a judgement on a listed
+    subject: it never reads ``subject_unlisted`` and is not counted as judged-but-not-listed.
+    Missing the candidate rows from the listed anchors would mark every such judgement unlisted
+    and move it out of the re-check set.
+
+    MUTATION (verified RED, 1 failed): candidate rows dropped from ``anchors_of`` (only the entry's
+    own anchor collected) -> RED (the row reads ``subject_unlisted``)."""
+    world.pair(DX, "00001000", "00002000")
+    world.rows[DX] = [a_row("00001000")]
+    pair_anchor = _pair_anchor(DX, "00001000", "00002000")
+    cand = dr.candidate_anchor("runA", "runB", f"callsite|cmd|{_ref('runA', '00001000')}|(none)")
+    assert pair_anchor in {e["anchor_ref"] for e in world.view()["entries"]}
+    world.judge(DX, cand, "change_inconclusive")
+    got = overlay.list_overlays(world.atlas, anchor_kind="diff_subject", run_id=PAIR)
+    rows = {r["anchor_ref"]: r for r in got["overlays"]}
+    assert cand in rows, sorted(rows)
+    assert rows[cand]["review_state"] != dr.SUBJECT_UNLISTED, rows[cand]
+    assert got["review_progress"]["judged_not_listed"]["count"] == 0

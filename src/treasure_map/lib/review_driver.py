@@ -10,14 +10,17 @@ built-in tool off. Before any unit, a probe checks it: the agent must reach a tm
 attempt to write a file with a built-in tool must fail. An experimental template is run only once
 that probe passes on this machine.
 
-A unit succeeds only when, after its launch, overlay_history holds a judgement naming the unit for
-EVERY one of its members — neither the agent's exit code nor its output is believed. A launch is
-killed at its deadline; a failed unit is retried, then left (named in the log) and the loop moves
-on. The first unit doubles as a probe of the whole chain: when it writes nothing, the loop stops
-and says why. An audit unit's launch is also denied the tool that returns the judgements
+A unit succeeds only when, re-read after its launch, it is disposed — every member's review state
+disposed (a judgement written but read as needs_recheck does not count), or, for an audit or the
+reduce, no longer owed; neither the agent's exit code nor its output is believed. A launch that
+disposes at least one new member but not all hands the same unit out again (the page then lists
+what is left), spending no retry; only a launch that disposes no new member is a failure. A launch
+is killed at its deadline; a failed unit is retried, then left (named in the log) and the loop
+moves on. The first unit doubles as a probe of the whole chain: when it writes nothing, the loop
+stops and says why. An audit unit's launch is also denied the tool that returns the judgements
 (list_overlays), so it reads blind.
 
-Each launch is logged — unit, attempt, exit status, seconds, members written — in
+Each launch is logged — unit, attempt, exit status, seconds, members written and disposed — in
 ``<atlas dir>/logs/review_driver.jsonl`` (outside the atlas, like the tool-call log).
 """
 
@@ -202,11 +205,14 @@ def unit_prompt(run_pair: str, u: ru.Unit, k: int) -> str:
         f"You are reviewing ONE work unit of the firmware version diff {run_pair} with the tmap "
         "tools. tmap draws no conclusion: the judgment is yours, and it records nothing for you. "
         f'1. Call start_diff_review(run_pair="{run_pair}", unit="{u.unit_id}"{kk}) and read its '
-        "material; when it says material_cut, read the rest with the calls it names. "
-        "2. Judge EVERY member with annotate_diff (or annotate_diff_batch), passing "
-        f'unit_id="{u.unit_id}": changed_real (with evidence and change_kind when you can), '
-        "no_real_change (checked + why_unchanged), or change_inconclusive (what is missing). "
-        "3. Then stop. Do not judge anything outside this unit."
+        "material; when it says material_cut is true, first read the rest with the read_more / "
+        "read_one calls it gives, then judge. "
+        "2. Judge EVERY member listed in members with annotate_diff (or annotate_diff_batch), "
+        f'passing unit_id="{u.unit_id}": changed_real (with evidence and change_kind when you '
+        "can), no_real_change (checked + why_unchanged), or change_inconclusive (what is "
+        "missing). "
+        "3. Then stop. Do not judge anything outside this unit; the unit comes back until all "
+        "its members are judged."
     )
     if u.kind == ru.AUDIT:
         text += (
@@ -375,6 +381,22 @@ def _log(path: Path, line: dict[str, Any]) -> None:
     tcl.append(path, {"ts": time.time(), **line})
 
 
+def _owed_members(review: ru.PairReview, u: ru.Unit) -> set[str]:
+    """The anchors of ``u``'s members still owed in ``review`` (a fresh reading): a subject unit's
+    member whose state is not disposed (needs_recheck is not); an audit's or the reduce's member
+    still in an open unit of that kind (they exist only while owed)."""
+    if u.kind in (ru.AUDIT, ru.REDUCE):
+        open_now = {m.anchor_ref for v in review.units if v.kind == u.kind for m in v.members}
+        return {m.anchor_ref for m in u.members} & open_now
+    states = review.progress.states
+    return {m.anchor_ref for m in u.members if not ru.disposed(states.get(m.anchor_ref))}
+
+
+def _disposed_count(review: ru.PairReview, u: ru.Unit) -> int:
+    """How many of ``u``'s members ``review`` reads disposed (no longer owed)."""
+    return len(u.members) - len(_owed_members(review, u))
+
+
 def drive(
     atlas_path: Path,
     run_a: str,
@@ -393,8 +415,9 @@ def drive(
     runner: Callable[..., Launch] = run_agent,
     echo: Callable[[str], None] = print,
 ) -> DriveResult:
-    """Hand the pair's units out, one launch each, until none is left (or a limit is reached);
-    see the module docstring."""
+    """Hand the pair's units out until none is left (or a limit is reached): a unit is launched
+    again while each launch disposes a new member, and retried only on a launch that disposes
+    none; see the module docstring."""
     from treasure_map.lib.atlas.connection import open_atlas
 
     run_pair = f"{run_a}::{run_b}"
@@ -434,8 +457,8 @@ def drive(
         finally:
             atlas.close()
         if nxt.unit_id in done_ids:
-            # Every member was written, yet the unit is still owed (a reduce member written
-            # without its group_ref, say): counted failed once, never handed out again here.
+            # Read disposed after its launch, yet owed again (a judgement moved since, say):
+            # counted failed once, never handed out again here.
             out.units_done -= 1
             out.failed.append(
                 {
@@ -443,25 +466,33 @@ def drive(
                     "kind": nxt.kind,
                     "written": len(nxt.members),
                     "members": len(nxt.members),
-                    "why": "written but still owed",
+                    "why": "disposed but owed again",
                 }
             )
             skip.add(nxt.unit_id)
             continue
         out.units_tried += 1
-        prompt = unit_prompt(run_pair, nxt, k)
-        values = _values(preset, atlas_path, workdir, prompt, nxt.unit_id, run_pair)
-        argv = render(preset, values, blind=nxt.kind == ru.AUDIT)
+        first_id = nxt.unit_id
         done = False
         written: set[str] = set()
-        for attempt in range(1, retries + 2):
+        before = _disposed_count(review, nxt)
+        attempt = fails = 0
+        while True:
+            attempt += 1
+            prompt = unit_prompt(run_pair, nxt, k)
+            values = _values(preset, atlas_path, workdir, prompt, nxt.unit_id, run_pair)
+            argv = render(preset, values, blind=nxt.kind == ru.AUDIT)
             launch = runner(argv, cwd=workdir, timeout=timeout)
             atlas = open_atlas(atlas_path)
             try:
                 written = members_written(atlas, nxt, mark)
+                review = ru.review_pair(
+                    atlas, run_a, run_b, k=k, pair_staleness=staleness, server_commit=None
+                )
             finally:
                 atlas.close()
-            done = len(written) == len(nxt.members)
+            now = _disposed_count(review, nxt)
+            done = now == len(nxt.members)
             _log(
                 log_path,
                 {
@@ -473,16 +504,30 @@ def drive(
                     "timed_out": launch.timed_out,
                     "seconds": round(launch.seconds, 1),
                     "members_written": len(written),
+                    "members_disposed": now,
                     "members": len(nxt.members),
                     "success": done,
                 },
             )
             echo(
                 f"{nxt.unit_id} {nxt.kind} attempt {attempt}: "
-                f"{len(written)}/{len(nxt.members)} written"
+                f"{now}/{len(nxt.members)} disposed, {len(written)} written"
                 + (" (deadline)" if launch.timed_out else f" (exit {launch.exit})")
             )
             if done:
+                break
+            if now > before:
+                # A new member disposed: the same unit again, no retry spent. The reduce is
+                # renamed as its owed members shrink: hand out the one now owed.
+                again = review.unit(nxt.unit_id)
+                if again is None and nxt.kind == ru.REDUCE:
+                    again = next((v for v in review.units if v.kind == ru.REDUCE), None)
+                if again is None:
+                    break
+                nxt, before = again, _disposed_count(review, again)
+                continue
+            fails += 1
+            if fails > retries:
                 break
         if done:
             out.units_done += 1
@@ -493,10 +538,11 @@ def drive(
                 "unit_id": nxt.unit_id,
                 "kind": nxt.kind,
                 "written": len(written),
+                "disposed": _disposed_count(review, nxt),
                 "members": len(nxt.members),
             }
         )
-        skip.add(nxt.unit_id)
+        skip.update((first_id, nxt.unit_id))
         if out.units_tried == 1 and not written:
             out.stopped = (
                 "the first unit wrote nothing in any attempt: the agent cannot judge through "
@@ -570,15 +616,22 @@ def parse_handoff_analysis(text: str) -> tuple[dict[str, dict[str, str]] | None,
     """The agent's texts per anchor_ref from its final message — ``{"findings": [{"anchor_ref":
     …, "hypotheses": …, "device_checks": …}, …]}`` (HANDOFF_SCHEMA), or the older object keyed by
     anchor_ref — or ``(None, error)``: not JSON (prose around it included), not an object, an
-    anchor_ref named twice, a value not an object, a field that is not text or a key that is
-    neither field — each refused, never half-read."""
+    object holding ``findings`` and any other top-level key, an anchor_ref named twice, a value
+    not an object, a field that is not text or a key that is neither field — each refused, never
+    half-read."""
     try:
         data = json.loads(_strip_fence(text))
     except ValueError as exc:
         return None, f"the agent's final message is not the JSON object asked for ({exc})"
     if not isinstance(data, dict):
         return None, "the agent's final message is JSON but not an object keyed by anchor_ref"
-    if set(data) == {"findings"} and isinstance(data["findings"], list):
+    others = sorted(str(key)[:120] for key in data if key != "findings")
+    if "findings" in data and others:
+        # The findings shape, with more beside it: refused, not read as the older mapping.
+        return None, (
+            f"the agent's final message holds findings and unexpected top-level keys: {others[:10]}"
+        )
+    if "findings" in data and isinstance(data["findings"], list):
         listed, err = _findings_by_anchor(data["findings"])
         if listed is None:
             return None, err

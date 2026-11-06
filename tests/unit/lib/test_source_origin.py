@@ -232,6 +232,48 @@ def test_dispatch_origin_carries_the_leads_real_fields(tmp_path: Path) -> None:
     }
 
 
+def test_dispatch_origin_says_when_its_lead_was_located_by_name_alone(tmp_path: Path) -> None:
+    """A lead whose edge callee was found by name alone (the edge had no binary path or no usable
+    callee address) carries ``match_basis: "name"``; its origin carries it too, so a reader sees
+    the routing claim is weaker than one located by path and address.
+
+    MUTATION (verified RED, 1 failed): ``match_basis`` not projected into the origin -> RED."""
+    conn = _atlas(tmp_path)
+    try:
+        out = _origin(conn, {"reachability_leads": [{**_LEAD, "match_basis": "name"}]})
+    finally:
+        conn.close()
+    assert out is not None
+    (origin,) = out["origins"]
+    assert origin == {
+        "axis": "dispatch",
+        "endpoint": "relay",
+        "mechanism": "strcmp_gate",
+        "through": "FUN_0040ef58",
+        "lead_via": "string_keyed_edge",
+        "hops": 1,
+        "match_basis": "name",
+    }
+
+
+def test_dispatch_origin_of_a_lead_located_by_address_has_no_match_basis(tmp_path: Path) -> None:
+    """A lead located by path and address carries no ``match_basis``, and neither does its origin:
+    the key is absent, never present as null, so such an origin reads exactly as it did before
+    the field existed.
+
+    MUTATION (verified RED, 2 failed: this test and the exact-fields one above): ``match_basis``
+    projected unconditionally (``None`` when the lead has none) -> RED."""
+    conn = _atlas(tmp_path)
+    try:
+        out = _origin(conn, {"reachability_leads": [_LEAD]})
+    finally:
+        conn.close()
+    assert out is not None
+    (origin,) = out["origins"]
+    assert "match_basis" not in origin
+    assert set(origin) == {"axis", "endpoint", "mechanism", "through", "lead_via", "hops"}
+
+
 def test_nvram_origin_names_the_key_and_says_so_when_it_cannot(tmp_path: Path) -> None:
     # A recognised accessor whose key argument resolved to a constant names it. One whose key did
     # not resolve still surfaces — "an nvram value, key unknown" is a usable lead, and dropping it

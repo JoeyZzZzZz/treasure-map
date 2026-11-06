@@ -1159,7 +1159,10 @@ def run_pair_coverage(
         "not_diffed_binaries": blind,
         "identical_binaries": identical,
         "binary_presence": bp.presence_block(presence, judged),
-        "all_candidate_binaries_covered": not failed and not blind and not presence.items,
+        # A one-sided binary holding no candidate is listed, but it is no candidate binary.
+        "all_candidate_binaries_covered": (
+            not failed and not blind and not any(b.candidates for b in presence.items)
+        ),
         "see": (
             "list_diff_blindspots for the failed diffs. identical_binaries are byte-identical in "
             f"both runs, so no diff covers them and none can show what is in them — their "

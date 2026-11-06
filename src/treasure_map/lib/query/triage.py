@@ -1346,9 +1346,12 @@ def _dispatch_origins(flow_evidence: Evidence) -> list[dict[str, Any]]:
     """Origins from the string-keyed dispatch leads: which key routes to this function.
 
     Field names are the lead's own, read off real data rather than guessed — a lead carries
-    ``key`` / ``mechanism`` / ``through`` / ``via`` / ``hops`` and nothing else. Passing them
-    through under their own names keeps this a projection of the fact instead of a re-spelling of
-    it, and means a lead gaining a field does not silently drop it here."""
+    ``key`` / ``mechanism`` / ``through`` / ``via`` / ``hops``, and ``match_basis`` when its edge
+    callee was located by name alone (the edge had no binary path or no usable callee address).
+    Those are projected under their own names, keeping this a projection of the fact instead of a
+    re-spelling of it. ``match_basis`` appears in the origin only when the lead carries it, so an
+    origin from a lead located by path and address reads exactly as before. The projection is a
+    fixed list: a field a lead gains beyond these is not carried until it is added here."""
     out: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
     for lead in _flow_list(flow_evidence, "reachability_leads"):
@@ -1362,6 +1365,8 @@ def _dispatch_origins(flow_evidence: Evidence) -> list[dict[str, Any]]:
             "lead_via": lead.get("via"),
             "hops": lead.get("hops"),
         }
+        if "match_basis" in lead:
+            origin["match_basis"] = lead["match_basis"]
         marker = tuple(sorted((k, str(v)) for k, v in origin.items()))
         if marker in seen:
             continue

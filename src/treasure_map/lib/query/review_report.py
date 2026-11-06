@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from treasure_map.lib import handoff_boundary as _handoff_boundary
+from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import review_units as ru
 
 if TYPE_CHECKING:
@@ -200,9 +201,11 @@ def markdown(review: ru.PairReview, *, header: dict[str, Any] | None = None) -> 
         )
         out += [f"  - changed_real: `{_md_cell(a)}`" for a in jnl["changed_real"]["anchors"]]
         apart = set(jnl["changed_real"]["anchors"])
-        out += [f"  - `{_md_cell(a)}`" for a in jnl["anchors"] if a not in apart]
-        if jnl["count"] > len(jnl["anchors"]):
-            out.append(f"  - … {jnl['count'] - len(jnl['anchors'])} more")
+        rest = [a for a in jnl["anchors"] if a not in apart]
+        out += [f"  - `{_md_cell(a)}`" for a in rest]
+        listed = len(apart) + len(rest)  # what the lines above name, each anchor once
+        if jnl["count"] > listed:
+            out.append(f"  - … {jnl['count'] - listed} more")
     out += ["", "## Units in hand-out order", ""]
     for u in review.units:
         done = sum(1 for m in u.members if ru.disposed(states.get(m.anchor_ref)))
@@ -894,13 +897,14 @@ def _handoff_file_facts(atlas: Any, run_a: str, run_b: str, path: str) -> list[s
     return out + tail
 
 
-def _handoff_binary_facts(side_path: str) -> list[str]:
-    """A binary present in one run of the pair only: a whole-binary add or remove, so the function
-    facts do not apply."""
+def _handoff_binary_facts(side_path: str, addr: str | None = None) -> list[str]:
+    """A binary present in one run of the pair only, or one function of it (``addr``): a
+    whole-binary add or remove, so the function-pair facts do not apply."""
+    where = f"present on one side only: {_inline(side_path)}"
+    if addr is not None:
+        where = f"function {_inline(addr)} of one-sided binary {_inline(side_path)} ({where})"
     return [
-        _cell(
-            "whole-binary presence (tmap facts)", f"present on one side only: {_inline(side_path)}"
-        ),
+        _cell("whole-binary presence (tmap facts)", where),
         _cell(_CHANGE, "not applicable (whole-binary add / remove)"),
         _cell(_SHAPE, "not applicable (whole-binary add / remove)"),
         _cell(_SIBLINGS, "not applicable (whole-binary add / remove)"),
@@ -919,14 +923,19 @@ def _finding_change_kind(finding: dict[str, Any]) -> str:
 
 def _finding_basis_line(finding: dict[str, Any]) -> str:
     """Whether the facts the judgment rests on still hold — a moved basis is marked, not dropped,
-    and never read as the current conclusion (B-4). The reason is the basis state when the basis
-    itself moved, else why the source reads stale (the diff's or the runs')."""
+    and never read as the current conclusion (B-4). The reason names a subject no longer listed,
+    or one that no longer resolves (the judgement is dangling), apart; else it is the basis state
+    when the basis itself moved, else why the source reads stale (the diff's or the runs')."""
     state = finding.get("review_state")
     if state == "concluded":
         return "current"
     moved = finding.get("basis_moved") or {}
     basis = finding.get("basis_state")
-    if basis and basis != "unchanged":
+    if state == "subject_unlisted":
+        reason = "subject_unlisted — no longer listed (now read identical)"
+    elif basis == "anchor_unresolved":
+        reason = "anchor_unresolved — the subject no longer resolves (pairing moved?)"
+    elif basis and basis != "unchanged":
         reason = str(basis)
     else:
         reason = str(finding.get("source_stale_reason") or state or "moved")
@@ -1061,8 +1070,10 @@ def handoff_chunk(
         else:
             lines += _handoff_file_facts(atlas, runs[0], runs[1], path)
     elif kind == "binary_presence":
-        side = anchor.split("#binary_presence#", 1)[1] if "#binary_presence#" in anchor else anchor
-        lines += _handoff_binary_facts(side)
+        fn = dr.split_presence_function(anchor)
+        base = fn[0] if fn is not None else anchor
+        side = base.split("#binary_presence#", 1)[1] if "#binary_presence#" in base else base
+        lines += _handoff_binary_facts(side, fn[1] if fn is not None else None)
     else:
         why = f"unknown subject kind {kind!r}" if kind else "no diff for this finding"
         lines.append(_cell(_CHANGE, _unavailable(why)))

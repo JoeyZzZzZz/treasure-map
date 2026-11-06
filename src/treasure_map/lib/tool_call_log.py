@@ -172,20 +172,48 @@ def build_line(
                 line["unit_material_cut"] = bool(
                     unit.get("material_cut") or result.get("material_cut")
                 )
-                whole = shown_members(material)
+                whole = whole_members(material)
                 if whole is not None:
                     line["unit_whole"] = whole
     return line
 
 
+def part_cut(value: Any) -> bool:
+    """Whether any part of ``value`` was held back or cut: a ``withheld`` part (the page budget,
+    an inline hunk over its gate or too large), code ``cut_at`` a length, or a subject's candidate
+    rows cut short (``rows_truncated``) — what reads on with the call it names."""
+    if isinstance(value, dict):
+        if value.get("withheld") or value.get("cut_at") or value.get("rows_truncated"):
+            return True
+        return any(part_cut(v) for v in value.values())
+    if isinstance(value, list):
+        return any(part_cut(v) for v in value)
+    return False
+
+
+def whole_members(material: dict[str, Any]) -> list[str] | None:
+    """The members a listing material showed whole: those it lists (``shown_members``) less the
+    ones whose own item had a part held back or cut (``part_cut``) — those are read on before
+    they count as read. None for a one-subject material, as ``shown_members``."""
+    shown = shown_members(material)
+    if shown is None:
+        return None
+    for key, ident in _MEMBER_LISTS:
+        items = material.get(key)
+        if isinstance(items, list):
+            cut = {str(x.get(ident)) for x in items if isinstance(x, dict) and part_cut(x)}
+            return [m for m in shown if m not in cut]
+    return shown
+
+
 # A material that lists members: the list's key and the identifier each item carries.
-_MEMBER_LISTS = (("entries", "entry_id"), ("owed", "anchor_ref"))
+_MEMBER_LISTS = (("entries", "entry_id"), ("owed", "anchor_ref"), ("functions", "anchor_ref"))
 
 
 def shown_members(material: dict[str, Any]) -> list[str] | None:
     """The members a unit's material lists — a batch's or a callee group's entries (entry ids,
-    only the ones the material kept), a reduce's owed judgements (anchors, only the ones listed) —
-    or None for a one-subject material (an entry, a binary's first candidates, a file), which
+    only the ones the material kept), a reduce's owed judgements or a one-sided binary's functions
+    (anchors, only the ones listed) — or None for a one-subject material (an entry, a file), which
     shows its subject whole unless it was cut."""
     for key, ident in _MEMBER_LISTS:
         items = material.get(key)

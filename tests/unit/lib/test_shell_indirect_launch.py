@@ -584,3 +584,13 @@ def test_a_declared_or_spaced_substitution_assignment_names_the_substituted_comm
     assert launched_command("local x") == "local"  # a bare declaration is still the builtin
     assert _all_rows(tmp_path, "local x=$(cat f)\n") == [(1, "cat", "inline", 1)]
     assert _all_rows(tmp_path, "x=$( cat f )\n") == [(1, "cat", "inline", 1)]
+
+
+def test_an_unpaired_quote_before_a_substitution_still_names_its_command(tmp_path: Path) -> None:
+    """``v="$(grep x f \\`` cannot be split by the shell's quoting rules (its quote is closed on a
+    later line), so its words keep the quote: the assignment is still recognized as a substitution
+    and the risk row names ``grep`` inline, never the literal word ``x`` after it.
+
+    MUTATION (verified RED, 1 failed): optional quote dropped from the assignment pattern -> RED
+    (literal ``x``)."""
+    assert _all_rows(tmp_path, 'v="$(grep x f \\\n') == [(1, "grep", "inline", 1)]

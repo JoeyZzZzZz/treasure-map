@@ -184,7 +184,7 @@ def test_an_attention_1_b_sink_entry_past_k_is_must_read(
     assert m["pair:00003000:00003000"].reasons == ("aligned_b_sink",)
     assert m["pair:00004000:00004000"].reasons == ()
     assert r.report["must_read"]["by_reason"]["aligned_b_sink"] == 2
-    assert r.report["predicate_version"] == "v1"
+    assert r.report["predicate_version"] == ru.PREDICATE_VERSION
     unit_of = {mm.entry_id: u for u in r.units for mm in u.members}
     assert unit_of["pair:00004000:00004000"].kind == ru.SECOND_TIER
     assert unit_of["pair:00002000:00002000"].kind == ru.ENTRY
@@ -368,15 +368,18 @@ def test_units_are_handed_out_round_robin_by_position() -> None:
 
 
 def test_s_entries_and_the_second_tier_are_batched_and_capped() -> None:
-    """Bucket S entries are one batch per diff (must-read), the second tier one per diff and
-    bucket; a batch never holds more than one annotate_diff_batch call takes.
+    """Bucket S entries are batched per diff (must-read), the second tier per diff and bucket; a
+    batch holds at most BATCH_UNIT_MAX (16) members — about what one page's material shows, so a
+    unit is read and judged from the page it is handed out on.
 
-    MUTATION (verified RED): drop the cap -> one S batch of 250 -> RED."""
+    MUTATION (verified RED): drop the cap -> one S batch of 250 -> RED. MUTATION (verified RED,
+    1 failed): cut batches at BATCH_MAX (200) again -> RED."""
     s = [_m(f"s{i}", "p::d", i, "S", ("bucket_s",)) for i in range(250)]
     c = [_m(f"c{i}", "p::d", 250 + i, "C") for i in range(3)]
     units = ru.cut_units(_facts(diffs=[_diff("p::d", s + c)]), k=0)
     sizes = sorted((u.kind, len(u.members)) for u in units)
-    assert sizes == [(ru.S_BATCH, 50), (ru.S_BATCH, ru.BATCH_MAX), (ru.SECOND_TIER, 3)]
+    assert ru.BATCH_UNIT_MAX == 16
+    assert sizes == sorted([(ru.S_BATCH, 16)] * 15 + [(ru.S_BATCH, 10), (ru.SECOND_TIER, 3)])
     assert all(u.must_read for u in units if u.kind == ru.S_BATCH)
 
 
@@ -495,6 +498,38 @@ def test_the_report_counts_judgements_whose_subject_is_no_longer_listed(
     assert f"- `{gone}`" in head and gone not in tail.split("## Units")[0]
 
 
+def test_the_markdown_counts_the_unlisted_judgements_it_does_not_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The markdown's "… N more" under the judgements no longer listed is the count less the
+    anchors its lines name: a changed_real anchor sorted past the first shown ones is named on its
+    own line, so it is not counted among the more.
+
+    MUTATION (verified RED, 1 failed): "more" = count - the first shown anchors (the changed_real
+    line left out of the sum) -> "… 10 more" -> RED."""
+    from treasure_map.lib.query import diff_review as dr
+    from treasure_map.lib.query import review_report as rr
+
+    w = World(tmp_path, monkeypatch)
+    _unlist_and_repair(w)
+    r = _review(w, k=0)
+
+    def judged(anchor: str, verdict: str) -> dr.DiffAnnotation:
+        return dr.DiffAnnotation(anchor, verdict, dr.CHANGED, {}, False, None)
+
+    rows = [judged(f"a{i:02d}", "no_real_change") for i in range(29)] + [
+        judged("z99", "changed_real")
+    ]
+    r.report["judged_not_listed"] = dr.judged_not_listed(rows)
+    shown = dr.JUDGED_NOT_LISTED_SHOWN
+    assert len(rows) > shown + 1 and "z99" not in r.report["judged_not_listed"]["anchors"]
+    md = rr.markdown(r)
+    section = md.partition("## Judgements whose subject is no longer listed")[2].split("## ")[0]
+    named = [ln for ln in section.splitlines() if ln.startswith("  - ") and "`" in ln]
+    assert len(named) == shown + 1 and "  - changed_real: `z99`" in named
+    assert f"  - … {len(rows) - len(named)} more" in section, section
+
+
 # ── the cache ────────────────────────────────────────────────────────────────────────────────
 
 
@@ -564,7 +599,7 @@ def test_the_pair_form_reports_and_hands_out_the_next_unit(world: World) -> None
     assert one["unit"]["unit_id"] == nxt["unit_id"] and one.get("material")
     assert "no unit" in tool(run_pair=PAIR, unit="0" * 16).get("error", "")
     shard = tool(run_pair=PAIR, worker=0, workers=2)
-    assert shard["shard"] == {"worker": 0, "workers": 2}
+    assert {k: shard["shard"][k] for k in ("worker", "workers")} == {"worker": 0, "workers": 2}
     if shard["next_unit"] is not None:
         assert ru.in_shard(shard["next_unit"]["unit_id"], 0, 2)
 
@@ -1858,22 +1893,27 @@ def _hex_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int) -> World
 def test_a_cut_batch_reads_only_the_members_its_material_showed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ FC01: a second-tier batch of 60 whose material showed some of its members. A member it
-    showed reads ``unit_delivered`` at once, named or not; one that NO delivery listed reads
-    ``none`` even after another member's entry was fetched — and ``unit_delivered``
-    (``material_cut``) once its own entry was. (A named write's answer hands the unit out again,
-    possibly listing other members: what counts is what some delivery listed.)
+    """★ FC01: a second-tier batch whose page showed some of its members (a small page budget,
+    so a 16-member batch does not fit). A member it showed reads ``unit_delivered`` at once, named
+    or not; one that NO delivery listed reads ``none`` even after another member's entry was
+    fetched — and ``unit_delivered`` (``material_cut``) once its own entry was. The hand-out names
+    exactly the members its page shows. (A named write's answer hands the unit out again, possibly
+    listing other members: what counts is what some delivery listed.)
 
     MUTATION (verified RED, 1 failed): the former rule — after a cut delivery a fetch of ANY member
     counts for the whole unit (``infer`` over every member of the unit) -> an unlisted member reads
     unit_delivered -> RED."""
     w = _hex_world(tmp_path, monkeypatch, 60)
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 12_000)
     server = mcp_app.build_server(w.path)
     nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
     listed = {e["entry_id"] for e in nu["material"]["entries"]}
-    members = list(nu["members"])
+    unit = _review(w, k=0).unit(nu["unit_id"])
+    assert unit is not None
+    members = [{"anchor_ref": m.anchor_ref, "entry_id": m.entry_id} for m in unit.members]
     # the preconditions: one cut batch that lists some members and not others
     assert nu["kind"] == "second_tier_batch" and nu["material_cut"] is True
+    assert {m["entry_id"] for m in nu["members"]} == listed
     assert 3 <= len(listed) <= len(members) - 4, (len(listed), len(members))
 
     def write(m: dict[str, Any], named: bool) -> dict[str, Any]:
@@ -1914,26 +1954,25 @@ def test_a_cut_batch_reads_only_the_members_its_material_showed(
     assert write(shown[0], True)["read_basis"] == {"basis": "unit_delivered", "material_cut": False}
 
 
-# Fixture sizes whose answer the former fit sent over the byte budget (each kind of answer at its
-# own n): a first write, an overwrite (its answer carries ``overwrote``), a batch write, and
-# start_diff_review(run_pair) itself.
-_OVER_AT = (43, 47, 51, 53, 61, 65, 69, 71)
+# Page budgets at which a single fit of the material (measured without its wrapping, or without
+# the member list the page then hands out) sends an answer over the budget.
+_OVER_AT = tuple(range(9_000, 24_001, 1_500))
 
 
-@pytest.mark.parametrize("n", _OVER_AT)
+@pytest.mark.parametrize("page", _OVER_AT)
 def test_every_answer_carrying_a_units_material_keeps_to_the_byte_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, page: int
 ) -> None:
     """★ FC02: the material's own budget counts its entries but not its wrapping, so the answer
     is measured as it is sent and the material cut again by what it is over. At each of these
-    sizes the former fit sent one kind of answer over 48,000 bytes; every answer keeps to it now,
-    and the write answers' next unit says its material was cut.
+    page budgets a single fit sends some kind of answer over the budget; every answer keeps to it
+    now, and each hands out exactly the members its page's material lists.
 
-    MUTATION (verified RED, 8 failed): drop the measure-and-cut-again pass (one fit to the
-    entries' budget, as before) -> RED at every n. MUTATION (verified RED): ``material_cut`` always
-    False -> RED. MUTATION (verified RED): the unit= read not measured as sent (its ``sent_size``
-    always 0) -> RED."""
-    w = _hex_world(tmp_path, monkeypatch, n)
+    MUTATION (verified RED, 11 failed): drop the measure-and-cut-again pass (one fit to the
+    entries' budget, as before) -> RED at every budget. MUTATION (verified RED, 9 failed): the
+    unit= read not measured as sent (its ``sent_size`` always 0) -> RED."""
+    w = _hex_world(tmp_path, monkeypatch, 60)
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", page)
     server = mcp_app.build_server(w.path)
     budget = mcp_app._RESPONSE_BYTE_BUDGET
     nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 1})["next_unit"]
@@ -1942,7 +1981,7 @@ def test_every_answer_carrying_a_units_material_keeps_to_the_byte_budget(
     for kind in ("write", "overwrite"):
         out = _server_call(server, "annotate_diff", args)
         assert out.get("written") is True, out
-        assert out["next_unit"]["material_cut"] is True
+        _assert_page_members(out["next_unit"])
         sizes[kind] = len(json.dumps(out))
     item = {k: args[k] for k in ("anchor_ref", "verdict", "rationale")}
     batch = _server_call(
@@ -1951,7 +1990,7 @@ def test_every_answer_carrying_a_units_material_keeps_to_the_byte_budget(
         {"annotations": [item], "diff_id": DX, "unit_id": nu["unit_id"]},
     )
     assert batch.get("written") is True, batch
-    assert batch["next_unit"]["material_cut"] is True
+    _assert_page_members(batch["next_unit"])
     sizes["batch"] = len(json.dumps(batch))
     alone = _server_call(
         server,
@@ -1959,11 +1998,29 @@ def test_every_answer_carrying_a_units_material_keeps_to_the_byte_budget(
         {"run_pair": PAIR, "unit": batch["next_unit"]["unit_id"], "k": 1},
     )
     assert "material" in alone, alone
+    _assert_page_members(alone)
     sizes["unit"] = len(json.dumps(alone))
     sizes["start"] = len(
         json.dumps(_server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 1}))
     )
     assert all(size <= budget for size in sizes.values()), sizes
+
+
+def _assert_page_members(holder: dict[str, Any]) -> None:
+    """A batch / group / reduce hand-out lists exactly the members its material shows (at least
+    one); a one-subject unit lists its one member."""
+    mat = holder["material"]
+    if "entries" in mat:
+        page = [e["entry_id"] for e in mat["entries"]]
+        got = [m["entry_id"] for m in holder["members"]]
+    elif "owed" in mat:
+        page = [o["anchor_ref"] for o in mat["owed"]]
+        got = [m["anchor_ref"] for m in holder["members"]]
+    else:
+        assert len(holder["members"]) == 1, holder["members"]
+        return
+    assert got and got == page, (got, page)
+    assert holder["members_total"] >= len(got)
 
 
 def test_the_walk_of_the_history_holds_off_the_report_k(
@@ -2190,154 +2247,174 @@ def _s_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int) -> World:
     return w
 
 
-def test_reading_a_full_batch_alone_keeps_every_member_and_room_for_its_material(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("budget", [48_000, 12_000], ids=["page", "small_page"])
+def test_every_hand_out_of_a_batch_names_the_members_its_page_shows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, budget: int
 ) -> None:
-    """start_diff_review(unit=) of a 200-member batch: the member list alone would fill the
-    page, so each member keeps only what names and judges it — every member stays — and the
-    material still shows entries, within the byte budget.
+    """A batch is handed out by its page: the overview's next unit, the unit= read and a write
+    answer's next unit each list exactly the members the material on that page shows — never more
+    (a member listed but not shown would be "handed out" and never read) — within the budget; what
+    is owed beyond the page is counted (``members_after_this_page``) and comes on the next.
 
-    MUTATION (verified RED, 1 failed): keep the full member list -> over the budget, no entry
-    shown -> RED."""
+    MUTATION (verified RED, 2 failed): hand out every member of the unit, as before -> RED."""
     w = _hex_world(tmp_path, monkeypatch, 200)
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", budget)
     server = mcp_app.build_server(w.path)
-    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
-    one = _server_call(
+    head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
+    nu = head["next_unit"]
+    assert nu["kind"] == ru.SECOND_TIER and nu["members_total"] == ru.BATCH_UNIT_MAX
+    alone = _server_call(
         server, "start_diff_review", {"run_pair": PAIR, "unit": nu["unit_id"], "k": 0}
     )
-    assert len(json.dumps(one)) <= mcp_app._RESPONSE_BYTE_BUDGET, len(json.dumps(one))
-    assert len(one["members"]) == 200
-    assert all({"anchor_ref", "entry_id", "reasons"} <= set(m) for m in one["members"])
-    assert one["members_compact"].startswith("per member: anchor_ref, entry_id")
-    assert len(one["material"]["entries"]) >= 1
+    wrote = _server_call(server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"]))
+    for answer, holder in ((head, nu), (alone, alone), (wrote, wrote["next_unit"])):
+        assert len(json.dumps(answer)) <= budget, len(json.dumps(answer))
+        _assert_page_members(holder)
+        shown = len(holder["members"])
+        owed = holder["members_total"] - holder["members_disposed"]
+        assert holder["members_after_this_page"] == owed - sum(
+            1 for m in holder["members"] if not ru.disposed(m.get("review_state"))
+        )
+        if budget < 48_000:
+            assert shown < ru.BATCH_UNIT_MAX and holder["members_after_this_page"] > 0
 
 
 def test_a_full_batch_write_answer_keeps_to_the_budget_and_names_the_unread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """annotate_diff_batch over a whole 200-member must-read batch, twice: each answer keeps to
-    the byte budget — the per-item echo shrinks to index and action, and what repeats is said
-    once: ``needs_recheck_indexes`` are exactly the items no delivery had listed, the second
-    write's ``overwrote_by`` counts the 200 it replaced — and the next unit still carries
-    material.
+    """annotate_diff_batch over 200 must-read members of one diff, twice (no unit named: read
+    against the unit this session was handed): each answer keeps to the byte budget — the
+    per-item echo shrinks to index and action, and what repeats is said once:
+    ``needs_recheck_indexes`` are exactly the items no delivery had listed, with what that means
+    (``needs_recheck_means``), and the second write's ``overwrote_by`` counts the 200 it replaced.
 
     MUTATION (verified RED, 1 failed): keep the full per-item echo -> over the budget -> RED."""
     w = _s_world(tmp_path, monkeypatch, 200)
     server = mcp_app.build_server(w.path)
     nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
     listed = {e["entry_id"] for e in nu["material"].get("entries") or []}
-    one = _server_call(
-        server, "start_diff_review", {"run_pair": PAIR, "unit": nu["unit_id"], "k": 0}
-    )
-    listed |= {e["entry_id"] for e in one["material"].get("entries") or []}
-    members = one["members"]
-    assert len(members) == 200 and len(listed) < 200  # the precondition: some never listed
+    members = [m for u in _review(w, k=0).units if u.kind == ru.S_BATCH for m in u.members]
+    assert len(members) == 200 and 0 < len(listed) < 200  # the precondition
     items = [
-        {"anchor_ref": m["anchor_ref"], "verdict": "changed_real", "rationale": "r"}
-        for m in members
+        {"anchor_ref": m.anchor_ref, "verdict": "changed_real", "rationale": "r"} for m in members
     ]
+    unread = [i for i, m in enumerate(members) if m.entry_id not in listed]
     for label in ("first", "overwrite"):
-        b = _server_call(
-            server,
-            "annotate_diff_batch",
-            {"annotations": items, "diff_id": DX, "unit_id": nu["unit_id"]},
-        )
+        b = _server_call(server, "annotate_diff_batch", {"annotations": items, "diff_id": DX})
         assert b.get("written") is True, b
         assert len(json.dumps(b)) <= mcp_app._RESPONSE_BYTE_BUDGET, (label, len(json.dumps(b)))
-        unread = sorted(i for i, m in enumerate(members) if m["entry_id"] not in listed)
-        assert b.get("needs_recheck_indexes", []) == unread, label
-        assert "needs_recheck_indexes" in b["note"] or not unread
+        assert b["needs_recheck_indexes"] == unread, label
+        assert b["needs_recheck_means"] == mcp_app._JUDGED_UNREAD
+        assert "needs_recheck_indexes" in b["note"]
         if label == "overwrite":
             assert b["overwrote_by"] == {"agent-via-mcp": 200}
-        nxt = b.get("next_unit") or {}
-        if nxt:
-            assert nxt.get("material", {}).get("entries"), label
-            if nxt["unit_id"] == nu["unit_id"]:
-                listed |= {e["entry_id"] for e in nxt["material"]["entries"]}
+
+
+def test_a_batch_echo_within_the_reserve_below_the_budget_is_compacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-item echo is compacted once it comes within 8,000 bytes of the budget, so the rest
+    of the answer (note, groups, the next unit) still has room: an echo of S bytes is kept whole
+    under a budget far above it and compacted under a budget of S + 4,000.
+
+    MUTATION (verified RED, 1 failed): compact only once the echo alone is over the budget (no
+    reserve) -> RED."""
+    w = _s_world(tmp_path, monkeypatch, 40)
+    server = mcp_app.build_server(w.path)
+    _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
+    members = [m for u in _review(w, k=0).units if u.kind == ru.S_BATCH for m in u.members]
+    items = [
+        {"anchor_ref": m.anchor_ref, "verdict": "changed_real", "rationale": "r"} for m in members
+    ]
+    args = {"annotations": items, "diff_id": DX}
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 10**7)
+    _server_call(server, "annotate_diff_batch", args)
+    whole = _server_call(server, "annotate_diff_batch", args)  # an overwrite, kept whole
+    assert "needs_recheck_indexes" not in whole and "anchor_ref" in whole["results"][0]
+    size = len(json.dumps(whole["results"]))
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", size + 4_000)
+    cut = _server_call(server, "annotate_diff_batch", args)
+    assert set(cut["results"][0]) <= {"index", "action", "group_ref"}, cut["results"][0]
+    assert cut["overwrote_by"] == {"agent-via-mcp": len(items)}
 
 
 def test_the_pair_loop_as_written_completes_a_cut_must_read_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A must-read batch of 60 whose material is cut, followed as the workflow says (judge each
-    member of next_unit naming the unit, call start_diff_review again, never fetch an entry):
-    a unit handed out again lists the members still owed a reading first, so the review
-    completes within four rounds.
+    """Must-read batches whose page shows only some members (a small page budget), followed as
+    the workflow says — judge each member next_unit lists, naming the unit, call
+    start_diff_review again, never fetch an entry: a unit handed out again lists the members still
+    owed a reading first, so the review completes.
 
-    MUTATION (verified RED, 1 failed): list the members in view order whatever was judged ->
-    the same members are listed every round and the rest stay judged unread -> RED."""
+    MUTATION (verified RED, 1 failed): list the members in view order whatever was judged -> the
+    page shows the members already judged every round and the rest are never handed out -> RED."""
     w = _s_world(tmp_path, monkeypatch, 60)
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 12_000)
     server = mcp_app.build_server(w.path)
     out = _server_call(server, "start_diff_review", {"run_pair": PAIR})
-    for _ in range(4):
+    cut = False
+    for _ in range(40):
         nu = out.get("next_unit")
         if not nu:
             break
-        members = nu["members"]
-        if nu.get("members_truncated"):
-            members = _server_call(
-                server, "start_diff_review", {"run_pair": PAIR, "unit": nu["unit_id"]}
-            )["members"]
-        for m in members:
+        cut = cut or nu["members_after_this_page"] > 0
+        for m in nu["members"]:
             r = _server_call(server, "annotate_diff", _judge_args(m, nu["unit_id"]))
             assert r.get("written") is True, r
         out = _server_call(server, "start_diff_review", {"run_pair": PAIR})
+    assert cut  # the precondition: some page did not show its whole unit
     assert out.get("next_unit") is None, out["report"]["coverage_statement"]
     assert out["report"]["must_read_complete"] is True, out["report"]["coverage_statement"]
 
 
-def test_a_batch_past_the_views_first_page_is_found_on_a_later_page(
+def test_a_batch_past_the_views_first_2000_entries_is_read_by_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A batch whose members sit past the view's first page (2,000 entries): its material reads
-    on to the later page, counts the unit's members, and shows them.
+    """A batch whose members sit past the view's first 2,000 entries: its material reads them
+    from the view by entry id (no paging from the top), counts the unit's members, and shows them.
 
-    MUTATION (verified RED, 1 failed): read only the view's first page, as before -> no entry
-    found, entries_total 0 and not cut -> RED."""
+    MUTATION (verified RED, 1 failed): read the view's first 2,000 entries only -> no entry
+    found -> RED."""
     w = _hex_world(tmp_path, monkeypatch, 2050)
-    review = _review(w, k=0)
-    batches = [u for u in review.units if u.kind == ru.SECOND_TIER]
+    batches = [u for u in _review(w, k=0).units if u.kind == ru.SECOND_TIER]
     last = batches[-1]
-    assert len(last.members) == 50, [len(u.members) for u in batches]
+    assert min(m.position for m in last.members) >= 2000, [m.position for m in last.members]
     server = mcp_app.build_server(w.path)
     one = _server_call(
         server, "start_diff_review", {"run_pair": PAIR, "unit": last.unit_id, "k": 0}
     )
     mat = one["material"]
-    assert mat["entries_total"] == 50
-    assert len(mat["entries"]) >= 1
-    assert one["material_cut"] or len(mat["entries"]) == len(one["members"])
-    assert "members_not_in_view" not in mat
+    assert mat["entries_total"] == len(last.members)
+    assert [e["entry_id"] for e in mat["entries"]] == [m.entry_id for m in last.members]
+    assert "members_not_in_view" not in mat and one["material_cut"] is False
 
 
-def test_a_short_member_list_is_never_marked_cut(
-    world: World, monkeypatch: pytest.MonkeyPatch
+def test_a_member_the_view_does_not_list_is_named_and_cuts_the_material(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A next unit with few members keeps them all, unmarked, however little room the page
-    leaves its material.
+    """A unit member the view does not list (the facts and the view out of step) is named under
+    ``members_not_in_view``, is not handed out, and makes the material cut.
 
-    MUTATION (verified RED, 1 failed): mark the list cut whenever room is short, on
-    start_diff_review's next unit -> RED; MUTATION (verified RED, 1 failed): the same on a write
-    answer's next unit -> RED."""
-    server = mcp_app.build_server(world.path)
-    head = _server_call(server, "start_diff_review", {"run_pair": PAIR})
-    nu = head["next_unit"]
-    count = len(nu["members"])
-    overview = len(json.dumps({k: v for k, v in head.items() if k != "next_unit"}))
-    args = _judge_args(nu["members"][0], nu["unit_id"])
-    wrote = _server_call(server, "annotate_diff", args)
-    assert wrote.get("written") is True and wrote.get("next_unit"), wrote
-    after = len(wrote["next_unit"]["members"])
-    answer = len(json.dumps({k: v for k, v in wrote.items() if k != "next_unit"}))
-    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", overview + 1_000)
-    tight = _server_call(server, "start_diff_review", {"run_pair": PAIR})["next_unit"]
-    assert "members_truncated" not in tight
-    assert len(tight["members"]) == after <= 20 and count <= 20
-    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", answer + 1_000)
-    again = _server_call(server, "annotate_diff", args)  # an overwrite: the same next unit
-    assert again.get("written") is True, again
-    assert "members_truncated" not in again["next_unit"]
-    assert len(again["next_unit"]["members"]) == after
+    MUTATION (verified RED, 1 failed): drop the members the view did not list -> RED."""
+    w = _hex_world(tmp_path, monkeypatch, 30)
+    unit = next(u for u in _review(w, k=0).units if u.kind == ru.SECOND_TIER)
+    gone = unit.members[0].entry_id
+    real = mcp_app._get_diff_patch_view
+
+    def hide(*a: Any, **kw: Any) -> Any:
+        page = real(*a, **kw)
+        if isinstance(page, dict) and page.get("entries") and kw.get("entry_ids"):
+            page = {**page, "entries": [e for e in page["entries"] if e.get("entry_id") != gone]}
+        return page
+
+    monkeypatch.setattr(mcp_app, "_get_diff_patch_view", hide)
+    server = mcp_app.build_server(w.path)
+    one = _server_call(
+        server, "start_diff_review", {"run_pair": PAIR, "unit": unit.unit_id, "k": 0}
+    )
+    assert one["material"].get("members_not_in_view") == [gone]
+    assert one["material_cut"] is True
+    assert gone not in {m["entry_id"] for m in one["members"]}
 
 
 def test_the_on_disk_stamp_is_rehashed_only_when_a_package_file_changes(
@@ -2374,3 +2451,253 @@ def test_the_on_disk_stamp_is_rehashed_only_when_a_package_file_changes(
     moved = _server_call(server, "start_diff_review", {"run_pair": PAIR})
     assert moved["server"]["code_moved_on_disk"] is True
     assert calls["n"] > hashed
+
+
+@pytest.mark.parametrize("part", ["structured", "hunk_shape"])
+def test_a_file_whose_lists_or_hunk_shape_continue_reads_as_a_cut_material(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, part: str
+) -> None:
+    """A file unit whose hunk text ends on its page but whose structured lists (or, for a
+    suppressed hunk, its hunk shape) continue on another page: the material is cut, and a named
+    write before anything else is read is judged unread.
+
+    MUTATION (verified RED, 1 failed each): leave the structured lists' paging out of the cut
+    -> structured RED; leave the hunk shape out -> hunk_shape RED."""
+    fw = _file_world(tmp_path, rows=False)
+    real = mcp_app._fd.file_diff
+
+    def shaped(*a: Any, **kw: Any) -> Any:
+        got = real(*a, **kw)
+        if kw.get("path") and isinstance(got.get("entry"), dict):
+            entry = dict(got["entry"])
+            hunk = dict(entry.pop("hunk", {}) or {})
+            hunk["next_hunk_offset"] = None
+            if part == "structured":
+                entry["hunk"] = hunk
+                entry["structured"] = {"commands": ["x"], "lists_paging": {"next_offset": 1}}
+            else:
+                entry["hunk_shape"] = {"segments": [], "next_hunk_offset": 3}
+            got = {**got, "entry": entry}
+        return got
+
+    monkeypatch.setattr(mcp_app._fd, "file_diff", shaped)
+    server = mcp_app.build_server(fw.path)
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR})["next_unit"]
+    assert nu["kind"] == ru.FILE
+    assert nu["material_cut"] is True
+    m = nu["members"][0]
+    first = _server_call(
+        server,
+        "annotate_diff",
+        {
+            "anchor_ref": m["anchor_ref"],
+            "verdict": "changed_real",
+            "rationale": "r",
+            "run_pair": PAIR,
+            "unit_id": nu["unit_id"],
+        },
+    )
+    assert first["read_basis"] == {"basis": "none", "unread_before_verdict": True}
+
+
+# ── what was read: a part held back counts as cut ─────────────────────────────────────────────
+
+
+def _withhold_hunk(monkeypatch: pytest.MonkeyPatch, entry_id: str) -> None:
+    """Every view page renders ``entry_id``'s inline hunk withheld over its gate (as an entry with
+    too many structural lines reads)."""
+    real = mcp_app._get_diff_patch_view
+
+    def gated(*a: Any, **kw: Any) -> Any:
+        page = real(*a, **kw)
+        if isinstance(page, dict) and page.get("entries"):
+            page = {
+                **page,
+                "entries": [
+                    {
+                        **e,
+                        "pseudocode_delta": {
+                            **(e.get("pseudocode_delta") or {}),
+                            "inline_hunk": {"withheld": "over_gate", "read_with": "get_pseudocode"},
+                        },
+                    }
+                    if e.get("entry_id") == entry_id
+                    else e
+                    for e in page["entries"]
+                ],
+            }
+        return page
+
+    monkeypatch.setattr(mcp_app, "_get_diff_patch_view", gated)
+
+
+def test_an_entry_whose_hunk_is_withheld_over_its_gate_reads_as_a_cut_material(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An entry unit whose inline hunk is withheld (over its gate) is a cut material: a write
+    before the entry is read on is judged unread, not read.
+
+    MUTATION (verified RED, 1 failed): count only the page budget's withholding as cut, as
+    before -> material_cut False, the write unit_delivered -> RED."""
+    _withhold_hunk(monkeypatch, "pair:00001000:00001000")
+    server = mcp_app.build_server(world.path)
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR})["next_unit"]
+    assert nu["kind"] == ru.ENTRY and nu["members"][0]["entry_id"] == "pair:00001000:00001000"
+    assert nu["material_cut"] is True
+    got = _server_call(server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"]))
+    assert got["read_basis"] == {"basis": "none", "unread_before_verdict": True}
+
+
+def test_a_batch_member_whose_hunk_was_withheld_is_not_read_whole_and_counts_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch lists a member whose own inline hunk it withholds: the member was not shown whole,
+    so a write on it before it is read on reads ``none``. Second tier (not must-read), it is
+    disposed — and counted apart in the coverage statement as ``basis incomplete``.
+
+    MUTATION (verified RED, 1 failed): count every listed member as shown whole -> the write reads
+    unit_delivered -> RED. MUTATION (verified RED, 1 failed): leave such judgements out of the
+    count -> RED."""
+    w = _hex_world(tmp_path, monkeypatch, 30)
+    unit = next(u for u in _review(w, k=0).units if u.kind == ru.SECOND_TIER)
+    target = unit.members[0]
+    _withhold_hunk(monkeypatch, str(target.entry_id))
+    server = mcp_app.build_server(w.path)
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    assert nu["unit_id"] == unit.unit_id
+    assert target.entry_id in {m["entry_id"] for m in nu["members"]}  # listed
+    m = {"anchor_ref": target.anchor_ref}
+    got = _server_call(server, "annotate_diff", _judge_args(m, nu["unit_id"]))
+    assert got["read_basis"] == {"basis": "none", "unread_before_verdict": False}
+    rep = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["report"]
+    assert rep["basis_incomplete"]["count"] == 1
+    assert rep["basis_incomplete"]["subjects"] == [target.anchor_ref]
+    assert "basis incomplete 1;" in rep["coverage_statement"]
+
+
+# ── judgements no unit hands out: dangling, and no longer listed ────────────────────────────
+
+
+@pytest.mark.parametrize("verdict", ["change_inconclusive", "changed_real"])
+def test_the_entry_point_counts_the_dangling_judgements_by_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: str
+) -> None:
+    """start_diff_review's report carries the judgements whose subject no longer resolves
+    (``dangling``, by verdict, changed_real apart) beside the ones no longer listed, and the
+    coverage statement names both counts — no unit hands either out, so the entry point is
+    where they are seen.
+
+    MUTATION (verified RED, 2 failed): leave ``dangling`` off the report keys start_diff_review
+    forwards -> RED; MUTATION (verified RED, 2 failed): ``read_progress`` does not collect the
+    dangling judgements -> RED; MUTATION (verified RED, 1 failed): no changed_real apart ->
+    changed_real RED."""
+    from tests.unit.lib.test_diff_review import _unlist_and_repair
+
+    w = World(tmp_path, monkeypatch)
+    unlisted, gone = _unlist_and_repair(w)
+    if verdict == "changed_real":
+        # the same judgement as a change found (a write is refused now that the subject is gone)
+        w.atlas.execute("UPDATE overlay SET verdict = 'changed_real' WHERE anchor_ref = ?", (gone,))
+        w.atlas.commit()
+    server = mcp_app.build_server(w.path)
+    rep = _server_call(server, "start_diff_review", {"run_pair": PAIR})["report"]
+    assert "dangling" in rep, sorted(rep)
+    dangling = rep["dangling"]
+    assert dangling["count"] == 1 and dangling["by_verdict"] == {verdict: 1}
+    assert dangling["anchors"] == [gone]
+    want = 1 if verdict == "changed_real" else 0
+    assert dangling["changed_real"]["count"] == want
+    assert rep["judged_not_listed"]["count"] == 1
+    assert f"dangling 1 (changed_real {want}); not listed 1;" in rep["coverage_statement"]
+
+
+# ── shards: what a write hands on, and what each shard holds ──────────────────────────────────
+
+
+def test_a_write_naming_no_shard_hands_on_the_shard_its_session_asked_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session that asked start_diff_review for shard 1 of 3 and then writes naming its unit
+    but no shard is handed the next unit of that shard, and the answer says so (``shard``,
+    ``inferred``), as a write reads the session's k.
+
+    MUTATION (verified RED, 1 failed): no shard from the session -> the answer names none and
+    the next unit may fall outside the shard -> RED."""
+    w = _hex_world(tmp_path, monkeypatch, 200)
+    server = mcp_app.build_server(w.path)
+    start = {"run_pair": PAIR, "k": 0, "worker": 1, "workers": 3}
+    nu = _server_call(server, "start_diff_review", start)["next_unit"]
+    assert ru.in_shard(nu["unit_id"], 1, 3)
+    got = _server_call(server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"]))
+    assert got.get("shard") == {"worker": 1, "workers": 3, "inferred": True}
+    assert got["next_unit"] is None or ru.in_shard(got["next_unit"]["unit_id"], 1, 3)
+
+
+def test_the_overview_says_what_each_shard_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With workers=3 the overview's shard block counts each shard's units, members, must-read
+    members and their candidate rows; summed over the shards they are the pair's own counts.
+
+    MUTATION (verified RED, 1 failed): no per-shard counts -> RED."""
+    w = _s_world(tmp_path, monkeypatch, 100)
+    server = mcp_app.build_server(w.path)
+    out = _server_call(server, "start_diff_review", {"run_pair": PAIR, "worker": 0, "workers": 3})
+    slices = out["shard"].get("slices")
+    assert slices is not None, out["shard"]
+    assert [s["worker"] for s in slices] == [0, 1, 2]
+    rep = out["report"]
+    units = sum(
+        r["units"] for k, r in rep["units_by_kind"].items() if k not in (ru.AUDIT, ru.REDUCE)
+    )
+    assert sum(s["units"] for s in slices) == units
+    assert sum(s["members"] for s in slices) == rep["all_listed"]["members"]
+    assert sum(s["must_read_members"] for s in slices) == rep["must_read"]["members"]
+    assert sum(s["candidate_rows"] for s in slices) == rep["must_read"]["candidate_rows"]
+
+
+def test_a_batch_whose_first_owed_entry_is_larger_than_the_page_hands_out_that_one_cut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first member still owed has an entry larger than the whole page: the batch is handed
+    out with that one member alone, its entry cut to fit (its hunk withheld, with where to read
+    it), and the material says it was cut — never an empty page that names no member.
+
+    MUTATION (verified RED, 1 failed): hand out no entry when the first does not fit -> the page
+    lists no member -> RED."""
+    w = _hex_world(tmp_path, monkeypatch, 30)
+    unit = next(u for u in _review(w, k=0).units if u.kind == ru.SECOND_TIER)
+    big = str(unit.members[0].entry_id)
+    real = mcp_app._get_diff_patch_view
+
+    def inflated(*a: Any, **kw: Any) -> Any:
+        page = real(*a, **kw)
+        if isinstance(page, dict) and page.get("entries"):
+            hunk = {"lines": [f"+ line {i} " + "x" * 200 for i in range(300)]}
+            page = {
+                **page,
+                "entries": [
+                    {
+                        **e,
+                        "pseudocode_delta": {
+                            **(e.get("pseudocode_delta") or {}),
+                            "inline_hunk": hunk,
+                        },
+                    }
+                    if e.get("entry_id") == big
+                    else e
+                    for e in page["entries"]
+                ],
+            }
+        return page
+
+    monkeypatch.setattr(mcp_app, "_get_diff_patch_view", inflated)
+    server = mcp_app.build_server(w.path)
+    one = _server_call(
+        server, "start_diff_review", {"run_pair": PAIR, "unit": unit.unit_id, "k": 0}
+    )
+    assert len(json.dumps(one)) <= mcp_app._RESPONSE_BYTE_BUDGET
+    assert [m["entry_id"] for m in one["members"]] == [big]
+    assert one["material"]["entries"][0]["entry_id"] == big
+    assert one["material_cut"] is True
+    assert one["members_after_this_page"] == len(unit.members) - 1

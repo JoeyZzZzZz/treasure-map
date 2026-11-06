@@ -234,7 +234,9 @@ def _validate_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | No
     return None
 
 
-def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | None:
+def _validate_diff_verdict_basis(
+    verdict: str, vb: dict[str, Any] | None, anchor_ref: str | None = None
+) -> str | None:
     """The diff side's counterpart of ``_validate_verdict_basis`` — SHAPE only.
 
     ``no_real_change`` REQUIRES ``checked`` (a non-empty list of non-blank items — the facts or
@@ -242,7 +244,10 @@ def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str
     wrong one only comes back when the diff's facts move, so it has to say what was looked at and
     why nothing real changed. ``changed_real`` MAY carry ``evidence`` (a non-empty list of non-blank
     items it rests on) and ``change_kind`` (one or more of ``CHANGE_KINDS``: what the change does),
-    and nothing else; the other verdicts carry no basis.
+    and nothing else. ``change_inconclusive`` MAY carry ``checked`` only, and only on a binary one
+    run holds alone (``anchor_ref`` a binary_presence anchor), where every verdict cites its
+    subject's candidates to count as disposed; elsewhere it carries no basis, nor does any other
+    verdict. ``anchor_ref`` also fills the copyable example a missing ``checked`` is refused with.
 
     ★ Shape only. The anchor threshold — that an item which looks like an anchor actually resolves
     in the diff's current view, and that at least one does — is enforced separately against the
@@ -250,6 +255,11 @@ def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str
     proves the object exists in the current view, never that it was read; and the entry's own anchor
     always resolves, so these are a ranking aid, never a proof the judgement is right."""
     vb = vb or None
+    example = ""
+    if anchor_ref is not None:
+        from treasure_map.lib.query.diff_review import checked_example
+
+        example = checked_example("checked", [anchor_ref])
     if vb is not None and "evidence" in vb and verdict != "changed_real":
         raise ConfigError("evidence applies to changed_real only")
     if vb is not None and "change_kind" in vb and verdict != "changed_real":
@@ -258,7 +268,7 @@ def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str
         if not vb:
             raise ConfigError(
                 "no_real_change requires verdict_basis with checked / why_unchanged — the facts "
-                "or anchors read, and why they show nothing real changed"
+                "or anchors read, and why they show nothing real changed" + example
             )
         checked = vb.get("checked")
         if not (
@@ -268,7 +278,7 @@ def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str
         ):
             raise ConfigError(
                 "no_real_change.checked needs at least one non-blank item — the facts or anchors "
-                "that were read to reach it"
+                "that were read to reach it" + example
             )
         why = vb.get("why_unchanged")
         if not (isinstance(why, str) and why.strip()):
@@ -320,11 +330,34 @@ def _validate_diff_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str
         if len(out) == 1:
             return None
         return json.dumps(out)
+    if verdict == "change_inconclusive" and vb is not None and _presence_anchor(anchor_ref):
+        # On a binary one run holds alone it cites what was read, like any verdict there: it
+        # counts as disposed only when it cites every candidate of its subject.
+        checked = vb.get("checked")
+        if set(vb) != {"checked"} or not (
+            isinstance(checked, list)
+            and checked
+            and all(isinstance(c, str) and c.strip() for c in checked)
+        ):
+            raise ConfigError(
+                "change_inconclusive on a binary one run holds alone takes checked only (the "
+                "anchors and candidates read, at least one non-blank item); put the next step in "
+                "rationale" + example
+            )
+        return json.dumps({"kind": "change_inconclusive", "checked": [c.strip() for c in checked]})
     if vb is not None:
         raise ConfigError(
             f"verdict_basis applies to no_real_change or changed_real only, not {verdict!r}"
         )
     return None
+
+
+def _presence_anchor(anchor_ref: str | None) -> bool:
+    if anchor_ref is None:
+        return False
+    from treasure_map.lib.query.diff_review import is_binary_presence_anchor
+
+    return is_binary_presence_anchor(anchor_ref)
 
 
 def _check_candidate_verdict(verdict: str) -> None:
@@ -740,7 +773,9 @@ def prepare_diff_annotation(
     ``side_meta`` is same_shape_siblings ``_meta`` (needed for a group_ref). Raises ConfigError on
     any problem. Shared by the single ``annotate_diff`` and the batch, so both validate alike.
     ``group_cache`` (see ``annotate_group_on``) lets a batch snapshot each group once."""
-    basis_json = _check_diff_write(verdict, verdict_basis, rationale, attributed_to, group_ref)
+    basis_json = _check_diff_write(
+        verdict, verdict_basis, rationale, attributed_to, group_ref, anchor_ref=anchor_ref
+    )
     # Imported here, not at the top: the query package imports this module on its own import, so a
     # top-level import from it would run before this module had finished loading.
     from treasure_map.lib.query.diff_annotations import (
@@ -756,9 +791,25 @@ def prepare_diff_annotation(
             atlas, built, side_meta, diff_id, anchor_ref, group_ref, cache=group_cache
         )
     if verdict == "no_real_change" and verdict_basis is not None:
-        require_checked_anchor(atlas, built, meta, side_meta, verdict_basis["checked"], "checked")
+        require_checked_anchor(
+            atlas,
+            built,
+            meta,
+            side_meta,
+            verdict_basis["checked"],
+            "checked",
+            anchor_ref=anchor_ref,
+        )
     elif verdict == "changed_real" and verdict_basis is not None and "evidence" in verdict_basis:
-        require_checked_anchor(atlas, built, meta, side_meta, verdict_basis["evidence"], "evidence")
+        require_checked_anchor(
+            atlas,
+            built,
+            meta,
+            side_meta,
+            verdict_basis["evidence"],
+            "evidence",
+            anchor_ref=anchor_ref,
+        )
     return PreparedDiffWrite(
         anchor_ref=anchor_ref,
         verdict=verdict,
@@ -775,9 +826,13 @@ def _check_diff_write(
     rationale: str,
     attributed_to: str | None,
     group_ref: Any,
+    *,
+    anchor_ref: str | None = None,
 ) -> str | None:
     """The checks every diff-side write makes before it reads anything: a diff verdict, its basis,
-    the rationale and attribution, and a group_ref that is a string. Returns the basis JSON."""
+    the rationale and attribution, and a group_ref that is a string. Returns the basis JSON.
+    ``anchor_ref`` (the subject written) fills a refusal's example and says whether a
+    change_inconclusive may carry ``checked`` (on a binary one run holds alone)."""
     if verdict not in _DIFF_VERDICTS:
         if verdict in _VERDICTS:
             raise ConfigError(
@@ -786,7 +841,7 @@ def _check_diff_write(
                 "one of its candidates with promote"
             )
         raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
-    basis_json = _validate_diff_verdict_basis(verdict, verdict_basis)
+    basis_json = _validate_diff_verdict_basis(verdict, verdict_basis, anchor_ref)
     _check_text_and_attribution(rationale, attributed_to)
     if group_ref is not None and not isinstance(group_ref, str):
         raise ConfigError(
@@ -813,7 +868,9 @@ def prepare_file_annotation(
     when a ``diff_id`` named the pair). The anchor must name a file get_file_diff lists for the
     pair now; ``checked`` / ``evidence`` resolve against the pair's files, and against the diff's
     view too when there is one. A file has no same-shape group, so ``group_ref`` is refused."""
-    basis_json = _check_diff_write(verdict, verdict_basis, rationale, attributed_to, group_ref)
+    basis_json = _check_diff_write(
+        verdict, verdict_basis, rationale, attributed_to, group_ref, anchor_ref=anchor_ref
+    )
     if group_ref is not None:
         raise ConfigError(
             "group_ref names a same-shape group of a function entry; a non-binary file has none"
@@ -861,11 +918,17 @@ def prepare_presence_annotation(
     """Validate and snapshot one judgement on a binary one run of the pair holds alone — READ ONLY,
     like ``prepare_file_annotation``, and written by the same ``write_prepared``. ``presence`` is
     lib/query/binary_presence ``Presence`` (diff_annotations.presence_scope). The anchor must name
-    a binary listed there now; its basis is that binary's facts (side, path, name, content hash,
-    candidates and their classes, recorded references). ``checked`` / ``evidence`` resolve to its
-    own anchor or one of its candidates in its own run. It has no same-shape group, so
-    ``group_ref`` is refused."""
-    basis_json = _check_diff_write(verdict, verdict_basis, rationale, attributed_to, group_ref)
+    a review subject listed there now: a function holding candidates of such a binary (its basis:
+    the binary's side, path, name and content hash, and the function's candidates), or a binary
+    judged whole (no candidate, or ones naming no function; its basis: the binary's facts —
+    candidates and their classes, recorded references). A binary whose candidates all sit in
+    functions is refused on its own anchor, naming its function anchors. ``checked`` /
+    ``evidence`` resolve to the subject's own anchor or one of its candidates in its own run (a
+    change_inconclusive may carry ``checked`` too). It has no same-shape group, so ``group_ref``
+    is refused."""
+    basis_json = _check_diff_write(
+        verdict, verdict_basis, rationale, attributed_to, group_ref, anchor_ref=anchor_ref
+    )
     if group_ref is not None:
         raise ConfigError(
             "group_ref names a same-shape group of a function entry; a binary one run holds alone "
@@ -881,13 +944,28 @@ def prepare_presence_annotation(
             "binary_presence.anchor_ref (get_diff_meta, list_diffs coverage, or the run pair's "
             "review_progress)"
         )
+    found = presence.resolve(anchor_ref)
+    if found is not None and found[1] is None and not found[0].judged_whole:
+        b = found[0]
+        raise ConfigError(
+            f"{anchor_ref!r} holds candidates: its review subjects are its {len(b.functions)} "
+            "function(s) holding them — judge each on its own anchor_ref (this anchor, then "
+            "::<function address>, as start_diff_review(run_pair) lists them), citing that "
+            "function's candidates"
+        )
     subject = bp.presence_subjects(presence).get(anchor_ref)
     if subject is None:
+        fn = dr.split_presence_function(anchor_ref)
+        if fn is not None and presence.resolve(fn[0]) is not None:
+            raise ConfigError(
+                f"{anchor_ref!r} names no function holding a candidate of {fn[0]!r} — copy a "
+                "function's anchor_ref as start_diff_review(run_pair) lists it"
+            )
         raise ConfigError(
             f"{anchor_ref!r} names no binary that only one run of {run_a}::{run_b} holds now"
         )
     snapshot = dr.file_snapshot(run_a, run_b, subject)
-    if verdict == "no_real_change" and verdict_basis is not None:
+    if verdict in ("no_real_change", "change_inconclusive") and verdict_basis is not None:
         bp.require_presence_checked(
             atlas, presence, anchor_ref, verdict_basis["checked"], "checked"
         )

@@ -70,6 +70,7 @@ from treasure_map.lib.query import apply_view as _apply_view
 from treasure_map.lib.query import canonical_view as _canonical_view
 from treasure_map.lib.query import coverage_report as _coverage_report
 from treasure_map.lib.query import density as _density
+from treasure_map.lib.query import diff_review as _dr_mod
 from treasure_map.lib.query import effective_float_filters as _effective_float_filters
 from treasure_map.lib.query import entry_words
 from treasure_map.lib.query import explain_candidate as _explain_candidate
@@ -405,6 +406,8 @@ def _anchor_placeholder(text: str, anchor_ref: Any) -> str:
     200 items that each failed naming their own anchor collapse to one merged error. Only the
     item's own ref is replaced; a ref it names in ``checked`` is not (that is a different fact)."""
     if isinstance(anchor_ref, str) and anchor_ref:
+        # Named in prose (repr) and in a copyable example (JSON): both forms are this item's.
+        text = text.replace(json.dumps(anchor_ref), '"<this item\'s anchor_ref>"')
         return text.replace(repr(anchor_ref), "'<this item's anchor_ref>'")
     return text
 
@@ -455,8 +458,8 @@ _START_META_KEYS = (
     "source_stale_reason",
     "toolchain_checked",
 )
-# A binary_presence unit's material: its binary's first candidates in the triage order.
-_PRESENCE_TOP = 20
+# The units handed out by the page: their member list is what the material on that page shows.
+_PAGED_KINDS = (_ru.S_BATCH, _ru.SECOND_TIER, _ru.GROUP, _ru.REDUCE, _ru.PRESENCE)
 # A diff write made before anything of its subject was read: what that reads as, on its answer.
 _JUDGED_UNREAD = (
     "written before anything of its subject was read: it reads needs_recheck (not disposed) "
@@ -2405,35 +2408,80 @@ def make_tools(
             out["review_state"] = state
         return out
 
-    def _presence_top(
-        atlas: sqlite3.Connection, facts: _ru.PairFacts, anchor: str
+    def _presence_functions(
+        atlas: sqlite3.Connection, review: _ru.PairReview, u: _ru.Unit, budget: int
     ) -> dict[str, Any]:
-        """The binary's first ``PRESENCE_TOP`` candidates in its run, in the triage order."""
-        b = next((b for b in facts.presence.items if facts.presence.anchor(b) == anchor), None)
-        if b is None:
+        """A one-sided binary's review subjects of this unit — each function holding candidates
+        (or the binary itself, judged whole) with its candidates as compact triage rows — the ones
+        not yet disposed first, fitted to ``budget`` bytes (``functions_truncated``)."""
+        from treasure_map.lib.query import binary_presence as _bp
+
+        facts = review.facts
+        found = facts.presence.resolve(u.members[0].anchor_ref)
+        if found is None:
             return {"error": "the binary is no longer held by one run alone"}
-        ranked = _ru.presence_ranked(atlas, b.run, b.path)
-        rows = [_candidate_row(c, i) for i, c in enumerate(ranked[:_PRESENCE_TOP])]
-        return {
+        b = found[0]
+        subjects = {s.anchor: s for s in _bp.review_subjects(facts.presence) if s.binary is b}
+        ranked = _ru.presence_ranked(atlas, b.run, b.path) if b.candidates else []
+        rank = {c.evidence_ref: i for i, c in enumerate(ranked)}
+        by_ref = {c.evidence_ref: c for c in ranked}
+        states = review.progress.states
+        members = sorted(u.members, key=lambda m: _ru.disposed(states.get(m.anchor_ref)))
+        out: dict[str, Any] = {
+            "run_pair": _dr_mod.run_pair(facts.run_a, facts.run_b),
             "binary": b.name,
             "rel_path": b.rel_path,
             "run": b.run,
             "side": b.tag,
-            "candidates_total": len(ranked),
-            "top": rows,
-            "top_rule": (
-                f"the binary's first {_PRESENCE_TOP} candidates in its run, in the triage order; "
-                "explain_candidate(evidence_ref) reads one's sink / source / flow. Its judgement "
-                "cites every one of them (checked / evidence), or it is not counted as disposed"
+            "candidates_total": b.candidates,
+            "rule": (
+                "judge each subject on its anchor_ref with annotate_diff(..., run_pair=...) — a "
+                "function, or a binary holding no candidate; whatever the verdict, it counts as "
+                "disposed only when its checked (or evidence) cites every one of its candidates' "
+                "evidence_ref. explain_candidate(evidence_ref) reads one's sink / source / flow"
+            ),
+            "read_more": (
+                f"list_candidates(run_id={json.dumps(b.run)}, binary={json.dumps(b.name)})"
             ),
         }
+        kept: list[dict[str, Any]] = []
+        room = budget - len(json.dumps(out)) - 200
+        for m in members:
+            s = subjects.get(m.anchor_ref)
+            refs = s.refs if s is not None else ()
+            order = sorted(refs, key=lambda r: rank.get(r, len(rank)))
+            item: dict[str, Any] = {
+                "anchor_ref": m.anchor_ref,
+                "function": s.addr if s is not None else None,
+                "candidates_total": len(refs),
+                "rows": [_candidate_row(by_ref[r], rank[r]) for r in order if r in by_ref],
+            }
+            if len(item["rows"]) < len(refs):
+                item["rows_not_in_triage"] = len(refs) - len(item["rows"])
+            size = len(json.dumps(item))
+            if size > room and not kept:
+                # The first subject alone fills the page: it is shown with its rows cut.
+                while item["rows"] and len(json.dumps(item)) > room:
+                    item["rows"].pop()
+                    item["rows_truncated"] = True
+                size = len(json.dumps(item))
+            if size > room:
+                break
+            kept.append(item)
+            room -= size
+        out["functions"] = kept
+        out["functions_total"] = len(u.members)
+        out["functions_truncated"] = len(kept) < len(u.members) or any(
+            f.get("rows_truncated") for f in kept
+        )
+        return out
 
     def _unit_material(
         atlas: sqlite3.Connection, review: _ru.PairReview, u: _ru.Unit, budget: int
     ) -> dict[str, Any]:
         """What a reviewer reads to judge the unit: one entry in full, a batch's entries as a
-        scan (summary and inline_hunk), a binary_presence binary's first candidates, a file's
-        line difference — fitted to ``budget`` bytes, with the call that reads more."""
+        scan (summary and inline_hunk), a one-sided binary's functions with their candidates, a
+        file's line difference — fitted to ``budget`` bytes, with the call that reads more."""
         facts = review.facts
         first = u.members[0]
         if u.kind in (_ru.ENTRY, _ru.AUDIT):
@@ -2468,11 +2516,15 @@ def make_tools(
                     break
                 kept.append(e)
                 used += size
+            if not kept and entries:
+                # The first member still owed is larger than the page: it is handed out alone,
+                # its entry cut to fit (the cut says where the rest is read).
+                kept = [_entry_within_budget(entries[0], 0, max(budget, 0))]
             out = {
                 "diff_id": u.stream,
                 "entries": kept,
                 "entries_total": len(u.members),
-                "entries_truncated": len(kept) < len(u.members),
+                "entries_truncated": len(kept) < len(entries) or bool(found["missing"]),
                 "read_one": (
                     f"get_diff_patch_view(diff_id={json.dumps(u.stream)}, entry_id=<entry_id>)"
                 ),
@@ -2482,12 +2534,7 @@ def make_tools(
                 out["members_not_in_view"] = found["missing"]
             return out
         if u.kind == _ru.PRESENCE:
-            top = _presence_top(atlas, facts, first.anchor_ref)
-            rows = top.get("top") or []
-            while rows and len(json.dumps(top)) > budget:
-                rows.pop()
-                top["top_truncated"] = True
-            return top
+            return _presence_functions(atlas, review, u, budget)
         if u.kind == _ru.FILE:
             path = first.anchor_ref.split("#non_binary#", 1)[-1]
             try:
@@ -2599,26 +2646,27 @@ def make_tools(
                 break
             kept.append(e)
             room -= size
+        if not kept and entries:
+            kept = [_entry_within_budget(entries[0], 0, max(room, 0))]
         out["entries"] = kept
         out["entries_total"] = len(u.members)
-        out["entries_truncated"] = len(kept) < len(u.members)
+        out["entries_truncated"] = len(kept) < len(entries) or bool(found["missing"])
         return out
 
     def _member_entries(
         atlas: sqlite3.Connection, review: _ru.PairReview, u: _ru.Unit, bucket: str | None
     ) -> dict[str, Any]:
         """A batch's or group's members as the view lists them (each with its summary and
-        inline_hunk), read page by page until every member is found or the view ends: members
-        not yet disposed first, view order kept within each part, so a unit handed out again
-        after some were judged shows the ones still owed a reading. ``missing`` names members no
-        page lists. ``{"error": ...}`` when the view cannot be read."""
+        inline_hunk), read from the view by entry id: members not yet disposed first, view order
+        kept within each part, so a unit handed out again after some were judged shows the ones
+        still owed a reading. ``missing`` names members the view does not list.
+        ``{"error": ...}`` when the view cannot be read."""
         by_entry = {m.entry_id: m.anchor_ref for m in u.members if m.entry_id is not None}
         wanted = set(by_entry)
         found: list[dict[str, Any]] = []
-        offset: int | None = 0
-        while offset is not None and wanted:
+        if wanted:
             page = _get_diff_patch_view(
-                atlas, u.stream, bucket=bucket, rows_limit=0, limit=2000, offset=offset
+                atlas, u.stream, bucket=bucket, rows_limit=0, entry_ids=frozenset(wanted)
             )
             if "error" in page:
                 return {"error": page["error"]}
@@ -2626,8 +2674,6 @@ def make_tools(
                 if e.get("entry_id") in wanted:
                     wanted.discard(e["entry_id"])
                     found.append(e)
-            nxt = page.get("next_offset")
-            offset = nxt if isinstance(nxt, int) and nxt > offset else None
         states = review.progress.states
         found.sort(key=lambda e: _ru.disposed(states.get(by_entry.get(str(e.get("entry_id")), ""))))
         missing = [m.entry_id for m in u.members if m.entry_id in wanted]
@@ -2660,12 +2706,13 @@ def make_tools(
         return call_log.session.id if call_log is not None else None
 
     def _material_cut(material: Any) -> bool:
-        """Whether a unit's material was cut to fit: a part withheld for the page budget, a list
-        cut short, an entry's rows or a file's hunks that continue on another page (the read_more /
-        read_one calls reach the rest)."""
+        """Whether a unit's material was cut: any part withheld (the page budget, an inline hunk
+        over its gate or too large) or code cut at a length, a list cut short, an entry's rows or
+        a file's hunks that continue on another page (the read_more / read_one / read_with calls
+        reach the rest)."""
         if not isinstance(material, dict):
             return False
-        if '"page_budget"' in json.dumps(material):
+        if _tool_call_log.part_cut(material):
             return True
         entry = material.get("entry")
         return (
@@ -2675,6 +2722,7 @@ def make_tools(
                     "entries_truncated",
                     "owed_truncated",
                     "top_truncated",
+                    "functions_truncated",
                     "structured_withheld",
                 )
             )
@@ -2693,6 +2741,48 @@ def make_tools(
         paging = block.get("lists_paging") if isinstance(block, dict) else None
         return isinstance(paging, dict) and paging.get("next_offset") is not None
 
+    def _set_shown_members(u: _ru.Unit, holder: dict[str, Any], states: dict[str, str]) -> None:
+        """A batch / group / reduce / one-sided binary hand-out names exactly the members its
+        material lists, in the
+        material's order (members still owed first), with how many the unit holds
+        (``members_total``), are disposed, and are owed but not on this page
+        (``members_after_this_page``: the unit comes back for them once these are judged)."""
+        mat = holder.get("material")
+        shown = _tool_call_log.shown_members(mat) if isinstance(mat, dict) else None
+        by_key: dict[str, _ru.Member] = {m.anchor_ref: m for m in u.members}
+        by_key.update({m.entry_id: m for m in u.members if m.entry_id is not None})
+        listed = [by_key[x] for x in (shown or []) if x in by_key]
+        holder["members"] = [_member_json(m, states.get(m.anchor_ref)) for m in listed]
+        on_page = {m.anchor_ref for m in listed}
+        holder["members_total"] = len(u.members)
+        holder["members_disposed"] = sum(
+            1 for m in u.members if _ru.disposed(states.get(m.anchor_ref))
+        )
+        holder["members_after_this_page"] = sum(
+            1
+            for m in u.members
+            if m.anchor_ref not in on_page and not _ru.disposed(states.get(m.anchor_ref))
+        )
+
+    def _shard_slices(review: _ru.PairReview, workers: int) -> list[dict[str, int]]:
+        """What each of the ``workers`` shards holds: its subject units, their members, the
+        must-read members and their candidate rows (audits and reduces are owed work, not
+        subjects, so they are left out) — summed over the shards, the report's own counts."""
+        slices = [
+            {"worker": i, "units": 0, "members": 0, "must_read_members": 0, "candidate_rows": 0}
+            for i in range(workers)
+        ]
+        for u in review.units:
+            if u.kind in (_ru.AUDIT, _ru.REDUCE):
+                continue
+            row = slices[int(u.unit_id[:8], 16) % workers]
+            row["units"] += 1
+            row["members"] += len(u.members)
+            if u.must_read:
+                row["must_read_members"] += len(u.members)
+                row["candidate_rows"] += sum(m.rows for m in u.members if m.kind == "entry")
+        return slices
+
     def _fit_unit_material(
         atlas: sqlite3.Connection,
         review: _ru.PairReview,
@@ -2704,11 +2794,14 @@ def make_tools(
         """Put ``u``'s material (and ``material_cut``) into ``holder``, fitted to ``room`` bytes
         and then measured in the answer as it is sent (``sent_size``): the material's own budget
         counts its entries, not its wrapping, so an answer still over the byte budget has its
-        material cut again by the bytes it is over."""
-        members_cut = bool(holder.get("members_truncated"))
+        material cut again by the bytes it is over. A batch, group or reduce is handed out by
+        its page: its ``members`` are the ones the material lists (``_set_shown_members``)."""
+        paged = u.kind in _PAGED_KINDS
         while True:
             holder["material"] = _unit_material(atlas, review, u, max(room, 0))
-            holder["material_cut"] = members_cut or _material_cut(holder["material"])
+            holder["material_cut"] = _material_cut(holder["material"])
+            if paged:
+                _set_shown_members(u, holder, review.progress.states)
             over = sent_size() - _RESPONSE_BYTE_BUDGET
             if over <= 0 or room <= 0:
                 return
@@ -2750,15 +2843,8 @@ def make_tools(
                     )
                     return out
                 out["unit"] = _unit_head(u, states)
-                out["members"] = _members_json(u, states)
+                out["members"] = [] if u.kind in _PAGED_KINDS else _members_json(u, states)
                 room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
-                if room < 2_000 and len(out["members"]) > 20:
-                    # A full batch's member list alone fills the page: every member stays, each
-                    # with only what names and judges it, so the material still has room.
-                    keep = ("anchor_ref", "entry_id", "reasons", "review_state")
-                    out["members"] = [{k: m[k] for k in keep if k in m} for m in out["members"]]
-                    out["members_compact"] = "per member: " + ", ".join(keep)
-                    room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
                 _fit_unit_material(atlas, review, u, out, lambda: len(json.dumps(out)), room)
                 return out
             rep = review.report
@@ -2775,6 +2861,9 @@ def make_tools(
                     "complete",
                     "not_seen",
                     "judged_not_listed",
+                    "dangling",
+                    "basis_incomplete",
+                    "presence_citations_short",
                 )
                 if key in rep
             }
@@ -2786,20 +2875,22 @@ def make_tools(
                 "non_binary_files_unavailable": nr["non_binary_files_unavailable"],
                 "see": "list_diff_blindspots(run_a, run_b); tmap review report for the lists",
             }
-            out["shard"] = {"worker": worker, "workers": workers} if workers is not None else None
+            out["shard"] = (
+                {"worker": worker, "workers": workers, "slices": _shard_slices(review, workers)}
+                if workers is not None
+                else None
+            )
             nxt = review.next_unit(worker, workers, session=_session_id())
             out["workflow"] = _PAIR_WORKFLOW
             out["full_list"] = f"tmap review report {run_pair} --md -o <file>.md"
             if nxt is None:
                 out["next_unit"] = None
                 return out
-            out["next_unit"] = {**_unit_head(nxt, states), "members": _members_json(nxt, states)}
+            out["next_unit"] = {
+                **_unit_head(nxt, states),
+                "members": [] if nxt.kind in _PAGED_KINDS else _members_json(nxt, states),
+            }
             room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
-            if room < 2_000 and len(out["next_unit"]["members"]) > 20:
-                # A batch's member list alone fills the page: the material is read by unit=.
-                out["next_unit"]["members"] = out["next_unit"]["members"][:20]
-                out["next_unit"]["members_truncated"] = True
-                room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
             out["next_unit"]["read_alone"] = (
                 f"start_diff_review(run_pair={json.dumps(run_pair)}, unit={json.dumps(nxt.unit_id)}"
                 + (f", k={kk}" if kk != _ru.DEFAULT_K else "")
@@ -2872,9 +2963,15 @@ def make_tools(
         ``worker`` / ``workers`` (both or neither) keep one shard: the units whose id's first 8 hex
         digits, as an integer, are worker modulo workers. ``unit=<unit_id>`` returns that one unit:
         its members with their review state and verdict, and its material. Judge each member with
-        annotate_diff (or annotate_diff_batch) and call again for the next unit. The full unit list
-        is not sent here: ``tmap review report <run_pair> --md -o <file>`` writes it. A pair with a
-        proven-stale run is refused."""
+        annotate_diff (or annotate_diff_batch) and call again for the next unit. A batch, callee
+        group, reduce or one-sided binary is handed out by the page: its ``members`` are the ones
+        its material shows
+        (members still owed first), with ``members_total`` and ``members_after_this_page``; the
+        unit comes back with the rest once those are judged. With ``workers``, ``shard.slices``
+        counts each shard's units, members, must-read members and candidate rows; a write naming
+        its unit but no shard is handed on in the shard this session last asked for. The full
+        unit list is not sent here: ``tmap review report <run_pair> --md -o <file>`` writes it. A
+        pair with a proven-stale run is refused."""
         if (diff_id is None) == (run_pair is None):
             return {
                 "error": "pass exactly one of diff_id (one diff) or run_pair (the whole pair)",
@@ -5071,14 +5168,26 @@ def make_tools(
             pair_staleness={"source_stale": False, "source_stale_reason": None},
             server_commit=_server_base.get("commit"),
         )
-        nxt = review.next_unit(worker, workers, session=_session_id())
         pair = f"{runs[0]}::{runs[1]}"
+        extra: dict[str, Any] = {}
+        if worker is None and workers is None:
+            worker, workers = _session_shard(pair)
+            if workers is not None:
+                extra["shard"] = {"worker": worker, "workers": workers, "inferred": True}
+        elif workers is not None:
+            extra["shard"] = {"worker": worker, "workers": workers}
+        used += len(json.dumps(extra))
+        nxt = review.next_unit(worker, workers, session=_session_id())
         if nxt is None:
-            return {"next_unit": None, "coverage_statement": review.report["coverage_statement"]}
+            return {
+                **extra,
+                "next_unit": None,
+                "coverage_statement": review.report["coverage_statement"],
+            }
         states = review.progress.states
         head: dict[str, Any] = {
             **_unit_head(nxt, states),
-            "members": _members_json(nxt, states),
+            "members": [] if nxt.kind in _PAGED_KINDS else _members_json(nxt, states),
             "read_with": (
                 f"start_diff_review(run_pair={json.dumps(pair)}, unit={json.dumps(nxt.unit_id)}"
                 + (f", k={k}" if k != _ru.DEFAULT_K else "")
@@ -5086,17 +5195,51 @@ def make_tools(
             ),
         }
         room = _RESPONSE_BYTE_BUDGET - used - len(json.dumps({"next_unit": head})) - 200
-        if room < 2_000 and len(head["members"]) > 20:
-            # A batch's member list alone fills the page: the material is read by read_with.
-            head["members"] = head["members"][:20]
-            head["members_truncated"] = True
-            room = _RESPONSE_BYTE_BUDGET - used - len(json.dumps({"next_unit": head})) - 200
         # The caller merges this into its answer of ``used`` bytes: the answer as sent is that
         # plus this block's own JSON (the braces it drops pay for the ", " joining it).
         _fit_unit_material(
             atlas, review, nxt, head, lambda: used + len(json.dumps({"next_unit": head})), room
         )
-        return {"next_unit": head}
+        return {**extra, "next_unit": head}
+
+    def _session_shard(pair: str) -> tuple[int | None, int | None]:
+        """The shard this session's last answered start_diff_review(run_pair=pair) call asked for
+        — a write that names its unit but no shard hands on the next unit of that shard, as it
+        reads k — or ``(None, None)`` (no shard)."""
+        from treasure_map.lib.query import read_basis as _rb
+
+        for ln in reversed(_rb.session_lines(call_log) or []):
+            params = ln.get("params") or {}
+            if ln.get("tool") != "start_diff_review" or ln.get("error"):
+                continue
+            if params.get("run_pair") != pair or params.get("unit") is not None:
+                continue
+            w, ws = params.get("worker"), params.get("workers")
+            if isinstance(w, int) and isinstance(ws, int) and _is_int(w) and _is_int(ws):
+                if 0 <= w < ws:
+                    return w, ws
+            return None, None
+        return None, None
+
+    def _presence_citations(
+        atlas: sqlite3.Connection, run_pair: str, anchor_ref: str, basis: Any
+    ) -> dict[str, Any]:
+        """A write's answer on a binary one run holds alone: how far it cites its subject's
+        candidates (``citations``, the shape of the report's presence_citations_short), and what a
+        short one reads as."""
+        from treasure_map.lib.query import binary_presence as _bp
+        from treasure_map.lib.query.diff_annotations import presence_scope
+
+        gap = _bp.citation_gap(presence_scope(atlas, run_pair), anchor_ref, basis)
+        if gap is None:
+            return {}
+        out: dict[str, Any] = {"citations": gap}
+        if gap["cited"] < gap["required"]:
+            out["citations_short"] = (
+                "cites fewer than every candidate of its subject: it reads needs_recheck (not "
+                "disposed) until judged again citing all of them (checked / evidence)"
+            )
+        return out
 
     def annotate_diff(
         anchor_ref: str,
@@ -5262,6 +5405,12 @@ def make_tools(
             result["read_basis"] = ctxs[anchor_ref].read_basis
             if result["read_basis"].get("unread_before_verdict"):
                 result["needs_recheck"] = _JUDGED_UNREAD
+            if (
+                run_pair is not None
+                and not shadow
+                and _dr_mod.is_binary_presence_anchor(anchor_ref)
+            ):
+                result.update(_presence_citations(atlas, run_pair, anchor_ref, given or None))
             if unit_id is not None:
                 result.update(
                     _after_unit_write(atlas, runs, worker, workers, unit_k, len(json.dumps(result)))

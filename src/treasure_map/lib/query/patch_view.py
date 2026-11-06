@@ -5290,6 +5290,7 @@ def get_diff_patch_view(
     rows_offset: int | None = None,
     rows_limit: int = ROWS_INLINE_LIMIT,
     detail: str = "full",
+    entry_ids: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """The function-level view of one diff (see the module docstring), one page of it.
 
@@ -5647,7 +5648,13 @@ def get_diff_patch_view(
     # The next unjudged entries are named in the order this page is read in.
     _progress({e.entry_id: i for i, e in enumerate(ordered)})
     end = offset + limit
-    page = ordered[offset:end]
+    if entry_ids is not None:
+        # In-process only (no tool passes it): the listed entries with these ids, in view order,
+        # rendered as a page would render them — a review unit's material reads its members so.
+        page = [e for e in ordered if e.entry_id in entry_ids]
+        end = len(ordered)
+    else:
+        page = ordered[offset:end]
     page_guards: dict[tuple[str, str], dict[str, Any]] = {}
     page_deltas = _deltas(
         readings, [p for e in page if (p := _delta_pair(e, readings)) is not None], page_guards

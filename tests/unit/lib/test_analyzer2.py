@@ -1108,6 +1108,73 @@ def test_one_hop_lead_reaches_the_sink_below_a_fat_edge_callee(tmp_path: Path) -
     }
 
 
+def _one_hop_sink(sink_class: str) -> dict[str, object]:
+    """One sink function per non-command axis, each a candidate on that axis through the sink it
+    calls; the fat handler hands its key to whichever one sits one call below it."""
+    return {
+        "copy": {
+            "name": "cp_sink",
+            "address": "00408b2c",
+            "pseudocode": (
+                "void cp_sink(char* param_1){ char d[64]; recv(fd,param_1,64); strcpy(d,param_1); }"
+            ),
+            "hash": "h_cp_sink",
+            "callees": ["recv", "strcpy"],
+        },
+        "format": {
+            "name": "fm_sink",
+            "address": "00408b2c",
+            "pseudocode": (
+                "void fm_sink(char* param_1){ char b[64]; recv(fd,param_1,256); "
+                'sprintf(b,"reply %s",param_1); }'
+            ),
+            "hash": "h_fm_sink",
+            "callees": ["recv", "sprintf"],
+        },
+        "fmt_string": {
+            "name": "fs_sink",
+            "address": "00408b2c",
+            "pseudocode": "void fs_sink(char* param_1){ syslog(0, param_1); }",
+            "hash": "h_fs_sink",
+            "callees": ["syslog"],
+        },
+        "path_sink": {**_path_sink_fn("ps_sink", path="free"), "address": "00408b2c"},
+    }[sink_class]
+
+
+@pytest.mark.parametrize("sink_class", ["copy", "format", "fmt_string", "path_sink"])
+def test_one_hop_lead_reaches_a_sink_of_every_axis_below_a_fat_edge_callee(
+    tmp_path: Path, sink_class: str
+) -> None:
+    """Every axis that carries flow evidence rides the one-hop lead along, located by the
+    candidate's binary path like the command axis: a copy, a buffer formatter, a format-string and
+    a path candidate one call below the edge callee each read the key.
+
+    MUTATION (verified RED, 1 failed each): the copy / format / fmt_string / path_sink branch hands
+    ``_attach_edge_leads`` no binary path (``None``) -> RED for that axis only (the lead is keyed
+    on the binary path, so a candidate looked up by its short name finds none)."""
+    sink = _one_hop_sink(sink_class)
+    fw = _fat_handler_fw()
+    funcs = fw[0]["funcs"]  # type: ignore[index]
+    funcs[1] = {**funcs[1], "callees": [sink["name"], "strlen"]}  # type: ignore[index]
+    fw[0]["funcs"] = [funcs[0], funcs[1], sink]  # type: ignore[index]
+    db = _make_db(tmp_path, fw)
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_axes")
+    rows = _by_anchor(atlas, sink_class)
+    assert sink["name"] in rows, sorted(rows)
+    ev = json.loads(rows[sink["name"]]["flow_evidence"])
+    assert ev.get("reachability_leads") == [
+        {
+            "via": "string_keyed_edge",
+            "key": "acct_link_code",
+            "hops": 1,
+            "through": "gen_token_mail",
+            "mechanism": "strcmp_gate",
+        }
+    ]
+
+
 def test_fanout_edge_callee_hands_the_key_to_both_sinks_below(tmp_path: Path) -> None:
     # One pass over the edge-callee set: a fan-out handler hands its key to EVERY candidate below.
     db = _make_db(tmp_path, _fat_handler_fw())
@@ -1289,6 +1356,34 @@ def test_one_hop_lead_from_a_pathless_edge_is_marked_and_never_guessed() -> None
     assert out == {}
 
 
+def test_a_pathless_edge_is_narrowed_to_the_same_named_function_at_its_callee_address() -> None:
+    """A pathless edge whose callee name two functions of one binary answer to, at different
+    addresses, still has one callee: the one at the edge's address. Its lead is read below that
+    function only, and is marked as located by name.
+
+    MUTATION (verified RED, 1 failed): the address narrowing of the name fallback removed -> RED
+    (two functions answer, so no lead at all)."""
+    funcs = [
+        _lead_func(1, "/lib/libx.so", "handler", "00000100", ["copy"]),
+        _lead_func(2, "/lib/libx.so", "handler", "00000200", ["move"]),
+        _lead_func(3, "/lib/libx.so", "copy", "00000300", []),
+        _lead_func(4, "/lib/libx.so", "move", "00000400", []),
+    ]
+    out = analyzer2_mod._one_hop_edge_leads(funcs, [_lead_edge("k", "handler", "0x200", None)])
+    assert out == {
+        (("path", "/lib/libx.so"), "move"): [
+            {
+                "via": "string_keyed_edge",
+                "key": "k",
+                "hops": 1,
+                "through": "handler",
+                "mechanism": "strcmp_gate",
+                "match_basis": "name",
+            }
+        ]
+    }
+
+
 def test_wrapper_edge_binds_to_the_wrapper_in_the_callers_own_binary_path() -> None:
     """A thin nvram wrapper in one libx.so must not turn a call to a same-named non-wrapper in the
     other libx.so (a different path) into an indirect key edge.
@@ -1305,6 +1400,28 @@ def test_wrapper_edge_binds_to_the_wrapper_in_the_callers_own_binary_path() -> N
     call = [{"callee": "get_cfg", "key": "lan_ipaddr", "key_kind": "constant"}]
     rows = analyzer2_mod._flatten_wrapper_edges(funcs, wrappers, {3: call, 4: call}, "runA")
     assert [(r.func, r.binary_path) for r in rows] == [("caller", "/lib/libx.so")]
+
+
+def test_two_same_named_wrappers_in_one_path_that_disagree_bind_no_edge() -> None:
+    """Two thin wrappers of one name in one binary path, one reading and one writing: which one a
+    call reaches cannot be told from the name, so the caller's literal key becomes no edge at all
+    rather than whichever wrapper was read last. Two that agree still bind it (the control).
+
+    MUTATION (verified RED, 1 failed): disagreeing wrappers resolved to the last one read instead
+    of none -> RED (a write edge for ``lan_ipaddr``)."""
+    funcs = [
+        _lead_func(1, "/lib/libx.so", "cfg", "00000100", ["nvram_get"]),
+        _lead_func(2, "/lib/libx.so", "cfg", "00000180", ["nvram_set"]),
+        _lead_func(3, "/lib/libx.so", "caller", "00000200", ["cfg"]),
+    ]
+    call = [{"callee": "cfg", "key": "lan_ipaddr", "key_kind": "constant"}]
+    disagree = {1: {"op": "read", "api": "nvram_get"}, 2: {"op": "write", "api": "nvram_set"}}
+    assert analyzer2_mod._flatten_wrapper_edges(funcs, disagree, {3: call}, "runA") == []
+    agree = {1: {"op": "read", "api": "nvram_get"}, 2: {"op": "read", "api": "nvram_get"}}
+    rows = analyzer2_mod._flatten_wrapper_edges(funcs, agree, {3: call}, "runA")
+    assert [(r.func, r.key, r.binary_path) for r in rows] == [
+        ("caller", "lan_ipaddr", "/lib/libx.so")
+    ]
 
 
 # ── detector A: static {string -> funcptr} dispatch tables (same atlas edge table) ───
