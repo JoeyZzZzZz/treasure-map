@@ -21,6 +21,7 @@ from treasure_map.cli import mcp_cli
 from treasure_map.lib import facts
 from treasure_map.lib.analyze.non_binary.framework import NonBinaryFile
 from treasure_map.lib.analyze.non_binary.shell_script import (
+    _first_substitution_command,
     _ingest_shell,
     _split_respecting_quotes,
     launched_command,
@@ -567,6 +568,20 @@ def test_a_backquoted_substitution_continued_on_the_next_line_names_its_command(
     finally:
         conn.close()
     assert launches == [(1, "/usr/sbin/foo", "inline", 1)]
+
+
+def test_an_escaped_backquote_opens_no_substitution(tmp_path: Path) -> None:
+    """A backslash-escaped backquote is a literal character: a line holding one opens no
+    substitution, so its risk row names no command made up from the text after it. A backquote
+    really left open (continued with ``\\``) is still read to the end of the line.
+
+    MUTATION (verified RED, 1 failed): every backquote counted, escaped ones included -> RED
+    (``$HOSTIP"`` named as the command)."""
+    assert _first_substitution_command('__IP="\\`$HOSTIP"') is None
+    assert _first_substitution_command('__IP="$__IP \\`"') is None
+    assert _first_substitution_command("X=`/usr/sbin/foo get a \\") == "/usr/sbin/foo"
+    # the risk row of such a line names no command at all
+    assert _all_rows(tmp_path, '__IP="\\`$HOSTIP"\n') == [(1, None, "literal", None)]
 
 
 def test_a_declared_or_spaced_substitution_assignment_names_the_substituted_command(

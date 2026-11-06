@@ -292,7 +292,8 @@ def _substitutions(line: str) -> list[tuple[int, str]]:
     """(start, inner text) of every ``$( … )`` (paren-balanced; ``$((`` arithmetic skipped) and
     every backquoted span on the line. An unclosed ``$(`` runs to the end of the line, and so does
     an unclosed last backquote (less a trailing ``\\`` continuation): a substitution continued on
-    the next line still names its command here."""
+    the next line still names its command here. Only unescaped backquotes are counted for that:
+    a backslash-escaped one is literal text, never the start of a substitution."""
     out: list[tuple[int, str]] = []
     i = 0
     while True:
@@ -315,8 +316,11 @@ def _substitutions(line: str) -> list[tuple[int, str]]:
         i += 2
     for m in re.finditer(r"`([^`]*)`", line):
         out.append((m.start(), m.group(1)))
-    if line.count("`") % 2:
-        last = line.rfind("`")
+    # Only an unescaped backquote opens or closes a substitution; a backslash-escaped one is a
+    # literal character (an even run of backslashes before it escapes only themselves).
+    ticks = [m.end() - 1 for m in re.finditer(r"(?<!\\)(?:\\\\)*`", line)]
+    if len(ticks) % 2 == 1:
+        last = ticks[-1]
         tail = line[last + 1 :].rstrip()
         out.append((last, tail[:-1] if tail.endswith("\\") else tail))
     return out
