@@ -2397,12 +2397,16 @@ def make_tools(
         any other unit's while not disposed."""
         return u.kind == _ru.REDUCE or not _ru.disposed(states.get(m.anchor_ref))
 
-    def _members_json(u: _ru.Unit, states: dict[str, str]) -> list[dict[str, Any]]:
+    def _members_json(u: _ru.Unit, states: dict[str, str], nav: Any = None) -> list[dict[str, Any]]:
         """A unit's members; an audit unit's without their review state (it is read blind)."""
         blind = u.kind == _ru.AUDIT
-        return [_member_json(m, None if blind else states.get(m.anchor_ref)) for m in u.members]
+        return [
+            _member_json(m, None if blind else states.get(m.anchor_ref), nav) for m in u.members
+        ]
 
-    def _member_json(m: _ru.Member, state: str | None) -> dict[str, Any]:
+    def _member_json(m: _ru.Member, state: str | None, nav: Any = None) -> dict[str, Any]:
+        """One member; a must-read entry a dispatch group names carries its ``dispatch`` label
+        (read by lib/query/review_navigation, passed through as it is)."""
         out: dict[str, Any] = {"anchor_ref": m.anchor_ref, "kind": m.kind}
         if m.entry_id is not None:
             out["entry_id"] = m.entry_id
@@ -2415,6 +2419,10 @@ def make_tools(
         out["reasons"] = list(m.reasons)
         if state is not None:
             out["review_state"] = state
+        if nav is not None and m.kind == "entry" and m.must_read:
+            label = nav.member_dispatch(m.stream, m.entry_id)
+            if label:
+                out["dispatch"] = label
         return out
 
     def _presence_functions(
@@ -2784,7 +2792,9 @@ def make_tools(
         paging = block.get("lists_paging") if isinstance(block, dict) else None
         return isinstance(paging, dict) and paging.get("next_offset") is not None
 
-    def _set_shown_members(u: _ru.Unit, holder: dict[str, Any], states: dict[str, str]) -> None:
+    def _set_shown_members(
+        u: _ru.Unit, holder: dict[str, Any], states: dict[str, str], nav: Any = None
+    ) -> None:
         """A batch / group / reduce / one-sided binary hand-out names exactly the members its
         material lists, in the
         material's order (only the members still owed, while any is), with how many the unit holds
@@ -2795,7 +2805,7 @@ def make_tools(
         by_key: dict[str, _ru.Member] = {m.anchor_ref: m for m in u.members}
         by_key.update({m.entry_id: m for m in u.members if m.entry_id is not None})
         listed = [by_key[x] for x in (shown or []) if x in by_key]
-        holder["members"] = [_member_json(m, states.get(m.anchor_ref)) for m in listed]
+        holder["members"] = [_member_json(m, states.get(m.anchor_ref), nav) for m in listed]
         on_page = {m.anchor_ref for m in listed}
         holder["members_total"] = len(u.members)
         holder["members_disposed"] = sum(1 for m in u.members if not _owed(u, m, states))
@@ -2840,31 +2850,18 @@ def make_tools(
             holder["material"] = _unit_material(atlas, review, u, max(room, 0))
             holder["material_cut"] = _material_cut(holder["material"])
             if paged:
-                _set_shown_members(u, holder, review.progress.states)
+                _set_shown_members(u, holder, review.progress.states, review.navigation)
             over = sent_size() - _RESPONSE_BYTE_BUDGET
             if over <= 0 or room <= 0:
                 return
             room -= over
 
-    def _upstream_groups(
-        atlas: sqlite3.Connection, review: _ru.PairReview, run_a: str, run_b: str
-    ) -> dict[str, Any]:
-        """F-4: the pair's upstream library groups, a navigation annotation read off the units
-        (lib/query/upstream_version.upstream_groups); the units are not touched."""
-        states = review.progress.states
-        return _uv.upstream_groups(
-            _uv.pair_upstream(atlas, run_a, run_b),
-            review.units,
-            lambda u: _ru.unit_disposed(u, states),
-            {d.diff_id: d.binary for d in review.facts.diffs},
-        )
-
-    def _label_upstream(
-        atlas: sqlite3.Connection, run_a: str, run_b: str, u: _ru.Unit, holder: dict[str, Any]
-    ) -> None:
+    def _label_upstream(review: _ru.PairReview, u: _ru.Unit, holder: dict[str, Any]) -> None:
         """``holder["upstream"]``: the library and versions of ``u``'s diff, when its binary names
-        an upstream library (nothing else is added or changed)."""
-        lab = _uv.label(_uv.pair_upstream(atlas, run_a, run_b).get(u.stream))
+        an upstream library, as the read layer (review_navigation) read it — nothing else is added
+        or changed."""
+        nav = review.navigation
+        lab = nav.unit_upstream(u) if nav is not None else None
         if lab is not None:
             holder["upstream"] = lab
 
@@ -2891,8 +2888,10 @@ def make_tools(
                 k=kk,
                 pair_staleness={"source_stale": False, "source_stale_reason": None},
                 server_commit=server.get("commit"),
+                navigation=True,
             )
             states = review.progress.states
+            nav = review.navigation
             out: dict[str, Any] = {"run_pair": run_pair, "server": server}
             if unit is not None:
                 u = review.unit(unit)
@@ -2904,8 +2903,8 @@ def make_tools(
                     )
                     return out
                 out["unit"] = _unit_head(u, states)
-                _label_upstream(atlas, run_a, run_b, u, out["unit"])
-                out["members"] = [] if u.kind in _PAGED_KINDS else _members_json(u, states)
+                _label_upstream(review, u, out["unit"])
+                out["members"] = [] if u.kind in _PAGED_KINDS else _members_json(u, states, nav)
                 room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
                 _fit_unit_material(atlas, review, u, out, lambda: len(json.dumps(out)), room)
                 return out
@@ -2927,10 +2926,10 @@ def make_tools(
                     "basis_incomplete",
                     "presence_citations_short",
                     "dispatch_groups",
+                    "upstream_groups",
                 )
                 if key in rep
             }
-            out["report"]["upstream_groups"] = _upstream_groups(atlas, review, run_a, run_b)
             nr = rep["not_reachable"]
             out["report"]["not_reachable"] = {
                 "failed_diffs": len(nr["failed_diffs"]),
@@ -2952,9 +2951,9 @@ def make_tools(
                 return out
             out["next_unit"] = {
                 **_unit_head(nxt, states),
-                "members": [] if nxt.kind in _PAGED_KINDS else _members_json(nxt, states),
+                "members": [] if nxt.kind in _PAGED_KINDS else _members_json(nxt, states, nav),
             }
-            _label_upstream(atlas, run_a, run_b, nxt, out["next_unit"])
+            _label_upstream(review, nxt, out["next_unit"])
             room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
             out["next_unit"]["read_alone"] = (
                 f"start_diff_review(run_pair={json.dumps(run_pair)}, unit={json.dumps(nxt.unit_id)}"
@@ -3038,23 +3037,30 @@ def make_tools(
         its unit but no shard is handed on in the shard this session last asked for. The full
         unit list is not sent here: ``tmap review report <run_pair> --md -o <file>`` writes it.
         ``report.upstream_groups`` is a navigation annotation: the pair's diffs whose binaries
-        name the same upstream library (by file name) at the same version on each side (see
-        get_diff_meta's ``upstream_version``), one row per (``library``, ``a``, ``b``) with its
-        ``diffs``, up to 4 ``binaries``, and the ``units`` / ``must_read_units`` / ``open_units``
+        name the same upstream library (by file name), one row per ``library`` with its
+        ``diffs``, up to 4 ``diff_ids`` and ``binaries``, its ``versions`` (each A/B version pair
+        its diffs state, see get_diff_meta's ``upstream_version``; ``unknown`` included, with how
+        many ``diffs`` state it), and the ``units`` / ``must_read_units`` / ``open_units``
         those diffs hand out; ``groups_total``, ``diffs_in_groups``, the 12 groups handing out the
         most units and ``groups_not_shown`` / ``units_not_shown`` for the rest. A unit of such a
-        diff carries ``upstream`` (``library``, ``a``, ``b``). Grouping changes no unit, unit id
+        diff carries ``upstream`` (``library``, ``a``, ``b``), here and in the next unit a write
+        hands on. Grouping changes no unit, unit id
         or must-read set and filters nothing; belonging to an upstream library is not a safety
         proof, so its units are read like any other. The ``report`` also carries
-        ``dispatch_groups``: a bounded navigation grouping of the must-read entries by the
+        ``dispatch_groups``: the counts of a navigation grouping of the must-read entries by the
         string-keyed edge that enumerates their function — a static {string, handler} table
-        (grouped by the two-side-aligned table) or a strcmp gate (grouped by the two-side aligned
-        dispatch function), each member labelled with its key. It is a stored enumeration, never a
-        reachability claim; an entry named by no recovered table or gate is in an explicit
-        ``uncovered`` bucket carrying the static-table detector's scan status, never read as not
-        dispatched. It groups only: the units, the must-read set, the ids and the order are
-        unchanged, and an entry can be in a callee group and a dispatch group at once. A
-        pair with a proven-stale run is refused."""
+        (grouped by the two-side-aligned table) or a strcmp gate (grouped by the dispatch function,
+        its two sides joined only by an ``aligned`` function pairing). It is a stored enumeration,
+        never a reachability claim; an entry named by no recovered table or gate is in an explicit
+        ``uncovered`` bucket, counted per side by the static-table detector's scan status, never
+        read as not dispatched. It groups only: the units, the must-read set, the ids and the order
+        are unchanged, and an entry can be in a callee group and a dispatch group at once.
+        Each grouped must-read entry member of a unit carries ``dispatch``: one row per group with
+        its ``mechanism``, ``group_ref``, the ``keys`` naming it per side (``a`` / ``b``; an empty
+        side names none) and ``group_members``. The block names the largest groups' refs; the
+        report file lists every group. A group whose other side enumerates nothing for it has that
+        side null and ``counterpart_enumerates`` false. A pair with a proven-stale run is
+        refused."""
         if (diff_id is None) == (run_pair is None):
             return {
                 "error": "pass exactly one of diff_id (one diff) or run_pair (the whole pair)",
@@ -3556,7 +3562,8 @@ def make_tools(
         none is given. ``recompile_only_diff: true`` on an entry is derived from the whole diff:
         get_diff_meta's ``recompile_only.value`` is true for it. It is no reading of the entry
         itself, it is absent when that value is false or null, and the entry stays listed and
-        owed as before."""
+        owed as before. The unit materials start_diff_review hands out do not carry this label, by
+        design."""
         if (
             isinstance(rows_limit, bool)
             or not isinstance(rows_limit, int)
@@ -3870,23 +3877,25 @@ def make_tools(
         refused, as on every diff tool.
 
         Across the run pair: pass the run pair (``{run_a}::{run_b}``) as ``diff_id`` and the group
-        (``scope`` ``run_pair``) holds the calls with the same ``f2_key`` in every binary a diff of
-        the pair covers, both sides; the key is the one-diff key, unchanged, and ``input.diff_id``
-        names the diff the input call is a candidate of. ``sides`` ({a, b}: ``member_count``,
-        ``binaries``, ``by_binary``, ``shared_literal_members``, ``literal_unknown_members``),
-        ``members_outside_input_diff``, ``input_group_ref`` (the input's one-diff group_ref, for
-        annotate_diff) and ``bounds``: ``calls_unreadable`` counts per side the diffed binaries
-        whose calls could not be read (never read as holding no member), ``literals_unreadable``,
-        ``unkeyed``, ``excluded_non_callsite``. Members are ordered by the literal strings their
-        function shares with the input's function (``members_order``): sharing first, the rarest
-        shared literal of its run first (``rarest_shared_literal_df`` = how many functions of that
-        run reference it), then those whose literals could not be read (``shared_literals``
-        null), then those sharing none — an order to read in, never a reading of the change. A
-        member row carries its ``diff_id`` and ``side`` but no landing: its landing and group_ref
-        are its own diff's answer, same_shape_siblings(diff_id=<its diff_id>,
-        evidence_ref=<its evidence_ref>). This group covers only binaries a diff covers; the calls
-        of the binaries no diff covers stay the one-diff group's ``binaries_not_diffed`` (a sink
-        name and kind count, not a shape), not repeated here."""
+        (``scope`` ``run_pair``) holds the calls with the same ``f2_key`` in every binary of the two
+        runs, both sides; the key is the one-diff key, unchanged, and ``input.diff_id`` names the
+        diff the input call is a candidate of. ``sides`` ({a, b}: ``member_count``, ``binaries``,
+        ``by_binary``, ``not_diffed_members``, ``by_binary_not_diffed``, ``shared_literal_members``,
+        ``literal_unknown_members``), ``members_outside_input_diff``, ``input_group_ref`` (the
+        input's one-diff group_ref, for annotate_diff) and ``bounds``: ``calls_unreadable`` counts
+        per side the binaries whose calls could not be read (never read as holding no member),
+        ``literals_unreadable``, ``unkeyed``, ``excluded_non_callsite``, ``recall_gaps`` (not read
+        at this scope) and ``not_diffed_same_shape`` (members no diff covers, per side and reason).
+        ``source_stale_diffs`` counts the pair's diffs by ``source_stale``. Members are ordered by
+        the literal strings their function shares with the input's function (``members_order``):
+        sharing first, the rarest shared literal of its run first (``rarest_shared_literal_df`` =
+        how many functions of that run reference it), then those whose literals could not be read
+        (``shared_literals`` null), then those sharing none — an order to read in, never a reading
+        of the change. A member row carries its ``diff_id`` and ``side`` but no landing: its landing
+        and group_ref are its own diff's answer, same_shape_siblings(diff_id=<its diff_id>,
+        evidence_ref=<its evidence_ref>). A member in a binary no diff of the pair covers has
+        ``diffed`` false, a null ``diff_id``, its ``binary`` and ``not_diffed_reason`` (the reasons
+        of the one-diff ``binaries_not_diffed``); it has no landing to read."""
         conn = open_atlas(atlas_path)
         try:
             # A run pair in diff_id is refused through the same gate as any diff of the pair.
@@ -4007,7 +4016,8 @@ def make_tools(
         component on (never one under /etc or another runtime root), and a dotted number shaped
         like an IPv4 address or netmask, or glued to an interface name, is not a version. true is
         not 'behaves the same' — a version string can feed a comparison — and it changes no unit,
-        order, must-read set or judgement."""
+        order, must-read set or judgement. The first call for a diff may take a few seconds (every
+        stored block is compared); later calls are served from a cache."""
         server, moved = _server_block()
         conn = open_atlas(atlas_path)
         try:
@@ -4414,9 +4424,6 @@ def make_tools(
         conn = open_atlas(atlas_path)
         try:
             out = _list_diffs(conn, run_a_id, run_b_id, file_staleness=_file_staleness(conn))
-            for row in out.get("diffs") or []:
-                if (lib := _uv.library_of(row.get("binary"))) is not None:
-                    row["upstream_library"] = lib
             out.update(_reverse_hint(conn, run_a_id, run_b_id, ("run_a_id", "run_b_id")))
             # First key: the answer can run long, and the whole-pair entry must not sit past it.
             return {"review_pairs": _review_pairs(out.get("diffs") or []), **out}
@@ -5338,6 +5345,7 @@ def make_tools(
             k=k,
             pair_staleness={"source_stale": False, "source_stale_reason": None},
             server_commit=_server_base.get("commit"),
+            navigation=True,
         )
         pair = f"{runs[0]}::{runs[1]}"
         extra: dict[str, Any] = {}
@@ -5358,13 +5366,16 @@ def make_tools(
         states = review.progress.states
         head: dict[str, Any] = {
             **_unit_head(nxt, states),
-            "members": [] if nxt.kind in _PAGED_KINDS else _members_json(nxt, states),
+            "members": (
+                [] if nxt.kind in _PAGED_KINDS else _members_json(nxt, states, review.navigation)
+            ),
             "read_with": (
                 f"start_diff_review(run_pair={json.dumps(pair)}, unit={json.dumps(nxt.unit_id)}"
                 + (f", k={k}" if k != _ru.DEFAULT_K else "")
                 + ")"
             ),
         }
+        _label_upstream(review, nxt, head)
         room = _RESPONSE_BYTE_BUDGET - used - len(json.dumps({"next_unit": head})) - 200
         # The caller merges this into its answer of ``used`` bytes: the answer as sent is that
         # plus this block's own JSON (the braces it drops pay for the ", " joining it).

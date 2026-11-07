@@ -12,16 +12,24 @@ fact — never a reachability verdict; see ``atlas_schema.sql`` ★IRON LAW):
   aligned table (``table_addr`` on each side). The key is only a member label.
 * ``strcmp_gate`` — an entry is a member when its function entry is the callee of a same-variable
   ``strcmp`` ladder; the group is the aligned dispatch FUNCTION (``from_func_addr``), the two sides'
-  dispatch functions aligned by function alignment. The gating key is only a member label.
+  dispatch functions aligned by a function pairing whose state is ``aligned`` (an undetermined
+  pairing joins nothing). The gating key is only a member label.
+
+Each side is read on its own: a member's keys are given per side (``{"a": [...], "b": [...]}``, an
+empty list = that side's enumeration names no key for it), and a group whose other side enumerates
+nothing for it — no aligned table, or an aligned dispatch function with no stored gate edge — has
+that side's anchor null and ``counterpart_enumerates`` false (with the aligned function, when there
+is one, as ``counterpart``). One side enumerated is never shown as both.
 
 This reads the STORED enumeration only; it never reads a call edge of the dispatch and never claims
 the handler is routed to or reachable. An entry named by no recovered table or gate falls to an
-explicit UNCOVERED bucket carrying the per-binary ``detector_scan_status`` (the static-table
-detector's honesty row), so "not enumerated" is never read as "not dispatched".
+explicit UNCOVERED bucket, counted per side by the static-table detector's ``detector_scan_status``
+(the atlas row stored beside the edges), so "not enumerated" is never read as "not dispatched".
 
 Only a grouping: the units, the must-read set, the unit ids and the order are untouched; an entry
 that joins a group also stays in whatever unit held it (ENTRY / S_BATCH / SECOND_TIER / callee
-GROUP). An entry can be in a callee group AND a dispatch group at once.
+GROUP). An entry can be in a callee group AND a dispatch group at once. It is read on demand
+(``review_pair(..., navigation=True)``), not on every reading of a pair.
 """
 
 from __future__ import annotations
@@ -32,11 +40,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from treasure_map.lib.diff.layer0 import norm_hex
-from treasure_map.lib.ro_db import ro_connect
 
 DISPATCH_GROUP_VERSION = "dispatch-v1"
 STATIC, GATE = "static_string_table", "strcmp_gate"
 _SPLIT = "split_by_undefined_handler"
+SIDES = ("a", "b")
 
 # Code-authored wording, kept apart so the neutrality test can scan it (firmware key labels and
 # addresses are DATA, never scanned). It describes the stored MECHANISM only — the enumerated edge —
@@ -48,11 +56,34 @@ MECHANISM_NOTE = (
 NOTE_STATIC = "stored as the handler of a key in this table"
 NOTE_GATE = "gated by a key in this function"
 _UNCOVERED_NOTE = (
-    "no recovered table or gate enumerates these entries; read them with the static-table "
-    "detector's scan status below"
+    "no recovered table or gate enumerates these entries; each side is counted by the static-table "
+    "detector's scan status of that side's binary"
+)
+DETECTOR_NOTE = (
+    "scanned_no_static_table_found holds only within supported_scope, never 'no table'; the "
+    "strcmp-gate detector records no scan status"
+)
+# Rendered by the report file only (the MCP answer's tool description says the same).
+COUNTERPART_NOTE = (
+    "a null side: that side's stored enumeration names nothing for this group (counterpart is the "
+    "aligned function there, if any)"
 )
 # The code-authored strings the neutrality test scans, and the words it forbids in them.
-NEUTRAL_TEXTS = (MECHANISM_NOTE, NOTE_STATIC, NOTE_GATE, _UNCOVERED_NOTE)
+NEUTRAL_TEXTS = (
+    MECHANISM_NOTE,
+    NOTE_STATIC,
+    NOTE_GATE,
+    _UNCOVERED_NOTE,
+    DETECTOR_NOTE,
+    COUNTERPART_NOTE,
+)
+# The uncovered buckets, as named in the block (scanned by the neutrality test too).
+BUCKETS = (
+    "static_table_detector_did_not_run",
+    "static_table_scan_capped",
+    "binary_has_edges_entry_not_a_member",
+    "scanned_no_static_table_found",
+)
 
 
 def group_ref(diff_id: str, mechanism: str, anchor: str) -> str:
@@ -73,21 +104,32 @@ class MemberRef:
     addr_b: str | None
 
 
+def _no_keys() -> dict[str, list[str]]:
+    return {"a": [], "b": []}
+
+
 @dataclass
 class DispatchGroup:
     mechanism: str
     diff_id: str
     binary: str | None
-    a_anchor: str | None  # table_addr / dispatcher addr on the A side (None = B-only)
+    a_anchor: str | None  # table_addr / dispatcher addr on the A side (None = nothing enumerated)
     b_anchor: str | None
-    # entry_id -> the sorted key labels by which this member is in the group
-    members: dict[str, list[str]] = field(default_factory=dict)
+    # a one-sided gate group: the aligned function on the side that enumerates nothing (or None)
+    counterpart: str | None = None
+    # entry_id -> per side, the sorted key labels by which this member is in the group
+    members: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     member_anchors: dict[str, str] = field(default_factory=dict)
     completeness_reasons: set[str] = field(default_factory=set)
 
     @property
     def split_by_undefined_handler(self) -> bool:
         return _SPLIT in self.completeness_reasons
+
+    @property
+    def counterpart_enumerates(self) -> bool:
+        """Whether both sides' stored enumerations name this group."""
+        return self.a_anchor is not None and self.b_anchor is not None
 
     @property
     def ref(self) -> str:
@@ -106,7 +148,8 @@ class PairDispatch:
     grouped_members: int
     also_in_callee_group: int
     uncovered: list[MemberRef]
-    uncovered_by_detector: dict[str, int]
+    # side -> bucket -> members (each uncovered member counted once on each side it has a function)
+    uncovered_by_detector: dict[str, dict[str, int]]
     detector_statuses: dict[tuple[str, str], dict[str, Any] | None]
 
 
@@ -137,7 +180,12 @@ def members_from_units(units: list[Any]) -> list[MemberRef]:
     return out
 
 
-# ── reading the enumerated edges (atlas) and the detector status (analysis.db) ──────────────────
+# ── reading the enumerated edges and the detector status (both atlas) ──────────────────────────
+
+
+def _reasons(reason: str | None) -> set[str]:
+    """A stored ``completeness_reason``: a comma-joined set (the extractor joins its reasons)."""
+    return {r.strip() for r in (reason or "").split(",") if r.strip()}
 
 
 def _diff_meta(atlas: sqlite3.Connection, run_a: str, run_b: str) -> dict[str, dict[str, Any]]:
@@ -172,8 +220,7 @@ def _static_tables(
         ca = norm_hex(callee_addr)
         t["handlers"].add(ca)
         t["keys"].setdefault(ca, []).append(key)
-        if reason:
-            t["reasons"].add(reason)
+        t["reasons"] |= _reasons(reason)
     return out
 
 
@@ -206,8 +253,7 @@ def _gates(
         g = out[path][ca][ffa]
         if key is not None:
             g["keys"].append(key)
-        if reason:
-            g["reasons"].add(reason)
+        g["reasons"] |= _reasons(reason)
     return out
 
 
@@ -215,17 +261,24 @@ def _new_gate() -> dict[str, Any]:
     return {"keys": [], "reasons": set()}
 
 
+def _dispatchers(gates: dict[str, dict[str, dict[str, Any]]]) -> set[str]:
+    """The dispatch functions of one binary's gate edges (every stored ``from_func_addr``)."""
+    return {ffa for by_ffa in gates.values() for ffa in by_ffa}
+
+
 def _alignment(
     atlas: sqlite3.Connection, diff_ids: set[str]
 ) -> dict[str, dict[str, dict[str, str]]]:
-    """``diff_id -> {"a2b": {addr_a: addr_b}, "b2a": {addr_b: addr_a}}``: the function pairing, so a
-    dispatch function on one side is aligned to its counterpart on the other."""
+    """``diff_id -> {"a2b": {addr_a: addr_b}, "b2a": {addr_b: addr_a}}``: the function pairing whose
+    state is ``aligned``, so a dispatch function on one side is aligned to its counterpart on the
+    other. An undetermined pairing is no alignment and joins nothing."""
     out: dict[str, dict[str, dict[str, str]]] = {d: {"a2b": {}, "b2a": {}} for d in diff_ids}
     if not diff_ids:
         return out
     placeholders = ",".join("?" * len(diff_ids))
     rows = atlas.execute(
-        f"SELECT diff_id, addr_a, addr_b FROM function_alignment WHERE diff_id IN ({placeholders})",
+        "SELECT diff_id, addr_a, addr_b FROM function_alignment "
+        f"WHERE alignment_state = 'aligned' AND diff_id IN ({placeholders})",
         tuple(sorted(diff_ids)),
     )
     for diff_id, addr_a, addr_b in rows:
@@ -237,42 +290,38 @@ def _alignment(
 
 
 def _detector_statuses(
-    atlas: sqlite3.Connection, run_id: str, shas: set[str]
+    atlas: sqlite3.Connection, run_id: str, paths: set[str]
 ) -> dict[str, dict[str, Any] | None]:
-    """``sha256 -> the string_tables detector_scan_status row (or None)`` from this run's
-    analysis.db — the honesty row that tells "scanned, found none" from "not scanned" from
-    "scan capped"."""
-    row = atlas.execute("SELECT analysis_db_path FROM run WHERE run_id = ?", (run_id,)).fetchone()
-    out: dict[str, dict[str, Any] | None] = {sha: None for sha in shas}
-    if row is None or not row[0] or not shas:
+    """``binary_path -> the static-table detector's status row (or None)``, read from the atlas
+    ``detector_scan_status`` row the hunt stores beside the edges (by run and path) — the honesty
+    row that tells "scanned, found none" from "not scanned" from "scan capped". No row, a
+    pre-column row or two rows for one path -> None (no status: read as not run, never scanned)."""
+    out: dict[str, dict[str, Any] | None] = {p: None for p in paths}
+    if not paths:
         return out
+    placeholders = ",".join("?" * len(paths))
     try:
-        conn = ro_connect(row[0])
-    except sqlite3.Error:
-        return out
-    try:
-        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if "detector_scan_status" not in names:
-            return out
-        placeholders = ",".join("?" * len(shas))
-        rows = conn.execute(
-            "SELECT b.sha256, d.scanned, d.supported_scope, d.unsupported_note, d.cap_hit, "
-            "d.found_count FROM detector_scan_status d JOIN binaries b ON b.id = d.binary_id "
-            f"WHERE d.detector = 'string_tables' AND b.sha256 IN ({placeholders})",
-            tuple(sorted(shas)),
-        )
-        for sha, scanned, scope, note, cap_hit, found in rows:
-            out[sha] = {
-                "scanned": bool(scanned),
-                "supported_scope": scope,
-                "unsupported_note": note,
-                "cap_hit": bool(cap_hit),
-                "found_count": found,
-            }
-    except sqlite3.Error:
-        return out
-    finally:
-        conn.close()
+        rows = atlas.execute(
+            "SELECT binary_path, scanned, supported_scope, unsupported_note, cap_hit, found_count "
+            "FROM detector_scan_status WHERE detector = 'string_tables' AND source_run_id = ? "
+            f"AND binary_path IN ({placeholders})",
+            (run_id, *sorted(paths)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return out  # a pre-feature atlas: no status recorded
+    seen: dict[str, int] = defaultdict(int)
+    for path, scanned, scope, note, cap_hit, found in rows:
+        seen[path] += 1
+        out[path] = {
+            "scanned": bool(scanned),
+            "supported_scope": scope,
+            "unsupported_note": note,
+            "cap_hit": bool(cap_hit),
+            "found_count": found,
+        }
+    for path, n in seen.items():
+        if n > 1:
+            out[path] = None
     return out
 
 
@@ -322,38 +371,50 @@ def compute_pair(
     their function. ``align_dispatchers`` merges a gate's two sides by function alignment (the spec
     grouping); False keeps each side's dispatch function a group of its own (the prototype)."""
     meta = _diff_meta(atlas, run_a, run_b)
-    paths_a = {m["binary_path_a"] for m in meta.values() if m["binary_path_a"]}
-    paths_b = {m["binary_path_b"] for m in meta.values() if m["binary_path_b"]}
-    shas_a = {m["sha256_a"] for m in meta.values() if m["sha256_a"]}
-    shas_b = {m["sha256_b"] for m in meta.values() if m["sha256_b"]}
-    tables_a = _static_tables(atlas, run_a, paths_a)
-    tables_b = _static_tables(atlas, run_b, paths_b)
-    gates_a = _gates(atlas, run_a, paths_a)
-    gates_b = _gates(atlas, run_b, paths_b)
+    paths = {
+        "a": {m["binary_path_a"] for m in meta.values() if m["binary_path_a"]},
+        "b": {m["binary_path_b"] for m in meta.values() if m["binary_path_b"]},
+    }
+    runs = {"a": run_a, "b": run_b}
+    tables = {s: _static_tables(atlas, runs[s], paths[s]) for s in SIDES}
+    gates = {s: _gates(atlas, runs[s], paths[s]) for s in SIDES}
+    det = {s: _detector_statuses(atlas, runs[s], paths[s]) for s in SIDES}
+    dispatchers = {s: {p: _dispatchers(g) for p, g in gates[s].items()} for s in SIDES}
     align = _alignment(atlas, set(meta))
-    det_a = _detector_statuses(atlas, run_a, shas_a)
-    det_b = _detector_statuses(atlas, run_b, shas_b)
     # B table_addr -> A table_addr per diff, so a two-sided table is one group.
     tmaps: dict[str, dict[str, str]] = {}
     for did, m in meta.items():
         tmaps[did] = _align_tables(
-            tables_a.get(m["binary_path_a"], {}), tables_b.get(m["binary_path_b"], {})
+            tables["a"].get(m["binary_path_a"], {}), tables["b"].get(m["binary_path_b"], {})
         )
 
     groups: dict[tuple[str, str, str | None, str | None], DispatchGroup] = {}
     member_mechanisms: dict[tuple[str, str], set[str]] = defaultdict(set)
     uncovered: list[MemberRef] = []
-    uncovered_by_detector: dict[str, int] = defaultdict(int)
+    uncovered_by_detector: dict[str, dict[str, int]] = {s: defaultdict(int) for s in SIDES}
     detector_statuses: dict[tuple[str, str], dict[str, Any] | None] = {}
 
-    def group_for(
-        mechanism: str, diff_id: str, binary: str | None, a_anchor: str | None, b_anchor: str | None
-    ) -> DispatchGroup:
-        key = (mechanism, diff_id, a_anchor, b_anchor)
+    def join(
+        mechanism: str,
+        mem: MemberRef,
+        binary: str | None,
+        anchors: tuple[str | None, str | None],
+        side: str,
+        keys: list[str],
+        reasons: set[str],
+        counterpart: str | None = None,
+    ) -> None:
+        key = (mechanism, mem.diff_id, *anchors)
         g = groups.get(key)
         if g is None:
-            g = groups[key] = DispatchGroup(mechanism, diff_id, binary, a_anchor, b_anchor)
-        return g
+            g = groups[key] = DispatchGroup(mechanism, mem.diff_id, binary, *anchors)
+        if counterpart is not None:
+            g.counterpart = counterpart
+        per_side = g.members.setdefault(mem.entry_id, _no_keys())
+        per_side[side] = sorted(set(per_side[side]) | set(keys))
+        g.member_anchors[mem.entry_id] = mem.anchor_ref
+        g.completeness_reasons |= reasons
+        member_mechanisms[(mem.diff_id, mem.entry_id)].add(mechanism)
 
     for mem in members:
         did = mem.diff_id
@@ -361,68 +422,58 @@ def compute_pair(
         if dm is None:
             continue
         binary = dm["binary_a"]
-        detector_statuses[(did, "a")] = det_a.get(dm["sha256_a"])
-        detector_statuses[(did, "b")] = det_b.get(dm["sha256_b"])
+        path = {"a": dm["binary_path_a"], "b": dm["binary_path_b"]}
+        addr = {"a": mem.addr_a, "b": mem.addr_b}
+        for s in SIDES:
+            detector_statuses[(did, s)] = det[s].get(path[s])
         in_group = False
-        a_anchor: str | None
-        b_anchor: str | None
+        anchors: tuple[str | None, str | None]
 
         # static tables: the member's per-side function is a stored handler in a table
-        for side, addr, tabs in (
-            ("a", mem.addr_a, tables_a.get(dm["binary_path_a"], {})),
-            ("b", mem.addr_b, tables_b.get(dm["binary_path_b"], {})),
-        ):
-            if addr is None:
+        for s in SIDES:
+            if addr[s] is None:
                 continue
-            for table_addr, tav in tabs.items():
-                if addr not in tav["handlers"]:
+            for table_addr, tav in tables[s].get(path[s], {}).items():
+                if addr[s] not in tav["handlers"]:
                     continue
-                keys = sorted({k for ca, ks in tav["keys"].items() if ca == addr for k in ks})
+                keys = sorted(set(tav["keys"].get(addr[s], [])))
                 # The group is the aligned TABLE (``table_addr``), never a single key: a table's
-                # handlers share one group, with the key(s) kept as each member's label below.
-                if side == "a":
-                    a_anchor, b_anchor = table_addr, _table_b_of(tmaps[did], table_addr)
+                # handlers share one group, with the key(s) kept as each member's label (per side).
+                if s == "a":
+                    anchors = (table_addr, _table_b_of(tmaps[did], table_addr))
                 else:
-                    a_anchor = tmaps[did].get(table_addr)
-                    b_anchor = table_addr
-                g = group_for(STATIC, did, binary, a_anchor, b_anchor)
-                g.members.setdefault(mem.entry_id, [])
-                g.members[mem.entry_id] = sorted(set(g.members[mem.entry_id]) | set(keys))
-                g.member_anchors[mem.entry_id] = mem.anchor_ref
-                g.completeness_reasons |= tav["reasons"]
-                member_mechanisms[(did, mem.entry_id)].add(STATIC)
+                    anchors = (tmaps[did].get(table_addr), table_addr)
+                join(STATIC, mem, binary, anchors, s, keys, tav["reasons"])
                 in_group = True
 
         # strcmp gates: the member's per-side function is the callee of a dispatch function
-        bin_gate_a = gates_a.get(dm["binary_path_a"], {})
-        bin_gate_b = gates_b.get(dm["binary_path_b"], {})
-        for side, addr, bin_gate in (("a", mem.addr_a, bin_gate_a), ("b", mem.addr_b, bin_gate_b)):
-            if addr is None:
+        bin_gate = {s: gates[s].get(path[s], {}) for s in SIDES}
+        for s in SIDES:
+            fn = addr[s]
+            if fn is None:
                 continue
-            for ffa, gv in bin_gate.get(addr, {}).items():
+            other = "b" if s == "a" else "a"
+            for ffa, gv in bin_gate[s].get(fn, {}).items():
+                cp: str | None = None
                 if align_dispatchers:
-                    if side == "a":
-                        a_anchor, b_anchor = ffa, align[did]["a2b"].get(ffa)
-                    else:
-                        a_anchor, b_anchor = align[did]["b2a"].get(ffa), ffa
-                else:
-                    a_anchor, b_anchor = (ffa, None) if side == "a" else (None, ffa)
-                g = group_for(GATE, did, binary, a_anchor, b_anchor)
-                g.members.setdefault(mem.entry_id, [])
-                g.members[mem.entry_id] = sorted(set(g.members[mem.entry_id]) | set(gv["keys"]))
-                g.member_anchors[mem.entry_id] = mem.anchor_ref
-                g.completeness_reasons |= gv["reasons"]
-                member_mechanisms[(did, mem.entry_id)].add(GATE)
+                    cp = align[did]["a2b" if s == "a" else "b2a"].get(ffa)
+                # The other side's anchor only when that side's aligned function is itself a
+                # stored dispatch function there; else null, with the aligned function as the
+                # counterpart (one side enumerated is never shown as both).
+                named = dispatchers[other].get(path[other], set())
+                there = cp if cp is not None and cp in named else None
+                anchors = (ffa, there) if s == "a" else (there, ffa)
+                lone = cp if there is None else None
+                join(GATE, mem, binary, anchors, s, gv["keys"], gv["reasons"], lone)
                 in_group = True
 
         if not in_group:
             uncovered.append(mem)
-            has_edges_a = bool(tables_a.get(dm["binary_path_a"]) or bin_gate_a)
-            has_edges_b = bool(tables_b.get(dm["binary_path_b"]) or bin_gate_b)
-            if mem.addr_a is not None:
-                uncovered_by_detector[_detector_bucket(det_a.get(dm["sha256_a"]), has_edges_a)] += 1
-            elif mem.addr_b is not None:
-                uncovered_by_detector[_detector_bucket(det_b.get(dm["sha256_b"]), has_edges_b)] += 1
+            for s in SIDES:
+                if addr[s] is None:
+                    continue
+                has_edges = bool(tables[s].get(path[s]) or bin_gate[s])
+                uncovered_by_detector[s][_detector_bucket(det[s].get(path[s]), has_edges)] += 1
 
     grouped_ids = set(member_mechanisms)
     also_callee = sum(
@@ -433,12 +484,14 @@ def compute_pair(
     return PairDispatch(
         run_a=run_a,
         run_b=run_b,
-        groups=sorted(groups.values(), key=lambda g: (-len(g.members), g.mechanism, g.diff_id)),
+        groups=sorted(
+            groups.values(), key=lambda g: (-len(g.members), g.mechanism, g.diff_id, g.ref)
+        ),
         member_mechanisms=dict(member_mechanisms),
         grouped_members=len(grouped_ids),
         also_in_callee_group=also_callee,
         uncovered=uncovered,
-        uncovered_by_detector=dict(uncovered_by_detector),
+        uncovered_by_detector={s: dict(v) for s, v in uncovered_by_detector.items()},
         detector_statuses=detector_statuses,
     )
 
@@ -458,37 +511,59 @@ def from_review(
     return compute_pair(atlas, facts.run_a, facts.run_b, members_from_units(units), **kwargs)
 
 
-# ── the compact report block (bounded; caps groups and counts the rest) ─────────────────────────
+# ── what is shown: the member label, the full group table, the compact report block ─────────────
 
-MAX_GROUPS_SHOWN = 8
-MAX_MEMBERS_PER_GROUP = 4
-MAX_KEYS_PER_MEMBER = 2
+MAX_KEYS_PER_MEMBER = 3  # key labels per side on a member label (the rest counted)
+LARGEST_SHOWN = 3  # group refs named in the compact report block (the full table has them all)
 
 
-def _group_json(g: DispatchGroup) -> dict[str, Any]:
-    entry_ids = sorted(g.members)
-    shown = entry_ids[:MAX_MEMBERS_PER_GROUP]
-    members = [
-        {
-            "entry_id": eid,
-            "anchor_ref": g.member_anchors.get(eid),
-            "key_label": g.members[eid][:MAX_KEYS_PER_MEMBER],
-        }
-        for eid in shown
-    ]
-    where = (
-        {"table": {"a": g.a_anchor, "b": g.b_anchor}}
-        if g.mechanism == STATIC
-        else {"dispatch_function": {"a": g.a_anchor, "b": g.b_anchor}}
-    )
+def _where(g: DispatchGroup) -> dict[str, Any]:
+    """A group's anchors per side, and why a side is null when one is."""
+    name = "table" if g.mechanism == STATIC else "dispatch_function"
+    out: dict[str, Any] = {name: {"a": g.a_anchor, "b": g.b_anchor}}
+    if not g.counterpart_enumerates:
+        out["counterpart_enumerates"] = False
+        out["counterpart"] = g.counterpart
+    return out
+
+
+def member_labels(pd: PairDispatch) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """``(diff_id, entry_id) -> the member's dispatch label``: each group it is in, with the
+    group's ref, the keys naming it on each side (an empty side = that side names none) and how many
+    must-read entries the group holds."""
+    out: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for g in pd.groups:
+        ref = g.ref
+        for eid, keys in g.members.items():
+            label: dict[str, Any] = {
+                "mechanism": g.mechanism,
+                "group_ref": ref,
+                "keys": {s: keys[s][:MAX_KEYS_PER_MEMBER] for s in SIDES},
+                "group_members": len(g.members),
+            }
+            cut = {s: len(keys[s]) - MAX_KEYS_PER_MEMBER for s in SIDES}
+            if any(n > 0 for n in cut.values()):
+                label["keys_omitted"] = {s: max(n, 0) for s, n in cut.items()}
+            out[(g.diff_id, eid)].append(label)
+    for labels in out.values():
+        labels.sort(key=lambda lab: (lab["mechanism"], lab["group_ref"]))
+    return dict(out)
+
+
+def group_json(g: DispatchGroup) -> dict[str, Any]:
+    """One group in full (the report file's table): its anchors per side, every member with its
+    per-side keys, and the stored completeness reasons of its table/gate edges."""
     out: dict[str, Any] = {
+        "group_ref": g.ref,
         "mechanism": g.mechanism,
         "diff_id": g.diff_id,
         "binary": g.binary,
-        **where,
-        "member_count": len(entry_ids),
-        "members": members,
-        "members_omitted": max(0, len(entry_ids) - len(shown)),
+        **_where(g),
+        "member_count": len(g.members),
+        "members": [
+            {"entry_id": eid, "anchor_ref": g.member_anchors.get(eid), "keys": g.members[eid]}
+            for eid in sorted(g.members)
+        ],
         "note": NOTE_STATIC if g.mechanism == STATIC else NOTE_GATE,
     }
     if g.completeness_reasons:
@@ -499,10 +574,35 @@ def _group_json(g: DispatchGroup) -> dict[str, Any]:
     return out
 
 
-def report_block(pd: PairDispatch, *, max_groups: int = MAX_GROUPS_SHOWN) -> dict[str, Any]:
-    """A bounded ``dispatch_groups`` block for the pair review report: counts, the largest groups
-    (capped, the rest counted), and the explicit uncovered bucket with the detector's scan status.
-    Only a navigation grouping — it moves nothing."""
+def _sizes(pd: PairDispatch, mechanism: str) -> dict[str, int]:
+    gs = [g for g in pd.groups if g.mechanism == mechanism]
+    sizes = sorted((len(g.members) for g in gs), reverse=True)
+    return {
+        "total": len(sizes),
+        "with_2_or_more_members": sum(1 for s in sizes if s >= 2),
+        "max_members": sizes[0] if sizes else 0,
+        "one_sided": sum(1 for g in gs if not g.counterpart_enumerates),
+    }
+
+
+def _detector_scope(pd: PairDispatch) -> dict[str, list[str]]:
+    """The static-table detector's recorded scope over the pair's read binaries (distinct)."""
+    rows = [st for st in pd.detector_statuses.values() if st is not None]
+    return {
+        "supported_scope": sorted(
+            {str(st["supported_scope"]) for st in rows if st["supported_scope"]}
+        ),
+        "unsupported_note": sorted(
+            {str(st["unsupported_note"]) for st in rows if st["unsupported_note"]}
+        ),
+    }
+
+
+def report_block(pd: PairDispatch) -> dict[str, Any]:
+    """The compact ``dispatch_groups`` block of the pair review report: counts, the refs of the
+    largest groups, the uncovered bucket counted per side by the static-table detector's status,
+    and that detector's scope. The groups themselves ride on the members (``member_labels``) and in
+    the report file (``group_json``). Only a navigation grouping — it moves nothing."""
     by_mechanism = {STATIC: 0, GATE: 0, "both": 0}
     for mechs in pd.member_mechanisms.values():
         if STATIC in mechs:
@@ -511,32 +611,23 @@ def report_block(pd: PairDispatch, *, max_groups: int = MAX_GROUPS_SHOWN) -> dic
             by_mechanism[GATE] += 1
         if STATIC in mechs and GATE in mechs:
             by_mechanism["both"] += 1
-    table_sizes = sorted((len(g.members) for g in pd.groups if g.mechanism == STATIC), reverse=True)
-    gate_sizes = sorted((len(g.members) for g in pd.groups if g.mechanism == GATE), reverse=True)
     must_read_entries = pd.grouped_members + len(pd.uncovered)
-    shown = pd.groups[:max_groups]
-    return {
+    out: dict[str, Any] = {
         "mechanism_note": MECHANISM_NOTE,
         "grouped_members": pd.grouped_members,
         "grouped_pct": round(100.0 * pd.grouped_members / max(must_read_entries, 1), 1),
         "by_mechanism": by_mechanism,
         "also_in_callee_group": pd.also_in_callee_group,
-        "table_groups": {
-            "total": len(table_sizes),
-            "with_2_or_more_members": sum(1 for s in table_sizes if s >= 2),
-            "max_members": table_sizes[0] if table_sizes else 0,
-        },
-        "gate_groups": {
-            "total": len(gate_sizes),
-            "with_2_or_more_members": sum(1 for s in gate_sizes if s >= 2),
-            "max_members": gate_sizes[0] if gate_sizes else 0,
-        },
-        "groups": [_group_json(g) for g in shown],
-        "groups_shown": len(shown),
-        "groups_omitted": max(0, len(pd.groups) - len(shown)),
+        "table_groups": _sizes(pd, STATIC),
+        "gate_groups": _sizes(pd, GATE),
+        "largest": [
+            {"group_ref": g.ref, "members": len(g.members)} for g in pd.groups[:LARGEST_SHOWN]
+        ],
         "uncovered": {
             "count": len(pd.uncovered),
             "by_static_table_detector": pd.uncovered_by_detector,
             "note": _UNCOVERED_NOTE,
         },
+        "static_table_detector": {**_detector_scope(pd), "note": DETECTOR_NOTE},
     }
+    return out

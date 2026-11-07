@@ -55,10 +55,11 @@ WHAT CAN MAKE THE GROUP LOOK SMALLER (``sibling_set_bounds``):
   shape.
 
 ACROSS THE RUN PAIR: a ``diff_id`` naming a run pair (``{run_a}::{run_b}``) asks for the same key's
-members in every binary a diff of the pair covers, both sides, ordered by the literals they share
-with the input's function (lib/query/same_shape_run_pair). The key is the one computed here,
-unchanged; ``binaries_not_diffed`` above stays this group's own count of the binaries no diff
-covers, which that group does not reach.
+members in every binary of either run, both sides, a diff of the pair covers it or not, ordered by
+the literals they share with the input's function (lib/query/same_shape_run_pair). The key is the
+one computed here, unchanged; ``binaries_not_diffed`` above stays this group's own count (by sink
+name and kind) of the binaries no diff covers, and the run-pair group lists those binaries'
+members of the key with ``diffed`` false, each binary's reason given by the same NotDiffedBasis.
 
 HANDLES on a member row: ``evidence_ref`` (a candidate-level judgement, annotate); for a member in
 a listed entry also ``entry_id`` + ``row_ref`` (what promote takes) and ``candidate_anchor`` (what
@@ -445,6 +446,58 @@ def _basename(path: str | None) -> str | None:
     return path.rsplit("/", 1)[-1] if path else None
 
 
+@dataclass(frozen=True)
+class NotDiffedBasis:
+    """What decides why a binary of one side's run is not diffed: the content hashes and names the
+    run pair's diffs cover on that side, and the content hashes and names the other side's run
+    holds. One classifier for the one-diff group's ``binaries_not_diffed`` and the run-pair group's
+    not-diffed members, so the two cannot give one binary two reasons."""
+
+    diffed_sha: frozenset[str]
+    diffed_names: frozenset[str]
+    other_sha: frozenset[str]
+    other_names: frozenset[str]
+
+    def reason(self, sha: str | None, path: str | None) -> str:
+        """The reason for a binary whose content is not in ``diffed_sha`` (NOT_DIFFED_REASONS)."""
+        name = _basename(path)
+        reason = not_diffed_reason(
+            sha or None, name, diffed_names=set(self.diffed_names), other_shas=set(self.other_sha)
+        )
+        if reason == "binary_not_diffed" and name in self.other_names:
+            reason = "other_side_same_name_not_diffed"
+        return reason
+
+
+def not_diffed_basis(
+    atlas: sqlite3.Connection, run_a: str, run_b: str, side: str
+) -> NotDiffedBasis:
+    """The NotDiffedBasis of one side of the run pair ``run_a`` / ``run_b``."""
+    other_run = run_b if side == "a" else run_a
+    sha_col, name_col = ("sha256_a", "binary_a") if side == "a" else ("sha256_b", "binary_b")
+    diffs = atlas.execute(
+        f"SELECT {sha_col}, {name_col} FROM diff_meta WHERE run_a_id = ? AND run_b_id = ?",
+        (run_a, run_b),
+    ).fetchall()
+    other_sha: set[str] = set()
+    other_names: set[str] = set()
+    for sha, path in atlas.execute(
+        "SELECT DISTINCT binary_content_hash, binary_path FROM instance WHERE source_run_id = ?",
+        (other_run,),
+    ):
+        if sha:
+            other_sha.add(sha)
+        name = _basename(path)
+        if name:
+            other_names.add(name)
+    return NotDiffedBasis(
+        frozenset(d[0] for d in diffs if d[0]),
+        frozenset(d[1] for d in diffs if d[1]),
+        frozenset(other_sha),
+        frozenset(other_names),
+    )
+
+
 def _not_diffed(
     atlas: sqlite3.Connection, meta: _Meta, side: str, sink: str, kind: str
 ) -> dict[str, dict[str, int]]:
@@ -454,25 +507,7 @@ def _not_diffed(
     list_diff_blindspots decides them (diff_align.not_diffed_reason, so one binary gets one reason
     in both): the same content is on the other side, then a same-named binary was diffed, then
     the other side holds a same-named binary with other content, else this side only."""
-    other = "b" if side == "a" else "a"
-    sha_col, name_col = ("sha256_a", "binary_a") if side == "a" else ("sha256_b", "binary_b")
-    diffs = atlas.execute(
-        f"SELECT {sha_col}, {name_col} FROM diff_meta WHERE run_a_id = ? AND run_b_id = ?",
-        (meta.run["a"], meta.run["b"]),
-    ).fetchall()
-    diffed_sha = {d[0] for d in diffs if d[0]}
-    diffed_names = {d[1] for d in diffs if d[1]}
-    other_sha: set[str] = set()
-    other_names: set[str] = set()
-    for sha, path in atlas.execute(
-        "SELECT DISTINCT binary_content_hash, binary_path FROM instance WHERE source_run_id = ?",
-        (meta.run[other],),
-    ):
-        if sha:
-            other_sha.add(sha)
-        name = _basename(path)
-        if name:
-            other_names.add(name)
+    basis = not_diffed_basis(atlas, meta.run["a"], meta.run["b"], side)
     found: dict[str, tuple[set[str], set[str]]] = {r: (set(), set()) for r in NOT_DIFFED_REASONS}
     for ref, sink_class, flow_raw, sha, path in atlas.execute(
         "SELECT i.evidence_ref, p.sink_class, i.flow_evidence, i.binary_content_hash, "
@@ -480,20 +515,14 @@ def _not_diffed(
         "WHERE i.source_run_id = ? AND i.sink_anchor = ?",
         (meta.run[side], sink),
     ):
-        if (sha and sha in diffed_sha) or not ref or _func_entry_hex(ref) is None:
+        if (sha and sha in basis.diffed_sha) or not ref or _func_entry_hex(ref) is None:
             continue
         flow = _parse_flow(flow_raw)
         if _classify(ref, flow)[0] not in MEMBER_GRANULARITIES:
             continue
         if call_kind(sink_class or "", flow) != kind:
             continue
-        name = _basename(path)
-        reason = not_diffed_reason(
-            sha or None, name, diffed_names=diffed_names, other_shas=other_sha
-        )
-        if reason == "binary_not_diffed" and name in other_names:
-            reason = "other_side_same_name_not_diffed"
-        binaries, calls = found[reason]
+        binaries, calls = found[basis.reason(sha, path)]
         binaries.add(sha or f"path:{path}")
         calls.add(ref)
     return {r: {"binaries": len(b), "calls": len(c)} for r, (b, c) in found.items()}
@@ -747,7 +776,11 @@ def same_shape_siblings(
         )
     meta = _meta(atlas, diff_id)
     if meta is None:
-        return {"diff_id": diff_id, "error": f"no diff {diff_id!r} in this atlas (see list_diffs)"}
+        return {
+            "diff_id": diff_id,
+            "error": f"no diff {diff_id!r} in this atlas (see list_diffs)."
+            + run_pair.pair_hint(atlas, diff_id),
+        }
     refusal = refuse_stale_diff(
         atlas, diff_id, build_hash=build_hash, current=current, commit=commit
     )

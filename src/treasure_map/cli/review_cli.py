@@ -133,6 +133,7 @@ def report(
             k=ru.DEFAULT_K if k is None else k,
             pair_staleness=staleness,
             server_commit=commit,
+            navigation=as_md or as_html,
         )
     finally:
         conn.close()

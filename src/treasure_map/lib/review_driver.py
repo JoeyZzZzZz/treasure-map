@@ -207,7 +207,8 @@ def unit_prompt(run_pair: str, u: ru.Unit, k: int) -> str:
         "tools. tmap draws no conclusion: the judgment is yours, and it records nothing for you. "
         f'1. Call start_diff_review(run_pair="{run_pair}", unit="{u.unit_id}"{kk}) and read its '
         "material; when it says material_cut is true, first read the rest with the read_more / "
-        "read_one calls it gives, then judge. "
+        "read_one calls it gives, and with read_rows for each member whose candidate rows go on "
+        "(rows_next_offset set), then judge. "
         "2. Judge EVERY member listed in members with annotate_diff (or annotate_diff_batch), "
         f'passing unit_id="{u.unit_id}": changed_real (with evidence and change_kind when you '
         "can), no_real_change (checked + why_unchanged), or change_inconclusive (what is "

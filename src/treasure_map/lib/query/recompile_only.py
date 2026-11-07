@@ -24,9 +24,14 @@ The explanations, and nothing else:
     identical;
   * a pair whose text differs only at sites that are a ``__FILE__``/``__LINE__``-style line number
     (a number passed right after a function-name or source-path string, the first ``%d`` of a
-    format with one constant step, or the view's own line_number_form) or an embedded
-    version / build string — only when its callee sets are proven equal and both body sizes are
-    recorded and equal (the text cannot show calls in code the decompiler dropped);
+    format, or the view's own line_number_form) or an embedded version / build string — only when
+    its callee sets are proven equal and both body sizes are recorded and equal (the text cannot
+    show calls in code the decompiler dropped). A number after a string is a line number by
+    evidence (strong) only when the string is a source path or the function's own name, or when
+    the same or the previous line holds, on both sides, a format with a ``%s`` conversion followed
+    by a ``%d`` / ``%u`` / ``%i`` one; after any other identifier-shaped string, or through a
+    variable assigned the number, it is weak, and a pair with no strong site reads its weak ones
+    as changed constants. Every line-number site of a pair must shift by one same nonzero step;
   * a string pair that becomes equal once its generic date / time / version shapes are replaced by
     placeholders, or its build-environment paths (below);
   * changed bytes that lie inside a GNU build-id note's descriptor at the same place on both
@@ -37,9 +42,13 @@ configuration root (``/etc``, ``/var``, ``/tmp``, ``/usr``, ...) is rewritten fr
 toolchain component (``toolchain(s)``, ``sysroot``, ``crosstool*``) — or, with none, from its first
 build-tree component (``src``, ``src-*``) — on, and only when at least two components follow that
 anchor. A ``user@host`` token is rewritten only in a string that also carries a date / time shape
-(a build banner). A dotted number is a version only when it is not shaped like an IPv4 address or
-netmask (four parts each at most 255, or three with one of 100 or more) and not glued to a name
-(``eth0.1``); a ``v``-prefixed one always is.
+(a build banner). A dotted number is a version only when it is not glued to a name (``eth0.1``,
+``TLSv1.2``) and, without a ``v`` prefix, not shaped like an IPv4 address or netmask (four parts
+each at most 255, or three with one of 100 or more).
+
+A reading that hits an error it did not expect is null (``reading_failed:<type>``), never a crash
+of the tool that asked; a block whose stored bytes fall short of its size makes it null
+(``data_blocks_truncated``) — the bytes past the cut were never compared.
 
 Fail closed: anything that is not one of these is an unexplained difference — a one-sided function,
 a changed callee, a constant, a moved code block, a byte no rule attributes. ``true`` is a fact
@@ -65,7 +74,7 @@ from treasure_map.lib.query import patch_view as pv
 from treasure_map.lib.ro_db import ro_connect
 
 # The rule version this reading follows; part of its cache key and of every answer.
-RULE = "recompile-only-v1"
+RULE = "recompile-only-v2"
 # The key a patch-view entry carries when its diff reads true (and only then).
 ENTRY_KEY = "recompile_only_diff"
 # How many characters of a firmware string an answer quotes.
@@ -161,12 +170,13 @@ def build_env_tail(path: str) -> str | None:
 
 
 def _not_a_version(s: str, m: re.Match[str]) -> bool:
-    """A dotted match that is an address / netmask or glued to a name, not a version."""
+    """A dotted match that is an address / netmask or glued to a name, not a version. The glued
+    test comes first, so a ``v`` prefix glued to a name (``TLSv1.2``) is not a version either."""
     text = m.group(0)
+    if m.start() > 0 and s[m.start() - 1].isascii() and s[m.start() - 1].isalpha():
+        return True  # eth0.1, wl0.1: an interface-style name; TLSv1.2: a protocol name
     if text[:1] in ("v", "V"):
         return False
-    if m.start() > 0 and s[m.start() - 1].isascii() and s[m.start() - 1].isalpha():
-        return True  # eth0.1, wl0.1: an interface-style name
     lead = _LEADING_DOTTED.match(text)
     parts = [int(p) for p in lead.group(0).split(".")] if lead else []
     if parts and all(p <= 255 for p in parts):
@@ -397,9 +407,16 @@ _FMT_CONV = re.compile(r"%[-0-9.]*[a-zA-Z]")
 _PASSED_AFTER_NAME = (
     r'("[A-Za-z_][A-Za-z0-9_]*"|&?(?:PTR_)?DAT_[0-9a-fA-F]+|"[^"]*\.(?:c|h|cpp)")\s*,\s*'
 )
+# Format-string evidence for a line-number argument: a literal holding a ``%…s`` conversion followed
+# later by a ``%…d`` / ``%…u`` / ``%…i`` one (a name-then-line log format such as ``"%s:%d"``).
+_FMT_EVIDENCE = re.compile(r'"[^"]*%[^"%]*s[^"]*%[^"%]*[dui][^"]*"')
 # The site classes a recompile explains: a line number, a line number by the first %d of a format,
-# an embedded version / build string.
+# an embedded version / build string. ``Lw`` (a weak line number: an identifier-shaped string or an
+# assigned variable without the evidence above) counts as ``L`` only beside a strong ``L`` site of
+# the same pair, else as a changed constant.
 _ACCEPTED_SITES = frozenset({"L", "L2", "V"})
+# The site classes that must all shift by one same nonzero step within a pair.
+_LINE_SITES = frozenset({"L", "Lw", "L2"})
 
 
 def _kind(t: str) -> str:
@@ -414,6 +431,10 @@ def _kind(t: str) -> str:
 
 def _norm(tokens: list[str]) -> list[str]:
     return ["LOCAL" if _kind(t) == "id" and _LOCAL.match(t) else t for t in tokens]
+
+
+# The two sides' own function names (None when synthetic or unknown).
+_Names = tuple[str | None, str | None]
 
 
 @dataclass(frozen=True)
@@ -486,23 +507,34 @@ def _ident_site(ta: str, tb: str, sides: _Sides) -> tuple[str, str]:
     return "U", "identifier changed"
 
 
-def _same_name_string(sides: _Sides, tok_a: str | None, tok_b: str | None) -> bool:
-    """Both tokens are labels of strings with the same text that is a function name or a source
-    path (a __func__ / __FILE__ argument)."""
+def _same_name_string(sides: _Sides, tok_a: str | None, tok_b: str | None) -> str | None:
+    """The quoted text when both tokens are labels of strings with the same text that is
+    identifier-shaped or a source path (a __func__ / __FILE__ argument), else None."""
     if not tok_a or not tok_b:
-        return False
+        return None
     ma, mb = _ADDR_TOK.match(tok_a), _ADDR_TOK.match(tok_b)
     if not ma or not mb:
-        return False
+        return None
     ca, cb = _cstr(sides.ia, int(ma.group(3), 16)), _cstr(sides.ib, int(mb.group(3), 16))
     if not ca or ca != cb:
-        return False
+        return None
     quoted = '"' + ca.decode(errors="replace") + '"'
-    return bool(_IDENT_STR.match(quoted) or _PATH_STR.match(quoted))
+    return quoted if _IDENT_STR.match(quoted) or _PATH_STR.match(quoted) else None
+
+
+def _fmt_near(lines: list[str], i: int) -> bool:
+    """Line ``i`` or the line before it holds a ``%s``-then-``%d`` format literal."""
+    return any(_FMT_EVIDENCE.search(lines[j]) for j in (i - 1, i) if 0 <= j < len(lines))
+
+
+def _strong_name(quoted: str, names: _Names) -> bool:
+    """The string before a number is a source path, or both sides' own function name."""
+    text = quoted[1:-1]
+    return bool(_PATH_STR.match(quoted)) or (bool(text) and names == (text, text))
 
 
 def _entry_sites(
-    la: list[str], lb: list[str], sides: _Sides
+    la: list[str], lb: list[str], sides: _Sides, names: _Names = (None, None)
 ) -> tuple[list[tuple[str, str, str, str]], str | None]:
     """((a token, b token, class, why) per differing site, why the text could not be read as sites
     — ``structural`` / ``too_large`` — or None)."""
@@ -538,7 +570,7 @@ def _entry_sites(
             for k, (p, q) in enumerate(zip(a_toks, b_toks, strict=True)):
                 if p == q:
                     continue
-                sites.append((p, q, *_site(la, lb, ta, tb, x, y, k, sides)))
+                sites.append((p, q, *_site(la, lb, ta, tb, x, y, k, sides, names)))
     return sites, None
 
 
@@ -551,6 +583,7 @@ def _site(
     y: int,
     k: int,
     sides: _Sides,
+    names: _Names = (None, None),
 ) -> tuple[str, str]:
     a_toks, b_toks = ta[x], tb[y]
     p, q = a_toks[k], b_toks[k]
@@ -568,15 +601,24 @@ def _site(
     pb = (tb[y - 1] if y > 0 else []) + b_toks[:k]
     prev_a, prev_b = (pa[-1] if pa else None), (pb[-1] if pb else None)
     prev2_a, prev2_b = (pa[-2] if len(pa) >= 2 else None), (pb[-2] if len(pb) >= 2 else None)
+    # a number after a string is a line number by evidence (L) only beside a format of the
+    # name-then-line shape on both sides, or after a source path / the function's own name; after
+    # any other identifier-shaped string it is weak (Lw)
+    fmt = _fmt_near(la, x) and _fmt_near(lb, y)
     if prev_a == "," and prev_b == ",":
         if (
             prev2_a
             and prev2_a == prev2_b
             and (_IDENT_STR.match(prev2_a) or _PATH_STR.match(prev2_a))
         ):
-            return "L", "number after a function-name / source-path string"
-        if _same_name_string(sides, prev2_a, prev2_b):
-            return "L", "number after a label of the same function-name / source-path string"
+            strong = fmt or _strong_name(prev2_a, names)
+            return ("L" if strong else "Lw"), "number after a function-name / source-path string"
+        quoted = _same_name_string(sides, prev2_a, prev2_b)
+        if quoted is not None:
+            strong = fmt or _strong_name(quoted, names)
+            return (
+                "L" if strong else "Lw"
+            ), "number after a label of the same function-name / source-path string"
     neg = (k >= 3 and a_toks[k - 1] == "-" and a_toks[k - 2] == "+") or (
         k >= 2 and a_toks[k - 1] == "-" and _kind(a_toks[k - 2]) == "id"
     )
@@ -588,7 +630,9 @@ def _site(
     if m:
         use = re.compile(_PASSED_AFTER_NAME + re.escape(m.group(1)) + r"\b")
         if any(use.search(ln) for ln in la) and any(use.search(ln) for ln in lb):
-            return "L", "number assigned to a variable passed after a function-name / path string"
+            # always weak: the evidence sits on another line than the number (the drift reading
+            # reads its L_var the same way)
+            return "Lw", "number assigned to a variable passed after a function-name / path string"
     if (
         k >= 2
         and a_toks[k - 1] == ","
@@ -609,37 +653,52 @@ def _number(t: str) -> int | None:
 
 
 def entry_explained(
-    la: list[str], lb: list[str], delta: dict[str, Any] | None, sides: _Sides
+    la: list[str],
+    lb: list[str],
+    delta: dict[str, Any] | None,
+    sides: _Sides,
+    names: _Names = (None, None),
 ) -> tuple[bool | None, str]:
     """Whether a pair's text difference is all line-number / version sites: (True, why) /
-    (False, why) / (None, why) when it could not be read as sites."""
+    (False, why) / (None, why) when it could not be read as sites. ``names`` are the two sides'
+    own function names (None when synthetic), for the strong line-number test."""
     delta = delta or {}
     calls = delta.get("calls") or {}
     if delta.get("kind") == "structural":
         return False, "structural text change"
     if any((v or {}).get("a") != (v or {}).get("b") for v in calls.values()):
         return False, "call counts differ"
-    sites, why = _entry_sites(la, lb, sides)
+    sites, why = _entry_sites(la, lb, sides, names)
     if why == "too_large":
         return None, "too large to read as sites"
     if why == "structural":
         return False, "structural text change"
     if not sites:
         return False, "no text difference behind the differing reading"
-    l2 = [s for s in sites if s[2] == "L2"]
-    steps = {(_number(b) or 0) - (_number(a) or 0) for a, b, _c, _w in l2}
-    classes = Counter(
-        ("L" if len(steps) == 1 else "C") if c == "L2" else c for _a, _b, c, _w in sites
-    )
-    kinds = set(classes)
+    lines = [s for s in sites if s[2] in _LINE_SITES]
+    steps = {_step(a, b) for a, b, _c, _w in lines}
+    if steps and (len(steps) != 1 or None in steps or 0 in steps):
+        first = lines[0]
+        return False, (
+            "line-number sites do not shift by one nonzero step: "
+            f"{first[0][:_QUOTE]} -> {first[1][:_QUOTE]}"
+        )
+    # weak line-number sites count only beside a strong one; else they are changed constants
+    strong = any(c == "L" for _a, _b, c, _w in sites)
+    weak_as = "L" if strong else "C"
+    sites = [(a, b, weak_as if c == "Lw" else "L" if c == "L2" else c, w) for a, b, c, w in sites]
+    kinds = {c for _a, _b, c, _w in sites}
     if delta.get("line_number_form") and kinds <= {"L", "C"}:
         kinds -= {"C"}  # the view's own reading: every changed number is a line-number argument
     if kinds and kinds <= _ACCEPTED_SITES:
         return True, "line-number / version sites"
-    first = next(
-        s for s in sites if s[2] not in _ACCEPTED_SITES or (s[2] == "L2" and len(steps) != 1)
-    )
+    first = next(s for s in sites if s[2] not in _ACCEPTED_SITES)
     return False, f"{first[3]}: {first[0][:_QUOTE]} -> {first[1][:_QUOTE]}"
+
+
+def _step(a: str, b: str) -> int | None:
+    na, nb = _number(a), _number(b)
+    return None if na is None or nb is None else nb - na
 
 
 # ── the judgement ────────────────────────────────────────────────────────────────────────────
@@ -742,7 +801,7 @@ def _judge(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
         _run(atlas, diff_id, st)
     except _UnexplainedError as stop:
         return {"value": False, "rule": RULE, "unexplained": stop.detail}
-    except (sqlite3.Error, ValueError, struct.error) as exc:  # an input that would not read
+    except Exception as exc:  # noqa: BLE001 — an input that would not read, or a reading bug
         st.unknown_because(f"reading_failed:{type(exc).__name__}")
     out: dict[str, Any] = {
         "value": None if st.unknown else True,
@@ -862,8 +921,12 @@ def _run(atlas: sqlite3.Connection, diff_id: str, st: _State) -> None:
         lb = (bodies_b.get(p.addr_b) or {}).get("pseudocode")
         if not la or not lb:
             raise _UnexplainedError("pair_differs_without_text", entry_id=e.entry_id)
+        names = (
+            p.name_a if p.name_a and not pv._is_synthetic_name(p.name_a, p.addr_a) else None,
+            p.name_b if p.name_b and not pv._is_synthetic_name(p.name_b, p.addr_b) else None,
+        )
         ok, why = entry_explained(
-            la.splitlines(), lb.splitlines(), deltas.get((p.addr_a, p.addr_b)), sides
+            la.splitlines(), lb.splitlines(), deltas.get((p.addr_a, p.addr_b)), sides, names
         )
         if ok is None:
             st.unknown_because(f"pair_not_read_as_sites:{e.entry_id}")
@@ -991,6 +1054,9 @@ def _bytes(
     ia, ib = sides.ia, sides.ib
     if ia.unavailable or ib.unavailable:
         st.unknown_because(f"blocks_unreadable:{ia.unavailable or ib.unavailable}")
+        return
+    if not (ia.complete and ib.complete):  # bytes past a cut were never stored, so never compared
+        st.unknown_because("data_blocks_truncated")
         return
     if _unaddressed_blocks(atlas, run_a, sha_a, ia) or _unaddressed_blocks(atlas, run_b, sha_b, ib):
         st.unknown_because("block_without_address")

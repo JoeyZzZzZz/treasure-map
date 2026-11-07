@@ -1183,6 +1183,8 @@ class PairReview:
     report: dict[str, Any]
     k: int
     audits: Audits = field(default_factory=Audits)
+    # The navigation facts (review_navigation.PairNavigation) when read with navigation=True.
+    navigation: Any = None
 
     def unit(self, uid: str) -> Unit | None:
         return next((u for u in self.units if u.unit_id == uid), None)
@@ -1215,11 +1217,14 @@ def review_pair(
     pair_staleness: dict[str, Any],
     server_commit: str | None,
     cache: _DiffCache | None = DIFF_CACHE,
+    navigation: bool = False,
 ) -> PairReview:
     """Read the pair's review: facts (each diff's through ``cache``), units, progress and report.
     ``pair_staleness`` is the caller's reading of the two runs (``source_stale`` /
     ``source_stale_reason``) for the binary_presence and file judgements; each diff's own
-    staleness is read here."""
+    staleness is read here. ``navigation`` also reads the navigation facts (dispatch and upstream
+    groups, lib/query/review_navigation) into ``PairReview.navigation`` and the report's
+    ``dispatch_groups`` / ``upstream_groups`` — only for a caller that shows them."""
     # The staleness each diff's view reads (patch_view's own reference to it), so a judgement here
     # reads exactly as it does on the diff's page.
     from treasure_map.lib.query import patch_view as pv
@@ -1275,13 +1280,16 @@ def review_pair(
         presence_short=short,
         reduce_owed=owed,
     )
-    # F-3 (D13): a navigation grouping of the must-read entries by the string-keyed edge that
-    # enumerates their function (dispatch tables / strcmp gates). Moves nothing — units, ids and
-    # must_read are already fixed above; this only annotates.
-    from treasure_map.lib.query import dispatch_groups as _dg
+    nav = None
+    if navigation:
+        # F-3 / F-4: the dispatch groups (by the string-keyed edge that enumerates an entry's
+        # function) and the upstream library groups. Moves nothing — units, ids and must_read are
+        # already fixed above; this only annotates.
+        from treasure_map.lib.query import review_navigation as _nav
 
-    rep["dispatch_groups"] = _dg.report_block(_dg.from_review(atlas, facts, units))
-    return PairReview(facts, units, progress, rep, k, audits)
+        nav = _nav.read(atlas, facts, units, lambda u: unit_disposed(u, progress.states))
+        rep.update(nav.report)
+    return PairReview(facts, units, progress, rep, k, audits, nav)
 
 
 def pair_staleness(

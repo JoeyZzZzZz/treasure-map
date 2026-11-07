@@ -26,8 +26,9 @@ of the writing server's session — recorded with the write in overlay_history a
 
 ``rows_partial`` (with ``unit_delivered`` or ``fetched``): the subject is an entry whose candidate
 rows this session read only part of — the windows its unit's material and its own reads held
-(``unit_rows`` / ``rows_read`` in the log) leave some of its ``rows_total`` out. The judgement still
-counts as disposed; the report counts it under ``basis_incomplete``.
+(``unit_rows`` / ``rows_read`` in the log) leave some of its ``rows_total`` out, or it was read by
+entry id with no window logged at all (fail-closed). The judgement still counts as disposed; the
+report counts it under ``basis_incomplete``.
 
 LIMIT, stated wherever this is reported: a subagent shares its parent's MCP connection, so in
 serial use "the same session" is the same window, not the same context — there ``unit_delivered``
@@ -158,9 +159,12 @@ def _rows_partial(
 ) -> bool:
     """Whether the row windows this session read of the entry (``unit_rows`` of the deliveries
     in ``delivered``, ``rows_read`` of its own reads) leave part of its candidate rows unread.
-    False when no window of it was logged (nothing to say) or one window holds them all."""
+    False when nothing of it was read by entry id (nothing to say) or one window holds them all.
+    FAIL-CLOSED: a read of it by entry id that logged no window says nothing of the rows it held,
+    so with no window logged at all it counts as partial."""
     keys = {anchor_ref, entry_id} - {None}
     windows: list[list[int]] = []
+    unlogged = False
     for i in delivered:
         rows = lines[i].get("unit_rows")
         if isinstance(rows, dict):
@@ -168,10 +172,13 @@ def _rows_partial(
     for ln in lines:
         if ln.get("tool") != "get_diff_patch_view" or ln.get("error"):
             continue
-        if (ln.get("params") or {}).get("entry_id") in keys and _is_window(ln.get("rows_read")):
-            windows.append(ln["rows_read"])
+        if (ln.get("params") or {}).get("entry_id") in keys:
+            if _is_window(ln.get("rows_read")):
+                windows.append(ln["rows_read"])
+            else:
+                unlogged = True
     if not windows:
-        return False
+        return unlogged
     total = max(w[2] for w in windows)
     reach = 0
     for start, end, _ in sorted(windows):

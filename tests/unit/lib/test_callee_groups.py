@@ -549,7 +549,8 @@ def test_the_reduce_is_handed_out_by_its_page(
 
     MUTATION (verified RED, 1 failed, AssertionError): drop REDUCE from mcp_app._PAGED_KINDS
     (hand out every owed member) -> RED; count a reduce's members by their judgements' state
-    (``_owed`` without its reduce case, as before) -> members_after_this_page 0 -> RED."""
+    (``_owed`` without its reduce case, as before) -> members_after_this_page 0 -> RED; count the
+    unit head's members_disposed by state (``_ru.disposed``) -> head says 4 -> RED."""
     from treasure_map import mcp_app
 
     w = _world(tmp_path)
@@ -572,6 +573,8 @@ def test_the_reduce_is_handed_out_by_its_page(
         # group_ref): the ones the page leaves out are all counted, none as disposed.
         assert out["members_after_this_page"] == total - len(page), (budget, page)
         assert out["members_disposed"] == 0, budget
+        # The unit head says the same (it is built apart from the paged top-level count).
+        assert (out.get("unit") or {}).get("members_disposed") == 0, (budget, out.get("unit"))
         if 0 < len(page) < total:
             cut_seen += 1
     assert cut_seen, "no budget cut the reduce's owed list part-way: the precondition did not hold"
@@ -608,3 +611,47 @@ def test_a_compacted_batch_answer_keeps_each_results_group_ref(
     assert all("anchor_ref" not in r for r in results), results
     assert "overwrote_by" in cut, sorted(cut)
     assert [r.get("group_ref") for r in results] == [ref] * len(items), results
+
+
+def test_a_group_material_names_the_call_that_reads_on_a_members_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A callee group whose member P1 has 35 candidate rows: the group's material carries the
+    first page of them (``rows_next_offset`` 20) and names the call that reads the rest
+    (``read_rows``), and that member is not logged as shown whole (``unit_whole``) — its judgement
+    is not read as every row read.
+
+    MUTATION (verified RED, 1 failed): in _group_material leave read_rows out of the material ->
+    RED."""
+    from tests.unit.lib.test_diff_review import _row
+    from tests.unit.lib.test_patch_view import _ref
+    from treasure_map import mcp_app
+    from treasure_map.lib import tool_call_log as tcl
+    from treasure_map.lib.query import sink_overlay as so
+
+    w = _world(tmp_path)
+    rows = [
+        _row(_ref("runA", P1[0], "cmd", f"0x{16 + j:x}"), None, reason="present_different_callee")
+        for j in range(35)
+    ]
+    monkeypatch.setattr(
+        pv,
+        "compute_sink_overlay",
+        lambda atlas, diff_id: so.SinkOverlayResult(
+            list(rows), so.SinkOverlayCoverage(0, 0, 0, 0, 0, False)
+        ),
+    )
+    group = next(u for u in _review(w).units if u.kind == ru.GROUP)
+    member = _pair_id(*P1)
+    assert member in {m.entry_id for m in group.members}  # the precondition
+    out = mcp_app.make_tools(w.path)["start_diff_review"](
+        run_pair="runA::runB", unit=group.unit_id, k=50
+    )
+    mat = out.get("material") or {}
+    by_id = {e.get("entry_id"): e for e in mat.get("entries") or []}
+    assert member in by_id, sorted(by_id)
+    assert (by_id[member].get("rows_total"), by_id[member].get("rows_next_offset")) == (35, 20)
+    assert "rows_offset=<rows_next_offset>" in (mat.get("read_rows") or ""), sorted(mat)
+    line = tcl.build_line(tcl.Session(id="s"), "start_diff_review", {"unit": group.unit_id}, out)
+    assert member not in (line.get("unit_whole") or []), line.get("unit_whole")
+    assert (line.get("unit_rows") or {}).get(member) == [0, 20, 35], line.get("unit_rows")

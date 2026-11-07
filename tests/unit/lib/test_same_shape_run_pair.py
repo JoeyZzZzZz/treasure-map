@@ -1,7 +1,8 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""The same-shape group across every diffed binary of a run pair (lib/query/same_shape_run_pair),
-asked of same_shape_siblings by passing the run pair as its diff_id.
+"""The same-shape group across every binary of a run pair's two runs
+(lib/query/same_shape_run_pair), asked of same_shape_siblings by passing the run pair as its
+diff_id.
 
 Zero real data: every run, binary, address, literal and function name is synthetic. Two runs, six
 diffed binaries and one binary no diff covers; each run has its own analysis.db holding the
@@ -120,12 +121,23 @@ class PairWorld:
         sink: str = "system",
         flow: str = FREE,
         lits: tuple[str, ...] = (),
+        cls: str = "cmd",
+        sink_class: str = "cmd",
+        path: str | None = None,
     ) -> str:
-        ref = _ref(run, func, "cmd", off, sha[:8])
+        ref = _ref(run, func, cls, off, sha[:8])
         self.atlas.execute(
             "INSERT INTO instance (pattern_id, evidence_ref, source_run_id, binary_content_hash, "
             "binary_path, sink_anchor, flow_evidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (self._pattern(fp), ref, run, sha, f"/fw/bin/{sha[:4]}", sink, flow),
+            (
+                self._pattern(fp, sink_class),
+                ref,
+                run,
+                sha,
+                path or f"/fw/bin/{sha[:4]}",
+                sink,
+                flow,
+            ),
         )
         side = "a" if run == "runA" else "b"
         if sha in self.bid:
@@ -144,17 +156,18 @@ class PairWorld:
             (self.bid[sha], value, f"0x{func}"),
         )
 
-    def _pattern(self, fp: str) -> int:
+    def _pattern(self, fp: str, sink_class: str = "cmd") -> int:
+        shape = f"shape_{fp}" if sink_class == "cmd" else f"shape_{fp}_{sink_class}"
         row = self.atlas.execute(
-            "SELECT pattern_id FROM pattern WHERE call_sequence_shape = ?", (f"shape_{fp}",)
+            "SELECT pattern_id FROM pattern WHERE call_sequence_shape = ?", (shape,)
         ).fetchone()
         if row is not None:
             return int(row[0])
         cur = self.atlas.execute(
             "INSERT INTO pattern (source_class, sink_class, call_sequence_shape, "
             "structural_fingerprint, fingerprint_algo_version) VALUES "
-            "('external_input', 'cmd', ?, ?, ?)",
-            (f"shape_{fp}", fp, FPV),
+            "('external_input', ?, ?, ?, ?)",
+            (sink_class, shape, fp, FPV),
         )
         return int(cur.lastrowid or 0)
 
@@ -179,8 +192,9 @@ def _build(w: PairWorld, bulk: int = 12) -> None:
     w.call("runA", BINS["libz"][0], "00001000")
     assert w.call("runB", MISSING_B, "00001000") == MISS
     assert w.call("runB", FAILED_B, "00001000") == FAIL
-    # No diff covers libnd: its calls are never members, its literals still count toward how many
-    # functions of the run reference one (B: COMMON 3, OTHER 2, RARE 1; A: each of the three 2).
+    # No diff covers libnd: its call is a member with diffed false (sharing COMMON), and its
+    # literals count toward how many functions of the run reference one (B: COMMON 3, OTHER 2,
+    # RARE 1; A: each of the three 2).
     assert w.call("runB", NOT_DIFFED[1], "00001000", lits=(COMMON,)) == ND
     w.lit("b", NOT_DIFFED[1], "00002000", COMMON)
     w.lit("b", NOT_DIFFED[1], "00003000", OTHER)
@@ -227,7 +241,7 @@ def _default_order(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
         members,
         key=lambda m: (
-            m["diff_id"],
+            m["diff_id"] or "~" + (m.get("binary") or ""),
             m["side"],
             m["function_entry"] or "",
             m["call_addr"] or "",
@@ -242,8 +256,8 @@ def _default_order(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def test_a_run_pair_in_diff_id_finds_the_shape_in_the_other_diffed_binaries(
     world: PairWorld,
 ) -> None:
-    """The run pair as diff_id: the input's key, read in every diffed binary on both sides; the
-    binary no diff covers is not drawn in, nor another sink or another fingerprint.
+    """The run pair as diff_id: the input's key, read in every diffed binary on both sides (and
+    in the binary no diff covers, counted apart), not another sink or another fingerprint.
 
     MUTATION (verified RED, 1 failed): read only the input's diff (_scope_side keeps the diff
     whose id is the input's) -> sides.b.by_binary lacks aa_other -> RED."""
@@ -264,10 +278,11 @@ def test_a_run_pair_in_diff_id_finds_the_shape_in_the_other_diffed_binaries(
         "libx": 1,
         "zz_target": 1,
     }
-    assert g["member_count"] == 16 + 17
-    assert g["members_outside_input_diff"] == 16 + 17 - 3
+    assert g["sides"]["b"]["by_binary_not_diffed"] == {"dddd": 1}
+    assert g["member_count"] == 16 + 18
+    assert g["members_outside_input_diff"] == 16 + 18 - 3
     refs = {m["evidence_ref"] for m in _all_members(world, INPUT)}
-    assert ND not in refs and TARGET in refs and INPUT in refs
+    assert ND in refs and TARGET in refs and INPUT in refs
     assert g["diffs_in_scope"] == 6
 
 
@@ -312,7 +327,7 @@ def test_a_member_whose_literals_cannot_be_read_sits_above_those_sharing_none(
     unknown = {m["evidence_ref"] for m in members if m["shared_literals"] is None}
     assert unknown == {MISS, FAIL}, unknown
     assert tiers == sorted(tiers, key=["shares", "unknown", "none"].index), tiers
-    assert tiers.count("shares") == 4 and tiers.count("none") == len(tiers) - 6
+    assert tiers.count("shares") == 5 and tiers.count("none") == len(tiers) - 7
     g = _sib(world, evidence_ref=INPUT)
     assert g["sides"]["b"]["literal_unknown_members"] == 2
     assert g["bounds"]["literals_unreadable"] == {
@@ -335,6 +350,12 @@ def test_the_key_is_the_one_diff_key_unchanged(world: PairWorld) -> None:
     assert len(members) == g["member_count"] > 0
     seen: dict[tuple[str, str], int] = {}
     for m in members:
+        if not m["diffed"]:  # no one-diff group: its own binary's calls give it the same key
+            run = "runA" if m["side"] == "a" else "runB"
+            sha = NOT_DIFFED[0] if m["side"] == "a" else NOT_DIFFED[1]
+            own = ss._groups(ss._calls(world.atlas, run, sha))
+            assert m["evidence_ref"] in {c.ref for c in own.get(g["f2_key"], [])}, m
+            continue
         one = _sib(world, diff_id=m["diff_id"], evidence_ref=m["evidence_ref"])
         assert "error" not in one, one
         assert f"#f2:{g['f2_key']}:{m['side']}@" in one["group_ref"], one["group_ref"]
@@ -390,7 +411,7 @@ def test_a_function_level_input_gets_its_shapes_with_pair_counts(world: PairWorl
             "f2_key": ss.f2_key("fp_cmd", "system", "free_string"),
             "sink_anchor": "system",
             "kind": "free_string",
-            "member_count": {"a": 16, "b": 17},
+            "member_count": {"a": 16, "b": 18},
         }
     ]
     page = _sib(world, evidence_ref=FALLBACK, members_offset=0)
@@ -448,7 +469,216 @@ def test_one_binary_diff_ids_are_not_the_run_pair_scope(world: PairWorld) -> Non
     )
     world.commit()
     assert rp.run_pair_scope(world.atlas, PAIR) == ("runA", "runB")
-    assert _sib(world, evidence_ref=INPUT)["member_count"] == 33
+    assert _sib(world, evidence_ref=INPUT)["member_count"] == 34
+
+
+# ── the binaries no diff covers ─────────────────────────────────────────────────────────────
+
+
+def test_a_member_in_a_binary_no_diff_covers_is_listed_with_diffed_false(world: PairWorld) -> None:
+    """libnd (no diff covers it) holds one call of the key on B: it is a member with diffed
+    false, a null diff_id, its binary and not_diffed_reason, ordered by the literal it shares like
+    any other member (COMMON, referenced by 3 functions of B: after TARGET_A), and counted per side
+    and reason in bounds.not_diffed_same_shape; a call of the same binary with another fingerprint
+    is no member. The reason is the one-diff group's for that binary (one classifier).
+
+    MUTATION (verified RED, 8 failed): drop the calls of binaries no diff covers in _read_calls
+    (``if key not in scope.diff_of: continue``) -> ND is not listed -> RED.
+    MUTATION (verified RED, 2 failed): order a not-diffed member after every diffed one (put
+    diffed-ness before the literal tier in _Member.order) -> ND falls below the unknown tier ->
+    RED."""
+    world.call("runB", NOT_DIFFED[1], "00005000", fp="fp_other")
+    world.commit()
+    members = _all_members(world, INPUT)
+    by_ref = {m["evidence_ref"]: m for m in members}
+    assert ND in by_ref, sorted(by_ref)
+    nd = by_ref[ND]
+    assert nd.get("diffed") is False and nd.get("diff_id") is None, nd
+    assert nd.get("binary") == "dddd" and nd.get("not_diffed_reason") == "binary_not_diffed", nd
+    assert nd["shared_literals"] == 1 and nd["rarest_shared_literal_df"] == 3
+    assert [m["evidence_ref"] for m in members].index(ND) == 4
+    assert all(m.get("diffed") is True and m["diff_id"] for m in members if m is not nd)
+    g = _sib(world, evidence_ref=INPUT)
+    zero = {"binaries": 0, "members": 0}
+    assert g["bounds"]["not_diffed_same_shape"] == {
+        "a": {"members": 0, "binaries": 0, "by_reason": dict.fromkeys(ss.NOT_DIFFED_REASONS, zero)},
+        "b": {
+            "members": 1,
+            "binaries": 1,
+            "by_reason": {
+                **dict.fromkeys(ss.NOT_DIFFED_REASONS, zero),
+                "binary_not_diffed": {"binaries": 1, "members": 1},
+            },
+        },
+    }
+    side_b = g["sides"]["b"]
+    assert side_b["not_diffed_members"] == 1 and side_b["not_diffed_binaries"] == 1
+    assert side_b["member_count"] == sum(side_b["by_binary"].values()) + 1
+    # The one-diff bound gives that binary the same reason; it counts by sink name and kind, so
+    # the other-fingerprint call is counted there and is no member here.
+    b_ref = _ref("runB", "00002000", "cmd", "0x10", "22222222")
+    one = _sib(world, diff_id=_diff("libx"), evidence_ref=b_ref)
+    assert one["sibling_set_bounds"]["binaries_not_diffed"]["binary_not_diffed"] == {
+        "binaries": 1,
+        "calls": 2,
+    }
+
+
+def test_a_binary_identical_on_both_sides_gives_members_on_both_with_that_reason(
+    world: PairWorld,
+) -> None:
+    """A binary with the same content in both runs is diffed by no diff (there was nothing to
+    diff): its calls of the key are members on each side, with the reason identical_both_sides.
+
+    MUTATION (verified RED, 1 failed): give every not-diffed member the reason binary_not_diffed
+    (``basis.reason`` -> a constant in _read_calls) -> RED."""
+    same = "a" * 64
+    for side, run in (("a", "runA"), ("b", "runB")):
+        cur = world.adb[side].execute(
+            "INSERT INTO binaries (name, sha256, ghidra_status) VALUES ('libsame', ?, 'ok')",
+            (same,),
+        )
+        world.bid[same] = int(cur.lastrowid or 0)
+        world.call(run, same, "00006000", path="/fw/lib/libsame")
+    world.commit()
+    rows = [m for m in _all_members(world, INPUT) if m.get("binary") == "libsame"]
+    assert [(m["side"], m["not_diffed_reason"], m["diffed"]) for m in rows] == [
+        ("a", "identical_both_sides", False),
+        ("b", "identical_both_sides", False),
+    ], rows
+    bound = _sib(world, evidence_ref=INPUT)["bounds"]["not_diffed_same_shape"]
+    assert bound["a"]["by_reason"]["identical_both_sides"] == {"binaries": 1, "members": 1}
+    assert bound["b"]["by_reason"]["identical_both_sides"] == {"binaries": 1, "members": 1}
+
+
+# ── staleness, recall gaps, a pair named wrong ──────────────────────────────────────────────
+
+
+def test_the_group_counts_the_pairs_diffs_by_source_stale_and_says_recall_gaps_are_not_read(
+    world: PairWorld,
+) -> None:
+    """The group object carries source_stale_diffs — every diff of the pair counted by its
+    source_stale as list_diffs gives each (here one stale, the rest unverified) — and
+    bounds.recall_gaps says it is not read at this scope (null families, never an empty list).
+
+    MUTATION (verified RED, 1 failed): count only the input's diff (``[g.inp_diff.diff_id]`` in
+    _group_object) -> diffs 1 -> RED.
+    MUTATION (verified RED, 1 failed): give recall_gaps an empty families list -> RED."""
+    from treasure_map.lib.query.diff_align import diffs_source_staleness, staleness_summary
+
+    g = _sib(world, evidence_ref=INPUT)
+    want = staleness_summary(diffs_source_staleness(world.atlas, [_diff(n) for n in BINS]))
+    assert g.get("source_stale_diffs") == want, g.get("source_stale_diffs")
+    # libmiss's B binary is not in its run's analysis.db (stale); the rest record no generation.
+    assert (want["diffs"], want["stale"], want["unverified"], want["current"]) == (6, 1, 5, 0)
+    assert g["bounds"].get("recall_gaps") == {
+        "families": None,
+        "state": "not_read_at_this_scope",
+    }
+
+
+def test_a_pair_named_the_other_way_round_or_misspelled_gets_a_hint(world: PairWorld) -> None:
+    """A run pair with its runs reversed names the pair the right way round; any other id
+    that is no diff says how a run pair is written. Both keep the 'no diff' sentence.
+
+    MUTATION (verified RED, 2 failed): return "" from pair_hint -> RED."""
+    rev = _sib(world, diff_id="runB::runA", evidence_ref=INPUT)
+    assert rev["error"].startswith("no diff 'runB::runA' in this atlas"), rev
+    assert "the run pair is 'runA::runB'" in rev["error"], rev
+    typo = _sib(world, diff_id="runA::runBx", evidence_ref=INPUT)
+    assert "diff_id='<run_a_id>::<run_b_id>'" in typo["error"], typo
+    assert "other way round" not in typo["error"]
+
+
+def test_the_mcp_tool_hints_diff_id_for_run_pair_and_names_a_reversed_pair(
+    world: PairWorld,
+) -> None:
+    """End to end: run_pair= on same_shape_siblings is refused naming diff_id (the server's
+    unknown-parameter check), and the tool's answer to a reversed pair names the pair.
+
+    MUTATION (verified RED, 1 failed): leave same_shape_siblings out of the run_pair synonym's
+    ``only`` in mcp_cards -> no 'did you mean' -> RED."""
+    import asyncio
+
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    server = mcp_app.build_server(world.path)
+    with pytest.raises(ToolError) as refused:
+        asyncio.run(
+            server.call_tool("same_shape_siblings", {"run_pair": PAIR, "evidence_ref": INPUT})
+        )
+    first = str(refused.value).split("\n", 1)[0]
+    assert first.endswith("'run_pair' — did you mean 'diff_id'?"), first
+    tool = mcp_app.make_tools(world.path)["same_shape_siblings"]
+    rev = tool("runB::runA", evidence_ref=INPUT)
+    assert "the run pair is 'runA::runB'" in rev.get("error", ""), rev
+
+
+# ── the literal sides, the read-layer refusal, the key not narrowed ──────────────────────────
+
+
+def test_a_b_side_input_reads_its_literals_from_its_own_run(world: PairWorld) -> None:
+    """A B-side input's literals come from run B's analysis.db, and each side's members' from
+    their own run's: TARGET (B, RARE) puts the members sharing RARE first — itself (RARE is
+    referenced by 1 function of B), then INPUT and TARGET_A on A (2 functions of A).
+
+    MUTATION (verified RED, 1 failed): read the input's literals from run A (``runs["a"]`` in
+    _build's _input_literals call) -> state unreadable, every member unknown -> RED.
+    MUTATION (verified RED, 7 failed): read every side's literals from run A (``runs["a"]`` in
+    _build's _side_literals call) -> TARGET's own literals unknown -> RED."""
+    g = _sib(world, evidence_ref=TARGET)
+    assert g["input"]["side"] == "b" and g["input"]["diff_id"] == _diff("zz_target")
+    assert g["shared_literals"]["state"] == "read" and g["shared_literals"]["input_literals"] == 1
+    members = _all_members(world, TARGET)
+    head = [
+        (m["evidence_ref"], m["shared_literals"], m["rarest_shared_literal_df"]) for m in members
+    ]
+    assert head[:3] == [(TARGET, 1, 1), (INPUT, 1, 2), (TARGET_A, 1, 2)], head[:4]
+    assert {m["evidence_ref"] for m in members if m["shared_literals"] is None} == {MISS, FAIL}
+
+
+def test_the_read_layer_refuses_a_stale_run_pair_itself(world: PairWorld) -> None:
+    """same_shape_siblings itself (not only the MCP tool, which refuses first) refuses a run
+    pair one of whose runs is a proven-stale scan, echoing the pair as diff_id.
+
+    MUTATION (verified RED, 1 failed): drop the run-pair branch's ``return {**refusal, ...}`` in
+    same_shape_siblings -> the group answers -> RED."""
+    world.atlas.execute("UPDATE run SET build_hash = 'other' WHERE run_id = 'runB'")
+    world.commit()
+    out = _sib(world, evidence_ref=INPUT)
+    assert out.get("stale_scan") and out.get("diff_id") == PAIR, out
+    assert "members_page_ref" not in out and "member_count" not in out
+    assert out["stale_scan"]["diff_side"] == "b"
+
+
+def test_members_are_not_narrowed_by_granularity_or_sink_class(world: PairWorld) -> None:
+    """Gate (3), the narrowing direction: a wrapper_callsite call and a call recorded under
+    another sink class, both of the key (same fingerprint, sink name and kind), are members — as
+    they are of their own one-diff group.
+
+    MUTATION (verified RED, 1 failed): keep only members of the input's granularity in _build ->
+    the wrapper_callsite call is gone -> RED.
+    MUTATION (verified RED, 1 failed): keep only members of the input's sink class in _build ->
+    the other-class call is gone -> RED."""
+    o_a = BINS["aa_other"][0]
+    wrapped = world.call(
+        "runA",
+        o_a,
+        "00030000",
+        "0x20",
+        cls="cmd_via_wrapper",
+        flow=json.dumps({"source_kind": "free_string", "flow_path": {"wrapper": {"name": "w"}}}),
+    )
+    other_class = world.call("runA", o_a, "00031000", sink_class="exec")
+    world.commit()
+    g = _sib(world, evidence_ref=INPUT)
+    members = {m["evidence_ref"]: m for m in _all_members(world, INPUT)}
+    assert members.get(wrapped, {}).get("key_granularity") == "wrapper_callsite", sorted(members)
+    assert other_class in members
+    assert g["sides"]["a"]["by_binary"]["aa_other"] == 14
+    for ref in (wrapped, other_class):
+        one = _sib(world, diff_id=_diff("aa_other"), evidence_ref=ref)
+        assert one.get("member_count") == 14 and g["f2_key"] in one["group_ref"], one
 
 
 # ── the summary prepared for a write answer ─────────────────────────────────────────────────
@@ -465,9 +695,10 @@ def test_the_summary_is_compact_and_names_the_members_outside_the_input_diff(
     s = rp.run_pair_group_summary(world.atlas, "runA", "runB", evidence_ref=INPUT)
     g = _sib(world, evidence_ref=INPUT)
     assert s["f2_key"] == g["f2_key"]
-    assert s["member_count"] == {"a": 16, "b": 17}
+    assert s["member_count"] == {"a": 16, "b": 18}
+    assert s["not_diffed_members"] == {"a": 0, "b": 1}
     assert s["members_outside_input_diff"] == g["members_outside_input_diff"]
-    assert s["shared_literal_members_outside_input_diff"] == 3
+    assert s["shared_literal_members_outside_input_diff"] == 4
     assert s["binaries_calls_unreadable"] == 2
     assert [m["evidence_ref"] for m in s["first_outside_input_diff"]] == [
         TARGET,
@@ -496,7 +727,7 @@ def test_the_mcp_tool_answers_the_run_pair_and_pages_it_within_the_budget(
     _build(w, bulk=200)
     tool = mcp_app.make_tools(w.path)["same_shape_siblings"]
     g = tool(PAIR, evidence_ref=INPUT)
-    assert g.get("scope") == "run_pair" and g.get("member_count") == 33 + 2 * 188, g
+    assert g.get("scope") == "run_pair" and g.get("member_count") == 34 + 2 * 188, g
     assert len(json.dumps(g)) <= mcp_app._RESPONSE_BYTE_BUDGET
     seen: list[str] = []
     offset: int | None = 0

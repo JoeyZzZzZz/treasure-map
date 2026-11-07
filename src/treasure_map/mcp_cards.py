@@ -179,7 +179,17 @@ _PARAM_SYNONYMS: dict[str, tuple[_Synonym, ...]] = {
             only=(*_DIFF_SCOPED, "get_file_diff", "annotate_diff", "annotate_diff_batch"),
         ),
     ),
-    "run_pair": (_syn("run_a_id", "run_b_id", "diff_id", "run_a", "run_b", only=_DIFF_SCOPED),),
+    "run_pair": (
+        _syn(
+            "run_a_id",
+            "run_b_id",
+            "diff_id",
+            "run_a",
+            "run_b",
+            # same_shape_siblings takes a run pair in its diff_id
+            only=(*_DIFF_SCOPED, "same_shape_siblings"),
+        ),
+    ),
     "diff_id": (_syn("run_pair", only=("get_file_diff",)),),
     "pair": (_syn("run_pair"),),
     "runs": (_syn("run_pair"),),

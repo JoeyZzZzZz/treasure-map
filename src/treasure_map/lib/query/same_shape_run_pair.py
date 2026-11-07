@@ -1,15 +1,19 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""The calls of the same shape as one sink call, across every diffed binary of a run pair.
+"""The calls of the same shape as one sink call, across every binary of a run pair's two runs.
 
 READ-ONLY and DERIVED, like same_shape_siblings (whose one-diff group this widens): it writes
 nothing and draws no conclusion. same_shape_siblings answers it when its ``diff_id`` names a run
 pair (``{run_a}::{run_b}``) instead of one binary's diff.
 
-THE SCOPE is every binary of the run pair that a diff covers, on both sides: side A's calls of each
-diffed binary in run A, side B's in run B, each side read from its own run's candidates as the
-one-diff group reads its side. The input call is looked up in the binary a diff of the pair covers
-on its side (the diff it is a candidate of is echoed as ``input.diff_id``).
+THE SCOPE is every binary of the two runs, on both sides: side A's calls in run A, side B's in run
+B, each side read from its own run's candidates as the one-diff group reads its side. A member in a
+binary a diff of the pair covers carries that diff (``diffed`` true); a member in a binary no diff
+of the pair covers carries ``diffed`` false, a null ``diff_id``, the binary's short name and
+``not_diffed_reason`` (same_shape_siblings.NotDiffedBasis, the reason the one-diff group's
+``binaries_not_diffed`` gives that binary), and is ordered like any other member. The input call is
+looked up in the binary a diff of the pair covers on its side (the diff it is a candidate of is
+echoed as ``input.diff_id``).
 
 THE SHAPE KEY is the one-diff key, unchanged: ``same_shape_siblings.f2_key`` of the pattern's
 structural fingerprint, the sink's name and the kind, computed by the same ``_call`` / ``_Call.key``
@@ -22,28 +26,35 @@ literals of at least ``MIN_LITERAL_LENGTH`` characters, compared by text): membe
 references a literal the input's function references come first, the one whose rarest shared
 literal is referenced by the fewest functions of its own run first, then the one sharing more of
 them; then the members whose literals could not be read (``?`` never sinks below a known none); then
-the members sharing none. Ties, and each tier, follow the diff, the side, then the one-diff order
-(function entry, call address, evidence_ref). The literals only order the list — they are never
-part of the key and never a reading of the change.
+the members sharing none. Ties, and each tier, follow the diffed members by diff then side, then
+the members no diff covers by binary name, side and content hash, then the one-diff order (function
+entry, call address, evidence_ref). The literals only order the list — they are never part of the
+key and never a reading of the change.
 
 WHERE A MEMBER LANDED is its own diff's answer, not repeated here (that would build every diff's
 view of the pair for one call): each member carries the ``diff_id`` and ``evidence_ref`` that
-same_shape_siblings takes for its one-diff group, with its landing and its ``group_ref``.
+same_shape_siblings takes for its one-diff group, with its landing and its ``group_ref``. A member
+no diff covers has no landing and no one-diff group to read.
 
 HOW THIS RELATES TO ``binaries_not_diffed``: the one-diff group's ``sibling_set_bounds`` counts
 calls of the same sink name and kind in the binaries of the run that NO diff of the pair covers — a
-different measure (sink name and kind, not shape) over a different set of binaries. This group
-covers only the binaries a diff covers, so the two never count the same call; it does not repeat
-that count, which stays on the one-diff group.
+coarser measure (sink name and kind, not shape). This group lists those binaries' calls of the
+shape itself as members, and ``bounds.not_diffed_same_shape`` counts them per side and reason.
 
-WHAT CAN MAKE THIS GROUP LOOK SMALLER (``bounds``): ``calls_unreadable`` — per side, the diffed
-binaries whose calls could not be read (the diff records no content hash for that side; the run's
-analysis.db records the binary's analysis as other than ok), counted and never read as holding no
-member (the calls such a binary does hold are members all the same); ``literals_unreadable`` —
-per side, binaries whose literals could not be read (not in the run's analysis.db, or an analysis
-recorded as other than ok; their members sit in the unknown tier); ``unkeyed`` — calls of this sink
-name, or with no sink name, that no shape could be given; ``excluded_non_callsite`` —
-function-level candidates of this sink name and kind, per granularity.
+WHAT CAN MAKE THIS GROUP LOOK SMALLER (``bounds``): ``calls_unreadable`` — per side, the binaries
+whose calls could not be read (a diff records no content hash for that side; the run's analysis.db
+records the binary's analysis as other than ok), counted and never read as holding no member (the
+calls such a binary does hold are members all the same); ``literals_unreadable`` — per side,
+binaries whose literals could not be read (not in the run's analysis.db, or an analysis recorded as
+other than ok; their members sit in the unknown tier); ``unkeyed`` — calls of this sink name, or
+with no sink name, that no shape could be given; ``excluded_non_callsite`` — function-level
+candidates of this sink name and kind, per granularity; ``recall_gaps`` — not read at this scope
+(it is a per-binary reading of callee lists; the one-diff group gives it). Beside them,
+``not_diffed_same_shape`` counts the members no diff covers, per side, by reason.
+
+SOURCE STALENESS: ``source_stale_diffs`` counts the pair's diffs by their ``source_stale`` as
+list_diffs gives each (diff_align.diffs_source_staleness / staleness_summary); a member row does
+not repeat its diff's.
 
 ``run_pair_group_summary`` returns a compact summary of one candidate's run-pair group for another
 answer to carry; nothing calls it yet.
@@ -58,15 +69,20 @@ from typing import Any
 
 from treasure_map.lib.query import diff_review
 from treasure_map.lib.query import same_shape_siblings as sss
-from treasure_map.lib.query.diff_align import _is_whole_run_row
+from treasure_map.lib.query.diff_align import (
+    _is_whole_run_row,
+    diffs_source_staleness,
+    staleness_summary,
+)
 from treasure_map.lib.ro_db import ro_connect
 
 RUN_PAIR_SCOPE = "run_pair"
 MIN_LITERAL_LENGTH = 4
 PAIR_MEMBERS_ORDER = (
-    "shared_literal_tier_then_rarest_shared_literal_then_most_shared_then_diff_id_then_side_"
-    "then_function_entry_then_call_address_then_evidence_ref"
+    "shared_literal_tier_then_rarest_shared_literal_then_most_shared_then_diffed_by_diff_id_side_"
+    "then_not_diffed_by_binary_side_then_function_entry_then_call_address_then_evidence_ref"
 )
+RECALL_GAPS_NOT_READ = "not_read_at_this_scope"
 NO_CONTENT_HASH = "no_content_hash"
 ANALYSIS_STATUS = "analysis_status"
 # A binary's analysis.db status that leaves its candidates readable: analysed (``ok``), or analysed
@@ -78,17 +94,17 @@ _IN_CHUNK = 500
 
 _SELECT = (
     "SELECT i.evidence_ref, p.sink_class, i.sink_anchor, i.flow_evidence, "
-    "p.structural_fingerprint, p.fingerprint_algo_version, i.binary_content_hash "
+    "p.structural_fingerprint, p.fingerprint_algo_version, i.binary_content_hash, i.binary_path "
     "FROM instance i JOIN pattern p ON i.pattern_id = p.pattern_id "
 )
 
 _NOTE = (
-    "The calls of this shape in every binary a diff of this run pair covers, both sides; the shape "
-    "key is the one-diff group's. Members whose function shares a literal string with the input's "
-    "function come first: an order to read in, not a reading of the change. Where a member landed "
-    "is its own diff's answer: same_shape_siblings(diff_id=<its diff_id>, evidence_ref=<its "
-    "evidence_ref>). Calls in binaries no diff covers are not members here; the one-diff group "
-    "counts them by sink name and kind (sibling_set_bounds.binaries_not_diffed)."
+    "The calls of this shape in every binary of the two runs, both sides; the shape key is the "
+    "one-diff group's. Members whose function shares a literal string with the input's function "
+    "come first: an order to read in, not a reading of the change. Where a member landed is its "
+    "own diff's answer: same_shape_siblings(diff_id=<its diff_id>, evidence_ref=<its "
+    "evidence_ref>). A member in a binary no diff of the pair covers has diffed false, a null "
+    "diff_id, its binary and not_diffed_reason: it has no landing to read."
 )
 
 
@@ -141,18 +157,43 @@ def probe_diff(atlas: sqlite3.Connection, diff_id: str) -> str | None:
     return _pair_diffs(atlas, *pair)[0].diff_id
 
 
+def pair_hint(atlas: sqlite3.Connection, diff_id: str) -> str:
+    """One sentence for a ``diff_id`` that names neither one binary's diff nor a run pair: the run
+    pair it names the other way round when there is one, else how a run pair is written."""
+    parts = diff_id.split("::")
+    for cut in range(1, len(parts)):
+        run_b, run_a = "::".join(parts[:cut]), "::".join(parts[cut:])
+        if _pair_diffs(atlas, run_a, run_b):
+            pair = diff_review.run_pair(run_a, run_b)
+            return f" Its two runs are the other way round: the run pair is {pair!r}."
+    return (
+        " A run pair is passed as diff_id='<run_a_id>::<run_b_id>', the two ids as list_diffs "
+        "gives them, run_a first."
+    )
+
+
 # ── one side's calls of the shape ───────────────────────────────────────────────────────────
 
 
 @dataclass
 class _Side:
-    """One side of the scope: the diffed binaries by content hash, their calls of the sink (and
-    with no sink name), and the binaries whose calls could not be read, by reason."""
+    """One side of the scope: the diffed binaries by content hash, the run's calls of the sink (and
+    with no sink name) by binary, the binaries no diff covers with their short name and reason,
+    and the binaries whose calls could not be read, by reason. A binary is keyed by its content
+    hash, or ``path:<path>`` when the instance row records none."""
 
     run: str
     diff_of: dict[str, _PairDiff] = field(default_factory=dict)  # sha -> its (first) diff
-    calls: dict[str, list[sss._Call]] = field(default_factory=dict)  # sha -> calls
+    calls: dict[str, list[sss._Call]] = field(default_factory=dict)  # binary key -> calls
+    not_diffed: dict[str, tuple[str | None, str]] = field(default_factory=dict)  # (name, reason)
     unreadable: dict[str, list[str]] = field(default_factory=dict)  # reason -> binary names
+
+    def name(self, side: str, key: str) -> str:
+        """A binary's short name: its diff's binary for a diffed one, else its path's basename."""
+        if key in self.diff_of:
+            d = self.diff_of[key]
+            return d.binary[side] or d.diff_id
+        return self.not_diffed[key][0] or key
 
 
 def _scope_side(diffs: list[_PairDiff], side: str, run: str) -> _Side:
@@ -166,10 +207,13 @@ def _scope_side(diffs: list[_PairDiff], side: str, run: str) -> _Side:
     return out
 
 
-def _read_calls(atlas: sqlite3.Connection, scope: _Side, sink: str) -> None:
-    """The calls of ``sink`` — and those with no sink name, which any shape may be — in the side's
-    diffed binaries, by content hash, in instance order. Filtering by the sink's name loses no
-    member: the name is part of the key."""
+def _read_calls(
+    atlas: sqlite3.Connection, scope: _Side, sink: str, basis: sss.NotDiffedBasis
+) -> None:
+    """The calls of ``sink`` — and those with no sink name, which any shape may be — in every
+    binary of the side's run, by binary, in instance order; a binary no diff covers is recorded
+    with its reason (``basis``). Filtering by the sink's name loses no member: the name is part of
+    the key."""
     for c in scope.diff_of:
         scope.calls.setdefault(c, [])
     for row in atlas.execute(
@@ -177,9 +221,12 @@ def _read_calls(atlas: sqlite3.Connection, scope: _Side, sink: str) -> None:
         "OR i.sink_anchor = '') ORDER BY i.instance_id",
         (scope.run, sink),
     ):
-        sha = row[6]
-        if sha in scope.diff_of:
-            scope.calls[sha].append(sss._call(tuple(row[:6])))
+        sha, path = row[6] or None, row[7]
+        key = sha if sha is not None else f"path:{path}"
+        if key not in scope.diff_of and key not in scope.not_diffed:
+            base = path.rsplit("/", 1)[-1] if path else None
+            scope.not_diffed[key] = (base, basis.reason(sha, path))
+        scope.calls.setdefault(key, []).append(sss._call(tuple(row[:6])))
 
 
 # ── the literals ────────────────────────────────────────────────────────────────────────────
@@ -341,10 +388,12 @@ def _function_names(
 @dataclass(frozen=True)
 class _Member:
     side: str
-    sha: str
-    diff_id: str
+    sha: str  # the binary key: its content hash, or path:<path>
+    diff_id: str | None  # None: no diff of the pair covers its binary
     call: sss._Call
     literal: tuple[int, int | None] | None  # (shared, rarest df) or None when unreadable
+    binary: str | None = None  # a member no diff covers: its binary's short name
+    not_diffed_reason: str | None = None  # ... and why (NOT_DIFFED_REASONS)
 
     def order(self) -> tuple[Any, ...]:
         if self.literal is None:
@@ -353,7 +402,11 @@ class _Member:
             tier = (0, self.literal[1] or 0, -self.literal[0])
         else:
             tier = (2, 0, 0)
-        return (*tier, self.diff_id, self.side, *sss._order(self.call))
+        if self.diff_id is not None:
+            where: tuple[Any, ...] = (0, self.diff_id, self.side, "")
+        else:
+            where = (1, self.binary or "", self.side, self.sha)
+        return (*tier, *where, *sss._order(self.call))
 
 
 @dataclass
@@ -372,6 +425,7 @@ class _Group:
     input_literals: frozenset[str]
     input_literals_error: str | None
     members: list[_Member]  # in PAIR_MEMBERS_ORDER
+    diff_ids: list[str]  # every per-binary diff of the pair
 
 
 def _err(pair: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -448,6 +502,7 @@ def _build(
     """The run-pair group of the input call, or the refusal / the not-a-member answer."""
     runs = {"a": run_a, "b": run_b}
     diffs = _pair_diffs(atlas, run_a, run_b)
+    bases = {s: sss.not_diffed_basis(atlas, run_a, run_b, s) for s in ("a", "b")}
     probe = sss._Meta(pair, runs, {"a": None, "b": None}, {"a": None, "b": None})
     inp = sss._resolve_input(probe, evidence_ref, candidate_anchor)
     if isinstance(inp, str):
@@ -488,7 +543,7 @@ def _build(
             counts = {}
             for s in ("a", "b"):
                 scope = _scope_side(diffs, s, runs[s])
-                _read_calls(atlas, scope, shapes[k].sink)
+                _read_calls(atlas, scope, shapes[k].sink, bases[s])
                 counts[s] = sum(len(sss._groups(cs).get(k, [])) for cs in scope.calls.values())
             f2_keys.append(
                 {
@@ -519,14 +574,12 @@ def _build(
     first = mine[0]
     key = first.key
     sides = {s: _scope_side(diffs, s, runs[s]) for s in ("a", "b")}
-    for scope in sides.values():
-        _read_calls(atlas, scope, first.sink)
+    for s, scope in sides.items():
+        _read_calls(atlas, scope, first.sink, bases[s])
     inp_sha = inp_diff.sha[side]
     assert inp_sha is not None and first.func_entry is not None
     wanted, wanted_error = _input_literals(atlas, runs[side], inp_sha, int(first.func_entry, 16))
-    literals = {
-        s: _side_literals(atlas, runs[s], set(sides[s].diff_of), wanted) for s in ("a", "b")
-    }
+    literals = {s: _side_literals(atlas, runs[s], set(sides[s].calls), wanted) for s in ("a", "b")}
     members: list[_Member] = []
     for s, scope in sides.items():
         status = literals[s].status
@@ -535,11 +588,17 @@ def _build(
             # what it holds: it is counted, and the calls it does hold are members all the same.
             st = status.get(sha)
             if st is not None and st not in _READ_STATUSES:
-                name = scope.diff_of[sha].binary[s] or scope.diff_of[sha].diff_id
-                scope.unreadable.setdefault(f"{ANALYSIS_STATUS}:{st}", []).append(name)
+                scope.unreadable.setdefault(f"{ANALYSIS_STATUS}:{st}", []).append(
+                    scope.name(s, sha)
+                )
+            d = scope.diff_of.get(sha)
+            nd = scope.not_diffed.get(sha, (None, None))
             for c in sss._groups(calls).get(key, []):
                 lit = _member_literal(literals[s], wanted, wanted_error, sha, c)
-                members.append(_Member(s, sha, scope.diff_of[sha].diff_id, c, lit))
+                if d is not None:
+                    members.append(_Member(s, sha, d.diff_id, c, lit))
+                else:
+                    members.append(_Member(s, sha, None, c, lit, scope.name(s, sha), nd[1]))
     members.sort(key=_Member.order)
     return _Group(
         run_a,
@@ -556,25 +615,56 @@ def _build(
         wanted,
         wanted_error,
         members,
+        [d.diff_id for d in diffs],
     )
 
 
+def _ranked(counts: Counter[str], key: str) -> dict[str, Any]:
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    out: dict[str, Any] = {key: dict(ranked[:BY_BINARY_CAP])}
+    if len(ranked) > BY_BINARY_CAP:
+        out[f"{key}_not_listed"] = len(ranked) - BY_BINARY_CAP
+    return out
+
+
 def _side_counts(g: _Group, side: str) -> dict[str, Any]:
+    """One side's members: all of them, then those a diff covers by the diff's binary and those no
+    diff covers by short name (``binaries`` counts both, by binary key)."""
+    scope = g.sides[side]
     ms = [m for m in g.members if m.side == side]
-    by_bin = Counter(g.sides[side].diff_of[m.sha].binary[side] or m.diff_id for m in ms)
-    ranked = sorted(by_bin.items(), key=lambda kv: (-kv[1], kv[0]))
+    diffed = [m for m in ms if m.diff_id is not None]
+    not_diffed = [m for m in ms if m.diff_id is None]
     out: dict[str, Any] = {
         "member_count": len(ms),
-        "binaries": len(by_bin),
-        "by_binary": dict(ranked[:BY_BINARY_CAP]),
+        "binaries": len({m.sha for m in ms}),
+        **_ranked(Counter(scope.name(side, m.sha) for m in diffed), "by_binary"),
+        "not_diffed_members": len(not_diffed),
+        "not_diffed_binaries": len({m.sha for m in not_diffed}),
+        **_ranked(Counter(m.binary or m.sha for m in not_diffed), "by_binary_not_diffed"),
     }
-    if len(ranked) > BY_BINARY_CAP:
-        out["by_binary_not_listed"] = len(ranked) - BY_BINARY_CAP
     shares = [m for m in ms if m.literal is not None and m.literal[0] > 0]
     out["shared_literal_members"] = len(shares)
     out["shared_literal_binaries"] = len({m.sha for m in shares})
     out["literal_unknown_members"] = sum(1 for m in ms if m.literal is None)
     return out
+
+
+def _not_diffed_bound(g: _Group, side: str) -> dict[str, Any]:
+    """The members no diff of the pair covers on one side, by reason: binaries by binary key,
+    members by evidence_ref; every reason is given, 0 included."""
+    found: dict[str, tuple[set[str], set[str]]] = {
+        r: (set(), set()) for r in sss.NOT_DIFFED_REASONS
+    }
+    for m in g.members:
+        if m.side == side and m.diff_id is None:
+            binaries, refs = found[m.not_diffed_reason or sss.NOT_DIFFED_REASONS[-1]]
+            binaries.add(m.sha)
+            refs.add(m.call.ref or "")
+    return {
+        "members": sum(len(r) for _b, r in found.values()),
+        "binaries": len({b for bs, _r in found.values() for b in bs}),
+        "by_reason": {r: {"binaries": len(b), "members": len(c)} for r, (b, c) in found.items()},
+    }
 
 
 def _bounds(g: _Group) -> dict[str, Any]:
@@ -589,11 +679,11 @@ def _bounds(g: _Group) -> dict[str, Any]:
         }
         lits = g.literals[s]
         if g.input_literals_error is not None:
-            literals_unreadable[s] = {"input_literals_unreadable": len(scope.diff_of)}
+            literals_unreadable[s] = {"input_literals_unreadable": len(scope.calls)}
         elif lits.error is not None:
-            literals_unreadable[s] = {"analysis_db_unreadable": len(scope.diff_of)}
+            literals_unreadable[s] = {"analysis_db_unreadable": len(scope.calls)}
         else:
-            missing = sum(1 for sha in scope.diff_of if sha not in lits.status)
+            missing = sum(1 for sha in scope.calls if sha not in lits.status)
             not_ok = sum(
                 1 for st in lits.status.values() if st is not None and st not in _READ_STATUSES
             )
@@ -608,6 +698,8 @@ def _bounds(g: _Group) -> dict[str, Any]:
         "literals_unreadable": literals_unreadable,
         "unkeyed": unkeyed,
         "excluded_non_callsite": excluded,
+        "recall_gaps": {"families": None, "state": RECALL_GAPS_NOT_READ},
+        "not_diffed_same_shape": {s: _not_diffed_bound(g, s) for s in ("a", "b")},
     }
 
 
@@ -649,7 +741,13 @@ def _outside(g: _Group) -> list[_Member]:
     return [m for m in g.members if m.diff_id != g.inp_diff.diff_id]
 
 
-def _group_object(g: _Group, page_ref: dict[str, Any]) -> dict[str, Any]:
+def source_stale_diffs(atlas: sqlite3.Connection, diff_ids: list[str]) -> dict[str, Any]:
+    """The pair's diffs counted by their ``source_stale`` as list_diffs gives each (stale true,
+    unverified null, current false) and by reason."""
+    return staleness_summary(diffs_source_staleness(atlas, diff_ids))
+
+
+def _group_object(atlas: sqlite3.Connection, g: _Group, page_ref: dict[str, Any]) -> dict[str, Any]:
     outside = _outside(g)
     return {
         **_head(g),
@@ -668,6 +766,7 @@ def _group_object(g: _Group, page_ref: dict[str, Any]) -> dict[str, Any]:
         "sides": {s: _side_counts(g, s) for s in ("a", "b")},
         "shared_literals": _literal_block(g),
         "bounds": _bounds(g),
+        "source_stale_diffs": source_stale_diffs(atlas, g.diff_ids),
         "members_order": PAIR_MEMBERS_ORDER,
         "members_page_ref": page_ref,
         "note": _NOTE,
@@ -678,7 +777,13 @@ def _member_row(m: _Member, names: dict[tuple[str, int], str]) -> dict[str, Any]
     c = m.call
     row: dict[str, Any] = {
         "diff_id": m.diff_id,
+        "diffed": m.diff_id is not None,
         "side": m.side,
+    }
+    if m.diff_id is None:
+        row["binary"] = m.binary
+        row["not_diffed_reason"] = m.not_diffed_reason
+    row |= {
         "evidence_ref": c.ref,
         "key_granularity": c.granularity,
         "function_entry": c.func_entry,
@@ -721,7 +826,7 @@ def run_pair_siblings(
             candidate_anchor if candidate_anchor is not None else g.inp_ref
         )
         page_ref["members_offset"] = 0
-        return _group_object(g, page_ref)
+        return _group_object(atlas, g, page_ref)
     total = len(g.members)
     if members_offset >= total and members_offset > 0:
         return _err(
@@ -755,8 +860,9 @@ def run_pair_group_summary(
     first: int = 3,
 ) -> dict[str, Any]:
     """A compact summary of one candidate call's run-pair same-shape group (the ``f2_key`` group
-    across every diffed binary of the pair), for another answer to carry beside a judgement: the
-    key, the member count per side, how many members sit outside the input's diff and how many of
+    across every binary of the pair's two runs), for another answer to carry beside a judgement: the
+    key, the member count per side (and how many of them no diff covers), how many members sit
+    outside the input's diff and how many of
     those share a literal with it, the binaries whose calls could not be read, the first ``first``
     members outside the input's diff in PAIR_MEMBERS_ORDER, and the call that pages the rest. The
     caller checks a stale run first, as same_shape_siblings does. A refusal or a function-level
@@ -776,6 +882,9 @@ def run_pair_group_summary(
         "f2_key": g.key,
         "input_diff_id": g.inp_diff.diff_id,
         "member_count": {s: sum(1 for m in g.members if m.side == s) for s in ("a", "b")},
+        "not_diffed_members": {
+            s: sum(1 for m in g.members if m.side == s and m.diff_id is None) for s in ("a", "b")
+        },
         "members_outside_input_diff": len(outside),
         "shared_literal_members_outside_input_diff": sum(
             1 for m in outside if m.literal is not None and m.literal[0] > 0
@@ -786,6 +895,8 @@ def run_pair_group_summary(
         "first_outside_input_diff": [
             {
                 "diff_id": m.diff_id,
+                "diffed": m.diff_id is not None,
+                **({} if m.diff_id is not None else {"binary": m.binary}),
                 "side": m.side,
                 "evidence_ref": m.call.ref,
                 "shared_literals": None if m.literal is None else m.literal[0],

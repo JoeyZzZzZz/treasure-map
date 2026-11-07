@@ -6517,6 +6517,8 @@ def test_the_anchor_template_rebuilds_every_entrys_anchor(
 # Re-recorded when R entries on an undetermined pairing gained ``pair_evidence`` (the only
 # difference, checked entry by entry with the new key removed: every other key of every entry
 # byte for byte as recorded before; this world gives no ``counterpart_hint``).
+# Re-recorded when ``drift`` was limited to bucket S entries (the only difference: the key removed
+# from the A / B / C entries, every other key of every entry byte for byte as before).
 _FULL_GOLDEN = Path(__file__).resolve().parents[2] / "fixtures" / "patch_view_full_entries.json"
 _GOLDEN_CALLS: dict[str, dict[str, Any]] = {
     "default": {"sort_by": "candidate_tier"},

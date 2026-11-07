@@ -322,15 +322,16 @@ def test_a_unit_written_but_read_as_needs_recheck_is_not_done(
 
 def test_the_unit_prompt_says_judge_the_listed_members_and_read_a_cut_page_first() -> None:
     """★ The unit prompt names the members the page lists, says the unit comes back until all are
-    judged, and that a page with material_cut true is read to its end (read_more / read_one) before
-    judging.
+    judged, and that a page with material_cut true is read to its end (read_more / read_one, and
+    read_rows for a member whose candidate rows go on) before judging.
 
     MUTATION (verified RED, 1 failed): the old prompt text ('Judge EVERY member with …', 'Then
-    stop.') -> RED."""
+    stop.') -> RED; the step-1 text without read_rows -> RED."""
     text = rd.unit_prompt("a::b", ru.Unit("0" * 16, ru.S_BATCH, True, (), "s", 0, 0), 4)
     assert "Judge EVERY member listed in members" in text
     assert "the unit comes back until all its members are judged" in text
     assert "material_cut is true, first read the rest with the read_more / read_one" in text
+    assert "with read_rows for each member whose candidate rows go on" in text
 
 
 def test_an_audit_unit_is_launched_blind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

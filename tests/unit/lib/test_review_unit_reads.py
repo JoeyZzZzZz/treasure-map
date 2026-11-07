@@ -24,6 +24,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
 )
 from treasure_map import mcp_app
 from treasure_map.lib import tool_call_log as tcl
+from treasure_map.lib.query import read_basis as rb
 from treasure_map.lib.query import review_units as ru
 from treasure_map.lib.query import sink_overlay as so
 
@@ -230,3 +231,74 @@ def test_the_row_window_of_a_read_is_logged_from_what_it_returned() -> None:
     )
     assert line.get("unit_rows") == {"e1": [0, 20, 35]}
     assert line.get("unit_whole") == ["e2"]
+
+
+def test_a_batch_member_read_on_only_for_its_first_page_reads_rows_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A 35-row member handed out in a batch (rows 0-20 in the material), then read by entry_id
+    for its first page only (rows 0-20 again) and judged with the unit: ``unit_delivered`` with
+    ``material_cut`` AND ``rows_partial`` — rows 20-35 were never read — counted under
+    ``basis_incomplete``.
+
+    MUTATION (verified RED, 1 failed): on the delivered branch of infer drop the rows_partial
+    check (``if False:``) -> RED."""
+    w = _world(tmp_path, monkeypatch, 20, {"00000003": 35, "00000004": 5})
+    server = mcp_app.build_server(w.path)
+    nu = _call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    big = "pair:00000003:00000003"
+    assert big in _ids(nu), _ids(nu)  # the precondition: the batch holds the 35-row member
+    anchors = {m["entry_id"]: m["anchor_ref"] for m in nu["members"]}
+    one = _call(server, "get_diff_patch_view", {"diff_id": DX, "entry_id": big})
+    assert "error" not in one, one
+    (entry,) = one["entries"]
+    assert (entry["rows_total"], entry["rows_next_offset"]) == (35, 20)  # first page only
+    got = _judge(server, anchors[big], nu["unit_id"])
+    assert got["read_basis"] == {
+        "basis": "unit_delivered",
+        "material_cut": True,
+        "rows_partial": True,
+    }, got["read_basis"]
+    assert anchors[big] in _review(w).audits.basis_incomplete
+
+
+def test_row_windows_with_a_gap_leave_the_entry_partial() -> None:
+    """Windows 0-20 and 25-35 of 35 rows leave rows 20-25 unread: partial. Windows 0-20 and 20-35
+    meet: every row read.
+
+    MUTATION (verified RED, 1 failed): in _rows_partial never stop at a gap
+    (``if start > reach`` -> ``if False``) -> RED."""
+    lines: list[dict[str, Any]] = [
+        {"tool": "get_diff_patch_view", "params": {"entry_id": "e"}, "rows_read": [0, 20, 35]},
+        {"tool": "get_diff_patch_view", "params": {"entry_id": "e"}, "rows_read": [25, 35, 35]},
+    ]
+    assert rb.infer(lines, anchor_ref="a", entry_id="e") == {
+        "basis": "fetched",
+        "rows_partial": True,
+    }
+    lines[1]["rows_read"] = [20, 35, 35]
+    assert rb.infer(lines, anchor_ref="a", entry_id="e") == {"basis": "fetched"}
+
+
+def test_an_entry_read_that_logged_no_row_window_reads_partial() -> None:
+    """FAIL-CLOSED: an entry read by entry id whose log line holds no ``rows_read`` window says
+    nothing of the rows it held, so the read basis carries ``rows_partial`` — never "every row
+    read". A window logged beside it that holds every row settles it; nothing read by entry id
+    says nothing.
+
+    MUTATION (verified RED, 1 failed): in _rows_partial return False when no window was logged
+    (the old default) -> RED."""
+    bare: list[dict[str, Any]] = [{"tool": "get_diff_patch_view", "params": {"entry_id": "e"}}]
+    assert rb.infer(bare, anchor_ref="a", entry_id="e") == {
+        "basis": "fetched",
+        "rows_partial": True,
+    }
+    whole = [
+        *bare,
+        {"tool": "get_diff_patch_view", "params": {"entry_id": "e"}, "rows_read": [0, 5, 5]},
+    ]
+    assert rb.infer(whole, anchor_ref="a", entry_id="e") == {"basis": "fetched"}
+    other: list[dict[str, Any]] = [{"tool": "get_pseudocode", "params": {"function": "1000"}}]
+    assert rb.infer(other, anchor_ref="r#x#function_00001000", entry_id=None) == {
+        "basis": "fetched"
+    }

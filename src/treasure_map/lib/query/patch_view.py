@@ -3930,7 +3930,8 @@ def _page_drift(
     want = [
         (e, e.pair)
         for e in page
-        if e.pair is not None
+        if e.shown_bucket == "S"  # only bucket S: an entry with candidate rows is never folded
+        and e.pair is not None
         and e.pair.aligned
         and page_deltas.get((e.pair.addr_a, e.pair.addr_b)) is not None
         and _sameness_of(e, readings) == sameness.DIFFERS

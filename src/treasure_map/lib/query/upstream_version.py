@@ -20,8 +20,9 @@ versions stated by one binary's strings -> ``unknown``, with the reason; a side 
 read -> ``unknown`` too. ``unknown`` is not "no version". Only the version is given: no advisory
 lookup is made and no reading of the version is offered.
 
-**Upstream groups** (pair review): the pair's diffs whose binaries name the same upstream library
-at the same version on each side, with how many work units each group's diffs hand out. A
+**Upstream groups** (pair review): the pair's diffs whose binaries name the same upstream library,
+with the versions each side states as a fact inside the group (one row per A/B version pair,
+``unknown`` included), and how many work units each group's diffs hand out. A
 navigation annotation only: units, unit ids, ``must_read`` and the must-read set are untouched —
 nothing is filtered, demoted or reordered — and belonging to an upstream library is not a safety
 proof (a fix in an upstream library is a change like any other).
@@ -50,11 +51,13 @@ _V3 = r"(\d+\.\d+\.\d+[a-z]?)"
 class Library:
     """An upstream project: the file names it ships under (``stem`` is fullmatched against the
     name in its unversioned form) and its version banners (``(label, pattern)``, group 1 = the
-    version). No banner -> its binaries' versions are ``unknown`` (``no_banner_rule``)."""
+    version). No banner -> its binaries' versions are ``unknown`` (``no_banner_rule``).
+    ``executable_only``: the rule names programs, so a file name carrying ``.so`` never matches."""
 
     name: str
     stem: str
     banners: tuple[tuple[str, str], ...] = ()
+    executable_only: bool = False
 
 
 # Public upstream projects only; the banners are the projects' own version strings.
@@ -89,10 +92,15 @@ LIBRARIES: tuple[Library, ...] = (
         r"libstrongswan.*|libcharon.*|charon|starter",
         (("strongSwan <v>", r"strongSwan (\d+\.\d+\.\d+)"),),
     ),
-    Library("iproute2", r"ip|tc|ss|bridge", (("iproute2-<v>", r"iproute2-(?:ss)?([0-9][0-9.]+)"),)),
+    Library(
+        "iproute2",
+        r"ip|tc|ss|bridge",
+        (("iproute2-<v>", r"iproute2-(?:ss)?([0-9][0-9.]+)"),),
+        executable_only=True,
+    ),
     Library(
         "uclibc",
-        r"(?:lib|ld-)uClibc.*",
+        r"(?:lib|ld-)uClibc(?!\+\+).*",
         (("uClibc <v>", r"uClibc(?:-ng)? (\d+\.\d+\.\d+(?:\.\d+)?)"),),
     ),
     Library(
@@ -162,8 +170,17 @@ def library_of(name: str | None) -> str | None:
     """The upstream library a file name names, or None when no rule's name pattern matches."""
     if not name:
         return None
-    stem = unversioned_name(os.path.basename(name))
-    return next((lib.name for lib, rx in _STEMS if rx.fullmatch(stem)), None)
+    base = os.path.basename(name)
+    stem = unversioned_name(base)
+    shared = stem != base  # the name carried a ``.so`` (versioned or not)
+    return next(
+        (
+            lib.name
+            for lib, rx in _STEMS
+            if rx.fullmatch(stem) and not (lib.executable_only and shared)
+        ),
+        None,
+    )
 
 
 def version_of(library: str, values: Iterable[str | None]) -> tuple[str, dict[str, Any]]:
@@ -183,7 +200,8 @@ def version_of(library: str, values: Iterable[str | None]) -> tuple[str, dict[st
         return UNKNOWN, {"reason": "no_banner_string"}
     if len(seen) > 1:
         return UNKNOWN, {"reason": "several_versions", "versions_seen": sorted(seen)[:4]}
-    ((version, (label, value)),) = seen.items()
+    version = min(seen)  # the one version stated
+    label, value = seen[version]
     return version, {"rule": label, "string": value[:_STRING_CLIP]}
 
 
@@ -357,12 +375,68 @@ def label(info: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 GROUPS_NOTE = (
-    "Navigation only: the diffs whose binaries name the same upstream library (by file name) at "
-    "the same version on each side (by the binary's own banner strings; unknown = no rule or no "
-    "string matched). Units, unit ids and the must-read set are unchanged, nothing is filtered or "
-    "reordered; belonging to an upstream library is not a safety proof, so read each unit as it "
-    "is handed out."
+    "Navigation only: the diffs whose binaries name the same upstream library (by file name), one "
+    "group per library; versions lists each A/B version pair its diffs state (by the binary's own "
+    "banner strings; unknown = no rule or no string matched, on either side). Units, unit ids and "
+    "the must-read set are unchanged, nothing is filtered or reordered; belonging to an upstream "
+    "library is not a safety proof, so read each unit as it is handed out."
 )
+
+
+def upstream_rows(
+    pair: dict[str, dict[str, Any]],
+    units: Iterable[Any],
+    disposed: Any,
+    binary_of: dict[str, str | None],
+    *,
+    diffs_shown: int | None = DIFFS_SHOWN,
+) -> list[dict[str, Any]]:
+    """Every upstream group of the pair, one per library: its diffs (``diff_ids`` and ``binaries``,
+    the first ``diffs_shown`` in binary-name order, None = all), the A/B version pairs they state
+    (``versions``: each with how many of its diffs state it) and how many units they hand out
+    (``units``, ``must_read_units``, ``open_units`` = not yet disposed), the groups handing out the
+    most units first. ``units`` are read, never changed; ``disposed(unit)`` says whether one is."""
+    by_diff: dict[str, list[Any]] = {}
+    for u in units:
+        by_diff.setdefault(u.stream, []).append(u)
+    groups: dict[str, dict[tuple[str, str], list[str]]] = {}
+    for diff_id in sorted(pair):
+        lab = label(pair[diff_id])
+        if lab is not None:
+            groups.setdefault(lab["library"], {}).setdefault((lab["a"], lab["b"]), []).append(
+                diff_id
+            )
+
+    def name(d: str) -> str:
+        return str(binary_of.get(d) or d.rsplit("::", 1)[-1])
+
+    def cut(ids: list[str]) -> list[str]:
+        return ids if diffs_shown is None else ids[:diffs_shown]
+
+    rows: list[dict[str, Any]] = []
+    for lib, by_version in groups.items():
+        diffs = sorted((d for ds in by_version.values() for d in ds), key=lambda d: (name(d), d))
+        us = [u for d in diffs for u in by_diff.get(d, [])]
+        versions: list[dict[str, Any]] = [
+            {"a": va, "b": vb, "diffs": len(ds)} for (va, vb), ds in by_version.items()
+        ]
+        versions.sort(key=lambda v: (-v["diffs"], v["a"], v["b"]))
+        rows.append(
+            {
+                "library": lib,
+                "diffs": len(diffs),
+                "diff_ids": cut(diffs),
+                "binaries": cut([name(d) for d in diffs]),
+                "versions": versions,
+                "units": len(us),
+                "must_read_units": sum(1 for u in us if u.must_read),
+                "open_units": sum(1 for u in us if not disposed(u)),
+            }
+        )
+    # Listed by how many units they hand out (then by name), so a cut keeps the largest; the
+    # units themselves keep their own order.
+    rows.sort(key=lambda r: (-r["units"], r["library"]))
+    return rows
 
 
 def upstream_groups(
@@ -371,37 +445,9 @@ def upstream_groups(
     disposed: Any,
     binary_of: dict[str, str | None],
 ) -> dict[str, Any]:
-    """The pair report's ``upstream_groups``: per (library, version A, version B), its diffs
-    (binary names, the first ``DIFFS_SHOWN``) and how many units they hand out (``units``,
-    ``must_read_units``, ``open_units`` = not yet disposed); the ``GROUPS_SHOWN`` groups handing
-    out the most units, the rest counted. ``units`` are read, never changed; ``disposed(unit)``
-    says whether one is disposed."""
-    by_diff: dict[str, list[Any]] = {}
-    for u in units:
-        by_diff.setdefault(u.stream, []).append(u)
-    groups: dict[tuple[str, str, str], list[str]] = {}
-    for diff_id in sorted(pair):
-        lab = label(pair[diff_id])
-        if lab is not None:
-            groups.setdefault((lab["library"], lab["a"], lab["b"]), []).append(diff_id)
-    rows = []
-    for (lib, va, vb), diffs in sorted(groups.items()):
-        us = [u for d in diffs for u in by_diff.get(d, [])]
-        names = sorted(str(binary_of.get(d) or d.rsplit("::", 1)[-1]) for d in diffs)
-        row: dict[str, Any] = {
-            "library": lib,
-            "a": va,
-            "b": vb,
-            "diffs": len(diffs),
-            "binaries": names[:DIFFS_SHOWN],
-            "units": len(us),
-            "must_read_units": sum(1 for u in us if u.must_read),
-            "open_units": sum(1 for u in us if not disposed(u)),
-        }
-        rows.append(row)
-    # Listed by how many units they hand out (then by name), so a cut keeps the largest; the
-    # units themselves keep their own order.
-    rows.sort(key=lambda r: (-r["units"], r["library"], r["a"], r["b"]))
+    """The pair report's ``upstream_groups``: the ``GROUPS_SHOWN`` groups of :func:`upstream_rows`
+    handing out the most units (each naming its first ``DIFFS_SHOWN`` diffs), the rest counted."""
+    rows = upstream_rows(pair, units, disposed, binary_of)
     rest = rows[GROUPS_SHOWN:]
     return {
         "groups_total": len(rows),

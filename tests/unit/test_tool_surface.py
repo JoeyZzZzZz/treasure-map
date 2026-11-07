@@ -674,6 +674,7 @@ APPENDIX_A: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     ("run_id", ("run_pair", "diff_id"), ("annotate_diff", "annotate_diff_batch")),
     ("run_name", ("run_id",), _ONE_RUN),
     ("run_pair", ("diff_id", "run_a", "run_b"), ("get_diff_sink_overlay",)),
+    ("run_pair", ("diff_id",), ("same_shape_siblings",)),  # its diff_id takes a run pair
     ("run_pair", ("run_a_id", "run_b_id"), ("list_diffs", "list_diff_blindspots")),
     (
         "runs",
@@ -720,7 +721,7 @@ def test_appendix_a_is_what_the_refusal_offers_and_nothing_outside_it_offers_any
     MUTATION (verified RED, 1 failed): drop the (stride, side) veto -> RED."""
     accepted = _accepted()
     want = {(w, t): offer for w, offer, ts in APPENDIX_A for t in ts}
-    assert len(want) == 257
+    assert len(want) == 258
     inputs = {p for ps in accepted.values() for p in ps} | set(cards._PARAM_SYNONYMS) | set(_TYPOS)
     seen = 0
     for wrong in sorted(inputs):

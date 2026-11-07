@@ -16,6 +16,26 @@ A pair reads ``drift_only`` only when ALL of:
   — the same extra gate the R bucket's line-number demotion uses, because the text alone cannot see
   a call added or dropped in a block the decompiler dropped as dead.
 
+The site rules, in short:
+
+* A number that is a string head in the image on both sides (``cstring_at``) is read first: the
+  same text is an address shift (``A_strptr``); a different text, or a head on one side only, is a
+  constant change (``C_num``). Only then are the line-number rules tried.
+* Line-number sites: a number right after the same string argument on both sides — the function's
+  own name (``L_str_own``), a source path (``L_str_path``), another identifier-shaped string
+  (``L_str_ident``) — or after a pointer to such a string (``L_ptr``), or a ``<var> = <num>;`` line
+  whose variable is passed after such an argument on both sides (``L_var``).
+* A line-number site is STRONG when the argument is a source path or the own name, or when both
+  sides have a ``%…s … %…d`` format string on its line or the line before (``_FMT_EVIDENCE``).
+  Any other line-number site is WEAK (``L_var`` always is).
+* In one pair, weak sites count only next to a strong one (else they are constant changes), and
+  every line-number site must shift by one same non-zero step.
+* Address sites: an aligned FUN pair (``A_fun``), a string label of the same text
+  (``A_strlabel``), a DAT label or bare address with the same non-zero bytes (``A_dat`` /
+  ``A_imgaddr``), a PTR slot pointing at the same content (``A_ptr``), a code label
+  (``A_codelabel``), a number in a ``/*`` comment line (``A_comment``), a gp-relative slot with the
+  same GOT target (``A_got``). All-zero bytes tell nothing apart and are not explained.
+
 ``undetermined`` (with ``why``) when an input cannot be read: a side with no text, an image whose
 blocks cannot be read, or a body over the size cap. Not "drift only", and never "no change".
 
@@ -54,6 +74,9 @@ _ADDRTOK = re.compile(
     r"switchdataD|caseD)_(.*?)_?([0-9a-fA-F]{6,8})$"
 )
 _NUM = re.compile(r"^(?:0x[0-9a-fA-F]+|\d+)$")
+# A format string with a ``%…s`` conversion followed later by a ``%…d/u/i`` one: the evidence that
+# an identifier-shaped string argument and the number after it are a "name, line" pair.
+_FMT_EVIDENCE = re.compile(r'"[^"]*%[^"%]*s[^"]*%[^"%]*[dui][^"]*"')
 # The global-pointer register, as the decompiler names it when the text reads it directly. A
 # base is proven gp only by its name here; nothing stored records the register otherwise.
 _GP_NAMES = frozenset({"gp", "unaff_gp", "in_gp", "_gp"})
@@ -151,8 +174,8 @@ class ImageReader:
     def content_at(self, va: int) -> tuple[str, bytes] | None:
         """What ``va`` points at inside the image: ``("str", bytes)`` when it is the head of a
         printable C string, ``("bytes", 16 bytes)`` for other INITIALIZED content, or None — ``va``
-        is not in a loaded block, or in an uninitialized one (``.bss``), whose two sides cannot be
-        told apart by content."""
+        is not in a loaded block, or in an uninitialized one (``.bss``), or its 16 bytes are all
+        zero: such content cannot tell two sides apart."""
         s = self.cstring_at(va)
         if s is not None:
             return ("str", s)
@@ -160,7 +183,7 @@ class ImageReader:
         if blk is None or not blk[3]:
             return None
         raw = self.bytes_at(va, 16)
-        return ("bytes", raw) if raw is not None else None
+        return ("bytes", raw) if raw is not None and any(raw) else None
 
     def _dynstr(self, name_off: int) -> bytes | None:
         if self.strtab is None:
@@ -206,7 +229,8 @@ def read_image(analysis_db_path: str | None, sha: str | None) -> ImageReader:
             return empty
         bid, arch = found
         rows = conn.execute(
-            "SELECT start_addr, size, bytes, initialized FROM data_blocks WHERE binary_id = ?",
+            "SELECT block_name, start_addr, size, bytes, initialized FROM data_blocks "
+            "WHERE binary_id = ?",
             (bid,),
         ).fetchall()
     except Exception:  # noqa: BLE001
@@ -214,7 +238,7 @@ def read_image(analysis_db_path: str | None, sha: str | None) -> ImageReader:
     finally:
         conn.close()
     blocks: list[tuple[int, int, bytes, bool]] = []
-    for start, size, data, init in rows:
+    for _name, start, size, data, init in rows:
         lo = _hex_int(start)
         if lo is not None and isinstance(size, int) and size > 0:
             blocks.append((lo, size, bytes(data or b""), bool(init)))
@@ -234,9 +258,10 @@ _GP_BIAS = 0x7FF0
 
 def _load_dynamic(reader: ImageReader, rows: list[Any]) -> None:
     """Fill ``reader``'s MIPS global-pointer and symbol-table fields from the ``.dynamic`` block, so
-    :meth:`ImageReader.got_target` can resolve a gp-relative slot. Best effort: any miss leaves the
+    :meth:`ImageReader.got_target` can resolve a gp-relative slot. ``rows`` are ``data_blocks``
+    rows ``(block_name, start_addr, size, bytes, initialized)``. Best effort: any miss leaves the
     fields None and gp-relative sites read unexplained."""
-    dyn = next((bytes(d or b"") for name, _s, d, _i in rows if name == ".dynamic"), None)
+    dyn = next((bytes(d or b"") for name, _s, _z, d, _i in rows if name == ".dynamic"), None)
     if not dyn:
         return
     fmt = "<II" if reader.little_endian else ">II"
@@ -315,28 +340,67 @@ def _base_and_sign(prev: list[str]) -> tuple[str, int]:
     return (prev[j] if j >= 0 else ""), sign
 
 
-def _line_var_shift(name: str, lines_a: list[str], lines_b: list[str]) -> bool:
-    """Whether a variable assigned a bare number is later passed right after a name/path string or a
-    DAT pointer on BOTH sides (a line number carried through a variable)."""
-    arg = r'("[A-Za-z_][A-Za-z0-9_]*"|"[^"]*\.(?:c|cc|cpp|h)"|&?(?:PTR_)?DAT_[0-9a-fA-F]+)'
-    use = re.compile(arg + r"\s*,\s*" + re.escape(name) + r"\b")
-    return any(use.search(ln) for ln in lines_a) and any(use.search(ln) for ln in lines_b)
+_VAR_ARG = r'("[A-Za-z_][A-Za-z0-9_]*"|"[^"]*\.(?:c|cc|cpp|h)"|&?(?:PTR_)?DAT_[0-9a-fA-F]+)'
 
 
-def classify_site(ta: str, tb: str, pa: list[str], pb: list[str], ctx: _Ctx) -> str:
+def _passed_after_name(var: str, lines: list[str]) -> bool:
+    """Whether ``var`` is passed right after a name/path string or a DAT pointer on one of
+    ``lines`` (space-joined tokens)."""
+    use = re.compile(_VAR_ARG + r"\s*,\s*" + re.escape(var) + r"\b")
+    return any(use.search(ln) for ln in lines)
+
+
+def _assigned_var(line: list[str]) -> str | None:
+    """The variable of a ``<var> = <num> ;`` line (its raw tokens), else None."""
+    if len(line) == 4 and line[1] == "=" and line[3] == ";" and _kind(line[2]) == "num":
+        return line[0] if _kind(line[0]) == "id" else None
+    return None
+
+
+def _ptr_string(arg_a: str, arg_b: str, ctx: _Ctx) -> str | None:
+    """The quoted text both sides' pointer/label arguments point at, when it is the same string
+    head on both sides, else None."""
+    ma, mb = _ADDRTOK.match(arg_a), _ADDRTOK.match(arg_b)
+    if not (ma and mb):
+        return None
+    ca = ctx.reader_a.cstring_at(int(ma.group(3), 16))
+    cb = ctx.reader_b.cstring_at(int(mb.group(3), 16))
+    if ca is None or ca != cb:
+        return None
+    return '"' + ca.decode("latin-1") + '"'
+
+
+def classify_site(
+    ta: str,
+    tb: str,
+    pa: list[str],
+    pb: list[str],
+    ctx: _Ctx,
+    line_a: list[str] | None = None,
+    line_b: list[str] | None = None,
+) -> str:
     """The rule a differing token pair satisfies (an ``L_*`` / ``A_*`` name when the site is a line
     number or an address shift, else a ``C_*`` / ``U_*`` name that is NOT explained). ``pa`` /
-    ``pb`` are the tokens before the site on each side (the previous line plus this line's head)."""
+    ``pb`` are the tokens before the site on each side (the previous line plus this line's head);
+    ``line_a`` / ``line_b`` the site's whole line (raw tokens) on each side."""
     ka, kb = _kind(ta), _kind(tb)
     if ka == "num" and kb == "num":
-        return _num_site(ta, tb, pa, pb, ctx)
+        return _num_site(ta, tb, pa, pb, ctx, line_a or [], line_b or [])
     if ka == "id" and kb == "id":
         return _id_site(ta, tb, ctx)
     # a string changed, or the kinds differ: not an explained drift
     return "C_str" if ka == "str" and kb == "str" else "U_kind"
 
 
-def _num_site(ta: str, tb: str, pa: list[str], pb: list[str], ctx: _Ctx) -> str:
+def _num_site(
+    ta: str,
+    tb: str,
+    pa: list[str],
+    pb: list[str],
+    ctx: _Ctx,
+    line_a: list[str],
+    line_b: list[str],
+) -> str:
     va, vb = _int(ta), _int(tb)
     if va is None or vb is None:
         return "C_num"
@@ -344,6 +408,16 @@ def _num_site(ta: str, tb: str, pa: list[str], pb: list[str], ctx: _Ctx) -> str:
     prev_b = pb[-1] if pb else ""
     arg_a = pa[-2] if len(pa) >= 2 else ""
     arg_b = pb[-2] if len(pb) >= 2 else ""
+    base_off = prev_a in ("+", "-") and prev_b in ("+", "-")
+    # A number that is a string head in the image is read as a pointer before any line-number
+    # rule: the same text is an address shift, a different text (or a head on one side only) a
+    # constant change. An offset after a base is not an image address and keeps its own rule.
+    if not base_off:
+        sa, sb = ctx.reader_a.cstring_at(va), ctx.reader_b.cstring_at(vb)
+        if sa is not None and sb is not None:
+            return "A_strptr" if sa == sb else "C_num"
+        if sa is not None or sb is not None:
+            return "C_num"
     # a number right after a string-literal argument that is the same on both sides
     if prev_a == "," and prev_b == "," and arg_a == arg_b and _kind(arg_a) == "str":
         rule = _str_rule(arg_a, ctx.own)
@@ -351,17 +425,12 @@ def _num_site(ta: str, tb: str, pa: list[str], pb: list[str], ctx: _Ctx) -> str:
             return rule
     # a number right after a pointer to the same identifier/path string on both sides
     if prev_a == "," and prev_b == ",":
-        ma, mb = _ADDRTOK.match(arg_a), _ADDRTOK.match(arg_b)
-        if ma and mb:
-            ca = ctx.reader_a.cstring_at(int(ma.group(3), 16))
-            cb = ctx.reader_b.cstring_at(int(mb.group(3), 16))
-            if ca is not None and ca == cb:
-                q = '"' + ca.decode("latin-1") + '"'
-                if _IDENT_STR.match(q) or _PATH_STR.match(q):
-                    return "L_ptr"
+        q = _ptr_string(arg_a, arg_b, ctx)
+        if q is not None and (_IDENT_STR.match(q) or _PATH_STR.match(q)):
+            return "L_ptr"
     # a base+offset: explained only when the base is PROVEN gp and both offsets reach the same
     # GOT target; any other base (frame pointer, parameter, local) is not explained.
-    if prev_a in ("+", "-") and prev_b in ("+", "-"):
+    if base_off:
         base_a, sign_a = _base_and_sign(pa)
         base_b, sign_b = _base_and_sign(pb)
         if base_a in _GP_NAMES and base_b in _GP_NAMES:
@@ -377,12 +446,39 @@ def _num_site(ta: str, tb: str, pa: list[str], pb: list[str], ctx: _Ctx) -> str:
             return "A_strptr" if da[0] == "str" else "A_imgaddr"
         if da is not None or db is not None:
             return "C_num"  # one side points at content, the other does not: undecidable
-    # a number assigned to a variable later passed as a line-number argument on both sides
-    for line in ctx.lines_a:
-        m = re.match(r"^\s*(\w+)\s*=\s*(?:0x[0-9a-fA-F]+|\d+);\s*$", line)
-        if m and _line_var_shift(m.group(1), ctx.lines_a, ctx.lines_b):
-            return "L_var"
+    # The site's own line is ``<var> = <num> ;`` on both sides and that variable is passed after a
+    # name/path string or a DAT pointer on both sides: a line number carried through a variable.
+    var_a, var_b = _assigned_var(line_a), _assigned_var(line_b)
+    if (
+        var_a is not None
+        and var_b is not None
+        and _passed_after_name(var_a, ctx.lines_a)
+        and _passed_after_name(var_b, ctx.lines_b)
+    ):
+        return "L_var"
     return "C_num"
+
+
+def _line_site_strong(
+    rule: str, arg_a: str, arg_b: str, around_a: list[str], around_b: list[str], ctx: _Ctx
+) -> bool:
+    """Whether a line-number site (``rule`` in ``_LINE_RULES``) is STRONG: its argument is a source
+    path or the function's own name (a literal or a pointer to one), or both sides have a
+    ``_FMT_EVIDENCE`` format string among ``around_a`` / ``around_b`` (the site's line and the line
+    before). ``L_var`` is never strong."""
+    if rule in ("L_str_own", "L_str_path"):
+        return True
+    if rule == "L_var":
+        return False
+    if rule == "L_ptr":
+        q = _ptr_string(arg_a, arg_b, ctx)
+        if q is not None and (_PATH_STR.match(q) or q[1:-1] in ctx.own):
+            return True
+
+    def fmt(tokens: list[str]) -> bool:
+        return any(_kind(t) == "str" and _FMT_EVIDENCE.search(t) for t in tokens)
+
+    return fmt(around_a) and fmt(around_b)
 
 
 def _id_site(ta: str, tb: str, ctx: _Ctx) -> str:
@@ -423,6 +519,17 @@ def _lines(text: str) -> tuple[list[list[str]], list[list[str]]]:
         raw.append(toks)
         norm.append(_norm(toks))
     return raw, norm
+
+
+def _comment_number(ra: list[str], rb: list[str], k: int) -> bool:
+    """Whether site ``k`` is a number on a line that starts a decompiler comment on both sides
+    (the tokenizer splits ``/*`` into ``/`` and ``*``)."""
+    return (
+        _kind(ra[k]) == "num"
+        and _kind(rb[k]) == "num"
+        and ra[:2] == ["/", "*"]
+        and rb[:2] == ["/", "*"]
+    )
 
 
 def _explained(rule: str) -> bool:
@@ -472,6 +579,8 @@ def drift_reading(
         None, [" ".join(n) for n in norm_a], [" ".join(n) for n in norm_b], autojunk=False
     )
     counts: dict[str, int] = {"line": 0, "address": 0}
+    strong = 0
+    steps: set[int] = set()
     for op, i1, i2, j1, j2 in matcher.get_opcodes():
         if op == "equal":
             continue
@@ -487,15 +596,30 @@ def drift_reading(
             for k, (p, q) in enumerate(zip(na, nb, strict=True)):
                 if p == q:
                     continue
-                if _kind(ra[k]) == "num" and ra[k - 1 : k] == ["/*"]:
-                    counts["address"] += 1  # an address inside a decompiler comment
+                if _comment_number(ra, rb, k):
+                    counts["address"] += 1  # an address inside a decompiler comment (A_comment)
                     continue
-                rule = classify_site(ra[k], rb[k], prev_a + ra[:k], prev_b + rb[:k], ctx)
+                head_a, head_b = prev_a + ra[:k], prev_b + rb[:k]
+                rule = classify_site(ra[k], rb[k], head_a, head_b, ctx, ra, rb)
                 if not _explained(rule):
                     return {"state": NOT_DRIFT_ONLY, "why": f"unexplained site: {rule}"}
-                counts["line" if rule in _LINE_RULES else "address"] += 1
+                if rule in _LINE_RULES:
+                    counts["line"] += 1
+                    steps.add((_int(rb[k]) or 0) - (_int(ra[k]) or 0))
+                    arg_a = head_a[-2] if len(head_a) >= 2 else ""
+                    arg_b = head_b[-2] if len(head_b) >= 2 else ""
+                    if _line_site_strong(rule, arg_a, arg_b, prev_a + ra, prev_b + rb, ctx):
+                        strong += 1
+                else:
+                    counts["address"] += 1
     if counts["line"] == 0 and counts["address"] == 0:
         return {"state": NOT_DRIFT_ONLY, "why": "no differing token site"}
+    # A weak line-number site (an identifier-shaped string with no format-string evidence, a
+    # variable) counts only beside a strong one; and all of them shift by one non-zero step.
+    if counts["line"] and not strong:
+        return {"state": NOT_DRIFT_ONLY, "why": "unexplained site: C_num (no strong line site)"}
+    if counts["line"] and (len(steps) != 1 or 0 in steps):
+        return {"state": NOT_DRIFT_ONLY, "why": "line-number sites do not share one step"}
     # The extra gate the R bucket uses: the text alone cannot see a call in a dropped dead block.
     if callee_state != "equal":
         return {"state": NOT_DRIFT_ONLY, "why": f"callee_set {callee_state or 'unknown'}"}

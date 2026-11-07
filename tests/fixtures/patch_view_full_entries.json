@@ -153,11 +153,7 @@
     "coverage": "unjudged",
     "var_const_total": 0
    },
-   "guards": [],
-   "drift": {
-    "state": "not_drift_only",
-    "why": "delta is structural"
-   }
+   "guards": []
   },
   {
    "entry_id": "pair:00003000:00004000",
@@ -462,11 +458,7 @@
      "const_class": "nonzero",
      "line_b": 5
     }
-   ],
-   "drift": {
-    "state": "not_drift_only",
-    "why": "delta is structural"
-   }
+   ]
   },
   {
    "entry_id": "pair:00101000:00102000",
@@ -994,11 +986,7 @@
     "coverage": "unjudged",
     "var_const_total": 0
    },
-   "guards": [],
-   "drift": {
-    "state": "undetermined",
-    "why": "an image could not be read"
-   }
+   "guards": []
   },
   {
    "entry_id": "pair:00136000:00137000",
@@ -1657,11 +1645,7 @@
     "coverage": "unjudged",
     "var_const_total": 0
    },
-   "guards": [],
-   "drift": {
-    "state": "not_drift_only",
-    "why": "delta is structural"
-   }
+   "guards": []
   },
   {
    "entry_id": "pair:00151000:00152000",
@@ -2094,11 +2078,7 @@
     "coverage": "unjudged",
     "var_const_total": 0
    },
-   "guards": [],
-   "drift": {
-    "state": "not_drift_only",
-    "why": "delta is structural"
-   }
+   "guards": []
   },
   {
    "entry_id": "pair:00003000:00004000",
@@ -2327,11 +2307,7 @@
      "const_class": "nonzero",
      "line_b": 5
     }
-   ],
-   "drift": {
-    "state": "not_drift_only",
-    "why": "delta is structural"
-   }
+   ]
   },
   {
    "entry_id": "pair:00101000:00102000",
@@ -2438,11 +2414,7 @@
     "coverage": "unjudged",
     "var_const_total": 0
    },
-   "guards": [],
-   "drift": {
-    "state": "undetermined",
-    "why": "an image could not be read"
-   }
+   "guards": []
   },
   {
    "entry_id": "pair:00136000:00137000",
@@ -3101,11 +3073,7 @@
     "coverage": "unjudged",
     "var_const_total": 0
    },
-   "guards": [],
-   "drift": {
-    "state": "not_drift_only",
-    "why": "delta is structural"
-   }
+   "guards": []
   },
   {
    "entry_id": "pair:00151000:00152000",
@@ -3485,10 +3453,6 @@
     "var_const_total": 0
    },
    "guards": [],
-   "drift": {
-    "state": "not_drift_only",
-    "why": "delta is structural"
-   },
    "significance": {
     "attention": 0,
     "basis": "sink_callee_swap"
@@ -3651,10 +3615,6 @@
     "var_const_total": 0
    },
    "guards": [],
-   "drift": {
-    "state": "not_drift_only",
-    "why": "delta is structural"
-   },
    "significance": {
     "attention": 0,
     "basis": "matched_call_other_callee"
@@ -4190,10 +4150,6 @@
     "var_const_total": 0
    },
    "guards": [],
-   "drift": {
-    "state": "undetermined",
-    "why": "an image could not be read"
-   },
    "significance": {
     "attention": 0,
     "basis": "sink_candidate_counts"
@@ -5126,10 +5082,6 @@
      "line_b": 5
     }
    ],
-   "drift": {
-    "state": "not_drift_only",
-    "why": "delta is structural"
-   },
    "significance": {
     "attention": 1,
     "basis": "recheckable_no_visible_delta"

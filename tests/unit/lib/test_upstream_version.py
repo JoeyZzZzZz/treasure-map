@@ -11,6 +11,7 @@ binaries are renamed in each run's analysis.db and given synthetic strings."""
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,7 +103,9 @@ def test_no_banner_is_unknown_and_the_library_is_still_named(world: World) -> No
     version (``return UNKNOWN, {"reason": "no_banner_string"}`` -> ``return "1.1", {...}``) ->
     the version reads 1.1 -> RED.
     MUTATION (verified RED, 1 failed): the OpenSSL banner loosened to any dotted version
-    (``r"OpenSSL " + _V3`` -> ``_V3``) -> the noise string "1.1.1" is read as the version -> RED."""
+    (``r"OpenSSL " + _V3`` -> ``_V3``) -> the noise string "1.1.1" is read as the version -> RED.
+    MUTATION (verified RED, 1 failed, an AssertionError): two versions read as the first
+    (``if len(seen) > 1:`` -> ``if False:``) -> the several_versions assertion reddens."""
     for side in ("a", "b"):
         _binary(world, DX, side, LIBCRYPTO, f"/usr/lib/{LIBCRYPTO}", NOISE)
     got = uv.diff_upstream(world.atlas, DX)
@@ -143,7 +146,14 @@ def test_no_banner_is_unknown_and_the_library_is_still_named(world: World) -> No
         ("busybox", "busybox"),
         ("libnl-genl-3.so.200.20.0", "libnl"),
         ("ld-uClibc-0.9.28.so", "uclibc"),
+        ("libuClibc-0.9.33.2.so", "uclibc"),
+        ("libuClibc++-0.2.5.so", None),
+        ("libuClibc++.so.0", None),
         ("/usr/sbin/charon", "strongswan"),
+        ("/sbin/ip", "iproute2"),
+        ("tc", "iproute2"),
+        ("ss.so", None),
+        ("/usr/lib/lua/ip.so", None),
         ("libx", None),
     ],
 )
@@ -152,7 +162,14 @@ def test_identity_is_the_file_name_in_its_unversioned_form(name: str, want: str 
     dropped), and the whole form must match: ``libsslvpn`` is not ``libssl``.
 
     MUTATION (verified RED, 2 failed): ``rx.fullmatch(stem)`` -> ``rx.match(stem)`` ->
-    libsslvpn.so and libcrypto++ read openssl -> RED."""
+    libsslvpn.so and libcrypto++ read openssl -> RED.
+    A rule naming programs (iproute2's ``ip`` / ``tc`` / ``ss``) never matches a name carrying
+    ``.so`` (a loadable module of that name is another project), and ``uClibc++`` (a C++ library)
+    is not uClibc.
+    MUTATION (verified RED, 2 failed): drop the ``executable_only`` check in library_of -> ss.so and
+    ip.so read iproute2 -> RED.
+    MUTATION (verified RED, 2 failed): the uClibc stem back to ``(?:lib|ld-)uClibc.*`` -> the two
+    uClibc++ names read uclibc -> RED."""
     assert uv.library_of(name) == want
 
 
@@ -173,17 +190,25 @@ def test_two_binaries_of_one_name_at_different_paths_are_told_apart(world: World
     assert (y["a"]["path"], y["a"]["version"]) == (f"/opt/app/lib/{LIBCRYPTO}", "1.0.2u"), y
     assert (y["b"]["path"], y["b"]["version"]) == (f"/opt/app/lib/{LIBCRYPTO}", "1.0.2u"), y
     groups = uv.upstream_groups(pair, [], lambda u: False, {DX: "libx", DY: "liby"})
-    keys = [(g["library"], g["a"], g["b"]) for g in groups["groups"]]
-    assert sorted(keys) == [("openssl", "1.0.2u", "1.0.2u"), ("openssl", "1.1.1k", "1.1.1t")]
+    (g,) = groups["groups"]  # one group per library; the two version pairs inside it
+    assert g["library"] == "openssl" and g["diff_ids"] == [DX, DY], g
+    got = sorted((v["a"], v["b"], v["diffs"]) for v in g["versions"])
+    assert got == [("1.0.2u", "1.0.2u", 1), ("1.1.1k", "1.1.1t", 1)], g
 
 
 def test_list_diffs_names_the_library_of_an_upstream_row_only(world: World) -> None:
     """list_diffs carries ``upstream_library`` on a row whose binary name names one, and no key on
     the others. (Its name is the diff's binary name: ``libcrypto.so.1.1`` here.)
 
-    MUTATION (verified RED, 1 failed): drop the list_diffs hook -> RED."""
+    The read layer (lib/query/diff_align.list_diffs) names it; the tool passes it through.
+
+    MUTATION (verified RED, 1 failed): drop the hook in diff_align.list_diffs -> RED."""
+    from treasure_map.lib.query import diff_align as da
+
     world.atlas.execute("UPDATE diff_meta SET binary_a = ? WHERE diff_id = ?", (LIBCRYPTO, DX))
     world.atlas.commit()
+    lib_rows = {r["diff_id"]: r for r in da.list_diffs(world.atlas, "runA", "runB")["diffs"]}
+    assert lib_rows[DX].get("upstream_library") == "openssl", lib_rows[DX]
     out = mcp_app.make_tools(world.path)["list_diffs"](run_a_id="runA", run_b_id="runB")
     rows = {r["diff_id"]: r for r in out["diffs"]}
     assert rows[DX].get("upstream_library") == "openssl", rows[DX]
@@ -218,7 +243,7 @@ def test_an_upstream_entry_that_is_a_real_fix_stays_must_read_after_grouping(
     but for ``upstream_groups``. The group counts the units libx hands out; the note says it is no
     safety proof. End to end through start_diff_review(run_pair=...), within the byte budget.
 
-    MUTATION (verified RED, 1 failed): upstream_groups filters the grouped units out of the
+    MUTATION (verified RED, 3 failed): upstream_groups filters the grouped units out of the
     review's list (``for u in list(units): if label(pair.get(u.stream)): units.remove(u)``)
     -> RED.
     MUTATION (verified RED, 1 failed): upstream_groups demotes them
@@ -242,12 +267,12 @@ def test_an_upstream_entry_that_is_a_real_fix_stays_must_read_after_grouping(
     (g,) = groups["groups"]
     libx_units = [u for u in after if u[4] == DX]
     assert libx_units, after
-    assert (g["library"], g["a"], g["b"], g["diffs"], g["binaries"]) == (
+    assert (g["library"], g["versions"], g["diffs"], g["binaries"], g["diff_ids"]) == (
         "openssl",
-        "1.1.1k",
-        "1.1.1t",
+        [{"a": "1.1.1k", "b": "1.1.1t", "diffs": 1}],
         1,
         ["libx"],
+        [DX],
     ), g
     assert g["units"] == len(libx_units) and g["must_read_units"] == sum(u[2] for u in libx_units)
     assert "not a safety proof" in groups.get("note", ""), groups
@@ -282,3 +307,109 @@ def test_the_groups_are_capped_and_the_rest_counted() -> None:
     assert out["groups_total"] == len(names) and len(out["groups"]) == uv.GROUPS_SHOWN, out
     assert out["groups_not_shown"] == 5 and out["units_not_shown"] == sum(range(5)), out
     assert out["groups"][0]["library"] == names[-1] and out["groups"][0]["units"] == len(names) - 1
+
+
+def test_two_sides_naming_two_libraries_name_neither(world: World) -> None:
+    """★ A diff whose A side is named like one library and B side like another is no library
+    (``libraries_differ``), each side kept as read, and it joins no upstream group — neither name
+    is picked for it.
+
+    MUTATION (verified RED, 1 failed): pick one (``libs.pop() if len(libs) == 1 else None`` ->
+    ``sorted(libs)[0]``) -> the diff reads one library -> RED."""
+    _binary(world, DX, "a", LIBCRYPTO, f"/usr/lib/{LIBCRYPTO}", ["OpenSSL 1.1.1k  1 Jan"])
+    _binary(world, DX, "b", "libz.so.1", "/usr/lib/libz.so.1", ["inflate 1.2.11 Copyright x"])
+    got = uv.diff_upstream(world.atlas, DX) or {}
+    assert got.get("library") is None and got.get("libraries_differ") is True, got
+    assert (got.get("a") or {}).get("library") == "openssl", got
+    assert (got.get("b") or {}).get("library") == "zlib", got
+    groups = uv.upstream_groups(uv.pair_upstream(world.atlas, "runA", "runB"), [], bool, {})
+    assert groups["groups_total"] == 0, groups
+
+
+def test_a_rescan_of_a_side_is_read_again_without_clearing_the_cache(world: World) -> None:
+    """★ The pair reading is cached by the two analysis.dbs' size and mtime: a side whose strings
+    changed (as a re-scan rewrites them) is read again, with no cache clear in between.
+
+    MUTATION (verified RED, 1 failed): key the cache by the diff rows only (drop both
+    ``_stat_key(...)`` parts of the key) -> the old version is served -> RED."""
+    _openssl(world)
+    first = uv.pair_upstream(world.atlas, "runA", "runB")[DX]
+    assert first["a"]["version"] == "1.1.1k", first
+    db = world.tmp / "analysis_a.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE strings SET value = ? WHERE value LIKE 'OpenSSL 1.1.1k%'",
+        ("OpenSSL 1.1.1w  9 Sep",),
+    )
+    conn.commit()
+    conn.close()
+    st = os.stat(db)
+    os.utime(db, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))  # the clock moved on
+    again = uv.pair_upstream(world.atlas, "runA", "runB")[DX]
+    assert again["a"]["version"] == "1.1.1w", again
+
+
+def test_a_diff_whose_versions_are_unknown_stays_in_its_library_group(world: World) -> None:
+    """★ G-2: one group per library, the versions a fact inside it. DX states 1.1.1k -> 1.1.1t; DY
+    (the same library) states no version on either side: both are in the one openssl group, DY as
+    an ``unknown`` / ``unknown`` row — an unknown version is never dropped from the group.
+
+    MUTATION (verified RED, 1 failed): skip a diff with an unknown version
+    (``if lab is not None:`` -> ``if lab is not None and UNKNOWN not in (lab["a"], lab["b"]):``)
+    -> DY is missing -> RED."""
+    _openssl(world)
+    for side in ("a", "b"):
+        _binary(world, DY, side, "libssl.so.1.1", "/usr/lib/libssl.so.1.1", NOISE)
+    groups = uv.upstream_groups(uv.pair_upstream(world.atlas, "runA", "runB"), [], bool, {})
+    (g,) = groups["groups"]
+    assert (g["library"], g["diffs"], g["diff_ids"]) == ("openssl", 2, [DX, DY]), g
+    got = sorted((v["a"], v["b"], v["diffs"]) for v in g["versions"])
+    assert got == [("1.1.1k", "1.1.1t", 1), (uv.UNKNOWN, uv.UNKNOWN, 1)], g
+    assert "one group per library" in groups["note"], groups["note"]
+
+
+def test_the_upstream_groups_are_read_by_the_read_layer_and_rendered_in_the_report_file(
+    world: World,
+) -> None:
+    """★ ``review_pair(..., navigation=True)`` carries ``upstream_groups`` in its report and each
+    unit's label; ``tmap review report --md`` renders every group with each diff's versions; the
+    next unit a write hands on carries its ``upstream`` label.
+
+    MUTATION (verified RED, 1 failed): ``_upstream_md`` returns ``[]`` -> RED.
+    MUTATION (verified RED, 1 failed): no ``_label_upstream`` in _after_unit_write -> the handed-on
+    unit has no label -> RED."""
+    from tests.unit.test_tool_surface import _call
+    from treasure_map.lib.query import review_report as rr
+
+    _openssl(world)
+    _openssl(world, DY, "1.0.2u", "1.0.2u")  # both diffs name a library: any unit is labelled
+    review = ru.review_pair(
+        world.atlas,
+        "runA",
+        "runB",
+        pair_staleness={"source_stale": False},
+        server_commit="c0",
+        navigation=True,
+    )
+    assert (review.report.get("upstream_groups") or {}).get("groups_total") == 1, review.report
+    assert review.navigation.unit_upstream(review.units[0]) is not None
+    md = rr.markdown(review)
+    section = md.split("## Upstream library groups", 1)[-1].split("\n## ", 1)[0]
+    assert f"`{DX}`: a `1.1.1k`, b `1.1.1t`" in section, section
+    server = mcp_app.build_server(world.path)
+    nxt = _call(server, "start_diff_review", {"run_pair": PAIR})["next_unit"]
+    assert nxt["stream"] == DX and nxt.get("upstream"), nxt
+    wrote = _call(
+        server,
+        "annotate_diff",
+        {
+            "anchor_ref": nxt["members"][0]["anchor_ref"],
+            "verdict": "changed_real",
+            "rationale": "r",
+            "diff_id": DX,
+            "unit_id": nxt["unit_id"],
+        },
+    )
+    handed = wrote.get("next_unit") or {}
+    want = {DX: ("1.1.1k", "1.1.1t"), DY: ("1.0.2u", "1.0.2u")}[handed.get("stream")]
+    assert handed.get("upstream") == {"library": "openssl", "a": want[0], "b": want[1]}, handed

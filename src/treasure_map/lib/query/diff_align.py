@@ -42,6 +42,7 @@ from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT
 from treasure_map.lib.diff.layer0 import norm_hex
 from treasure_map.lib.diff.toolchain import current_bindiff_version
 from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW
+from treasure_map.lib.query.upstream_version import library_of
 from treasure_map.lib.ro_db import ro_connect
 
 _ALIGN_NOTE = (
@@ -1106,6 +1107,9 @@ def list_diffs(
         # rather than rounded to either answer.
         row["source_stale"], row["source_stale_reason"] = diff_staleness(cache, meta)
         row["toolchain_checked"] = toolchain_checked()
+        # The upstream library the binary's file name names, by name only (absent otherwise).
+        if (lib := library_of(row.get("binary"))) is not None:
+            row["upstream_library"] = lib
         diffs.append(row)
     result: dict[str, Any] = {
         "diffs": diffs,
