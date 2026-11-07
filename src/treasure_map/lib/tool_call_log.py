@@ -175,15 +175,59 @@ def build_line(
                 whole = whole_members(material)
                 if whole is not None:
                     line["unit_whole"] = whole
+                partial = partial_rows(material)
+                if partial:
+                    line["unit_rows"] = partial
+        # One entry read with its entry_id: the window of its candidate rows this page held.
+        if tool == "get_diff_patch_view" and arguments.get("entry_id") is not None:
+            entries = result.get("entries")
+            if isinstance(entries, list) and len(entries) == 1 and isinstance(entries[0], dict):
+                window = rows_window(entries[0])
+                if window is not None:
+                    line["rows_read"] = window
     return line
+
+
+def rows_window(entry: dict[str, Any]) -> list[int] | None:
+    """The candidate rows one rendered entry holds, as ``[start, end, total]`` — the rows from
+    ``start`` (its ``rows_offset``, else 0) up to ``end`` of the ``rows_total`` it has, in the
+    view's row order; None when the entry carries no row window."""
+    rows, total = entry.get("rows"), entry.get("rows_total")
+    if not isinstance(rows, list) or not isinstance(total, int) or isinstance(total, bool):
+        return None
+    start = entry.get("rows_offset")
+    start = start if isinstance(start, int) and not isinstance(start, bool) else 0
+    return [start, start + len(rows), total]
+
+
+def partial_rows(material: dict[str, Any]) -> dict[str, list[int]]:
+    """The entries of a unit's material (its one ``entry`` or its listed ``entries``) holding
+    only part of their candidate rows, by entry id: ``[start, end, total]`` (``rows_window``) — a
+    later read of the rest adds to them."""
+    items: list[Any] = []
+    if isinstance(material.get("entry"), dict):
+        items.append(material["entry"])
+    if isinstance(material.get("entries"), list):
+        items.extend(material["entries"])
+    out: dict[str, list[int]] = {}
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("entry_id"), str):
+            continue
+        window = rows_window(item)
+        if window is not None and (window[0] > 0 or window[1] < window[2]):
+            out[item["entry_id"]] = window
+    return out
 
 
 def part_cut(value: Any) -> bool:
     """Whether any part of ``value`` was held back or cut: a ``withheld`` part (the page budget,
-    an inline hunk over its gate or too large), code ``cut_at`` a length, or a subject's candidate
-    rows cut short (``rows_truncated``) — what reads on with the call it names."""
+    an inline hunk over its gate or too large), code ``cut_at`` a length, a subject's candidate
+    rows cut short (``rows_truncated``), or an entry whose candidate rows continue on another page
+    (``rows_next_offset`` set) — what reads on with the call it names."""
     if isinstance(value, dict):
         if value.get("withheld") or value.get("cut_at") or value.get("rows_truncated"):
+            return True
+        if value.get("rows_next_offset") is not None:
             return True
         return any(part_cut(v) for v in value.values())
     if isinstance(value, list):

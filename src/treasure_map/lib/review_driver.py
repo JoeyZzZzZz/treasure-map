@@ -16,9 +16,10 @@ reduce, no longer owed; neither the agent's exit code nor its output is believed
 disposes at least one new member but not all hands the same unit out again (the page then lists
 what is left), spending no retry; only a launch that disposes no new member is a failure. A launch
 is killed at its deadline; a failed unit is retried, then left (named in the log) and the loop
-moves on. The first unit doubles as a probe of the whole chain: when it writes nothing, the loop
-stops and says why. An audit unit's launch is also denied the tool that returns the judgements
-(list_overlays), so it reads blind.
+moves on. ``max_minutes`` is checked before every launch, a unit's relaunch included: past it the
+drive stops, the unit in hand named failed with why. The first unit doubles as a probe of the
+whole chain: when it writes nothing, the loop stops and says why. An audit unit's launch is also
+denied the tool that returns the judgements (list_overlays), so it reads blind.
 
 Each launch is logged — unit, attempt, exit status, seconds, members written and disposed — in
 ``<atlas dir>/logs/review_driver.jsonl`` (outside the atlas, like the tool-call log).
@@ -478,6 +479,11 @@ def drive(
         before = _disposed_count(review, nxt)
         attempt = fails = 0
         while True:
+            if attempt and deadline is not None and time.monotonic() > deadline:
+                # The unit is launched again only within max_minutes: a unit disposing one member
+                # a launch would otherwise run on past it.
+                out.stopped = f"max_minutes {max_minutes} reached"
+                break
             attempt += 1
             prompt = unit_prompt(run_pair, nxt, k)
             values = _values(preset, atlas_path, workdir, prompt, nxt.unit_id, run_pair)
@@ -517,11 +523,9 @@ def drive(
             if done:
                 break
             if now > before:
-                # A new member disposed: the same unit again, no retry spent. The reduce is
-                # renamed as its owed members shrink: hand out the one now owed.
+                # A new member disposed: the same unit again, no retry spent (the reduce keeps its
+                # id as its owed members shrink).
                 again = review.unit(nxt.unit_id)
-                if again is None and nxt.kind == ru.REDUCE:
-                    again = next((v for v in review.units if v.kind == ru.REDUCE), None)
                 if again is None:
                     break
                 nxt, before = again, _disposed_count(review, again)
@@ -533,15 +537,18 @@ def drive(
             out.units_done += 1
             done_ids.add(nxt.unit_id)
             continue
-        out.failed.append(
-            {
-                "unit_id": nxt.unit_id,
-                "kind": nxt.kind,
-                "written": len(written),
-                "disposed": _disposed_count(review, nxt),
-                "members": len(nxt.members),
-            }
-        )
+        failed: dict[str, Any] = {
+            "unit_id": nxt.unit_id,
+            "kind": nxt.kind,
+            "written": len(written),
+            "disposed": _disposed_count(review, nxt),
+            "members": len(nxt.members),
+        }
+        if out.stopped is not None:
+            failed["why"] = out.stopped
+            out.failed.append(failed)
+            break
+        out.failed.append(failed)
         skip.update((first_id, nxt.unit_id))
         if out.units_tried == 1 and not written:
             out.stopped = (

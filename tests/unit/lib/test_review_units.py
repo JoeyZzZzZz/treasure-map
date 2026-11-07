@@ -2633,6 +2633,35 @@ def test_a_write_naming_no_shard_hands_on_the_shard_its_session_asked_for(
     assert got["next_unit"] is None or ru.in_shard(got["next_unit"]["unit_id"], 1, 3)
 
 
+def test_a_unit_read_between_the_sharded_overview_and_the_write_keeps_the_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The session asked the overview for shard 1 of 3, then read one unit alone with
+    start_diff_review(run_pair, unit=...) naming no shard, then wrote naming only the unit: the
+    unit= read is not the session's last overview (it asks for no shard), so the write still
+    hands on the next unit of shard 1 and says the shard was inferred.
+
+    MUTATION (verified RED, 1 failed, AssertionError): let a unit= call count as the session's
+    last overview in _session_shard (drop ``or params.get("unit") is not None``) -> no shard ->
+    RED."""
+    w = _hex_world(tmp_path, monkeypatch, 200)
+    server = mcp_app.build_server(w.path)
+    start = {"run_pair": PAIR, "k": 0, "worker": 1, "workers": 3}
+    nu = _server_call(server, "start_diff_review", start)["next_unit"]
+    assert nu is not None and ru.in_shard(nu["unit_id"], 1, 3)
+    alone = _server_call(
+        server, "start_diff_review", {"run_pair": PAIR, "unit": nu["unit_id"], "k": 0}
+    )
+    assert "material" in alone and alone.get("members"), sorted(alone)
+    got = _server_call(server, "annotate_diff", _judge_args(alone["members"][0], nu["unit_id"]))
+    assert got.get("written") is True, got
+    assert got.get("shard") == {"worker": 1, "workers": 3, "inferred": True}, got.get("shard")
+    nxt = got.get("next_unit")
+    assert nxt is not None, sorted(got)  # the precondition: a next unit is handed on
+    assert ru.in_shard(nxt["unit_id"], 1, 3), nxt["unit_id"]
+    assert int(nxt["unit_id"][:8], 16) % 3 == 1
+
+
 def test_the_overview_says_what_each_shard_holds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

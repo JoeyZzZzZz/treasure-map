@@ -271,7 +271,8 @@ def _echo_coverage(coverage: dict[str, Any] | None, after: str) -> None:
             f"  only in {label}     : {len(items)} binaries / "
             f"{sum(b['candidates'] for b in items)} candidates, {unjudged} not looked at — "
             f"{', '.join(b['rel_path'] for b in items)} (the other run holds no binary, file or "
-            "symlink like them; judge each by its binary_presence anchor_ref with run_pair)"
+            "symlink like them; judge each subject start_diff_review(run_pair=...) lists for it — "
+            "a function holding candidates, or a binary holding none — with run_pair)"
         )
     if coverage["all_candidate_binaries_covered"]:
         click.echo(

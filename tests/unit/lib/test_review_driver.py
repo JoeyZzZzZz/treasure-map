@@ -221,6 +221,56 @@ def test_a_unit_judged_one_member_per_launch_is_handed_out_until_disposed(
     assert all(r[1] == 1 and json.loads(r[2]).get("basis") == "unit_delivered" for r in rows)
 
 
+def test_a_unit_handed_out_again_is_not_launched_past_max_minutes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ max_minutes holds between the launches of one unit too: a six-member batch whose agent
+    disposes one member per launch, each launch taking two minutes of a one-minute drive, is
+    launched once — the drive stops with the reason and names the unit failed with why — not six
+    times past its limit.
+
+    MUTATION (verified RED, 1 failed): check the deadline only before a new unit (as before) ->
+    six launches -> RED."""
+    from tests.unit.lib.test_review_units import _wide_world
+
+    w = _wide_world(tmp_path, monkeypatch, 6)
+    batch = next(u for u in _units_at(w, 0).values() if len(u.members) > 1)
+    assert len(batch.members) == 6
+    clock = [0.0]
+
+    class _Time:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(time, name)
+
+        def monotonic(self) -> float:
+            return clock[0]
+
+    monkeypatch.setattr(rd, "time", _Time())
+    launches: dict[str, int] = {}
+    agent = _one_listed_member_agent(w, 0, launches)
+
+    def slow(argv: list[str], *, cwd: Path, timeout: float) -> rd.Launch:
+        clock[0] += 120.0
+        return agent(argv, cwd=cwd, timeout=timeout)
+
+    result = rd.drive(
+        w.path,
+        "runA",
+        "runB",
+        PRESET,
+        workdir=tmp_path,
+        k=0,
+        max_minutes=1,
+        runner=slow,
+        echo=lambda s: None,
+    )
+    assert launches == {batch.unit_id: 1}, launches
+    assert result.stopped == "max_minutes 1 reached", result
+    assert [(f["unit_id"], f.get("why")) for f in result.failed] == [
+        (batch.unit_id, "max_minutes 1 reached")
+    ]
+
+
 def test_a_unit_written_but_read_as_needs_recheck_is_not_done(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

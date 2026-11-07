@@ -464,7 +464,8 @@ _PAGED_KINDS = (_ru.S_BATCH, _ru.SECOND_TIER, _ru.GROUP, _ru.REDUCE, _ru.PRESENC
 _JUDGED_UNREAD = (
     "written before anything of its subject was read: it reads needs_recheck (not disposed) "
     "until judged again after reading the subject: the entry in full, or a unit material that "
-    "lists it"
+    "lists it — a file by get_file_diff(path), a one-sided binary's function by "
+    "explain_candidate on every one of its candidates"
 )
 _HEADLINE_WITHHELD = "diff_undetermined (meta.banners)"
 _HEADLINE_NONE = "no listed entry"
@@ -2380,13 +2381,17 @@ def make_tools(
             "members": len(u.members),
         }
         if states is not None:
-            out["members_disposed"] = sum(
-                1 for m in u.members if _ru.disposed(states.get(m.anchor_ref))
-            )
+            out["members_disposed"] = sum(1 for m in u.members if not _owed(u, m, states))
         if u.group is not None:
             out["group_ref"] = u.group.get("ref")
             out["callee"] = u.group.get("name")
         return out
+
+    def _owed(u: _ru.Unit, m: _ru.Member, states: dict[str, str]) -> bool:
+        """Whether ``m`` is still owed in ``u``: a reduce's member always is (it is in the unit
+        only while its judgement owes a group_ref, though the judgement itself reads disposed);
+        any other unit's while not disposed."""
+        return u.kind == _ru.REDUCE or not _ru.disposed(states.get(m.anchor_ref))
 
     def _members_json(u: _ru.Unit, states: dict[str, str]) -> list[dict[str, Any]]:
         """A unit's members; an audit unit's without their review state (it is read blind)."""
@@ -2412,8 +2417,8 @@ def make_tools(
         atlas: sqlite3.Connection, review: _ru.PairReview, u: _ru.Unit, budget: int
     ) -> dict[str, Any]:
         """A one-sided binary's review subjects of this unit — each function holding candidates
-        (or the binary itself, judged whole) with its candidates as compact triage rows — the ones
-        not yet disposed first, fitted to ``budget`` bytes (``functions_truncated``)."""
+        (or the binary itself, judged whole) with its candidates as compact triage rows — only the
+        ones still owed while any is — fitted to ``budget`` bytes (``functions_truncated``)."""
         from treasure_map.lib.query import binary_presence as _bp
 
         facts = review.facts
@@ -2426,7 +2431,10 @@ def make_tools(
         rank = {c.evidence_ref: i for i, c in enumerate(ranked)}
         by_ref = {c.evidence_ref: c for c in ranked}
         states = review.progress.states
-        members = sorted(u.members, key=lambda m: _ru.disposed(states.get(m.anchor_ref)))
+        # While any subject is still owed, only the owed ones (as _member_entries).
+        members = [m for m in u.members if not _ru.disposed(states.get(m.anchor_ref))] or list(
+            u.members
+        )
         out: dict[str, Any] = {
             "run_pair": _dr_mod.run_pair(facts.run_a, facts.run_b),
             "binary": b.name,
@@ -2441,7 +2449,8 @@ def make_tools(
                 "evidence_ref. explain_candidate(evidence_ref) reads one's sink / source / flow"
             ),
             "read_more": (
-                f"list_candidates(run_id={json.dumps(b.run)}, binary={json.dumps(b.name)})"
+                "explain_candidate(evidence_ref=<a row's evidence_ref>) for each candidate of a "
+                "function: explaining every one of them reads that function"
             ),
         }
         kept: list[dict[str, Any]] = []
@@ -2471,7 +2480,7 @@ def make_tools(
             room -= size
         out["functions"] = kept
         out["functions_total"] = len(u.members)
-        out["functions_truncated"] = len(kept) < len(u.members) or any(
+        out["functions_truncated"] = len(kept) < len(members) or any(
             f.get("rows_truncated") for f in kept
         )
         return out
@@ -2530,6 +2539,9 @@ def make_tools(
                 ),
                 "judge_with": f"annotate_diff_batch(diff_id={json.dumps(u.stream)}, ...)",
             }
+            rows = _read_rows_hint(u.stream, kept)
+            if rows is not None:
+                out["read_rows"] = rows
             if found["missing"]:
                 out["members_not_in_view"] = found["missing"]
             return out
@@ -2651,22 +2663,43 @@ def make_tools(
         out["entries"] = kept
         out["entries_total"] = len(u.members)
         out["entries_truncated"] = len(kept) < len(entries) or bool(found["missing"])
+        rows = _read_rows_hint(u.stream, kept)
+        if rows is not None:
+            out["read_rows"] = rows
         return out
+
+    def _read_rows_hint(diff_id: str, kept: list[dict[str, Any]]) -> str | None:
+        """The call that reads on an entry's candidate rows, when one of ``kept`` has more rows
+        than it carries (``rows_next_offset``); None when every one carries all of its rows."""
+        if all(e.get("rows_next_offset") is None for e in kept):
+            return None
+        return (
+            f"get_diff_patch_view(diff_id={json.dumps(diff_id)}, entry_id=<entry_id>, "
+            "rows_offset=<rows_next_offset>) for each entry with rows_next_offset set"
+        )
 
     def _member_entries(
         atlas: sqlite3.Connection, review: _ru.PairReview, u: _ru.Unit, bucket: str | None
     ) -> dict[str, Any]:
-        """A batch's or group's members as the view lists them (each with its summary and
-        inline_hunk), read from the view by entry id: members not yet disposed first, view order
-        kept within each part, so a unit handed out again after some were judged shows the ones
-        still owed a reading. ``missing`` names members the view does not list.
+        """A batch's or group's members as the view lists them (each with its summary, inline_hunk
+        and up to a page of its candidate rows), read from the view by entry id, in view order.
+        While any member is still owed (not disposed), only the owed ones: a unit handed out again
+        after some were judged lists just the ones still owed a reading, never fills its page with
+        judged ones (a reader told to judge every member listed would judge those again). A unit
+        with every member disposed lists them all. ``missing`` names members the view does not list.
         ``{"error": ...}`` when the view cannot be read."""
         by_entry = {m.entry_id: m.anchor_ref for m in u.members if m.entry_id is not None}
         wanted = set(by_entry)
         found: list[dict[str, Any]] = []
         if wanted:
+            # Each with up to a page of its candidate rows (the rest read on by entry_id and
+            # rows_offset): a member whose rows are not all here is not shown whole.
             page = _get_diff_patch_view(
-                atlas, u.stream, bucket=bucket, rows_limit=0, entry_ids=frozenset(wanted)
+                atlas,
+                u.stream,
+                bucket=bucket,
+                rows_limit=_ROWS_INLINE_LIMIT,
+                entry_ids=frozenset(wanted),
             )
             if "error" in page:
                 return {"error": page["error"]}
@@ -2675,7 +2708,13 @@ def make_tools(
                     wanted.discard(e["entry_id"])
                     found.append(e)
         states = review.progress.states
-        found.sort(key=lambda e: _ru.disposed(states.get(by_entry.get(str(e.get("entry_id")), ""))))
+        owed = [
+            e
+            for e in found
+            if not _ru.disposed(states.get(by_entry.get(str(e.get("entry_id")), "")))
+        ]
+        if owed:
+            found = owed
         missing = [m.entry_id for m in u.members if m.entry_id in wanted]
         return {"entries": found, "missing": missing}
 
@@ -2744,7 +2783,7 @@ def make_tools(
     def _set_shown_members(u: _ru.Unit, holder: dict[str, Any], states: dict[str, str]) -> None:
         """A batch / group / reduce / one-sided binary hand-out names exactly the members its
         material lists, in the
-        material's order (members still owed first), with how many the unit holds
+        material's order (only the members still owed, while any is), with how many the unit holds
         (``members_total``), are disposed, and are owed but not on this page
         (``members_after_this_page``: the unit comes back for them once these are judged)."""
         mat = holder.get("material")
@@ -2755,13 +2794,9 @@ def make_tools(
         holder["members"] = [_member_json(m, states.get(m.anchor_ref)) for m in listed]
         on_page = {m.anchor_ref for m in listed}
         holder["members_total"] = len(u.members)
-        holder["members_disposed"] = sum(
-            1 for m in u.members if _ru.disposed(states.get(m.anchor_ref))
-        )
+        holder["members_disposed"] = sum(1 for m in u.members if not _owed(u, m, states))
         holder["members_after_this_page"] = sum(
-            1
-            for m in u.members
-            if m.anchor_ref not in on_page and not _ru.disposed(states.get(m.anchor_ref))
+            1 for m in u.members if m.anchor_ref not in on_page and _owed(u, m, states)
         )
 
     def _shard_slices(review: _ru.PairReview, workers: int) -> list[dict[str, int]]:
@@ -2966,9 +3001,10 @@ def make_tools(
         annotate_diff (or annotate_diff_batch) and call again for the next unit. A batch, callee
         group, reduce or one-sided binary is handed out by the page: its ``members`` are the ones
         its material shows
-        (members still owed first), with ``members_total`` and ``members_after_this_page``; the
-        unit comes back with the rest once those are judged. With ``workers``, ``shard.slices``
-        counts each shard's units, members, must-read members and candidate rows; a write naming
+        (only the members still owed, while any is), with ``members_total`` and
+        ``members_after_this_page``; the unit comes back with the rest once those are judged.
+        With ``workers``, ``shard.slices`` counts each shard's units, members, must-read members
+        and candidate rows; a write naming
         its unit but no shard is handed on in the shard this session last asked for. The full
         unit list is not sent here: ``tmap review report <run_pair> --md -o <file>`` writes it. A
         pair with a proven-stale run is refused."""
@@ -5092,6 +5128,7 @@ def make_tools(
         # write that names no unit is read against them — for its read basis only, never as the
         # unit it judges (no unit_id is recorded, no audit, no next unit).
         handed = {ln["unit"] for ln in lines or [] if ln.get("unit")} if unit_id is None else set()
+        cands = _presence_candidates(lambda: review(k), anchors)
         out: dict[str, Any] = {}
         for anchor in anchors:
             if attributed_to == "human-via-agent":
@@ -5102,9 +5139,13 @@ def make_tools(
                     anchor_ref=anchor,
                     entry_id=_entry_id_of(anchor),
                     unit_id=unit_id,
+                    candidates=cands.get(anchor),
                 )
                 if handed and rb["basis"] != "unit_delivered":
-                    rb = _inferred_unit_basis(lines, anchor, handed, ks, review) or rb
+                    rb = (
+                        _inferred_unit_basis(lines, anchor, handed, ks, review, cands.get(anchor))
+                        or rb
+                    )
                 if rb["basis"] == "none":
                     must = {
                         m.anchor_ref
@@ -5130,8 +5171,29 @@ def make_tools(
             f"coverage_statement; get_diff_handoff(run_pair='{pair}') for the hand-off."
         )
 
+    def _presence_candidates(
+        review: Callable[[], Any], anchors: list[str]
+    ) -> dict[str, frozenset[str]]:
+        """The candidates (evidence_refs) of each of ``anchors`` that is a one-sided binary's
+        review subject holding some — what explain_candidate reads it by. The pair's review is
+        read (``review()``) only when one of them is such an anchor."""
+        from treasure_map.lib.query import binary_presence as _bp
+
+        if not any(_dr_mod.is_binary_presence_anchor(a) for a in anchors):
+            return {}
+        return {
+            s.anchor: frozenset(s.refs)
+            for s in _bp.review_subjects(review().facts.presence)
+            if s.refs and s.anchor in anchors
+        }
+
     def _inferred_unit_basis(
-        lines: Any, anchor: str, handed: set[str], ks: list[int], review: Any
+        lines: Any,
+        anchor: str,
+        handed: set[str],
+        ks: list[int],
+        review: Any,
+        candidates: frozenset[str] | None = None,
     ) -> dict[str, Any] | None:
         """The read basis of a write that names no unit, read as if it named a unit this session
         was handed that holds ``anchor`` (largest k first; the first such unit whose delivery
@@ -5147,6 +5209,7 @@ def make_tools(
                     anchor_ref=anchor,
                     entry_id=_entry_id_of(anchor),
                     unit_id=u.unit_id,
+                    candidates=candidates,
                 )
                 if got["basis"] == "unit_delivered":
                     return {**got, "unit_inferred": True}
@@ -5272,8 +5335,12 @@ def make_tools(
         (``{run_a}::{run_b}#binary_presence#{a_only|b_only}:{path}``, printed in
         ``binary_presence`` by list_diffs coverage and list_overlays' run-pair progress) and takes
         ``run_pair`` only (no binary diff covers it); it rests on its side, path, name, sha256,
-        candidates by sink class and recorded references, and its ``checked`` cites its own
-        anchor_ref or one of its candidates' evidence_ref in its own run.
+        candidates by sink class and recorded references. Such a binary holding candidates is
+        judged function by function, each function on ``<the binary's anchor_ref>::<function
+        address>`` (start_diff_review(run_pair=...) hands them out), and whatever the verdict a
+        function's ``checked`` (or ``evidence``) cites every one of its candidates' evidence_ref;
+        a binary holding none, or only candidates that name no function, is judged on its own
+        anchor_ref, citing those candidates (or, holding none, the anchor_ref itself).
 
         ``anchor_ref`` is the entry's ``anchor_ref`` as get_diff_patch_view prints it (a function
         pair, or a function with no counterpart), or a candidate row's

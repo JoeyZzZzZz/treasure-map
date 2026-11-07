@@ -644,7 +644,10 @@ def presence_block(presence: Presence, judged: dict[str, dr.DiffAnnotation]) -> 
             }
         out[b.tag].append(row)
     out["basis"] = BASIS
-    out["see"] = "list_candidates(run_id=<run of that side>, binary=<name>)"
+    out["see"] = (
+        "start_diff_review(run_pair=<the pair>) hands out each binary's functions with their "
+        "candidates; explain_candidate(evidence_ref=<a candidate's evidence_ref>) reads one"
+    )
     out["annotate_with"] = (
         "annotate_diff(anchor_ref=<anchor_ref>, run_pair="
         f'"{dr.run_pair(presence.run_a, presence.run_b)}", verdict=..., rationale=...)'

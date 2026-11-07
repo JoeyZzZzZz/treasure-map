@@ -1092,13 +1092,15 @@ def test_a_one_sided_binarys_unit_lists_its_functions_with_their_candidates(
     world: World,
 ) -> None:
     """★ A binary_presence unit's material lists each of its functions — anchor_ref, address,
-    candidates_total and the candidates as rows — the ones not yet disposed first; the tool-call
-    log reads the functions it listed as shown whole; the pair report carries
-    presence_citations_short.
+    candidates_total and the candidates as rows — while any is still owed, only the owed ones (a
+    disposed one is not listed again, and the page is not cut for leaving it out); once every one
+    is disposed, all of them; the tool-call log reads the functions it listed as shown whole; the
+    pair report carries presence_citations_short.
 
-    MUTATION (verified RED, 1 failed each): list the functions in member order (disposed ones
-    first) -> RED; leave the functions out of the log's member lists -> RED; leave
-    presence_citations_short out of the report -> RED."""
+    MUTATION (verified RED, 1 failed each): list the disposed functions too, owed first (as
+    before) -> RED; count functions_truncated against every member, not the listed ones -> RED;
+    leave the functions out of the log's member lists -> RED; leave presence_citations_short out
+    of the report -> RED."""
     from treasure_map.lib import tool_call_log as tcl
     from treasure_map.lib.query import review_units as ru
 
@@ -1121,7 +1123,7 @@ def test_a_one_sided_binarys_unit_lists_its_functions_with_their_candidates(
     call = _server(world)
     got = call("start_diff_review", {"run_pair": PAIR, "unit": unit.unit_id})
     mat = got["material"]
-    assert [f["anchor_ref"] for f in mat["functions"]] == [second, first]
+    assert [f["anchor_ref"] for f in mat["functions"]] == [second]
     one = mat["functions"][0]
     assert one["function"] == second.rsplit("::", 1)[1] and one["candidates_total"] == 1
     assert [r["evidence_ref"] for r in one["rows"]] == list(
@@ -1129,9 +1131,181 @@ def test_a_one_sided_binarys_unit_lists_its_functions_with_their_candidates(
     )
     assert (mat["functions_total"], mat["functions_truncated"]) == (2, False)
     assert got["material_cut"] is False
-    assert tcl.shown_members(mat) == [second, first]
+    assert tcl.shown_members(mat) == [second]
+    assert [m["anchor_ref"] for m in got["members"]] == [second]
+    assert (got["members_total"], got["members_after_this_page"]) == (2, 0)
     report = call("start_diff_review", {"run_pair": PAIR})["report"]
     assert report.get("presence_citations_short") == {}, sorted(report)
+    _ok, second_refs = _fn(world, "a_only", "web/app/app.cgi", 1)
+    overlay.annotate_diff(
+        world.atlas,
+        anchor_ref=second,
+        verdict="change_inconclusive",
+        rationale="r",
+        verdict_basis={"checked": [second, *second_refs]},
+        run_pair=PAIR,
+    )
+    done = call("start_diff_review", {"run_pair": PAIR, "unit": unit.unit_id})["material"]
+    assert [f["anchor_ref"] for f in done["functions"]] == [first, second]
+
+
+def test_a_one_sided_binarys_unit_is_handed_out_by_its_page(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ At a page budget where a one-sided binary's material lists fewer of its functions than
+    the unit holds (``functions_truncated``), the unit= read names exactly the functions the
+    material lists, in its order — none it does not show — with how many the unit holds and how
+    many owed ones the page leaves out. The budgets are scanned, not hard-coded: some budget must
+    cut the page part-way (the precondition).
+
+    MUTATION (verified RED, 1 failed, AssertionError): drop PRESENCE from mcp_app._PAGED_KINDS
+    (hand out every function of the binary) -> RED."""
+    from treasure_map.lib.query import review_units as ru
+
+    sha = "f2" * 32
+    world.binary("b", "usr/bin/many", sha)
+    for i in range(6):
+        world.cand("b", "usr/bin/many", sha, "cmd", n=2, addr=f"{0x400000 + 0x100 * i:08x}")
+    world.commit()
+    base = _anchor("b_only", "usr/bin/many")
+    (unit,) = [
+        u
+        for u in _review(world).units
+        if u.kind == ru.PRESENCE and u.members[0].anchor_ref.startswith(base)
+    ]
+    total = len(unit.members)
+    assert total == 6
+    cut_seen = 0
+    for budget in range(1_000, 9_001, 500):
+        monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", budget)
+        out = mcp_app.make_tools(world.path)["start_diff_review"](run_pair=PAIR, unit=unit.unit_id)
+        mat = out.get("material") or {}
+        if "functions" not in mat:
+            continue
+        page = [f["anchor_ref"] for f in mat["functions"]]
+        assert "members" in out, sorted(out)
+        got = [m.get("anchor_ref") for m in out["members"]]
+        assert got == page, (budget, got, page)
+        assert "members_total" in out and "members_after_this_page" in out, sorted(out)
+        assert out["members_total"] == total
+        # nothing of the binary is judged yet: every function the page leaves out is owed
+        assert out["members_after_this_page"] == total - len(page), (budget, page)
+        if 0 < len(page) < total:
+            cut_seen += 1
+    assert cut_seen, "no budget cut the binary's page part-way: the precondition did not hold"
+
+
+def _cut_function_unit(world: World, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Any]:
+    """The binary_presence unit of web/app/app.cgi, the call of a NEW session (no reading of
+    its own yet), and that session's hand-out of the unit at a page budget at which the first
+    function listed comes with its candidate rows cut (``rows_truncated``)."""
+    from treasure_map.lib.query import review_units as ru
+
+    (unit,) = [
+        u
+        for u in _review(world).units
+        if u.kind == ru.PRESENCE
+        and u.members[0].anchor_ref.startswith(_anchor("a_only", "web/app/app.cgi"))
+    ]
+    full = _server(world)("start_diff_review", {"run_pair": PAIR, "unit": unit.unit_id})
+    base = len(json.dumps({k: v for k, v in full.items() if k != "material"}))
+    for extra in range(1_600, 100, -50):
+        monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", base + extra)
+        call = _server(world)
+        got = call("start_diff_review", {"run_pair": PAIR, "unit": unit.unit_id})
+        functions = (got.get("material") or {}).get("functions") or []
+        if functions and functions[0].get("rows_truncated"):
+            return unit, call, got
+    raise AssertionError("no budget cut the first function's rows: the precondition did not hold")
+
+
+@pytest.mark.parametrize("explained", ["every", "all_but_one"])
+def test_a_function_shown_with_its_rows_cut_is_read_by_explaining_its_candidates(
+    world: World, monkeypatch: pytest.MonkeyPatch, explained: str
+) -> None:
+    """★ A one-sided binary's function handed out with its candidate rows cut is not shown whole;
+    no entry or pseudocode read names it, so it is read by explain_candidate on every one of its
+    candidates: then its judgement (citing them all) reads ``unit_delivered`` (``material_cut``)
+    and it is disposed. One candidate left unexplained: read nothing, judged unread
+    (needs_recheck).
+
+    MUTATION (verified RED, 1 failed each): leave _explained_all out of the read basis -> the
+    function is never read -> RED ("every"); pass the write no candidates of its subject
+    (``candidates=`` dropped in _write_plan) -> RED ("every")."""
+    from treasure_map.lib.query import review_units as ru
+
+    unit, call, got = _cut_function_unit(world, monkeypatch)
+    anchor = got["material"]["functions"][0]["anchor_ref"]
+    (refs,) = [
+        r for a, r in (_fn(world, "a_only", "web/app/app.cgi", i) for i in range(2)) if a == anchor
+    ]
+    assert got["material_cut"] is True
+    read = list(refs) if explained == "every" else list(refs)[:-1]
+    assert refs  # the precondition: a candidate to leave out
+    for ref in read:
+        assert "error" not in call("explain_candidate", {"evidence_ref": ref})
+    wrote = call(
+        "annotate_diff",
+        {
+            "anchor_ref": anchor,
+            "verdict": "change_inconclusive",
+            "rationale": "r",
+            "checked": [anchor, *refs],
+            "run_pair": PAIR,
+            "unit_id": unit.unit_id,
+        },
+    )
+    assert wrote.get("written") is True, wrote
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 48_000)
+    state = _review(world).progress.states.get(anchor)
+    if explained == "every":
+        assert wrote["read_basis"] == {"basis": "unit_delivered", "material_cut": True}
+        assert ru.disposed(state), state
+    else:
+        assert wrote["read_basis"] == {"basis": "none", "unread_before_verdict": True}
+        assert state == ru.NEEDS_RECHECK
+
+
+def _calls_name_real_parameters(text: str) -> list[str]:
+    """The tool calls ``text`` names (``tool(param=...)``), each checked to be a tool of the
+    server whose every named parameter is one of that tool's parameters."""
+    import inspect
+    import re
+
+    tools = mcp_app.make_tools(Path("/nonexistent/atlas.db"))
+    named: list[str] = []
+    for tool, args in re.findall(r"\b([a-z_]+)\(([^()]*)\)", text):
+        if tool not in tools:
+            continue
+        named.append(tool)
+        params = set(inspect.signature(tools[tool]).parameters)
+        for param in re.findall(r"\b([a-z_]+)=", args):
+            assert param in params, (tool, param, text)
+    return named
+
+
+def test_the_one_sided_binary_reads_name_callable_tools(world: World) -> None:
+    """★ The read a one-sided binary's material names (``read_more``) and the one its
+    binary_presence block names (``see``) are calls of real tools with real parameters — the
+    material's read, filled with a row's evidence_ref, answers without error.
+
+    MUTATION (verified RED, 1 failed each): name list_candidates(run_id=..., binary=...) again in
+    ``read_more`` -> binary is no parameter of it -> RED; the same in ``see`` -> RED."""
+    from treasure_map.lib.query import review_units as ru
+
+    (unit,) = [
+        u
+        for u in _review(world).units
+        if u.kind == ru.PRESENCE
+        and u.members[0].anchor_ref.startswith(_anchor("a_only", "web/app/app.cgi"))
+    ]
+    call = _server(world)
+    mat = call("start_diff_review", {"run_pair": PAIR, "unit": unit.unit_id})["material"]
+    assert _calls_name_real_parameters(mat["read_more"]) == ["explain_candidate"]
+    row = mat["functions"][0]["rows"][0]
+    assert "error" not in call("explain_candidate", {"evidence_ref": row["evidence_ref"]})
+    see = bp.presence_block(_presence(world), {})["see"]
+    assert "explain_candidate" in _calls_name_real_parameters(see)
 
 
 def test_a_function_finding_of_a_one_sided_binary_names_the_function_and_the_binary(

@@ -24,7 +24,11 @@ so are the binaries one run of the pair holds alone (``binary_presence``): each 
 binary holding a candidate is a must-read member (a binary holding none is one member on its own
 anchor), handed out per binary in batches. Such a member is disposed only when its judgement, of
 whatever verdict, cites every candidate of its subject (``presence_citations_short``). Every
-candidate row of a must-read entry is read with it (its unit's material). The listed entries
+candidate row of a must-read entry is read with it: its unit's material carries up to a page of
+its rows (an entry alone, or each entry of a batch or group), the rest read on by entry_id and
+rows_offset; a member whose rows were not all delivered is not read whole by the material, and a
+judgement written having read only part of them is counted under ``basis_incomplete``. The listed
+entries
 outside the set are the second tier, handed out in batches per diff and bucket: the set orders
 what is read first and says when the must-read part is done; it is not a part that may be skipped.
 
@@ -735,7 +739,8 @@ class Audits:
     needs_recheck: list[str] = field(default_factory=list)
     # Subjects whose current judgement reads disposed although its latest write read nothing of the
     # subject whole (basis ``none``: a member its unit's material did not show whole, or a material
-    # cut and not read on). Not must-read at the report's k, so not judged unread; counted apart.
+    # cut and not read on) — not must-read at the report's k, so not judged unread — or read it with
+    # only part of its candidate rows (``rows_partial``, at any k). Counted apart.
     basis_incomplete: list[str] = field(default_factory=list)
 
 
@@ -864,7 +869,9 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
                 and m.anchor_ref in must_now
             ):
                 out.needs_recheck.append(m.anchor_ref)
-            elif last is not None and last["read_basis"].get("basis") == "none":
+            elif last is not None and (
+                last["read_basis"].get("basis") == "none" or last["read_basis"].get("rows_partial")
+            ):
                 out.basis_incomplete.append(m.anchor_ref)
             # Below: the blind audit unit. Sealed off by default (A-1); produced only when the
             # sealed section is satisfied and the flag is flipped back on.
@@ -1243,9 +1250,12 @@ def review_pair(
         unit_disposed(u, progress.states) for u in units if u.kind not in (AUDIT, REDUCE)
     ):
         # Handed out once every other unit is disposed (the must-read set and the second tier).
+        # Its id is the pair's (and the predicate's), not its owed members': judging one of them
+        # leaves the same unit, so its other members — of any diff — are written with the id it
+        # was handed out with.
         extra.append(
             Unit(
-                unit_id=unit_id(REDUCE, [m.anchor_ref + "|" + m.reasons[0] for m in owed]),
+                unit_id=unit_id(REDUCE, [dr.run_pair(facts.run_a, facts.run_b)]),
                 kind=REDUCE,
                 must_read=True,
                 members=tuple(owed),

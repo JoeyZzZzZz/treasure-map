@@ -339,6 +339,53 @@ def test_a_group_whose_view_fails_hands_out_no_material(
     assert "unit" not in tcl.build_line(tcl.Session(), "start_diff_review", {}, out)
 
 
+def test_the_reduce_keeps_its_id_while_its_owed_judgements_are_written(tmp_path: Path) -> None:
+    """★ The reduce is one unit while it is owed: written one owed judgement at a time with the
+    unit_id it was handed out with, every write is taken (none refused as naming no unit), each
+    answer hands the same reduce on until the last, and the reduce is then done.
+
+    MUTATION (verified RED, 1 failed): take the reduce's id from its owed members (as before) ->
+    the first answer hands on a reduce of another id (the next write naming the id it was handed
+    out with is refused) -> RED."""
+    from tests.unit.test_tool_surface import _call
+    from treasure_map import mcp_app
+
+    w = _world(tmp_path)
+    for u in _review(w, k=ru.DEFAULT_K).units:
+        for m in u.members:
+            if m.kind == "entry":
+                overlay.annotate_diff(
+                    w.atlas,
+                    anchor_ref=m.anchor_ref,
+                    verdict="changed_real",
+                    rationale="r",
+                    diff_id=DIFF,
+                )
+    server = mcp_app.build_server(w.path)
+    head = _call(server, "start_diff_review", {"run_pair": "runA::runB"})["next_unit"]
+    assert head is not None and head["kind"] == ru.REDUCE, head
+    uid = head["unit_id"]
+    owed = head["material"]["owed"]
+    assert len(owed) == 4  # the precondition: several judgements owed
+    for n, item in enumerate(owed, 1):
+        got = _call(
+            server,
+            "annotate_diff",
+            {
+                "anchor_ref": item["anchor_ref"],
+                "verdict": "changed_real",
+                "rationale": "r",
+                "diff_id": DIFF,
+                "group_ref": item["group_ref"],
+                "unit_id": uid,
+            },
+        )
+        assert got.get("written") is True, (n, got)
+        nxt = got.get("next_unit")
+        assert (nxt or {}).get("unit_id") == (uid if n < len(owed) else None), (n, nxt)
+    assert _review(w, k=ru.DEFAULT_K).report["reduce"]["owed"] == 0
+
+
 def test_a_reduce_whose_owed_list_was_cut_says_its_material_was_cut(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -371,3 +418,193 @@ def test_a_reduce_whose_owed_list_was_cut_says_its_material_was_cut(
     cut = mcp_app.make_tools(w.path)["start_diff_review"](run_pair="runA::runB", unit=red.unit_id)
     assert cut["material"].get("owed_truncated") is True, cut["material"]
     assert cut["material_cut"] is True
+
+
+# ── a group and the reduce are handed out by their page ───────────────────────────────────────
+
+
+def _judge_every_entry(w: World) -> None:
+    """Judge every entry member of every unit, without a group_ref: the reduce comes due."""
+    for u in _review(w, k=ru.DEFAULT_K).units:
+        for m in u.members:
+            if m.kind == "entry":
+                overlay.annotate_diff(
+                    w.atlas,
+                    anchor_ref=m.anchor_ref,
+                    verdict="changed_real",
+                    rationale="r",
+                    diff_id=DIFF,
+                )
+
+
+def _assert_handed_by_page(out: dict[str, Any], page: list[str], key: str, total: int) -> None:
+    """A paged hand-out names exactly the members its material lists (same order) and counts
+    the unit's members."""
+    assert "members" in out, sorted(out)
+    got = [m.get(key) for m in out["members"]]
+    assert got == page, (got, page)
+    assert "members_total" in out and "members_after_this_page" in out, sorted(out)
+    assert out["members_total"] == total, out["members_total"]
+
+
+def test_a_callee_group_is_handed_out_by_its_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ At a page budget where the group's material lists fewer members than the group holds,
+    the unit= read (and the overview's next unit, when that is the group) names exactly the
+    members the material lists — none it does not show — and counts the rest owed in
+    members_after_this_page. The budgets are scanned, not hard-coded: some budget must cut the
+    page part-way (the precondition), or the test says so.
+
+    MUTATION (verified RED, 1 failed, AssertionError): drop GROUP from mcp_app._PAGED_KINDS (hand
+    out every member of the group) -> RED."""
+    from treasure_map import mcp_app
+
+    w = _world(tmp_path)
+    group = next(u for u in _review(w).units if u.kind == ru.GROUP)
+    total = len(group.members)
+    assert total == 3
+    cut_seen: set[str] = set()
+    for budget in range(3_000, 20_001, 1_000):
+        monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", budget)
+        tools = mcp_app.make_tools(w.path)
+        alone = tools["start_diff_review"](run_pair="runA::runB", unit=group.unit_id, k=50)
+        head = tools["start_diff_review"](run_pair="runA::runB", k=50).get("next_unit") or {}
+        holders = {"unit": alone}
+        if head.get("unit_id") == group.unit_id:
+            holders["overview"] = head
+        for path, out in holders.items():
+            mat = out.get("material") or {}
+            if "entries" not in mat:
+                continue
+            page = [e["entry_id"] for e in mat["entries"]]
+            _assert_handed_by_page(out, page, "entry_id", total)
+            # nothing of the group is judged yet: every member the page leaves out is owed
+            assert out["members_after_this_page"] == total - len(page), (path, budget, page)
+            if 0 < len(page) < total:
+                cut_seen.add(path)
+    # the precondition: some budget cut the page part-way, on the unit= read at least
+    assert "unit" in cut_seen, "no budget cut the group's page part-way on the unit= read"
+
+
+def test_a_group_whose_first_entry_is_larger_than_the_page_hands_out_that_one_cut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Every member's entry is larger than the whole page (an inflated inline hunk): the group
+    is handed out with its first listed member alone, that entry cut to fit (its hunk withheld),
+    and the material says it was cut — never an empty page that names no member.
+
+    MUTATION (verified RED, 1 failed, AssertionError): in _group_material drop the "first entry
+    alone over the page is handed out cut" branch (``if not kept and entries: kept = [...]``) ->
+    the page lists no member -> RED."""
+    from treasure_map import mcp_app
+
+    w = _world(tmp_path)
+    group = next(u for u in _review(w).units if u.kind == ru.GROUP)
+    ids = {m.entry_id for m in group.members}
+    real = mcp_app._get_diff_patch_view
+
+    def inflated(*a: Any, **kw: Any) -> Any:
+        page = real(*a, **kw)
+        if isinstance(page, dict) and page.get("entries"):
+            hunk = {"lines": [f"+ line {i} " + "x" * 200 for i in range(300)]}
+            page = {
+                **page,
+                "entries": [
+                    {
+                        **e,
+                        "pseudocode_delta": {
+                            **(e.get("pseudocode_delta") or {}),
+                            "inline_hunk": hunk,
+                        },
+                    }
+                    if e.get("entry_id") in ids
+                    else e
+                    for e in page["entries"]
+                ],
+            }
+        return page
+
+    monkeypatch.setattr(mcp_app, "_get_diff_patch_view", inflated)
+    out = mcp_app.make_tools(w.path)["start_diff_review"](
+        run_pair="runA::runB", unit=group.unit_id, k=50
+    )
+    assert len(json.dumps(out)) <= mcp_app._RESPONSE_BYTE_BUDGET
+    mat = out.get("material") or {}
+    assert "entries" in mat, mat
+    page = [e["entry_id"] for e in mat["entries"]]
+    assert len(page) == 1 and page[0] in ids, page
+    _assert_handed_by_page(out, page, "entry_id", len(group.members))
+    assert out["members_after_this_page"] == len(group.members) - 1
+    assert out.get("material_cut") is True
+
+
+def test_the_reduce_is_handed_out_by_its_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ At a page budget where the reduce's owed list is cut (``owed_truncated``), the unit=
+    read names exactly the owed judgements the material lists, in its order, with how many the
+    reduce holds and how many it owes beyond the page — never a member it does not show. The
+    budgets are scanned; some budget must cut the owed list part-way (the precondition).
+
+    MUTATION (verified RED, 1 failed, AssertionError): drop REDUCE from mcp_app._PAGED_KINDS
+    (hand out every owed member) -> RED; count a reduce's members by their judgements' state
+    (``_owed`` without its reduce case, as before) -> members_after_this_page 0 -> RED."""
+    from treasure_map import mcp_app
+
+    w = _world(tmp_path)
+    _judge_every_entry(w)
+    red = next(u for u in _review(w, k=ru.DEFAULT_K).units if u.kind == ru.REDUCE)
+    total = len(red.members)
+    assert total == 4
+    cut_seen = 0
+    for budget in range(1_500, 3_501, 100):
+        monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", budget)
+        out = mcp_app.make_tools(w.path)["start_diff_review"](
+            run_pair="runA::runB", unit=red.unit_id
+        )
+        mat = out.get("material") or {}
+        if "owed" not in mat:
+            continue
+        page = [o["anchor_ref"] for o in mat["owed"]]
+        _assert_handed_by_page(out, page, "anchor_ref", total)
+        # Every member of a reduce is owed (its judgement reads concluded, yet owes the
+        # group_ref): the ones the page leaves out are all counted, none as disposed.
+        assert out["members_after_this_page"] == total - len(page), (budget, page)
+        assert out["members_disposed"] == 0, budget
+        if 0 < len(page) < total:
+            cut_seen += 1
+    assert cut_seen, "no budget cut the reduce's owed list part-way: the precondition did not hold"
+
+
+def test_a_compacted_batch_answer_keeps_each_results_group_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A batch answer whose per-item echo comes near the page is compacted to index and action
+    per result — and each result written with a group_ref keeps it, so the compact answer still
+    says which judgements leaned on the group.
+
+    MUTATION (verified RED, 1 failed, AssertionError): drop "group_ref" from the compacted keys
+    in annotate_diff_batch -> RED."""
+    from treasure_map import mcp_app
+
+    w = _world(tmp_path)
+    ref = cg.group_ref(DIFF, X_B)
+    items = [
+        {"anchor_ref": _anchor(p), "verdict": "changed_real", "rationale": "r", "group_ref": ref}
+        for p in (P1, P2, P4, (X_A, X_B))
+    ]
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 10**7)
+    whole = mcp_app.make_tools(w.path)["annotate_diff_batch"](items, diff_id=DIFF)
+    assert whole.get("written") is True, whole
+    assert all("anchor_ref" in r for r in whole["results"]), whole["results"]
+    size = len(json.dumps(whole["results"]))
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", size + 4_000)
+    cut = mcp_app.make_tools(w.path)["annotate_diff_batch"](items, diff_id=DIFF)
+    assert cut.get("written") is True, cut
+    results = cut.get("results") or []
+    assert len(results) == len(items), results
+    # the precondition: the echo was compacted (no anchor_ref; who was overwritten said once)
+    assert all("anchor_ref" not in r for r in results), results
+    assert "overwrote_by" in cut, sorted(cut)
+    assert [r.get("group_ref") for r in results] == [ref] * len(items), results

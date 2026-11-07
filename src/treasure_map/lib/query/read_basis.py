@@ -17,10 +17,17 @@ of the writing server's session — recorded with the write in overlay_history a
 * ``fetched`` — this session read the subject itself before the write: the entry in full
   (get_diff_patch_view with its entry_id), a side's pseudocode, disassembly or callees, a file's
   difference (get_file_diff with its path).
+  A one-sided binary's function is read by explain_candidate on every one of its candidates
+  (``candidates``, the evidence_refs it must cite).
 * ``none`` — the log holds nothing of the kind. On a must-read subject the caller marks it
   ``unread_before_verdict``: the subject reads needs_recheck (not disposed) until a judgement
   written after reading it.
 * ``unknown`` — there is no log, or no session to read it by: nothing can be said either way.
+
+``rows_partial`` (with ``unit_delivered`` or ``fetched``): the subject is an entry whose candidate
+rows this session read only part of — the windows its unit's material and its own reads held
+(``unit_rows`` / ``rows_read`` in the log) leave some of its ``rows_total`` out. The judgement still
+counts as disposed; the report counts it under ``basis_incomplete``.
 
 LIMIT, stated wherever this is reported: a subagent shares its parent's MCP connection, so in
 serial use "the same session" is the same window, not the same context — there ``unit_delivered``
@@ -132,6 +139,56 @@ def _fetched(line: dict[str, Any], anchor_ref: str, entry_id: str | None) -> boo
     return False
 
 
+def _explained_all(lines: list[dict[str, Any]], candidates: frozenset[str] | None) -> bool:
+    """Whether ``lines`` hold an answered explain_candidate for every one of ``candidates`` (a
+    one-sided binary's function: its candidates' evidence_refs); never for an empty or absent
+    set."""
+    if not candidates:
+        return False
+    read = {
+        (ln.get("params") or {}).get("evidence_ref")
+        for ln in lines
+        if ln.get("tool") == "explain_candidate" and not ln.get("error")
+    }
+    return candidates <= read
+
+
+def _rows_partial(
+    lines: list[dict[str, Any]], anchor_ref: str, entry_id: str | None, delivered: list[int]
+) -> bool:
+    """Whether the row windows this session read of the entry (``unit_rows`` of the deliveries
+    in ``delivered``, ``rows_read`` of its own reads) leave part of its candidate rows unread.
+    False when no window of it was logged (nothing to say) or one window holds them all."""
+    keys = {anchor_ref, entry_id} - {None}
+    windows: list[list[int]] = []
+    for i in delivered:
+        rows = lines[i].get("unit_rows")
+        if isinstance(rows, dict):
+            windows.extend(w for k, w in rows.items() if k in keys and _is_window(w))
+    for ln in lines:
+        if ln.get("tool") != "get_diff_patch_view" or ln.get("error"):
+            continue
+        if (ln.get("params") or {}).get("entry_id") in keys and _is_window(ln.get("rows_read")):
+            windows.append(ln["rows_read"])
+    if not windows:
+        return False
+    total = max(w[2] for w in windows)
+    reach = 0
+    for start, end, _ in sorted(windows):
+        if start > reach:
+            break
+        reach = max(reach, end)
+    return reach < total
+
+
+def _is_window(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 3
+        and all(isinstance(x, int) and not isinstance(x, bool) for x in value)
+    )
+
+
 def _shown_whole(line: dict[str, Any], anchor_ref: str, entry_id: str | None) -> bool:
     """Whether one delivery of a unit showed this subject whole: listed among the members its
     material kept, or — a one-subject material, which logs no member list — not cut."""
@@ -147,8 +204,10 @@ def infer(
     anchor_ref: str,
     entry_id: str | None = None,
     unit_id: str | None = None,
+    candidates: frozenset[str] | None = None,
 ) -> dict[str, Any]:
-    """The read basis of one write of ``anchor_ref`` (see the module docstring)."""
+    """The read basis of one write of ``anchor_ref`` (see the module docstring). ``candidates``:
+    the evidence_refs of a one-sided binary's function, read by explain_candidate on each."""
     if lines is None:
         return {"basis": "unknown", "why": "no tool-call log for this session"}
     if unit_id is not None:
@@ -157,10 +216,21 @@ def infer(
             whole = any(_shown_whole(lines[i], anchor_ref, entry_id) for i in delivered)
             # Not shown whole by any delivery: it counts once the subject itself was fetched
             # after the first of them.
-            if whole or any(_fetched(ln, anchor_ref, entry_id) for ln in lines[delivered[0] + 1 :]):
-                return {"basis": "unit_delivered", "material_cut": not whole}
-    if any(_fetched(ln, anchor_ref, entry_id) for ln in lines):
-        return {"basis": "fetched"}
+            after = lines[delivered[0] + 1 :]
+            if (
+                whole
+                or any(_fetched(ln, anchor_ref, entry_id) for ln in after)
+                or _explained_all(after, candidates)
+            ):
+                out: dict[str, Any] = {"basis": "unit_delivered", "material_cut": not whole}
+                if not whole and _rows_partial(lines, anchor_ref, entry_id, delivered):
+                    out["rows_partial"] = True
+                return out
+    if any(_fetched(ln, anchor_ref, entry_id) for ln in lines) or _explained_all(lines, candidates):
+        got: dict[str, Any] = {"basis": "fetched"}
+        if _rows_partial(lines, anchor_ref, entry_id, []):
+            got["rows_partial"] = True
+        return got
     return {"basis": "none"}
 
 
