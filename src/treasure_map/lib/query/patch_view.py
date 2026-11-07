@@ -3452,6 +3452,9 @@ _DELTA_CACHE: _BoundedCache[tuple[Any, ...], dict[str, Any]] = _BoundedCache(409
 # two are computed in one pass and written together, and a pair missing from EITHER is recomputed
 # whole, so the delta never carries the scan.
 _GUARD_CACHE: _BoundedCache[tuple[Any, ...], dict[str, Any]] = _BoundedCache(4096)
+# The drift reading (drift_reading) of each bucket S pair, on the delta cache's key: computed from
+# the two texts and images, cached so pages and renders of one diff read it once.
+_DRIFT_CACHE: _BoundedCache[tuple[Any, ...], dict[str, Any]] = _BoundedCache(4096)
 # One candidate's instance rows, parsed and cut (diff_sink_axes.RowAxes), per (atlas, run, the run
 # row's stamps, evidence_ref): read for the rows a page renders, never the raw record.
 _SINK_AXIS_CACHE: _BoundedCache[tuple[str, ...], tuple[diff_sink_axes.RowAxes, ...]] = (
@@ -3471,6 +3474,7 @@ def _clear_view_caches() -> None:
     _UNDETERMINED_READING_CACHE.clear()
     _DELTA_CACHE.clear()
     _GUARD_CACHE.clear()
+    _DRIFT_CACHE.clear()
     _SINK_AXIS_CACHE.clear()
     _B_MENTIONS_CACHE.clear()
     _SIZE_FACT_CACHE.clear()
@@ -3907,6 +3911,80 @@ def _hidden_region(read: _Read, p: _Pair) -> dict[str, Any] | None:
         "bindiff_matched_instructions": p.instructions,
         "similarity": p.similarity,
     }
+
+
+def _page_drift(
+    atlas: sqlite3.Connection,
+    built: BuiltDiff,
+    readings: _Readings,
+    page: list[_Entry],
+    page_deltas: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """The drift reading (lib/query/drift_reading) of each bucket S entry on ``page`` — an aligned
+    pair whose pseudocode differs: whether its two texts differ only by shifted line numbers or
+    addresses (``drift_only``), a navigation fact that moves nothing. Cached per pair (the texts
+    and images are re-read only on a miss); the diff's full alignment map decides whether a FUN
+    pair named inside a body is itself aligned (an address shift) or not."""
+    from treasure_map.lib.query import drift_reading as _drift
+
+    want = [
+        (e, e.pair)
+        for e in page
+        if e.pair is not None
+        and e.pair.aligned
+        and page_deltas.get((e.pair.addr_a, e.pair.addr_b)) is not None
+        and _sameness_of(e, readings) == sameness.DIFFERS
+    ]
+    if not want:
+        return {}
+    aligned = frozenset(
+        (p.addr_a.zfill(8), p.addr_b.zfill(8))
+        for ee in built.placed
+        if (p := ee.pair) is not None and p.aligned
+    )
+    (pa, sha_a), (pb, sha_b) = readings.sources
+    readers: dict[tuple[str | None, str | None], _drift.ImageReader] = {}
+
+    def reader(path: str | None, sha: str | None) -> _drift.ImageReader:
+        key = (path, sha)
+        if key not in readers:
+            readers[key] = _drift.read_image(path, sha)
+        return readers[key]
+
+    bodies_a: sameness.Bodies | None = None
+    bodies_b: sameness.Bodies | None = None
+    out: dict[str, dict[str, Any]] = {}
+    for e, p in want:
+        key = (readings.key, p.addr_a, p.addr_b)
+        hit = _DRIFT_CACHE.get(key)
+        if hit is None:
+            if bodies_a is None or bodies_b is None:
+                bodies_a = sameness.read_function_bodies(pa, sha_a) or {}
+                bodies_b = sameness.read_function_bodies(pb, sha_b) or {}
+            ta = (bodies_a.get(p.addr_a) or {}).get("pseudocode")
+            tb = (bodies_b.get(p.addr_b) or {}).get("pseudocode")
+            if not ta or not tb:
+                hit = {"state": _drift.UNDETERMINED, "why": "a body could not be read"}
+            else:
+                na = p.name_a if p.name_a and not _is_synthetic_name(p.name_a, p.addr_a) else None
+                nb = p.name_b if p.name_b and not _is_synthetic_name(p.name_b, p.addr_b) else None
+                sizes = e.sizes if e.sizes is not None else (None, None)
+                hit = _drift.drift_reading(
+                    ta,
+                    tb,
+                    page_deltas[(p.addr_a, p.addr_b)],
+                    reader(pa, sha_a),
+                    reader(pb, sha_b),
+                    aligned,
+                    na,
+                    nb,
+                    (e.callee_set or {}).get("state"),
+                    sizes[0],
+                    sizes[1],
+                )
+            _DRIFT_CACHE[key] = hit
+        out[e.entry_id] = hit
+    return out
 
 
 def _deltas(
@@ -4430,6 +4508,7 @@ _SUMMARY_COPY = frozenset(
         "b_other_fn_mentions",
         "pseudocode_sameness",
         "text_unverified_reasons",
+        "drift",
         "significance",
         "lift_basis",
         "swap_pairing_note",
@@ -5660,6 +5739,7 @@ def get_diff_patch_view(
         readings, [p for e in page if (p := _delta_pair(e, readings)) is not None], page_guards
     )
     page_bodies = _page_bodies(readings, page)
+    page_drift = _page_drift(atlas, built, readings, page, page_deltas)
     # A summary entry is projected from the entry as a scan (rows_limit=0) renders it.
     inline = 0 if summary else rows_limit
     windows = {e.entry_id: _rows_window(e.row_views, rows_offset or 0, inline) for e in page}
@@ -5704,6 +5784,8 @@ def get_diff_patch_view(
                     out.update(guard_fields)
             if (e.pair.addr_a, e.pair.addr_b) in page_bodies:
                 out["bodies"] = page_bodies[(e.pair.addr_a, e.pair.addr_b)]
+        if e.entry_id in page_drift:
+            out["drift"] = page_drift[e.entry_id]
         if e.entry_id in proposed and e.pair is not None:
             out["proposed_pair_reading"] = _proposed_json(
                 e, *proposed[e.entry_id], page_deltas, page_bodies, guard_fields

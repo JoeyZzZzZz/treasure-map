@@ -99,6 +99,7 @@ from treasure_map.lib.query import runs_where_function_exists as _runs_where_fun
 from treasure_map.lib.query import state_value_label as _state_value_label
 from treasure_map.lib.query import triage as _triage
 from treasure_map.lib.query import unknown_dimension_refusal as _unknown_dim_refusal
+from treasure_map.lib.query import upstream_version as _uv
 from treasure_map.lib.query.diff_align import align_by_function as _align_by_function
 from treasure_map.lib.query.diff_align import diff_source_staleness as _diff_source_staleness
 from treasure_map.lib.query.diff_align import diffs_source_staleness as _diffs_source_staleness
@@ -117,6 +118,9 @@ from treasure_map.lib.query.diff_workflow import DIFF_ONE_DIFF, DIFF_WORKFLOW
 from treasure_map.lib.query.diff_workflow import PAIR_WORKFLOW as _PAIR_WORKFLOW
 from treasure_map.lib.query.patch_view import ROWS_INLINE_LIMIT as _ROWS_INLINE_LIMIT
 from treasure_map.lib.query.patch_view import get_diff_patch_view as _get_diff_patch_view
+from treasure_map.lib.query.recompile_only import label_entries as _label_recompile_only
+from treasure_map.lib.query.recompile_only import recompile_only as _recompile_only
+from treasure_map.lib.query.same_shape_run_pair import probe_diff as _same_shape_pair_probe
 from treasure_map.lib.query.same_shape_siblings import (
     same_shape_siblings as _same_shape_siblings,
 )
@@ -2842,6 +2846,28 @@ def make_tools(
                 return
             room -= over
 
+    def _upstream_groups(
+        atlas: sqlite3.Connection, review: _ru.PairReview, run_a: str, run_b: str
+    ) -> dict[str, Any]:
+        """F-4: the pair's upstream library groups, a navigation annotation read off the units
+        (lib/query/upstream_version.upstream_groups); the units are not touched."""
+        states = review.progress.states
+        return _uv.upstream_groups(
+            _uv.pair_upstream(atlas, run_a, run_b),
+            review.units,
+            lambda u: _ru.unit_disposed(u, states),
+            {d.diff_id: d.binary for d in review.facts.diffs},
+        )
+
+    def _label_upstream(
+        atlas: sqlite3.Connection, run_a: str, run_b: str, u: _ru.Unit, holder: dict[str, Any]
+    ) -> None:
+        """``holder["upstream"]``: the library and versions of ``u``'s diff, when its binary names
+        an upstream library (nothing else is added or changed)."""
+        lab = _uv.label(_uv.pair_upstream(atlas, run_a, run_b).get(u.stream))
+        if lab is not None:
+            holder["upstream"] = lab
+
     def _start_pair_review(
         run_pair: str, limit: Any, worker: Any, workers: Any, unit: Any, k: Any
     ) -> dict[str, Any]:
@@ -2878,6 +2904,7 @@ def make_tools(
                     )
                     return out
                 out["unit"] = _unit_head(u, states)
+                _label_upstream(atlas, run_a, run_b, u, out["unit"])
                 out["members"] = [] if u.kind in _PAGED_KINDS else _members_json(u, states)
                 room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
                 _fit_unit_material(atlas, review, u, out, lambda: len(json.dumps(out)), room)
@@ -2899,9 +2926,11 @@ def make_tools(
                     "dangling",
                     "basis_incomplete",
                     "presence_citations_short",
+                    "dispatch_groups",
                 )
                 if key in rep
             }
+            out["report"]["upstream_groups"] = _upstream_groups(atlas, review, run_a, run_b)
             nr = rep["not_reachable"]
             out["report"]["not_reachable"] = {
                 "failed_diffs": len(nr["failed_diffs"]),
@@ -2925,6 +2954,7 @@ def make_tools(
                 **_unit_head(nxt, states),
                 "members": [] if nxt.kind in _PAGED_KINDS else _members_json(nxt, states),
             }
+            _label_upstream(atlas, run_a, run_b, nxt, out["next_unit"])
             room = _RESPONSE_BYTE_BUDGET - len(json.dumps(out)) - 200
             out["next_unit"]["read_alone"] = (
                 f"start_diff_review(run_pair={json.dumps(run_pair)}, unit={json.dumps(nxt.unit_id)}"
@@ -3006,7 +3036,24 @@ def make_tools(
         With ``workers``, ``shard.slices`` counts each shard's units, members, must-read members
         and candidate rows; a write naming
         its unit but no shard is handed on in the shard this session last asked for. The full
-        unit list is not sent here: ``tmap review report <run_pair> --md -o <file>`` writes it. A
+        unit list is not sent here: ``tmap review report <run_pair> --md -o <file>`` writes it.
+        ``report.upstream_groups`` is a navigation annotation: the pair's diffs whose binaries
+        name the same upstream library (by file name) at the same version on each side (see
+        get_diff_meta's ``upstream_version``), one row per (``library``, ``a``, ``b``) with its
+        ``diffs``, up to 4 ``binaries``, and the ``units`` / ``must_read_units`` / ``open_units``
+        those diffs hand out; ``groups_total``, ``diffs_in_groups``, the 12 groups handing out the
+        most units and ``groups_not_shown`` / ``units_not_shown`` for the rest. A unit of such a
+        diff carries ``upstream`` (``library``, ``a``, ``b``). Grouping changes no unit, unit id
+        or must-read set and filters nothing; belonging to an upstream library is not a safety
+        proof, so its units are read like any other. The ``report`` also carries
+        ``dispatch_groups``: a bounded navigation grouping of the must-read entries by the
+        string-keyed edge that enumerates their function — a static {string, handler} table
+        (grouped by the two-side-aligned table) or a strcmp gate (grouped by the two-side aligned
+        dispatch function), each member labelled with its key. It is a stored enumeration, never a
+        reachability claim; an entry named by no recovered table or gate is in an explicit
+        ``uncovered`` bucket carrying the static-table detector's scan status, never read as not
+        dispatched. It groups only: the units, the must-read set, the ids and the order are
+        unchanged, and an entry can be in a callee group and a dispatch group at once. A
         pair with a proven-stale run is refused."""
         if (diff_id is None) == (run_pair is None):
             return {
@@ -3358,7 +3405,14 @@ def make_tools(
         the similarity-1 pairs that place no entry are counted by it under ``not_listed``
         (``not_listed_page=<name>`` walks one category), except those reading ``differs``, which
         are listed as bucket S — their category keeps a count of 0 with ``listed_as``, and its page
-        is empty and names ``bucket="S"``. A
+        is empty and names ``bucket="S"``. A bucket S entry carries ``drift``: whether its two
+        texts differ ONLY by shifted line numbers or shifted addresses (``state`` ``drift_only``
+        with ``sites`` ``{line, address}``, ``not_drift_only`` with ``why``, or ``undetermined``
+        with ``why`` — an input could not be read). It is a navigation fact that MOVES NOTHING: a
+        drift-only entry stays must-read and may be folded below the rest, never skipped; a shift
+        of line numbers never asserts nothing else changed, so the reading demands every differing
+        site be an explained line-number or address shift AND the two callee sets and body sizes be
+        proven equal, and fails to ``not_drift_only`` otherwise. A
         qualified match carries ``hidden_region``: each decompiler warning with the address it
         names and whether that lies in the function's own body, ``body`` (``structure_differs``
         when the byte counts differ, else ``unknown`` — never ``identical``), the byte counts,
@@ -3499,7 +3553,10 @@ def make_tools(
         / address: segment / tier / lane / subclass rank; significance: attention, then the swap
         and read-first heads): due a re-check first, then change_inconclusive, unjudged,
         changed_real, no_real_change; off, the order is the page's sort_by — significance when
-        none is given."""
+        none is given. ``recompile_only_diff: true`` on an entry is derived from the whole diff:
+        get_diff_meta's ``recompile_only.value`` is true for it. It is no reading of the entry
+        itself, it is absent when that value is false or null, and the entry stays listed and
+        owed as before."""
         if (
             isinstance(rows_limit, bool)
             or not isinstance(rows_limit, int)
@@ -3536,6 +3593,7 @@ def make_tools(
                 rows_limit=rows_limit,
                 detail=detail,
             )
+            _label_recompile_only(conn, diff_id, result)
             return _fit_entries(result, offset)
         finally:
             conn.close()
@@ -3809,12 +3867,33 @@ def make_tools(
         ``candidate_anchor`` (what annotate_diff takes). A member in a pair the view does not list
         has neither: annotate_diff and promote take only what the view lists. ``source_stale`` /
         ``source_stale_reason`` as in list_diffs. A diff whose side is a proven-stale scan is
-        refused, as on every diff tool."""
+        refused, as on every diff tool.
+
+        Across the run pair: pass the run pair (``{run_a}::{run_b}``) as ``diff_id`` and the group
+        (``scope`` ``run_pair``) holds the calls with the same ``f2_key`` in every binary a diff of
+        the pair covers, both sides; the key is the one-diff key, unchanged, and ``input.diff_id``
+        names the diff the input call is a candidate of. ``sides`` ({a, b}: ``member_count``,
+        ``binaries``, ``by_binary``, ``shared_literal_members``, ``literal_unknown_members``),
+        ``members_outside_input_diff``, ``input_group_ref`` (the input's one-diff group_ref, for
+        annotate_diff) and ``bounds``: ``calls_unreadable`` counts per side the diffed binaries
+        whose calls could not be read (never read as holding no member), ``literals_unreadable``,
+        ``unkeyed``, ``excluded_non_callsite``. Members are ordered by the literal strings their
+        function shares with the input's function (``members_order``): sharing first, the rarest
+        shared literal of its run first (``rarest_shared_literal_df`` = how many functions of that
+        run reference it), then those whose literals could not be read (``shared_literals``
+        null), then those sharing none — an order to read in, never a reading of the change. A
+        member row carries its ``diff_id`` and ``side`` but no landing: its landing and group_ref
+        are its own diff's answer, same_shape_siblings(diff_id=<its diff_id>,
+        evidence_ref=<its evidence_ref>). This group covers only binaries a diff covers; the calls
+        of the binaries no diff covers stay the one-diff group's ``binaries_not_diffed`` (a sink
+        name and kind count, not a shape), not repeated here."""
         conn = open_atlas(atlas_path)
         try:
-            refusal = _refuse_stale_diff(conn, diff_id)
+            # A run pair in diff_id is refused through the same gate as any diff of the pair.
+            pair_probe = _same_shape_pair_probe(conn, diff_id)
+            refusal = _refuse_stale_diff(conn, pair_probe or diff_id)
             if refusal is not None:
-                return refusal
+                return refusal if pair_probe is None else {**refusal, "diff_id": diff_id}
             result = _same_shape_siblings(
                 conn,
                 diff_id,
@@ -3907,7 +3986,28 @@ def make_tools(
         an ``a_only`` / ``b_only`` name may still be called through another stub (``.MIPS.stubs`` or
         an unnamed ``.plt`` entry) on the other side — not a determined one-sided add. Null on a
         diff written before.
-        ``server`` reports the running server's own build (D33; see list_runs)."""
+        ``server`` reports the running server's own build (D33; see list_runs).
+        ``upstream_version``: the upstream library the binary's file name names (matched as the
+        dependency resolver matches names, libssl.so.1.1 -> libssl.so -> libssl; the binary's own
+        DT_SONAME is not extracted), ``library`` null when it names none; otherwise per side
+        ``a`` / ``b`` its ``path``, ``version`` and ``basis`` — the banner ``rule`` and the
+        ``string`` of the binary that states the version, or the ``reason`` it is ``unknown``
+        (``no_banner_rule``, ``no_banner_string``, ``several_versions``, ``side_unreadable``).
+        ``unknown`` is not "no version". It gives the version only: no advisory is looked up.
+        ``recompile_only`` says whether every change this diff holds is explained by recompiling
+        the same source: ``value`` true / false / null (null = an input could not be read,
+        ``unknown_because`` names each), with its ``rule``. ``explained`` counts what was given an
+        explanation (identical, same-name stub or byte-identical pairs; pairs whose text differs
+        only at line-number or version-string sites with equal callee sets and body sizes;
+        version and build-environment string pairs; build-id, string and function bytes), and
+        ``unexplained`` names the first difference with none (the reading stops there, so later
+        ones are not counted). It compares the function pairs, the one-sided functions and import
+        stubs, the one-sided strings and every stored block's bytes, position by position. A
+        build-environment string is only a path rewritten from a toolchain or build-tree
+        component on (never one under /etc or another runtime root), and a dotted number shaped
+        like an IPv4 address or netmask, or glued to an interface name, is not a version. true is
+        not 'behaves the same' — a version string can feed a comparison — and it changes no unit,
+        order, must-read set or judgement."""
         server, moved = _server_block()
         conn = open_atlas(atlas_path)
         try:
@@ -3918,9 +4018,11 @@ def make_tools(
             out = _get_diff_meta(conn, diff_id)
             out["server"] = server
             if out.get("found"):
+                out["upstream_version"] = _uv.diff_upstream(conn, diff_id)
                 files = _file_block(conn, diff_id)
                 if files is not None:
                     out["non_binary"] = files
+                out["recompile_only"] = _recompile_only(conn, diff_id)
             return out
         finally:
             conn.close()
@@ -4305,10 +4407,16 @@ def make_tools(
         ★ ``run_a_id`` / ``run_b_id`` are the before / after roles. When both are given, none is
         recorded in that direction and some are recorded the other way round, the answer carries
         ``reverse_direction_diffs`` (how many) and ``reverse_direction_note``; nothing is
-        swapped."""
+        swapped.
+        ``upstream_library`` (on a row whose binary's file name names an upstream library, absent
+        otherwise) is that library by name only; its versions are get_diff_meta's
+        ``upstream_version``."""
         conn = open_atlas(atlas_path)
         try:
             out = _list_diffs(conn, run_a_id, run_b_id, file_staleness=_file_staleness(conn))
+            for row in out.get("diffs") or []:
+                if (lib := _uv.library_of(row.get("binary"))) is not None:
+                    row["upstream_library"] = lib
             out.update(_reverse_hint(conn, run_a_id, run_b_id, ("run_a_id", "run_b_id")))
             # First key: the answer can run long, and the whole-pair entry must not sit past it.
             return {"review_pairs": _review_pairs(out.get("diffs") or []), **out}

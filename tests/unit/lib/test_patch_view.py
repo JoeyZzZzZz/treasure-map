@@ -6121,7 +6121,7 @@ _S_COPY = (
     "entry_id bucket subclass tier blind_spots review_state addr_a addr_b name_a name_b "
     "similarity export_gap_a export_gap_b side addr name presence_state export_gap pairing "
     "callers_b b_other_fn_mentions pseudocode_sameness text_unverified_reasons significance "
-    "lift_basis swap_pairing_note rows_total rows_by_presence"
+    "lift_basis swap_pairing_note rows_total rows_by_presence drift"
 ).split()
 _S_COUNTS = {
     "rows_total",

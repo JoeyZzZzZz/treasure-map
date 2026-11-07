@@ -1275,6 +1275,12 @@ def review_pair(
         presence_short=short,
         reduce_owed=owed,
     )
+    # F-3 (D13): a navigation grouping of the must-read entries by the string-keyed edge that
+    # enumerates their function (dispatch tables / strcmp gates). Moves nothing — units, ids and
+    # must_read are already fixed above; this only annotates.
+    from treasure_map.lib.query import dispatch_groups as _dg
+
+    rep["dispatch_groups"] = _dg.report_block(_dg.from_review(atlas, facts, units))
     return PairReview(facts, units, progress, rep, k, audits)
 
 

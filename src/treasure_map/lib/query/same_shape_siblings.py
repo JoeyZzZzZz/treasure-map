@@ -54,6 +54,12 @@ WHAT CAN MAKE THE GROUP LOOK SMALLER (``sibling_set_bounds``):
   no structural fingerprint, no sink name), once per evidence_ref: any of them may be of this
   shape.
 
+ACROSS THE RUN PAIR: a ``diff_id`` naming a run pair (``{run_a}::{run_b}``) asks for the same key's
+members in every binary a diff of the pair covers, both sides, ordered by the literals they share
+with the input's function (lib/query/same_shape_run_pair). The key is the one computed here,
+unchanged; ``binaries_not_diffed`` above stays this group's own count of the binaries no diff
+covers, which that group does not reach.
+
 HANDLES on a member row: ``evidence_ref`` (a candidate-level judgement, annotate); for a member in
 a listed entry also ``entry_id`` + ``row_ref`` (what promote takes) and ``candidate_anchor`` (what
 annotate_diff takes). promote itself decides whether it carries a judgement onto that row — a row
@@ -708,8 +714,37 @@ def same_shape_siblings(
 
     ``reads`` (SameShapeReads) is the caller's holder for one pass over many calls of the same
     diffs: the view and the side reads are taken from it, read once each. The answer is the same
-    with it or without it."""
+    with it or without it.
+
+    A ``diff_id`` that names a run pair (``{run_a}::{run_b}``) instead of one binary's diff asks
+    for the group across every diffed binary of the pair, both sides, under the same shape key
+    (lib/query/same_shape_run_pair; ``reads`` is not used there)."""
     reads = SameShapeReads() if reads is None else reads
+    # A run pair in place of one binary's diff: the group across every diffed binary of the pair
+    # (lib/query/same_shape_run_pair), refused and checked the way a diff is.
+    from treasure_map.lib.query import same_shape_run_pair as run_pair
+
+    pair = run_pair.run_pair_scope(atlas, diff_id)
+    if pair is not None:
+        probe = run_pair.probe_diff(atlas, diff_id)
+        assert probe is not None
+        refusal = refuse_stale_diff(
+            atlas, probe, build_hash=build_hash, current=current, commit=commit
+        )
+        if refusal is not None:
+            return {**refusal, "diff_id": diff_id}
+        bad = _check_args(evidence_ref, candidate_anchor, members_offset, members_limit)
+        if bad is not None:
+            return {"diff_id": diff_id, "scope": run_pair.RUN_PAIR_SCOPE, "error": bad}
+        return run_pair.run_pair_siblings(
+            atlas,
+            diff_id,
+            *pair,
+            evidence_ref=evidence_ref,
+            candidate_anchor=candidate_anchor,
+            members_offset=members_offset,
+            members_limit=members_limit,
+        )
     meta = _meta(atlas, diff_id)
     if meta is None:
         return {"diff_id": diff_id, "error": f"no diff {diff_id!r} in this atlas (see list_diffs)"}
