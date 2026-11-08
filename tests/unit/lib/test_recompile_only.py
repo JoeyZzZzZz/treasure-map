@@ -496,9 +496,11 @@ def test_a_null_diff_carries_no_entry_label(tmp_path: Path) -> None:
 # ── which numbers are line numbers (strong / weak evidence, one step) ──────────────────────────
 
 
-def _numbers(tmp: Path, a: str, b: str, *, byte_b: int = 0x2B) -> dict[str, Any]:
+def _numbers(
+    tmp: Path, a: str, b: str, *, byte_b: int = 0x2B, name_b: str | None = None
+) -> dict[str, Any]:
     """The reading of a diff whose handle_req text is ``a`` / ``b`` (statements), its one immediate
-    byte changed with it, everything else recompiled."""
+    byte changed with it, everything else recompiled. ``name_b`` renames the pair's B side."""
     tmp.mkdir(parents=True, exist_ok=True)
     r = _same(tmp)
     r.side["a"]["f2_text"] = _f2(a)
@@ -506,7 +508,11 @@ def _numbers(tmp: Path, a: str, b: str, *, byte_b: int = 0x2B) -> dict[str, Any]
     r.side["b"]["f2_byte"] = byte_b
     for s in ("a", "b"):
         r.side[s]["f2_callees"] = ["log_msg", "check_len", "syslog"]
-    return _read(r.build())
+    w = r.build()
+    if name_b is not None:
+        w.atlas.execute("UPDATE function_alignment SET name_b = ? WHERE addr_a = ?", (name_b, F2))
+        w.commit()
+    return _read(w)
 
 
 def test_a_length_after_an_identifier_string_is_not_a_line_number(tmp_path: Path) -> None:
@@ -653,6 +659,115 @@ def test_a_plain_constant_change_reads_false(tmp_path: Path) -> None:
     out = _numbers(tmp_path, "  set_mode(param_1,5);\n", "  set_mode(param_1,6);\n")
     assert out["value"] is False, out
     assert out["unexplained"]["kind"] == "pair_text_differs"
+
+
+def test_a_format_of_a_finished_statement_before_a_length_is_no_evidence(tmp_path: Path) -> None:
+    """★ A finished ``log_msg("%s:%d","fn_x",0x2a);`` on the line before ``check_len(param_1,
+    "admin",5)`` -> ``6``: the format belongs to another statement, so the length stays weak — a
+    changed constant, false. (A format on the line before counts only for a call folded onto the
+    number's line.)
+
+    MUTATION (verified RED, 1 failed): drop the continuation test in line_format.format_evidence
+    (``statement_continues(prev) and`` removed) -> the length reads strong -> true -> RED."""
+    log = '  log_msg("%s:%d","fn_x",0x2a);\n'
+    out = _numbers(
+        tmp_path,
+        log + '  check_len(param_1,"admin",5);\n',
+        log + '  check_len(param_1,"admin",6);\n',
+    )
+    assert out["value"] is False, out
+    assert out["unexplained"]["kind"] == "pair_text_differs"
+
+
+def test_a_format_two_lines_before_the_number_is_no_evidence(tmp_path: Path) -> None:
+    """★ A call folded over three lines with its format two lines above the number: only the
+    number's own line and the line before are read — weak, false.
+
+    MUTATION (verified RED, 1 failed): read the format anywhere in the function (``_fmt_near``
+    -> ``any(format_evidence(t, []) for t in lines)``) -> true -> RED."""
+    text = '  log_msg("%s:%d",\n          param_2,\n          "fn",{n});\n'
+    out = _numbers(tmp_path, text.format(n=10), text.format(n=11))
+    assert out["value"] is False, out
+
+
+def test_a_format_on_one_side_only_is_no_evidence(tmp_path: Path) -> None:
+    """★ The format must hold on both sides. ``"%1.2s:%d"`` -> ``"%1.3d:%d"`` differs only by a
+    version-shaped run (a version-string site, explained), yet only side A's literal still has a
+    ``%…s`` conversion: the number after ``"fn"`` stays weak — false.
+
+    MUTATION (verified RED, 1 failed): evidence on either side (``_fmt_near(ta, x) and
+    _fmt_near(tb, y)`` -> ``or``) -> true -> RED."""
+    out = _numbers(tmp_path, '  log_msg("%1.2s:%d","fn",10);\n', '  log_msg("%1.3d:%d","fn",11);\n')
+    assert out["value"] is False, out
+    # the precondition: the literal pair itself is an explained version site
+    assert ro.string_pair_classes("%1.2s:%d", "%1.3d:%d") is not None
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ('  log_msg("%d:%x","fn",10);\n', '  log_msg("%d:%x","fn",11);\n'),  # no %s at all
+        ('  log_msg("%d bytes %d","fn",10);\n', '  log_msg("%d bytes %d","fn",11);\n'),
+        # the ``%`` operators between two literals are code, not a format
+        (
+            '  check_len("t",n % sz,m % idx,"admin",5);\n',
+            '  check_len("t",n % sz,m % idx,"admin",6);\n',
+        ),
+    ],
+)
+def test_a_line_without_a_name_then_line_format_literal_is_no_evidence(
+    tmp_path: Path, a: str, b: str
+) -> None:
+    """★ Number conversions alone (``%d`` / ``%x``), a letter ``s`` after a ``%d``, or code
+    between two literals holding ``% s`` / ``% i`` operators are no name-then-line format: the
+    number after the identifier string stays weak — false.
+
+    MUTATION (verified RED, 3 failed): any token holding a ``%`` is evidence (``return "%" in
+    literal`` at the top of line_format.name_line_format; the ``%`` operator token too) -> true ->
+    RED. MUTATION (verified RED, 1 failed, the operators): the whole line read as one literal
+    (``any(name_line_format(t) for t in line)`` -> ``name_line_format('"' + " ".join(line) +
+    '"')``) -> true -> RED."""
+    out = _numbers(tmp_path, a, b)
+    assert out["value"] is False, out
+
+
+def test_the_own_name_of_one_side_only_is_weak(tmp_path: Path) -> None:
+    """★ ``log_msg("handle_req",10)`` -> ``11`` where side B's function is named otherwise: the
+    string is the own name on one side only, so the site is weak — false. (Both sides named
+    ``handle_req`` is the strong case of test_a_source_path_or_the_own_name_is_strong_evidence.)
+
+    MUTATION (verified RED, 1 failed): own name on either side (``names == (text, text)`` ->
+    ``text in names``) -> true -> RED."""
+    out = _numbers(
+        tmp_path,
+        '  log_msg("handle_req",10);\n',
+        '  log_msg("handle_req",11);\n',
+        name_b="handle_other",
+    )
+    assert out["value"] is False, out
+
+
+def test_a_line_number_spelled_as_the_same_value_reads_false(tmp_path: Path) -> None:
+    """★ ``10`` -> ``0xa`` after a format: the step is zero — no line shift, false.
+
+    MUTATION (verified RED, 1 failed): allow a zero step (``or 0 in steps`` removed) -> true ->
+    RED."""
+    out = _numbers(
+        tmp_path, '  log_msg("%s:%d","fn",10);\n', '  log_msg("%s:%d","fn",0xa);\n', byte_b=0x2A
+    )
+    assert out["value"] is False, out
+    assert "one nonzero step" in out["unexplained"]["why"], out
+
+
+def test_a_number_whose_step_cannot_be_computed_reads_false(tmp_path: Path) -> None:
+    """★ A number token that is no integer literal Python reads (``010`` -> ``011``, a
+    leading-zero spelling) has no computable step — fail closed, false.
+
+    MUTATION (verified RED, 1 failed): accept an uncomputable step (``None in steps or``
+    removed) -> true -> RED."""
+    out = _numbers(tmp_path, '  log_msg("%s:%d","fn",010);\n', '  log_msg("%s:%d","fn",011);\n')
+    assert out["value"] is False, out
+    assert "one nonzero step" in out["unexplained"]["why"], out
 
 
 # ── inputs that cannot be read in full ───────────────────────────────────────────────────────

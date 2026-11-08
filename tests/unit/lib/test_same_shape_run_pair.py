@@ -418,15 +418,24 @@ def test_a_function_level_input_gets_its_shapes_with_pair_counts(world: PairWorl
     assert "no group's member" in page.get("error", ""), page
 
 
-def test_an_input_outside_the_diffed_binaries_is_refused_with_where_it_is_counted(
+def test_an_input_outside_the_diffed_binaries_is_refused_with_where_it_is_read(
     world: PairWorld,
 ) -> None:
-    """A call of a binary no diff covers is refused at this scope, naming the one-diff bound that
-    counts such calls; a ref of no candidate and a call naming no input are refused too.
+    """A call of a binary no diff covers is refused as the input at this scope; the refusal says
+    where such a call IS read — as a ``diffed`` false member of the group of a same-shape call in a
+    diffed binary, counted in ``bounds.not_diffed_same_shape`` — and it is so: the same call is
+    a member of the input's group. A ref of no candidate and a call naming no input are refused
+    too.
 
-    MUTATION (verified RED, 1 failed): leave the bound's name out of the refusal -> RED."""
+    MUTATION (verified RED, 1 failed): the refusal names the one-diff group's
+    ``sibling_set_bounds.binaries_not_diffed`` again (the text before this fix) -> RED."""
     out = _sib(world, evidence_ref=ND)
-    assert "binaries_not_diffed" in out.get("error", ""), out
+    err = out.get("error", "")
+    assert "cannot be the input" in err, out
+    assert "diffed false" in err and "bounds.not_diffed_same_shape" in err, err
+    assert "binaries_not_diffed" not in err, err
+    nd = [m for m in _all_members(world, INPUT) if m["evidence_ref"] == ND]
+    assert [m.get("diffed") for m in nd] == [False], nd
     assert "not a candidate" in _sib(world, evidence_ref="runA#11111111:0000f000@cmd@0x10")["error"]
     assert "exactly one" in _sib(world)["error"]
 
@@ -549,6 +558,64 @@ def test_a_binary_identical_on_both_sides_gives_members_on_both_with_that_reason
     bound = _sib(world, evidence_ref=INPUT)["bounds"]["not_diffed_same_shape"]
     assert bound["a"]["by_reason"]["identical_both_sides"] == {"binaries": 1, "members": 1}
     assert bound["b"]["by_reason"]["identical_both_sides"] == {"binaries": 1, "members": 1}
+
+
+def test_a_not_diffed_binary_missing_from_its_runs_analysis_db_is_a_literal_unknown_member(
+    world: PairWorld,
+) -> None:
+    """A binary no diff covers and its run's analysis.db does not hold, with a call of the key on
+    B: the call is a member with diffed false whose literals are unknown (``shared_literals``
+    null), and ``bounds.literals_unreadable`` counts that binary beside the diffed one missing
+    there — the count runs over every binary holding a call, not only the diffed ones.
+
+    MUTATION (verified RED, 1 failed): count ``not_in_analysis_db`` over the diffed binaries only
+    (``scope.calls`` -> ``scope.diff_of`` in _bounds) -> 1, not 2 -> RED."""
+    lone = "ab" * 32  # in no diff and not in B's analysis.db
+    ref = world.call("runB", lone, "00005000", path="/fw/bin/liblone")
+    world.commit()
+    by_ref = {m["evidence_ref"]: m for m in _all_members(world, INPUT)}
+    assert ref in by_ref, sorted(by_ref)
+    m = by_ref[ref]
+    assert m.get("diffed") is False and m.get("binary") == "liblone", m
+    assert m.get("shared_literals", "absent") is None, m
+    assert m.get("rarest_shared_literal_df", "absent") is None, m
+    g = _sib(world, evidence_ref=INPUT)
+    assert g["bounds"]["literals_unreadable"]["b"] == {
+        "not_in_analysis_db": 2,
+        "analysis_status": 1,
+    }, g["bounds"]["literals_unreadable"]
+    assert g["sides"]["b"]["literal_unknown_members"] == 3, g["sides"]["b"]
+
+
+def test_two_binaries_with_no_content_hash_at_two_paths_stay_two_binaries(
+    world: PairWorld,
+) -> None:
+    """Two binaries no diff covers whose instance rows record no content hash, with one short
+    name at two paths: each is keyed by its own path, so they are two members in two binaries
+    (per side and in ``bounds.not_diffed_same_shape``), never folded into one.
+
+    MUTATION (verified RED, 1 failed): key a binary with no content hash by ``"path:"`` alone in
+    _read_calls -> the two read as one binary -> RED."""
+    pid = world._pattern("fp_cmd")
+    refs = []
+    for i, path in enumerate(("/fw/p1/libq", "/fw/p2/libq")):
+        ref = _ref("runA", f"0000610{i}", "cmd", "0x10", f"0000aaa{i}")
+        world.atlas.execute(
+            "INSERT INTO instance (pattern_id, evidence_ref, source_run_id, binary_content_hash, "
+            "binary_path, sink_anchor, flow_evidence) VALUES (?, ?, 'runA', NULL, ?, 'system', ?)",
+            (pid, ref, path, FREE),
+        )
+        refs.append(ref)
+    world.commit()
+    by_ref = {m["evidence_ref"]: m for m in _all_members(world, INPUT)}
+    rows = [by_ref.get(r) for r in refs]
+    assert all(r is not None for r in rows), sorted(by_ref)
+    assert [(r["diffed"], r["binary"]) for r in rows if r] == [(False, "libq"), (False, "libq")]
+    g = _sib(world, evidence_ref=INPUT)
+    side_a = g["sides"]["a"]
+    assert (side_a["not_diffed_members"], side_a["not_diffed_binaries"]) == (2, 2), side_a
+    bound = g["bounds"]["not_diffed_same_shape"]["a"]
+    assert (bound["members"], bound["binaries"]) == (2, 2), bound
 
 
 # ── staleness, recall gaps, a pair named wrong ──────────────────────────────────────────────

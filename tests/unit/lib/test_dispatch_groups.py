@@ -322,6 +322,109 @@ def test_two_tables_align_only_on_half_their_keys(tmp_path: Path) -> None:
     assert dg._align_tables(table("k1", "k2", "k3"), table("k1", "y", "z")) == {}
 
 
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_a_table_with_no_aligned_counterpart_is_null_on_that_side(
+    tmp_path: Path, side: str
+) -> None:
+    """★ A static table stored on one side only (the other side's table rows gone): the group is
+    that side's table and null on the other, ``counterpart_enumerates`` false, the report table's
+    other side null and F1's keys there empty — a table one side enumerates is never shown as both
+    sides' table.
+
+    MUTATION (verified RED, 2 failed): an unaligned A table takes itself as the B anchor too
+    (``(table_addr, None) if s == "a"`` -> ``(table_addr, table_addr) if s == "a"``) -> RED.
+    MUTATION (verified RED, 1 failed): the mirror on B (``else (None, table_addr)`` -> ``else
+    (table_addr, table_addr)``) -> RED."""
+    fx = _Fixture(tmp_path, with_sibling=False)
+    fx.sql("DELETE FROM string_keyed_edge WHERE table_addr = ?", T1B if side == "a" else T1)
+    member = dg.MemberRef(D1, F1, f"anc:{F1A}", "entry", F1A, F1B)
+    pd = dg.compute_pair(fx.atlas, "runA", "runB", [member])
+    (g,) = _by_mech(pd, dg.STATIC)
+    want = (T1, None) if side == "a" else (None, T1B)
+    assert (g.a_anchor, g.b_anchor) == want
+    j = dg.group_json(g)
+    assert j.get("table") == dict(zip(("a", "b"), want, strict=True)), j
+    assert j.get("counterpart_enumerates") is False, j
+    keys = {"a": ["k1"], "b": []} if side == "a" else {"a": [], "b": ["k1"]}
+    assert g.members[F1] == keys, g.members
+
+
+# ── a table split into pieces on one side, whole on the other ───────────────────────────────────
+
+F2 = f"pair:{F2A}:{F2B}"
+T1P = "0x7050"  # the second piece of the A table (or of the B table, mirrored)
+
+
+def _split_members() -> list[dg.MemberRef]:
+    return [
+        dg.MemberRef(D1, F1, f"anc:{F1A}", "entry", F1A, F1B),
+        dg.MemberRef(D1, F2, f"anc:{F2A}", "entry", F2A, F2B),
+    ]
+
+
+def _split_side(fx: _Fixture, side: str, *, split: bool = True) -> str:
+    """Cut ``side``'s table {k1, k2} into two pieces {k1} and {k2} (the second at T1P), both stored
+    as split by an undefined handler when ``split``; the other side keeps the whole table."""
+    run, table, f2 = ("runA", T1, F2A) if side == "a" else ("runB", T1B, F2B)
+    reason = "split_by_undefined_handler" if split else None
+    fx.sql("DELETE FROM string_keyed_edge WHERE table_addr = ? AND key = 'k2'", table)
+    fx.sql(
+        "UPDATE string_keyed_edge SET completeness_reason = ? WHERE table_addr = ?", reason, table
+    )
+    fx.static(run, "app", "/p1/app", T1P, [("k2", f2)], reason)
+    fx.atlas.commit()
+    return table
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_split_pieces_on_one_side_join_the_whole_table_of_the_other(
+    tmp_path: Path, side: str
+) -> None:
+    """★ One side's table is split by an undefined handler into the pieces {k1->F1} and {k2->F2};
+    the other side holds the whole table {k1, k2}. Every key of both pieces is enumerated by the
+    whole table, so F1 and F2 are ONE two-sided group (its pieces listed on the split side), and
+    neither reads 'the other side enumerates nothing' — on either side.
+
+    MUTATION (verified RED, 2 failed): pieces aligned one to one only (the split-piece pass's
+    ``if addr in paired[side] or _SPLIT not in table["reasons"]:`` -> ``if True:``) -> one piece is
+    a one-sided group -> RED.
+    MUTATION (verified RED, 1 failed): the split pass on the A side only (``(("a", ta, tb), ("b",
+    tb, ta))`` -> ``(("a", ta, tb),)``) -> the B-split case reddens.
+    MUTATION (verified RED, 2 failed): ``table_pieces`` never shown (``if any(len(g.pieces[s]) > 1
+    ...)`` -> ``if False:``) -> RED."""
+    fx = _Fixture(tmp_path, with_sibling=False)
+    piece = _split_side(fx, side)
+    pd = dg.compute_pair(fx.atlas, "runA", "runB", _split_members())
+    groups = _by_mech(pd, dg.STATIC)
+    assert [(g.counterpart_enumerates, sorted(g.members)) for g in groups] == [
+        (True, sorted([F1, F2]))
+    ], [(g.a_anchor, g.b_anchor, g.members) for g in groups]
+    (g,) = groups
+    assert g.members[F1] == {"a": ["k1"], "b": ["k1"]}, g.members
+    assert g.members[F2] == {"a": ["k2"], "b": ["k2"]}, g.members
+    whole = T1B if side == "a" else T1
+    other = "b" if side == "a" else "a"
+    j = dg.group_json(g)
+    assert j.get("table_pieces") == {side: sorted([piece, T1P]), other: [whole]}, j
+    assert (j.get("completeness") or {}).get("split_by_undefined_handler") is True, j
+    assert pd.grouped_members == 2
+
+
+def test_an_unaligned_table_not_stored_as_split_stays_one_to_one(tmp_path: Path) -> None:
+    """★ The same two pieces on A, but neither stored as split by an undefined handler: they are
+    two tables, aligned one to one, so only one of them joins B's table and the other is a
+    one-sided group — only a stored split joins many tables to one.
+
+    MUTATION (verified RED, 1 failed): any unaligned table joins (the split-piece pass's ``or _SPLIT
+    not in table["reasons"]`` dropped) -> both pieces join B's table -> RED."""
+    fx = _Fixture(tmp_path, with_sibling=False)
+    _split_side(fx, "a", split=False)
+    pd = dg.compute_pair(fx.atlas, "runA", "runB", _split_members())
+    shape = sorted((g.b_anchor is not None, len(g.members)) for g in _by_mech(pd, dg.STATIC))
+    assert shape == [(False, 1), (True, 2)], shape
+    assert all("table_pieces" not in dg.group_json(g) for g in pd.groups)
+
+
 # ── the stored completeness, read as a set (F3-1) ───────────────────────────────────────────────
 
 
@@ -397,6 +500,44 @@ def test_the_uncovered_bucket_is_counted_on_each_side(tmp_path: Path) -> None:
         "a": {"scanned_no_static_table_found": 1},
         "b": {"static_table_detector_did_not_run": 1},
     }
+
+
+def test_two_status_rows_for_one_path_read_as_not_run(tmp_path: Path) -> None:
+    """★ The atlas stores one detector status row per (run, binary); two rows for one path cannot
+    say which scan is true, so that side reads ``static_table_detector_did_not_run`` (no status),
+    never the scanned tier of either row; the other side keeps its own.
+
+    MUTATION (verified RED, 1 failed): keep the last of the duplicate rows (``if n > 1:`` ->
+    ``if False:`` in ``_detector_statuses``) -> side a reads the scanned tier -> RED."""
+    member = dg.MemberRef(D1, f"pair:{NA}:{NB}", f"anc:{NA}", "entry", NA, NB)
+    fx = _Fixture(tmp_path)
+    fx.status("runA", "app", "/p1/app")
+    fx.atlas.commit()
+    pd = dg.compute_pair(fx.atlas, "runA", "runB", [member])
+    assert pd.uncovered_by_detector == {
+        "a": {"static_table_detector_did_not_run": 1},
+        "b": {"binary_has_edges_entry_not_a_member": 1},
+    }
+    assert pd.detector_statuses.get((D1, "a"), "missing") is None
+
+
+def test_a_member_label_counts_the_keys_it_leaves_out_per_side(tmp_path: Path) -> None:
+    """★ A member label shows at most MAX_KEYS_PER_MEMBER keys a side and counts the rest per side:
+    F1 named by four A keys and one B key reads three A keys and ``keys_omitted`` {"a": 1, "b": 0}.
+
+    MUTATION (verified RED, 1 failed): never count the cut (``if any(n > 0 for n in
+    cut.values()):`` -> ``if False:``) -> RED."""
+    fx = _Fixture(tmp_path, with_sibling=False)
+    extra = [f"k{i}" for i in range(5, 5 + dg.MAX_KEYS_PER_MEMBER)]
+    fx.static("runA", "app", "/p1/app", T1, [(k, F1A) for k in extra])
+    fx.atlas.commit()
+    member = dg.MemberRef(D1, F1, f"anc:{F1A}", "entry", F1A, F1B)
+    pd = dg.compute_pair(fx.atlas, "runA", "runB", [member])
+    (label,) = dg.member_labels(pd)[(D1, F1)]
+    shown = sorted(["k1", *extra])
+    assert label.get("keys") == {"a": shown[: dg.MAX_KEYS_PER_MEMBER], "b": ["k1"]}, label
+    assert label.get("keys_omitted") == {"a": len(shown) - dg.MAX_KEYS_PER_MEMBER, "b": 0}, label
+    assert label.get("keys_omitted") == {"a": 1, "b": 0}, label
 
 
 def test_the_members_are_taken_from_every_kind_of_unit() -> None:
@@ -795,17 +936,38 @@ def test_the_report_file_lists_every_group_with_its_members(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """★ ``tmap review report --md`` (and --html) renders the full table from the same reading:
-    the table group's ref with F1 and F2 and their keys, the gate group's ref with H1, in the
-    report's dispatch section.
+    the table group's ref with F1 and F2 and their keys — F1's two sides in their own columns
+    (``k1`` on A, ``k4`` on B) — the table's stored split, and the gate group's ref with H1, its B
+    side enumerating nothing (``counterpart_enumerates: false``), in the report's dispatch section.
 
     MUTATION (verified RED, 1 failed): the CLI reads without navigation (``navigation=as_md or
     as_html`` dropped in review_cli.report) -> no dispatch section -> RED.
-    MUTATION (verified RED, 1 failed): ``_dispatch_md`` returns ``[]`` -> RED."""
+    MUTATION (verified RED, 1 failed): ``_dispatch_md`` returns ``[]`` -> RED.
+    MUTATION (verified RED, 1 failed): the counterpart line dropped (``if
+    j.get("counterpart_enumerates") is False:`` -> ``if False:`` in ``_dispatch_md``) -> RED.
+    MUTATION (verified RED, 1 failed): the completeness line dropped (``if "completeness" in j:``
+    -> ``if False:``) -> RED.
+    MUTATION (verified RED, 1 failed): the B column shows the A keys (``{_keys(keys['b'])} |`` ->
+    ``{_keys(keys['a'])} |``) -> RED."""
     from click.testing import CliRunner
 
     from treasure_map.cli import review_cli
 
     w = _e2e_world(tmp_path, monkeypatch)
+    # F1 keyed k1 on A and k4 on B (the tables still align on k2), A's table stored as split, and
+    # the gate enumerated on A only.
+    w.atlas.execute(
+        "UPDATE string_keyed_edge SET key = 'k4' WHERE source_run_id = 'runB' AND key = 'k1'"
+    )
+    w.atlas.execute(
+        "UPDATE string_keyed_edge SET completeness_reason = 'split_by_undefined_handler' "
+        "WHERE source_run_id = 'runA' AND table_addr = ?",
+        (T1,),
+    )
+    w.atlas.execute(
+        "DELETE FROM string_keyed_edge WHERE source_run_id = 'runB' AND mechanism = ?", (dg.GATE,)
+    )
+    w.atlas.commit()
     review = _review(w, navigation=True)
     refs = {g.mechanism: g.ref for g in review.navigation.dispatch.groups}
     md_file = tmp_path / "r.md"
@@ -819,5 +981,16 @@ def test_the_report_file_lists_every_group_with_its_members(
     section = md.split("## Dispatch groups", 1)[1].split("\n## ", 1)[0]
     for text in (refs[dg.STATIC], F1, f"pair:{F2A}:{F2B}", refs[dg.GATE], H1.entry_id, "`k1`"):
         assert text in section, (text, section[:1500])
+    rows = {
+        cells[0].strip("` "): [c.strip() for c in cells[1:]]
+        for line in section.splitlines()
+        if line.startswith("| `")
+        for cells in [line.strip("|").split("|")]
+    }
+    assert rows.get(F1) == ["`k1`", "`k4`"], rows
+    gate_part = section.split(f"### `{refs[dg.GATE]}`", 1)[1].split("\n### ", 1)[0]
+    assert "counterpart_enumerates: false" in gate_part, gate_part
+    table_part = section.split(f"### `{refs[dg.STATIC]}`", 1)[1].split("\n### ", 1)[0]
+    assert "split_by_undefined_handler: true" in table_part, table_part
     page = rr.html_page(review)
     assert "Dispatch groups" in page and refs[dg.STATIC] in page

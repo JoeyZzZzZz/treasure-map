@@ -413,3 +413,46 @@ def test_the_upstream_groups_are_read_by_the_read_layer_and_rendered_in_the_repo
     handed = wrote.get("next_unit") or {}
     want = {DX: ("1.1.1k", "1.1.1t"), DY: ("1.0.2u", "1.0.2u")}[handed.get("stream")]
     assert handed.get("upstream") == {"library": "openssl", "a": want[0], "b": want[1]}, handed
+
+
+def test_an_unreadable_upstream_read_is_said_so_and_fails_nothing(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A sqlite error while reading the pair's upstream versions is ``{"unreadable": <why>}`` in
+    the report's ``upstream_groups``, labels no unit, and fails neither the pair review, the MCP
+    answer nor the report file: ``--md`` and ``--html`` say ``unreadable`` with the reason under the
+    upstream heading. The dispatch block is read all the same.
+
+    MUTATION (verified RED, 1 failed): catch only ``ZeroDivisionError`` around ``pair_upstream``
+    in review_navigation.read -> the error escapes the review -> RED."""
+    from treasure_map.lib.query import review_report as rr
+
+    _openssl(world)
+
+    def broken(*_a: Any, **_kw: Any) -> Any:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(uv, "pair_upstream", broken)
+    review = ru.review_pair(
+        world.atlas,
+        "runA",
+        "runB",
+        pair_staleness={"source_stale": False},
+        server_commit="c0",
+        navigation=True,
+    )
+    assert review.report.get("upstream_groups") == {
+        "unreadable": "OperationalError: disk I/O error"
+    }, review.report.get("upstream_groups")
+    assert "unreadable" not in (review.report.get("dispatch_groups") or {"unreadable": 1})
+    assert all(review.navigation.unit_upstream(u) is None for u in review.units)
+    md = rr.markdown(review)
+    section = md.split("## Upstream library groups", 1)[-1].split("\n## ", 1)[0]
+    assert "- unreadable: `OperationalError: disk I/O error`" in section, section
+    page = rr.html_page(review)
+    tail = page.split("<h2>Upstream library groups</h2>", 1)[-1]
+    assert "unreadable: <code>OperationalError: disk I/O error</code>" in tail, tail[:300]
+    out = mcp_app.make_tools(world.path)["start_diff_review"](run_pair=PAIR)
+    assert "error" not in out, out
+    assert out["report"].get("upstream_groups") == review.report["upstream_groups"], out["report"]
+    assert "upstream" not in (out.get("next_unit") or {}), out.get("next_unit")

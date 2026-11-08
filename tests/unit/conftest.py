@@ -11,6 +11,8 @@ builds one under ``tmp_path`` and points at it.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import pytest
 
 import treasure_map.lib.setup.completion as _completion
@@ -34,3 +36,14 @@ def _hermetic_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_completion, "bash_version", lambda *_a: None)
     for name in _HOST_VARS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_cached_navigation() -> Iterator[None]:
+    """The pair review's dispatch grouping is cached per process (lib/query/review_navigation):
+    no test starts from, or leaves behind, another test's grouping."""
+    from treasure_map.lib.query import review_navigation
+
+    review_navigation.clear_cache()
+    yield
+    review_navigation.clear_cache()

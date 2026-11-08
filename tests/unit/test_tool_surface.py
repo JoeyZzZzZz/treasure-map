@@ -1453,6 +1453,63 @@ def test_the_parameter_table_covers_every_parameter_and_says_where_it_is_used() 
             assert name.endswith(("_offset", "_page")), name
 
 
+# ── what a few descriptions must keep saying ─────────────────────────────────────────────────
+
+
+def test_the_get_strings_card_says_its_results_are_binary_wide() -> None:
+    """``function`` does not scope get_strings because strings sit outside every function's code;
+    the card says the results are binary-wide, and no longer that no string-to-function index
+    exists (get_string_reference_anchors is one).
+
+    MUTATION (verified RED, 1 failed): put back the card's old sentence ("there is no
+    string-to-function index") in place of "they are binary-wide" -> RED."""
+    short = _norm(cards.render_description("get_strings", cards.TOOL_CARDS["get_strings"]))
+    assert "(they are binary-wide)" in short
+    assert "string-to-function index" not in short
+
+
+def test_a_thunk_entry_word_is_described_where_its_record_is_read(
+    tools: dict[str, Callable[..., Any]],
+) -> None:
+    """A thunk the export lists apart has no recorded name: get_data_table says such a word reads
+    name null with thunk true, and get_xrefs that a series does not break at it.
+
+    MUTATION (verified RED, 1 failed): drop the thunk sentence from get_data_table's docstring
+    -> RED.
+    MUTATION (verified RED, 1 failed): drop the thunk sentence from get_xrefs' docstring -> RED."""
+    ref = tools["get_tool_reference"]
+    table = _norm(ref(name="get_data_table")["description"])
+    assert "holding its entry reads ``name`` null with ``thunk`` true" in table
+    xrefs = _norm(ref(name="get_xrefs")["description"])
+    assert "A thunk the export listed apart is an entry word too" in xrefs
+    assert "``name`` null, ``thunk`` true" in xrefs
+
+
+def test_get_diff_meta_names_both_kinds_of_glued_dotted_number(
+    tools: dict[str, Callable[..., Any]],
+) -> None:
+    """The recompile reading treats a dotted number glued to a name as no version — an interface
+    name, and a protocol name even with its ``v`` prefix; get_diff_meta says both.
+
+    MUTATION (verified RED, 1 failed): put back "or glued to an interface name, is not a
+    version" -> RED."""
+    meta = _norm(tools["get_tool_reference"](name="get_diff_meta")["description"])
+    assert "glued to a name (an interface name, or a protocol name" in meta
+    assert "even with its ``v`` prefix), is not a version" in meta
+
+
+def test_the_guide_says_what_over_budget_on_any_answer_means() -> None:
+    """Every tool's answer can carry over_budget (the call path marks it); the guide — not the
+    instructions, which are at their length — says where it sits and what to do.
+
+    MUTATION (verified RED, 1 failed): drop the over_budget sentence from the guide -> RED."""
+    guide = _norm(mcp_app._AGENT_GUIDE)
+    assert "Any tool's answer larger than the response budget (48,000 bytes)" in guide
+    assert "carries over_budget: true as its first key" in guide
+    assert "so narrow the call" in guide
+    assert f"({mcp_app._RESPONSE_BYTE_BUDGET:,} bytes)" in guide
+
+
 # ── T-12 / T-13: the reference is the docstring, the schema is the tool's own ─────────────────
 
 

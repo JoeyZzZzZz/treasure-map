@@ -322,6 +322,22 @@ def test_a_call_through_an_unnamed_stub_is_unknown(tmp_path: Path, current: None
     assert not _fewer(scc)
 
 
+def test_an_unparseable_unnamed_stub_list_is_unknown(tmp_path: Path, current: None) -> None:
+    """B's ``unresolved_external_calls`` column is there but its value does not parse: which stubs
+    went unnamed cannot be read, so B's count is unknown (``stub_call_unresolved``), never a
+    determined 2 -> 1. A side whose value parses to an empty list keeps its count.
+
+    MUTATION (verified RED, 1 failed): read an unparseable value as no unresolved stub (drop the
+    ``unresolved_unreadable`` check in _callsite_side) -> delta system 2 -> 1."""
+    w = _pair(tmp_path, ["system", "system"], ["system", "FUN_00000600"])
+    w.adb["b"].execute("UPDATE functions SET unresolved_external_calls = 'not json'")
+    w.adb["b"].commit()
+    scc = _scc(w)
+    assert scc["delta"] == [], scc
+    assert scc["unknown"] == [{"sink": "system", "side": "b", "reason": "stub_call_unresolved"}]
+    assert not _fewer(scc)
+
+
 @pytest.mark.parametrize("table", [None, {}], ids=["null_table", "empty_table"])
 def test_no_stub_table_keeps_the_counts_by_name(
     tmp_path: Path, current: None, table: dict[str, str] | None
@@ -330,9 +346,19 @@ def test_no_stub_table_keeps_the_counts_by_name(
     decompiler's names give: system 2 -> 1 stays a delta and the "fewer" reason stays. Reading
     every FUN_ call of such a side as unknown would erase real deltas on binaries with no table.
 
-    MUTATION (verified RED, 2 failed): in _callsite_side treat a side with no stub table that
-    makes a FUN_ call as ``stub_call_unresolved`` -> the delta is erased."""
-    w = _pair(tmp_path, ["system", "system", "FUN_00000700"], ["system", "FUN_00000700"])
+    The FUN_ call is in each side's callee list as well as in its call tokens, as a real
+    extraction writes it, so a check on either reads it.
+
+    MUTATION (verified RED, 2 failed each): in _callsite_side treat a side with no stub table that
+    makes a FUN_ call as ``stub_call_unresolved`` — read off the call tokens, or off the callee
+    list — -> the delta is erased."""
+    w = _pair(
+        tmp_path,
+        ["system", "system", "FUN_00000700"],
+        ["system", "FUN_00000700"],
+        a_callees=["system", "FUN_00000700"],
+        b_callees=["system", "FUN_00000700"],
+    )
     _stubs(w, "a", table)
     _stubs(w, "b", table)
     scc = _scc(w)

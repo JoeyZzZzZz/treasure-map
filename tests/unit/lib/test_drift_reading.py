@@ -300,15 +300,15 @@ def test_an_identifier_string_argument_without_format_evidence_is_not_a_line_num
 def test_a_format_string_with_a_name_and_a_number_makes_the_site_strong() -> None:
     """``log("%s:%d","fn",10)`` -> 12: the format string (``%s`` then ``%d``) on the site's line on
     both sides makes the identifier-string site strong, so the pair reads drift_only; a format
-    string on the line before counts too.
+    string on the line before counts too when the call continues from it onto the site's line.
 
-    MUTATION (verified RED, 1 failed): make _FMT_EVIDENCE match nothing (pattern 'x^') -> the
+    MUTATION (verified RED, 1 failed): make line_format.name_line_format return False -> the
     site is weak with no strong one -> not_drift_only -> RED."""
     got = _read(_body('log("%s:%d","fn",10);'), _body('log("%s:%d","fn",12);'))
     assert got.get("state") == dr.DRIFT_ONLY and got.get("sites") == {"line": 1, "address": 0}
     before = _read(
-        _lines_body('fmt = "%s line %d";', 'log(fmt,"fn",10);'),
-        _lines_body('fmt = "%s line %d";', 'log(fmt,"fn",12);'),
+        _lines_body('log("%s line %d",', '    "fn",10);'),
+        _lines_body('log("%s line %d",', '    "fn",12);'),
     )
     assert before.get("state") == dr.DRIFT_ONLY
 
@@ -339,6 +339,68 @@ def test_line_number_sites_must_share_one_non_zero_step() -> None:
     assert two["state"] == dr.NOT_DRIFT_ONLY and "one step" in two["why"]
     zero = _read(_body('log("foo.c",10);'), _body('log("foo.c",0xa);'))
     assert zero["state"] == dr.NOT_DRIFT_ONLY and "one step" in zero["why"]
+
+
+def test_a_format_of_a_finished_statement_before_the_site_is_no_evidence() -> None:
+    """A finished log call on the line before (``log_msg("%s:%d","fn_x",0x2a);``) says nothing
+    about the next line's ``check_len(p,"admin",5)`` -> ``6``: the length stays a weak site, alone
+    a constant change. The same for a format assigned to a variable on the line before.
+
+    MUTATION (verified RED, 1 failed): drop the continuation test in line_format.format_evidence
+    (``statement_continues(prev) and`` removed) -> both read drift_only -> RED."""
+    after_log = _read(
+        _lines_body('log_msg("%s:%d","fn_x",0x2a);', 'check_len(p,"admin",5);'),
+        _lines_body('log_msg("%s:%d","fn_x",0x2a);', 'check_len(p,"admin",6);'),
+    )
+    assert after_log["state"] == dr.NOT_DRIFT_ONLY and "no strong line site" in after_log["why"]
+    after_fmt = _read(
+        _lines_body('fmt = "%s line %d";', 'log(fmt,"fn",10);'),
+        _lines_body('fmt = "%s line %d";', 'log(fmt,"fn",12);'),
+    )
+    assert after_fmt["state"] == dr.NOT_DRIFT_ONLY and "no strong line site" in after_fmt["why"]
+
+
+def test_a_format_without_a_string_conversion_is_no_evidence() -> None:
+    """``log("%d bytes %d","fn",10)`` -> ``12``: the literal has two number conversions and no
+    ``%…s`` one (the ``s`` of ``bytes`` is a letter), so it is no name-then-line format and the
+    site stays weak — not drift_only.
+
+    MUTATION (verified RED, 1 failed): any ``%`` is evidence (``return "%" in literal`` at the top
+    of line_format.name_line_format) -> drift_only -> RED; the old loose pattern (``_CONVERSION``
+    -> ``%(?:%|[^"%]*([A-Za-z]))``) -> drift_only -> RED."""
+    got = _read(_body('log("%d bytes %d","fn",10);'), _body('log("%d bytes %d","fn",12);'))
+    assert got["state"] == dr.NOT_DRIFT_ONLY and "no strong line site" in got["why"]
+
+
+def test_a_lone_line_number_variable_is_never_a_strong_site() -> None:
+    """``uVar1 = 10;`` passed as ``log("foo.c",uVar1)`` -> ``12`` with no other line-number site:
+    the variable site is weak (its evidence sits on another line), so the pair has no strong site
+    and reads not drift_only — named as such, not as a plain constant.
+
+    MUTATION (verified RED, 1 failed): L_var strong (``if rule == "L_var": return False`` ->
+    ``return True`` in _line_site_strong) -> drift_only -> RED."""
+    got = _read(
+        _lines_body("uVar1 = 10;", 'log("foo.c",uVar1);'),
+        _lines_body("uVar1 = 12;", 'log("foo.c",uVar1);'),
+    )
+    assert got["state"] == dr.NOT_DRIFT_ONLY
+    assert "no strong line site" in got["why"], got
+
+
+def test_an_assigned_number_never_passed_after_a_name_is_a_constant() -> None:
+    """``uVar1 = 0x40;`` used as ``memcpy(d,s,uVar1)`` -> ``0x42``, beside a strong line-number
+    site of the same step (``log("foo.c",10)`` -> ``12``): the variable is never passed after a
+    name or path string, so its number is a constant change — not drift_only, at that site.
+
+    MUTATION (verified RED, 1 failed): drop the use test of L_var (the two
+    ``_passed_after_name`` conditions removed) -> the assignment reads L_var beside the strong
+    site -> drift_only -> RED."""
+    got = _read(
+        _lines_body("uVar1 = 0x40;", "memcpy(d,s,uVar1);", 'log("foo.c",10);'),
+        _lines_body("uVar1 = 0x42;", "memcpy(d,s,uVar1);", 'log("foo.c",12);'),
+    )
+    assert got["state"] == dr.NOT_DRIFT_ONLY
+    assert got["why"] == "unexplained site: C_num", got
 
 
 def _str_image(*texts: tuple[int, bytes], ptrs: tuple[tuple[int, int], ...] = ()) -> bytes:
@@ -498,6 +560,30 @@ def test_a_string_label_pair_is_a_shift_only_when_its_text_is_the_same() -> None
     assert yes.get("state") == dr.DRIFT_ONLY and yes.get("sites") == {"line": 0, "address": 1}
     no = _read(_body("puts(s_hello_00401000);"), _body("puts(s_world_00402000);"))
     assert no["state"] == dr.NOT_DRIFT_ONLY and "C_strlabel" in no["why"]
+
+
+def test_a_string_label_of_one_text_over_two_different_strings_is_a_changed_string() -> None:
+    """``s_hello_00001100`` -> ``s_hello_00001200``: the label texts are the same (the decompiler
+    shortens a string to its label), but the two images hold ``hello world`` and ``hello there``
+    at the labels — a changed string, not an address shift; so is a string head on one side only
+    (side B's label lands mid-string). The same string at both labels is a shift.
+
+    MUTATION (verified RED, 1 failed): read the label by its text alone (``_strlabel_site``
+    returns A_strlabel whenever the texts match) -> drift_only -> RED. MUTATION (verified RED, 1
+    failed): compare the strings only when both heads read (``sa == sb`` -> ``sa is None or sb
+    is None or sa == sb``) -> the one-sided pair reads drift_only -> RED."""
+    ra = _reader([(0x1000, 0x1000, _str_image((0x100, b"hello world")), True)])
+    rb = _reader([(0x1000, 0x1000, _str_image((0x200, b"hello there")), True)])
+    rb_same = _reader([(0x1000, 0x1000, _str_image((0x200, b"hello world")), True)])
+    rb_mid = _reader([(0x1000, 0x1000, _str_image((0x1FA, b"hello world")), True)])
+    ta, tb = _body("puts(s_hello_00001100);"), _body("puts(s_hello_00001200);")
+    differ = _read(ta, tb, ra=ra, rb=rb)
+    assert differ["state"] == dr.NOT_DRIFT_ONLY and "C_strlabel" in differ["why"], differ
+    one_side = _read(ta, tb, ra=ra, rb=rb_mid)
+    assert rb_mid.cstring_at(0x1200) is None  # the precondition: no head at B's label
+    assert one_side["state"] == dr.NOT_DRIFT_ONLY and "C_strlabel" in one_side["why"], one_side
+    same = _read(ta, tb, ra=ra, rb=rb_same)
+    assert same.get("state") == dr.DRIFT_ONLY and same.get("sites") == {"line": 0, "address": 1}
 
 
 def test_a_dat_label_pair_is_a_shift_only_when_its_bytes_are_the_same() -> None:

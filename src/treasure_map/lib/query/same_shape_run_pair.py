@@ -460,8 +460,9 @@ def _locate_input(
             return _err(
                 pair,
                 f"{inp.ref!r} is a candidate of run {runs[s]!r} in a binary no diff of this run "
-                "pair covers (its calls are counted by the one-diff group's "
-                "sibling_set_bounds.binaries_not_diffed)",
+                "pair covers, so it cannot be the input here: pass a call of the same shape in a "
+                "diffed binary, and this binary's calls of that shape are listed among its "
+                "members with diffed false (counted per side in bounds.not_diffed_same_shape)",
             )
         if len(hits) > 1:
             return _err(

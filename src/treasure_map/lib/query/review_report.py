@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from treasure_map.lib import handoff_boundary as _handoff_boundary
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import dispatch_groups as dg
+from treasure_map.lib.query import review_navigation as _rn
 from treasure_map.lib.query import review_units as ru
 from treasure_map.lib.query import upstream_version as uv
 
@@ -178,17 +179,17 @@ def _dispatch_md(review: ru.PairReview) -> list[str]:
         return [*out, f"- unreadable: `{_md_cell(block.get('unreadable'))}`"]
     unc, det = block["uncovered"], block["static_table_detector"]
     out += [
-        f"_{_md_cell(block['mechanism_note'])}_",
+        f"_{_md_cell(_rn.DISPATCH_NOTES['mechanism'])}_",
         "",
         f"- grouped must-read entries: {block['grouped_members']} ({block['grouped_pct']}%), "
         f"also in a callee group: {block['also_in_callee_group']}",
-        f"- uncovered: {unc['count']} — {_md_cell(unc['note'])}",
+        f"- uncovered: {unc['count']} — {_md_cell(_rn.DISPATCH_NOTES['uncovered'])}",
         f"  - side a: {_md_cell(_counts(unc['by_static_table_detector'].get('a') or {}))}",
         f"  - side b: {_md_cell(_counts(unc['by_static_table_detector'].get('b') or {}))}",
         f"- static-table detector supported_scope: "
         f"{_keys(det['supported_scope'])}; unsupported: {_keys(det['unsupported_note'])}",
-        f"- {_md_cell(det['note'])}",
-        f"- {_md_cell(dg.COUNTERPART_NOTE)}",
+        f"- {_md_cell(_rn.DISPATCH_NOTES['static_table_detector'])}",
+        f"- {_md_cell(_rn.DISPATCH_NOTES['counterpart'])}",
     ]
     for g in nav.dispatch.groups:
         j = dg.group_json(g)
@@ -226,7 +227,7 @@ def _upstream_md(review: ru.PairReview) -> list[str]:
     out = ["", "## Upstream library groups", ""]
     if "unreadable" in block:
         return [*out, f"- unreadable: `{_md_cell(block['unreadable'])}`"]
-    out += [f"_{_md_cell(block['note'])}_", ""]
+    out += [f"_{_md_cell(_rn.UPSTREAM_NOTES['groups'])}_", ""]
     if not nav.upstream_rows:
         return [*out, "- none"]
     out += ["| library | diffs | units | must-read units | open units |", "|---|---|---|---|---|"]
@@ -359,16 +360,17 @@ def _navigation_html(review: ru.PairReview) -> list[str]:
             unc, det = block["uncovered"], block["static_table_detector"]
             by = unc["by_static_table_detector"]
             out += [
-                f"<p><em>{e(block['mechanism_note'])}</em></p><ul>",
+                f"<p><em>{e(_rn.DISPATCH_NOTES['mechanism'])}</em></p><ul>",
                 f"<li>grouped must-read entries: {block['grouped_members']} "
                 f"({block['grouped_pct']}%), also in a callee group: "
                 f"{block['also_in_callee_group']}</li>",
-                f"<li>uncovered: {unc['count']} — {e(unc['note'])}; side a: "
+                f"<li>uncovered: {unc['count']} — {e(_rn.DISPATCH_NOTES['uncovered'])}; side a: "
                 f"{e(_counts(by.get('a') or {}))}; side b: {e(_counts(by.get('b') or {}))}</li>",
                 f"<li>static-table detector supported_scope: "
                 f"{e(', '.join(det['supported_scope']) or '—')}; unsupported: "
                 f"{e(', '.join(det['unsupported_note']) or '—')}</li>",
-                f"<li>{e(det['note'])}</li><li>{e(dg.COUNTERPART_NOTE)}</li></ul>",
+                f"<li>{e(_rn.DISPATCH_NOTES['static_table_detector'])}</li>"
+                f"<li>{e(_rn.DISPATCH_NOTES['counterpart'])}</li></ul>",
             ]
             for g in nav.dispatch.groups:
                 j = dg.group_json(g)
@@ -401,7 +403,7 @@ def _navigation_html(review: ru.PairReview) -> list[str]:
         if "unreadable" in ublock:
             out.append(f"<p>unreadable: <code>{e(str(ublock['unreadable']))}</code></p>")
             return out
-        out.append(f"<p><em>{e(ublock['note'])}</em></p>")
+        out.append(f"<p><em>{e(_rn.UPSTREAM_NOTES['groups'])}</em></p>")
         out.append(
             "<table><tr><th>library</th><th>diff</th><th>a</th><th>b</th><th>units</th>"
             "<th>must-read units</th><th>open units</th></tr>"

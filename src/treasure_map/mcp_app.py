@@ -316,12 +316,21 @@ def _mark_over_budget(result: Any) -> None:
     """The one fallback every tool answer passes on the MCP path: an answer larger than the
     response budget, measured as every page fitter measures it (``json.dumps``' default form, one
     copy), carries ``over_budget: true`` — so no tool is over it silently, whether or not it fits
-    its pages itself. An answer that already says so, or is within the budget, is left as it is.
-    Marking only: nothing is cut here (a tool that can page or withhold does that itself)."""
-    if not isinstance(result, dict) or result.get("over_budget") is True:
+    its pages itself. The mark is the answer's FIRST key, so a client that keeps only the head of
+    a long answer still reads it; an answer a tool marked itself has its mark moved there too. An
+    answer within the budget is left as it is. Marking only: nothing is cut here (a tool that can
+    page or withhold does that itself)."""
+    if not isinstance(result, dict):
         return
-    if len(json.dumps(result, default=str)) > _RESPONSE_BYTE_BUDGET:
-        result["over_budget"] = True
+    if result.get("over_budget") is not True:
+        if len(json.dumps(result, default=str)) <= _RESPONSE_BYTE_BUDGET:
+            return
+    elif next(iter(result)) == "over_budget":
+        return
+    rest = [(k, v) for k, v in result.items() if k != "over_budget"]
+    result.clear()
+    result["over_budget"] = True
+    result.update(rest)
 
 
 # What a withheld sink-summary entry is read with: the tool and parameter names of the full record.
@@ -350,13 +359,27 @@ def _fit_sink_summary(data: dict[str, Any], budget: int | None = None) -> dict[s
     }
     data["sink_arg_provenance_summary"] = kept
     data["sink_arg_provenance_summary_withheld"] = withheld
+    # Measured whole once, then kept up to date entry by entry (json.dumps' default form adds
+    # ", " only between two elements, so the running size is exact): linear in the summary, not
+    # one whole-answer serialization per withheld entry. Whenever it says the answer fits, the
+    # whole answer is measured once more, and withholding goes on should it not.
+    running = len(json.dumps(data))
     i = len(kept) - 1
-    while i >= 0 and len(json.dumps(data)) > limit:
+    while i >= 0:
+        if running <= limit:
+            running = len(json.dumps(data))
+            if running <= limit:
+                break
         entry = kept[i]
         if not (isinstance(entry, dict) and entry.get("is_candidate_callsite") is True):
+            idx = entry.get("sink_idx") if isinstance(entry, dict) else None
+            n = len(withheld_idx)
+            running -= len(json.dumps(entry)) + (2 if len(kept) > 1 else 0)
+            running += len(json.dumps(idx)) + (2 if n else 0)
+            running += len(json.dumps(n + 1)) - len(json.dumps(n))
             kept.pop(i)
-            withheld_idx.insert(0, entry.get("sink_idx") if isinstance(entry, dict) else None)
-            withheld["count"] = len(withheld_idx)
+            withheld_idx.insert(0, idx)
+            withheld["count"] = n + 1
         i -= 1
     if not withheld_idx:
         del data["sink_arg_provenance_summary_withheld"]
@@ -670,7 +693,11 @@ _AGENT_GUIDE = (
     "yours). "
     "(3) Judge value with the cross-firmware signal cross_firmware_patterns (a pattern "
     "recurring across many firmware images). Prefer narrow filters (run_id / sink "
-    "/ status) and paging over pulling everything; fetch detail per evidence_ref. The tools draw "
+    "/ status) and paging over pulling everything; fetch detail per evidence_ref. Any tool's "
+    "answer larger than the response budget (48,000 bytes) carries over_budget: true as its first "
+    "key: the mark cuts nothing, but a client may cut the answer, so narrow the call (its paging "
+    "offset / limit, a binary, an entry_id or sink_idx) rather than read a cut answer as all "
+    "there is. The tools draw "
     "no conclusion and generate no payload/PoC (list_verified_exploits(reveal=true) returns only "
     "what a person recorded) — that judgment is yours. (4) RECORD a conclusion "
     "worth keeping past this session, so the next one inherits it instead of starting over: "
@@ -3094,8 +3121,10 @@ def make_tools(
         ``report.upstream_groups`` is a navigation annotation: the pair's diffs whose binaries
         name the same upstream library (by file name), one row per ``library`` with its
         ``diffs``, up to 4 ``diff_ids`` and ``binaries``, its ``versions`` (each A/B version pair
-        its diffs state, see get_diff_meta's ``upstream_version``; ``unknown`` included, with how
-        many ``diffs`` state it), and the ``units`` / ``must_read_units`` / ``open_units``
+        its diffs state by the binary's own banner strings, see get_diff_meta's
+        ``upstream_version``; ``unknown`` = no rule or no string matched, on either side, is
+        included, with how many ``diffs`` state it), and the ``units`` / ``must_read_units`` /
+        ``open_units``
         those diffs hand out; ``groups_total``, ``diffs_in_groups``, the 12 groups handing out the
         most units and ``groups_not_shown`` / ``units_not_shown`` for the rest. A unit of such a
         diff carries ``upstream`` (``library``, ``a``, ``b``), here and in the next unit a write
@@ -3108,13 +3137,17 @@ def make_tools(
         its two sides joined only by an ``aligned`` function pairing). It is a stored enumeration,
         never a reachability claim; an entry named by no recovered table or gate is in an explicit
         ``uncovered`` bucket, counted per side by the static-table detector's scan status, never
-        read as not dispatched. It groups only: the units, the must-read set, the ids and the order
-        are unchanged, and an entry can be in a callee group and a dispatch group at once.
+        read as not dispatched; ``scanned_no_static_table_found`` holds only within the
+        detector's ``supported_scope`` (``static_table_detector``), never "no table", and the
+        strcmp-gate detector records no scan status. It groups only: the units, the must-read
+        set, the ids and the order are unchanged, and an entry can be in a callee group and a
+        dispatch group at once.
         Each grouped must-read entry member of a unit carries ``dispatch``: one row per group with
         its ``mechanism``, ``group_ref``, the ``keys`` naming it per side (``a`` / ``b``; an empty
         side names none) and ``group_members``. The block names the largest groups' refs; the
         report file lists every group. A group whose other side enumerates nothing for it has that
-        side null and ``counterpart_enumerates`` false. A pair with a proven-stale run is
+        side null and ``counterpart_enumerates`` false. Both blocks carry data and one short
+        ``note``; the report file prints the full wording above. A pair with a proven-stale run is
         refused."""
         if (diff_id is None) == (run_pair is None):
             return {
@@ -3454,9 +3487,9 @@ def make_tools(
         ``call_tokens_unavailable``, ``call_counts_incomplete`` (its callee list was cut),
         ``stub_call_unresolved`` (it calls a stub its table could not name); a call through a
         named stub counts as that import. It never moves attention: inside attention 0, an entry
-        floated by a candidate count alone that has no call count (or a
+        floated by a candidate count alone whose call counts show no difference (or with a
         ``same_callee_non_candidate`` row) reads last, unless it shows a command sink, a
-        ``rematch_suspected`` row or a callee only B calls.
+        ``rematch_suspected`` row or a callee identified only on B.
 
         Two signals BinDiff similarity is blind to, on the function-pair view: each aligned entry
         carries ``pseudocode_sameness`` — ``identical`` (address-normalised pseudocode AND callees
@@ -4077,7 +4110,8 @@ def make_tools(
         stubs, the one-sided strings and every stored block's bytes, position by position. A
         build-environment string is only a path rewritten from a toolchain or build-tree
         component on (never one under /etc or another runtime root), and a dotted number shaped
-        like an IPv4 address or netmask, or glued to an interface name, is not a version. true is
+        like an IPv4 address or netmask, or glued to a name (an interface name, or a protocol name
+        such as TLSv1.2 even with its ``v`` prefix), is not a version. true is
         not 'behaves the same' — a version string can feed a comparison — and it changes no unit,
         order, must-read set or judgement. The first call for a diff may take a few seconds (every
         stored block is compared); later calls are served from a cache."""
@@ -4632,8 +4666,9 @@ def make_tools(
         counted apart, and a word inside a stored string is flagged. Each word carries its nearest
         recorded label and, when it sits in an evenly spaced series of such words, that series;
         ``next`` names a get_data_table call (an MCP tool: ``surface`` mcp) for the first
-        comparable one. A stored value, not
-        proof of a call; ``none_found`` only when every block was stored in full.
+        comparable one. A thunk the export listed apart is an entry word too (a series does not
+        break at it; get_data_table lists it with ``name`` null, ``thunk`` true). A stored value,
+        not proof of a call; ``none_found`` only when every block was stored in full.
 
         Run-aware: ``run_id`` + ``function`` or ``evidence_ref``; echoes ``resolved_run``.
 
@@ -4819,8 +4854,9 @@ def make_tools(
         word when it is less than the stride, else 0). Each record carries its entry word (the
         function it names), the other words that equal a function entry / a stored string's start
         / an address in a block, its printable runs and its bytes; ``table`` says where the series
-        ended on each side and why. Paged by record (``limit`` 1..256, ``offset``; follow
-        ``next_offset``).
+        ended on each side and why. A thunk the export listed apart has no recorded name: a word
+        holding its entry reads ``name`` null with ``thunk`` true. Paged by record (``limit``
+        1..256, ``offset``; follow ``next_offset``).
 
         ★ RECORDS BY ENTRY-WORD SPACING, not a declared layout: a record holding two function
         pointers reads as two records unless you pass ``stride``. ``words`` / ``ascii_runs`` are

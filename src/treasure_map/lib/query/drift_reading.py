@@ -26,15 +26,21 @@ The site rules, in short:
   (``L_str_ident``) — or after a pointer to such a string (``L_ptr``), or a ``<var> = <num>;`` line
   whose variable is passed after such an argument on both sides (``L_var``).
 * A line-number site is STRONG when the argument is a source path or the own name, or when both
-  sides have a ``%…s … %…d`` format string on its line or the line before (``_FMT_EVIDENCE``).
-  Any other line-number site is WEAK (``L_var`` always is).
+  sides have a string literal with a ``%…s`` conversion followed by a ``%…d/u/i/x`` one on its
+  line, or on the line before when that line's statement continues onto the site's line
+  (lib/query/line_format, the test the recompile reading shares). Any other line-number site is
+  WEAK (``L_var`` always is).
 * In one pair, weak sites count only next to a strong one (else they are constant changes), and
-  every line-number site must shift by one same non-zero step.
-* Address sites: an aligned FUN pair (``A_fun``), a string label of the same text
-  (``A_strlabel``), a DAT label or bare address with the same non-zero bytes (``A_dat`` /
-  ``A_imgaddr``), a PTR slot pointing at the same content (``A_ptr``), a code label
-  (``A_codelabel``), a number in a ``/*`` comment line (``A_comment``), a gp-relative slot with the
-  same GOT target (``A_got``). All-zero bytes tell nothing apart and are not explained.
+  every line-number site must shift by one same non-zero step. A weak site is not tied to the
+  strong one beyond that step: it need not sit in the same call or near it, so a real constant
+  that moves by exactly the step of a line number elsewhere in the same function reads as a line
+  number — the accepted cost of reading unlabelled line numbers at all.
+* Address sites: an aligned FUN pair (``A_fun``), a string label of the same text over the same
+  string head in both images, or over none in either (``A_strlabel``), a DAT label or bare
+  address with the same non-zero bytes (``A_dat`` / ``A_imgaddr``), a PTR slot pointing at the
+  same content (``A_ptr``), a code label (``A_codelabel``), a number in a ``/*`` comment line
+  (``A_comment``), a gp-relative slot with the same GOT target (``A_got``). All-zero bytes tell
+  nothing apart and are not explained.
 
 ``undetermined`` (with ``why``) when an input cannot be read: a side with no text, an image whose
 blocks cannot be read, or a body over the size cap. Not "drift only", and never "no change".
@@ -50,6 +56,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
 
+from treasure_map.lib.query.line_format import format_evidence
 from treasure_map.lib.ro_db import ro_connect
 
 DRIFT_ONLY = "drift_only"
@@ -74,9 +81,6 @@ _ADDRTOK = re.compile(
     r"switchdataD|caseD)_(.*?)_?([0-9a-fA-F]{6,8})$"
 )
 _NUM = re.compile(r"^(?:0x[0-9a-fA-F]+|\d+)$")
-# A format string with a ``%…s`` conversion followed later by a ``%…d/u/i`` one: the evidence that
-# an identifier-shaped string argument and the number after it are a "name, line" pair.
-_FMT_EVIDENCE = re.compile(r'"[^"]*%[^"%]*s[^"]*%[^"%]*[dui][^"]*"')
 # The global-pointer register, as the decompiler names it when the text reads it directly. A
 # base is proven gp only by its name here; nothing stored records the register otherwise.
 _GP_NAMES = frozenset({"gp", "unaff_gp", "in_gp", "_gp"})
@@ -460,12 +464,17 @@ def _num_site(
 
 
 def _line_site_strong(
-    rule: str, arg_a: str, arg_b: str, around_a: list[str], around_b: list[str], ctx: _Ctx
+    rule: str,
+    arg_a: str,
+    arg_b: str,
+    sides_a: tuple[list[str], list[str]],
+    sides_b: tuple[list[str], list[str]],
+    ctx: _Ctx,
 ) -> bool:
     """Whether a line-number site (``rule`` in ``_LINE_RULES``) is STRONG: its argument is a source
-    path or the function's own name (a literal or a pointer to one), or both sides have a
-    ``_FMT_EVIDENCE`` format string among ``around_a`` / ``around_b`` (the site's line and the line
-    before). ``L_var`` is never strong."""
+    path or the function's own name (a literal or a pointer to one), or both sides have
+    name-then-line format evidence (:func:`line_format.format_evidence`) — ``sides_a`` /
+    ``sides_b`` are each side's (site line, line before) tokens. ``L_var`` is never strong."""
     if rule in ("L_str_own", "L_str_path"):
         return True
     if rule == "L_var":
@@ -475,10 +484,21 @@ def _line_site_strong(
         if q is not None and (_PATH_STR.match(q) or q[1:-1] in ctx.own):
             return True
 
-    def fmt(tokens: list[str]) -> bool:
-        return any(_kind(t) == "str" and _FMT_EVIDENCE.search(t) for t in tokens)
+    return format_evidence(*sides_a) and format_evidence(*sides_b)
 
-    return fmt(around_a) and fmt(around_b)
+
+def _strlabel_site(text_a: str, text_b: str, addr_a: str, addr_b: str, ctx: _Ctx) -> str:
+    """A string-label pair (``s_<text>_<addr>``): an address shift only when the label texts are the
+    same AND the strings the two images hold at the labels (``cstring_at``) are the same. A label's
+    text is the decompiler's shortened spelling of the string, so two different strings can carry
+    one label text: two heads that differ, or a head on one side only, are a changed string
+    (``C_strlabel``). When neither image reads a string head at the label, the label text is the
+    only evidence and is read alone."""
+    if text_a != text_b:
+        return "C_strlabel"
+    sa = ctx.reader_a.cstring_at(int(addr_a, 16))
+    sb = ctx.reader_b.cstring_at(int(addr_b, 16))
+    return "A_strlabel" if sa == sb else "C_strlabel"
 
 
 def _id_site(ta: str, tb: str, ctx: _Ctx) -> str:
@@ -496,7 +516,7 @@ def _id_site(ta: str, tb: str, ctx: _Ctx) -> str:
         if pre in ("FUN", "PTR_FUN", "thunk_FUN"):
             return "A_fun" if (aa.lower().zfill(8), ab.lower().zfill(8)) in ctx.aligned else "U_fun"
         if pre in ("s", "u"):
-            return "A_strlabel" if _ta_txt == _tb_txt else "C_strlabel"
+            return _strlabel_site(_ta_txt, _tb_txt, aa, ab, ctx)
         if pre in ("DAT", "UNK"):
             ba, bb = ctx.reader_a.content_at(int(aa, 16)), ctx.reader_b.content_at(int(ab, 16))
             return "A_dat" if ba is not None and ba == bb else "U_dat"
@@ -608,7 +628,7 @@ def drift_reading(
                     steps.add((_int(rb[k]) or 0) - (_int(ra[k]) or 0))
                     arg_a = head_a[-2] if len(head_a) >= 2 else ""
                     arg_b = head_b[-2] if len(head_b) >= 2 else ""
-                    if _line_site_strong(rule, arg_a, arg_b, prev_a + ra, prev_b + rb, ctx):
+                    if _line_site_strong(rule, arg_a, arg_b, (ra, prev_a), (rb, prev_b), ctx):
                         strong += 1
                 else:
                     counts["address"] += 1

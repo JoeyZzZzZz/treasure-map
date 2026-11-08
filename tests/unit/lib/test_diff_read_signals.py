@@ -883,7 +883,21 @@ G_CMD = ("00055000", "00056000")  # noise shape, but the counted sink is a comma
 G_ONLY_B = ("00057000", "00058000")  # noise shape, but B calls a callee A does not
 G_REMATCH = ("00059000", "0005a000")  # noise shape, but a row is rematch_suspected
 REAL = ("0005b000", "0005c000")  # call counts differ 2 -> 1, same text: not noise
-NOISE_ORDER = {N_G1: 0.30, N_G3: 0.32, G_CMD: 0.34, G_ONLY_B: 0.36, G_REMATCH: 0.38, REAL: 0.90}
+# noise shape, but B's callee set is undetermined (a FUN_ name with no aligned pair) and its
+# identified part holds a callee A does not call
+G_NAMED_ONLY_B = ("0005d000", "0005e000")
+NOISE_ORDER = {
+    N_G1: 0.30,
+    N_G3: 0.32,
+    G_CMD: 0.34,
+    G_ONLY_B: 0.36,
+    G_REMATCH: 0.38,
+    G_NAMED_ONLY_B: 0.40,
+    REAL: 0.90,
+}
+# noise shape (no call count differs), but floated by a sink in an aligned callee-set difference
+# (basis sink_callee_swap), not by its candidate count alone
+SWAP_NOT_COUNT = ("0005f000", "00060000")
 
 
 def _noise_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
@@ -902,10 +916,14 @@ def _noise_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
             size_bytes=200,
             calls=[sink, sink] if calls else None,
         )
+        b_callees = {
+            G_ONLY_B: [sink, "helper"],
+            G_NAMED_ONLY_B: [sink, "FUN_00099000", "helper"],
+        }.get((a, b), [sink])
         w.fn(
             "b",
             b,
-            [sink, "helper"] if (a, b) == G_ONLY_B else [sink],
+            b_callees,
             pseudocode="f();" if calls else None,
             size_bytes=200,
             calls=[sink] if calls else None,
@@ -934,6 +952,19 @@ def _noise_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
                 },
             )
         rows.append(odd)
+    # the swap pair: A also calls popen and two other names (a wide difference, the sink on A, so
+    # no callee only B calls) and holds two strcpy candidates to B's one, with no call tokens
+    a, b = SWAP_NOT_COUNT
+    w.pair(a, b, 0.97, 0.42)
+    w.fn("a", a, ["strcpy", "popen", "l1", "l2"], size_bytes=200)
+    w.fn("b", b, ["strcpy"], size_bytes=200)
+    refs = []
+    for side, f, at in (("a", a, "0x10"), ("a", a, "0x14"), ("b", b, "0x10")):
+        ref = _ref("runA" if side == "a" else "runB", f, "copy", at)
+        w.inst(side, ref, "copy", "strcpy")
+        refs.append(ref)
+    rows.append(_overlay_row(refs[0], refs[2], "callsite", "copy"))
+    rows.append(_overlay_row(refs[1], None, "callsite", "copy"))
     w.commit()
     _rows(monkeypatch, rows)
     return w
@@ -946,13 +977,18 @@ def test_count_noise_reads_last_inside_attention_0(
     Inside attention 0 the two noise shapes — no call count to compare, a row whose call is the
     same on both sides — read after the rest: after the entry whose call count really fell (REAL,
     despite its higher similarity) and after the three that show a change beyond the count (a
-    command sink, a callee only B calls, a rematch_suspected row), which keep their place.
+    command sink, a callee only B calls — in a set read in full, or in the identified part of an
+    undetermined one —, a rematch_suspected row), which keep their place. An entry of the noise
+    shape floated by a callee-set swap, not by its count, is no noise either.
 
     MUTATION (verified RED, 1 failed each): drop the count_noise key from the order -> the noise
     entries lead (lowest similarity) -> RED; drop the command-sink guard -> G_CMD sinks -> RED;
-    drop the B-only-callee guard -> G_ONLY_B sinks -> RED; drop the rematch guard -> G_REMATCH
-    sinks -> RED; widen the gate past its two noise shapes -> REAL sinks -> RED; read only
-    the absent call count (drop the same_callee_non_candidate clause) -> N_G3 stays -> RED."""
+    drop the B-only-callee guard -> G_ONLY_B and G_NAMED_ONLY_B sink -> RED; read only the
+    top-level ``only_in_b`` (not ``named_callees_differ``) -> G_NAMED_ONLY_B sinks -> RED; drop
+    the rematch guard -> G_REMATCH sinks -> RED; widen the gate past its two noise shapes -> REAL
+    sinks -> RED; read only the absent call count (drop the same_callee_non_candidate clause) ->
+    N_G3 stays -> RED; sink any attention-0 entry, whatever its basis (drop the
+    ``sink_candidate_counts`` basis condition) -> SWAP_NOT_COUNT sinks -> RED."""
     w = _noise_world(tmp_path, monkeypatch)
     v = _view(w, sort_by="significance")
     ids = {k: _pair_id(*k) for k in NOISE_ORDER}
@@ -968,8 +1004,25 @@ def test_count_noise_reads_last_inside_attention_0(
     ]
     assert "same_callee_non_candidate" in v["by_id"][ids[N_G3]]["subclasses"]
     assert "rematch_suspected" in v["by_id"][ids[G_REMATCH]]["subclasses"]
-    order = [e["entry_id"] for e in v["entries"] if e["entry_id"] in ids.values()]
-    assert order == [ids[k] for k in (G_CMD, G_ONLY_B, G_REMATCH, REAL, N_G1, N_G3)], order
+    named = v["by_id"][ids[G_NAMED_ONLY_B]]["callee_set"]
+    assert named.get("state") == "undetermined" and "only_in_b" not in named, named
+    assert named.get("named_callees_differ", {}).get("only_in_b") == ["helper"], named
+    swap = _pair_id(*SWAP_NOT_COUNT)
+    assert swap in v["by_id"]
+    assert v["by_id"][swap]["significance"] == {"attention": 0, "basis": "sink_callee_swap"}
+    assert v["by_id"][swap].get("sink_callsite_counts") is None
+    assert v["by_id"][swap].get("sink_candidate_counts", {}).get("delta"), v["by_id"][swap]
+    order = [e["entry_id"] for e in v["entries"] if e["entry_id"] in {*ids.values(), swap}]
+    assert order == [
+        ids[G_CMD],
+        ids[G_ONLY_B],
+        ids[G_REMATCH],
+        ids[G_NAMED_ONLY_B],
+        swap,
+        ids[REAL],
+        ids[N_G1],
+        ids[N_G3],
+    ], order
 
 
 def test_count_noise_moves_nothing_but_the_order_inside_attention_0(

@@ -113,6 +113,53 @@ def test_an_answer_that_says_so_already_is_left_as_it_is(
     assert err.get("over_budget") is True and err.get("error") == "too much"
 
 
+def _call_both(server: Any, name: str, args: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+    """One call's answer twice, as the client gets it: the text block parsed in its own key
+    order, and the structured content."""
+    res = asyncio.run(server.call_tool(name, args))
+    blocks, structured = res if isinstance(res, tuple) else (res, None)
+    text: dict[str, Any] = json.loads(blocks[0].text)
+    return text, structured
+
+
+def test_the_mark_is_the_first_key_of_the_text_and_of_the_structured_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client that keeps only the head of a long answer still reads the mark: over_budget is
+    the FIRST key, in the text block and in the structured content alike, and every other key
+    follows in the tool's own order, its value unchanged.
+
+    MUTATION (verified RED, 1 failed): set the mark at the end (``result["over_budget"] = True``
+    with no reordering) -> the first key is "error" -> RED."""
+    answer = _sized(_RESPONSE_BYTE_BUDGET + 10, error="first", hint="second")
+    server = _server_answering(tmp_path, monkeypatch, lambda: dict(answer))
+    text, structured = _call_both(server, "legal_notice", {})
+    assert next(iter(text)) == "over_budget" and text["over_budget"] is True
+    assert list(text)[1:] == list(answer)
+    assert {k: text.get(k) for k in answer} == answer
+    assert isinstance(structured, dict) and next(iter(structured)) == "over_budget"
+    assert list(structured)[1:] == list(answer)
+
+
+def test_a_tools_own_mark_at_the_end_is_moved_first_and_kept_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tool that marked itself last (as a page fitter does) has that mark moved to the front:
+    one over_budget key, the rest in order. An answer within the budget is not reordered.
+
+    MUTATION (verified RED, 1 failed): return early when the answer already carries the mark
+    -> the mark stays last -> RED."""
+    marked = {**_sized(_RESPONSE_BYTE_BUDGET + 10, first="a"), "over_budget": True}
+    within = {**_sized(_RESPONSE_BYTE_BUDGET - 100, first="a"), "last": 1}
+    answers = iter([dict(marked), dict(within)])
+    server = _server_answering(tmp_path, monkeypatch, lambda: next(answers))
+    text, _ = _call_both(server, "legal_notice", {})
+    assert list(text) == ["over_budget", "first", "notice"]
+    assert text.get("over_budget") is True
+    text, _ = _call_both(server, "legal_notice", {})
+    assert list(text) == list(within) and "over_budget" not in text
+
+
 # ── explain_candidate: the sink summary is withheld from the end, never the own callsite ─────
 
 
@@ -225,3 +272,96 @@ def test_the_server_marks_an_unpaged_tool_and_fits_the_explanation(tmp_path: Pat
     ex = _call(server, "explain_candidate", {"evidence_ref": ref})
     assert "over_budget" not in ex
     assert (ex.get("sink_arg_provenance_summary_withheld") or {}).get("count", 0) > 0
+
+
+# ── the summary fit is linear: one running size, re-measured whole only to confirm ────────────
+
+
+def _reference_fit(data: dict[str, Any], limit: int) -> dict[str, Any]:
+    """The fit by its definition: re-serialize the whole answer before each entry withheld."""
+    summary = data.get("sink_arg_provenance_summary")
+    if not isinstance(summary, (list, tuple)) or len(json.dumps(data)) <= limit:
+        return data
+    kept = list(summary)
+    held: list[Any] = []
+    withheld = {"count": 0, "sink_idx": held, "read_with": mcp_app._SINK_SUMMARY_READ_WITH}
+    data["sink_arg_provenance_summary"] = kept
+    data["sink_arg_provenance_summary_withheld"] = withheld
+    i = len(kept) - 1
+    while i >= 0 and len(json.dumps(data)) > limit:
+        entry = kept[i]
+        if not (isinstance(entry, dict) and entry.get("is_candidate_callsite") is True):
+            kept.pop(i)
+            held.insert(0, entry.get("sink_idx") if isinstance(entry, dict) else None)
+            withheld["count"] = len(held)
+        i -= 1
+    if not held:
+        del data["sink_arg_provenance_summary_withheld"]
+    if len(json.dumps(data)) > limit:
+        data["over_budget"] = True
+    return data
+
+
+def _synthetic_summary(n: int, own: int | None) -> dict[str, Any]:
+    """An answer whose summary entries vary in width (and in the width of their sink_idx), with
+    entries that carry no sink_idx and entries that are not objects among them."""
+    summary: list[Any] = []
+    for i in range(n):
+        entry: Any = {
+            "sink_idx": i * 37,
+            "sink": "system",
+            "kind": "stack_buf",
+            "fmt": "c" * ((i * 53) % 311),
+            "is_candidate_callsite": i == own,
+        }
+        if i % 17 == 5 and i != own:
+            entry = {"note": "x" * (i % 40)}
+        elif i % 29 == 7 and i != own:
+            entry = "not an object"
+        summary.append(entry)
+    return {"found": True, "sink_arg_provenance_summary": summary, "pad": "y" * 900}
+
+
+@pytest.mark.parametrize("n", [1, 2, 9, 10, 11, 120])
+def test_the_fit_is_the_one_its_definition_gives(n: int) -> None:
+    """Against budgets from tight to just enough, the fitted answer is the one the whole-answer
+    re-measuring loop gives, key for key and byte for byte.
+
+    MUTATION (verified RED, the n=120 case): count no separator for an entry withheld (``+ 0``
+    for ``+ (2 if len(kept) > 1 else 0)``) -> the running size reads too wide, an entry too many
+    is withheld -> RED."""
+    for own in (None, 0, n - 1, n // 2):
+        whole = len(json.dumps(_synthetic_summary(n, own)))
+        for limit in sorted({1, 200, 1_000, 3_000, whole // 2, whole - 1, whole, whole + 1}):
+            got = mcp_app._fit_sink_summary(_synthetic_summary(n, own), budget=limit)
+            want = _reference_fit(_synthetic_summary(n, own), limit)
+            assert list(got) == list(want), (n, own, limit)
+            assert json.dumps(got) == json.dumps(want), (n, own, limit)
+
+
+def test_fitting_a_2000_entry_summary_serializes_a_bounded_multiple_of_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2,000 entries, most of them withheld: the bytes json.dumps produces while fitting stay
+    within a few times the answer's own size (one running size, the whole answer measured only
+    to start and to confirm) — not one whole serialization per entry withheld.
+
+    MUTATION (verified RED, 1 failed): re-measure the whole answer before every entry (the
+    running size dropped) -> ~485 MB serialized for a ~474 KB answer -> RED."""
+    data = _synthetic_summary(2_000, own=3)
+    whole = len(json.dumps(data))
+    produced = [0]
+    real_dumps = json.dumps
+
+    def counting(obj: Any, *a: Any, **k: Any) -> str:
+        out = real_dumps(obj, *a, **k)
+        produced[0] += len(out)
+        return out
+
+    monkeypatch.setattr(mcp_app.json, "dumps", counting)
+    out = mcp_app._fit_sink_summary(data)
+    monkeypatch.undo()
+    held = (out.get("sink_arg_provenance_summary_withheld") or {}).get("count", 0)
+    assert held > 1_500
+    assert len(json.dumps(out)) <= _RESPONSE_BYTE_BUDGET
+    assert produced[0] <= 4 * whole, (produced[0], whole)

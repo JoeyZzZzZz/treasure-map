@@ -123,6 +123,7 @@ from treasure_map.lib.diff.code_version import diff_code_version, sink_overlay_l
 from treasure_map.lib.diff.layer0 import _thunk_spans, norm_hex
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE, DECOMPILE_ERROR_PLACEHOLDER
 from treasure_map.lib.facts import has_text as _has_text
+from treasure_map.lib.hunt.downweight import _address_taken
 from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review, diff_sink_axes, entry_words, sameness
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN
@@ -736,6 +737,9 @@ class _Fn:
     # calls nothing — the D29 reader reports those sides unknown, never a 0 count.
     has_text: bool | None = None  # None: pseudocode column not recorded by that analysis.db
     size_bytes: int | None = None  # the function's byte size; < _DECOMPILE_MIN_SIZE = a micro-stub
+    # The unresolved_external_calls column holds a value that does not read as a list: which stubs
+    # went unnamed is unknown, so a call through one may be a sink (``unresolved`` is then None).
+    unresolved_unreadable: bool = False
 
 
 @dataclass
@@ -798,11 +802,12 @@ class _Side:
 
     def named_outside_a_call(self, name: str) -> bool | None:
         """Whether ``name`` appears in some function's text other than as a call (``name(``): its
-        address taken, passed or stored as a function pointer. None when the text cannot be read."""
+        address taken, passed or stored as a function pointer. Read by the hunt's own rule
+        (``downweight._address_taken``): a mention inside a string or char literal, or on a
+        function's declaration line, is not one. None when the text cannot be read."""
         if self.source is None:
             return None
         path, binary_id = self.source
-        pattern = re.compile(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])(?!\s*\()")
         try:
             conn = ro_connect(path)
             try:
@@ -811,7 +816,7 @@ class _Side:
                     "WHERE binary_id = ? AND instr(pseudocode, ?) > 0",
                     (binary_id, name),
                 ):
-                    if isinstance(text, str) and pattern.search(text):
+                    if isinstance(text, str) and _address_taken(text, name):
                         return True
             finally:
                 conn.close()
@@ -878,6 +883,9 @@ def _parse_fn(raw: tuple[Any, ...], stubs: dict[int, str] | None = None) -> _Fn:
     ) = raw
     callees = _json_list(callees_raw)
     unresolved = _json_list(unresolved_raw) if has_unresolved else None
+    # A column that exists and holds something that will not parse: unreadable, never "none
+    # unresolved". A NULL / empty value, or an older analysis.db with no column, stays None.
+    unresolved_unreadable = bool(has_unresolved and unresolved_raw and unresolved is None)
     norm_unresolved = (
         frozenset(a for a in (norm_hex(str(u)) for u in unresolved) if a is not None)
         if unresolved is not None
@@ -892,6 +900,7 @@ def _parse_fn(raw: tuple[Any, ...], stubs: dict[int, str] | None = None) -> _Fn:
         sink_callsites=_sink_callsites(call_tokens_raw, has_call_tokens, stubs),
         has_text=bool(has_text) if has_text is not None else None,
         size_bytes=int(size_bytes) if isinstance(size_bytes, int) else None,
+        unresolved_unreadable=unresolved_unreadable,
     )
 
 
@@ -1643,9 +1652,10 @@ class _Builder:
         An empty call_tokens read off empty text is NOT a 0, it is unknown. Last, ``call_counts_
         incomplete`` when the function's callee list was truncated, so call_tokens may be too, and
         ``stub_call_unresolved`` when it calls a lazy-binding stub its binary's stub table could not
-        name (``unresolved_external_calls``): that call may be a sink, so its count is not read as
-        unchanged. A binary with no stub table at all is NOT unknown — its calls are counted by the
-        names the decompiler wrote. The decision never reads ``decompile_status`` (an r6 column):
+        name (``unresolved_external_calls``), or that column holds a value that does not parse:
+        that call may be a sink, so its count is not read as unchanged. A binary with no stub
+        table at all is NOT unknown — its calls are counted by the names the decompiler wrote. The
+        decision never reads ``decompile_status`` (an r6 column):
         empty text + size alone decide it, so a pre-r6 analysis.db is judged the same way."""
         s = self.sides[side]
         if s.error is not None:
@@ -1662,7 +1672,7 @@ class _Builder:
             return "text_unavailable", {}
         if fn.truncated is True:
             return "call_counts_incomplete", counts
-        if fn.unresolved:
+        if fn.unresolved or fn.unresolved_unreadable:
             return "stub_call_unresolved", counts
         return None, counts
 
@@ -2761,7 +2771,9 @@ class _PairEvidence:
         (``b_address_stored``), or b's name appears in some function's text other than as a call
         — its address taken or passed (``b_name_referenced``). A text or image that cannot be
         read cannot rule these out, so it is ``none`` too (``*_unreadable``): a refutation is
-        only made on what was read."""
+        only made on what was read. ``caller_text_unreadable`` is any mapped B caller with no text
+        to read, whatever the cause: a decompile that gave none, a side whose text cannot be
+        opened, or a ``skipped_micro`` function the exporter leaves without text by design."""
         sb = self.builder.sides["b"]
         texts = sb.text_of(mapped)
         if texts is not None and any(_INDIRECT_CALL.search(t or "") for t in texts.values()):
@@ -2998,11 +3010,14 @@ def _supported_lift(e: _Entry) -> str | None:
 def _count_noise(e: _Entry) -> bool:
     """Whether an aligned entry floated to attention 0 by a sink candidate-count delta alone reads
     as likely noise, to be read after the rest of attention 0 (still in it, still must-read): its
-    call count could not be compared (``sink_callsite_counts`` absent — the calls themselves may
-    not differ), or a row of it is ``same_callee_non_candidate`` (the call is there on both sides,
+    sink CALL counts show no difference (``sink_callsite_counts`` absent: no sink named in either
+    side's call tokens counts differently or reads unknown — the calls themselves may not
+    differ), or a row of it is ``same_callee_non_candidate`` (the call is there on both sides,
     only not a candidate on one). Never when it shows a change beyond the count: a command sink
-    among the counted ones, a ``rematch_suspected`` row, or a callee only B calls. An order inside
-    attention 0 only: the attention, the basis and the must-read reasons do not read it."""
+    among the counted ones, a ``rematch_suspected`` row, or a callee identified only on B — in a
+    set read in full (``only_in_b``) or in the identified part of an undetermined one
+    (``named_callees_differ.only_in_b``). An order inside attention 0 only: the attention, the
+    basis and the must-read reasons do not read it."""
     subclasses = {v["subclass"] for v in e.row_views if v["subclass"]} or {e.shown_subclass}
     if e.sink_callsite_counts is not None and "same_callee_non_candidate" not in subclasses:
         return False
@@ -3011,7 +3026,8 @@ def _count_noise(e: _Entry) -> bool:
         return False
     if "rematch_suspected" in subclasses:
         return False
-    return not (e.callee_set or {}).get("only_in_b")
+    cs = e.callee_set or {}
+    return not (cs.get("only_in_b") or (cs.get("named_callees_differ") or {}).get("only_in_b"))
 
 
 def _held_up(item: diff_review.Item | None) -> bool:

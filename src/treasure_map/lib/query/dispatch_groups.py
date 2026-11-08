@@ -8,8 +8,12 @@ fact — never a reachability verdict; see ``atlas_schema.sql`` ★IRON LAW):
 
 * ``static_string_table`` — an entry is a member when its function entry (on a side) is the stored
   handler of a key in a recovered ``{string_ptr, func_ptr}`` table of that side's binary. The two
-  sides' tables are aligned by key-set overlap (>= 50% of the smaller key set); the group is the
-  aligned table (``table_addr`` on each side). The key is only a member label.
+  sides' tables are aligned by key-set overlap (>= 50% of the smaller key set), one table to one;
+  the group is the aligned table (``table_addr`` on each side). A table stored as split by an
+  undefined handler is one piece of a table: a piece left unaligned joins the group of the other
+  side's table it overlaps by that same measure, even when that table is aligned to another piece,
+  so a table cut into pieces on one side and whole on the other is one group (its pieces listed per
+  side). The key is only a member label.
 * ``strcmp_gate`` — an entry is a member when its function entry is the callee of a same-variable
   ``strcmp`` ladder; the group is the aligned dispatch FUNCTION (``from_func_addr``), the two sides'
   dispatch functions aligned by a function pairing whose state is ``aligned`` (an undetermined
@@ -25,6 +29,12 @@ This reads the STORED enumeration only; it never reads a call edge of the dispat
 the handler is routed to or reachable. An entry named by no recovered table or gate falls to an
 explicit UNCOVERED bucket, counted per side by the static-table detector's ``detector_scan_status``
 (the atlas row stored beside the edges), so "not enumerated" is never read as "not dispatched".
+
+The static tables are read here from the hunt-flattened atlas ``string_keyed_edge`` rows (by run
+and binary path, per table address). The patch view reads the same detector's output another way —
+from that run's analysis.db ``string_tables`` by binary hash, a key over all the binary's tables,
+kept only when it has exactly one handler — so the two readings can differ on a key; neither is
+rewritten to match the other.
 
 Only a grouping: the units, the must-read set, the unit ids and the order are untouched; an entry
 that joins a group also stays in whatever unit held it (ENTRY / S_BATCH / SECOND_TIER / callee
@@ -121,6 +131,9 @@ class DispatchGroup:
     members: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     member_anchors: dict[str, str] = field(default_factory=dict)
     completeness_reasons: set[str] = field(default_factory=set)
+    # a static group: per side, every table of that side that joins it (more than one = the pieces
+    # of a table split by an undefined handler); empty for a gate group
+    pieces: dict[str, list[str]] = field(default_factory=_no_keys)
 
     @property
     def split_by_undefined_handler(self) -> bool:
@@ -328,16 +341,27 @@ def _detector_statuses(
 # ── the grouping ───────────────────────────────────────────────────────────────────────────────
 
 
+def _key_set(table: dict[str, Any]) -> set[str]:
+    return {k for ks in table["keys"].values() for k in ks}
+
+
+def _overlap(ka: set[str], kb: set[str]) -> int:
+    """The keys two tables share when they are >= 50% of the smaller key set, else 0."""
+    overlap = len(ka & kb)
+    if overlap and overlap >= 0.5 * min(len(ka), len(kb)):
+        return overlap
+    return 0
+
+
 def _align_tables(ta: dict[str, dict[str, Any]], tb: dict[str, dict[str, Any]]) -> dict[str, str]:
     """B table_addr -> A table_addr, aligned by key-set overlap >= 50% of the smaller key set
     (greedy, best overlap first, one A table per B table)."""
     scored: list[tuple[int, str, str]] = []
     for b, tbv in tb.items():
-        kb = {k for ks in tbv["keys"].values() for k in ks}
+        kb = _key_set(tbv)
         for a, tav in ta.items():
-            ka = {k for ks in tav["keys"].values() for k in ks}
-            overlap = len(ka & kb)
-            if overlap and overlap >= 0.5 * min(len(ka), len(kb)):
+            overlap = _overlap(_key_set(tav), kb)
+            if overlap:
                 scored.append((overlap, a, b))
     out: dict[str, str] = {}
     used_a: set[str] = set()
@@ -345,6 +369,48 @@ def _align_tables(ta: dict[str, dict[str, Any]], tb: dict[str, dict[str, Any]]) 
         if b not in out and a not in used_a:
             out[b] = a
             used_a.add(a)
+    return out
+
+
+def _table_groups(
+    ta: dict[str, dict[str, Any]], tb: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, tuple[str, str]]]:
+    """``side -> table_addr -> (A table, B table)``: the two-sided group each table of a side joins.
+
+    Tables align one to one (``_align_tables``). A table left unaligned whose stored reasons say it
+    was split by an undefined handler is a PIECE of a table: it joins the one-to-one group of the
+    other side's table it overlaps most (by the same >= 50% measure), even though that table is
+    already aligned to another piece — many pieces to one whole table, on either side. Any other
+    unaligned table joins no two-sided group (its group is one-sided)."""
+    paired: dict[str, dict[str, tuple[str, str]]] = {"a": {}, "b": {}}
+    for b, a in _align_tables(ta, tb).items():
+        paired["a"][a] = paired["b"][b] = (a, b)
+    out = {s: dict(v) for s, v in paired.items()}
+    for side, mine, theirs in (("a", ta, tb), ("b", tb, ta)):
+        other = "b" if side == "a" else "a"
+        for addr, table in mine.items():
+            if addr in paired[side] or _SPLIT not in table["reasons"]:
+                continue
+            keys = _key_set(table)
+            scored = [
+                (ov, there)
+                for there, tt in theirs.items()
+                if there in paired[other] and (ov := _overlap(keys, _key_set(tt)))
+            ]
+            if scored:
+                out[side][addr] = paired[other][max(scored)[1]]
+    return out
+
+
+def _pieces(
+    tgroups: dict[str, dict[str, tuple[str, str]]], anchors: tuple[str | None, str | None]
+) -> dict[str, list[str]]:
+    """Per side, every table that joins the static group with these anchors (an unaligned table
+    is a one-sided group of its own)."""
+    out = {s: sorted(t for t, anc in tgroups[s].items() if anc == anchors) for s in SIDES}
+    for s, anchor in zip(SIDES, anchors, strict=True):
+        if anchor is not None and anchor not in out[s]:
+            out[s].append(anchor)
     return out
 
 
@@ -381,10 +447,10 @@ def compute_pair(
     det = {s: _detector_statuses(atlas, runs[s], paths[s]) for s in SIDES}
     dispatchers = {s: {p: _dispatchers(g) for p, g in gates[s].items()} for s in SIDES}
     align = _alignment(atlas, set(meta))
-    # B table_addr -> A table_addr per diff, so a two-sided table is one group.
-    tmaps: dict[str, dict[str, str]] = {}
+    # side -> table_addr -> (A table, B table) per diff, so a two-sided table is one group.
+    tgroups: dict[str, dict[str, dict[str, tuple[str, str]]]] = {}
     for did, m in meta.items():
-        tmaps[did] = _align_tables(
+        tgroups[did] = _table_groups(
             tables["a"].get(m["binary_path_a"], {}), tables["b"].get(m["binary_path_b"], {})
         )
 
@@ -403,11 +469,14 @@ def compute_pair(
         keys: list[str],
         reasons: set[str],
         counterpart: str | None = None,
+        pieces: dict[str, list[str]] | None = None,
     ) -> None:
         key = (mechanism, mem.diff_id, *anchors)
         g = groups.get(key)
         if g is None:
             g = groups[key] = DispatchGroup(mechanism, mem.diff_id, binary, *anchors)
+            if pieces is not None:
+                g.pieces = pieces
         if counterpart is not None:
             g.counterpart = counterpart
         per_side = g.members.setdefault(mem.entry_id, _no_keys())
@@ -439,11 +508,12 @@ def compute_pair(
                 keys = sorted(set(tav["keys"].get(addr[s], [])))
                 # The group is the aligned TABLE (``table_addr``), never a single key: a table's
                 # handlers share one group, with the key(s) kept as each member's label (per side).
-                if s == "a":
-                    anchors = (table_addr, _table_b_of(tmaps[did], table_addr))
-                else:
-                    anchors = (tmaps[did].get(table_addr), table_addr)
-                join(STATIC, mem, binary, anchors, s, keys, tav["reasons"])
+                # A table in no two-sided group is null on the other side.
+                anchors = tgroups[did][s].get(table_addr) or (
+                    (table_addr, None) if s == "a" else (None, table_addr)
+                )
+                pieces = _pieces(tgroups[did], anchors)
+                join(STATIC, mem, binary, anchors, s, keys, tav["reasons"], pieces=pieces)
                 in_group = True
 
         # strcmp gates: the member's per-side function is the callee of a dispatch function
@@ -496,14 +566,6 @@ def compute_pair(
     )
 
 
-def _table_b_of(tmap: dict[str, str], table_a: str) -> str | None:
-    """The B table aligned to an A table (invert the B->A alignment map)."""
-    for b, a in tmap.items():
-        if a == table_a:
-            return b
-    return None
-
-
 def from_review(
     atlas: sqlite3.Connection, facts: Any, units: list[Any], **kwargs: Any
 ) -> PairDispatch:
@@ -552,7 +614,8 @@ def member_labels(pd: PairDispatch) -> dict[tuple[str, str], list[dict[str, Any]
 
 def group_json(g: DispatchGroup) -> dict[str, Any]:
     """One group in full (the report file's table): its anchors per side, every member with its
-    per-side keys, and the stored completeness reasons of its table/gate edges."""
+    per-side keys, the tables of each side when a side has more than one (``table_pieces``: the
+    pieces of a split table), and the stored completeness reasons of its table/gate edges."""
     out: dict[str, Any] = {
         "group_ref": g.ref,
         "mechanism": g.mechanism,
@@ -566,6 +629,8 @@ def group_json(g: DispatchGroup) -> dict[str, Any]:
         ],
         "note": NOTE_STATIC if g.mechanism == STATIC else NOTE_GATE,
     }
+    if any(len(g.pieces[s]) > 1 for s in SIDES):
+        out["table_pieces"] = {s: list(g.pieces[s]) for s in SIDES}
     if g.completeness_reasons:
         out["completeness"] = {
             "reasons": sorted(g.completeness_reasons),

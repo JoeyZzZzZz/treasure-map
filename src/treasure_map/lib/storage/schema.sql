@@ -276,6 +276,11 @@ CREATE TABLE IF NOT EXISTS xrefs (
     callee_binary_id    INTEGER,
     callee_func_id      INTEGER,        -- NULL = a library-level reference
     xref_type           TEXT,           -- callees_exports / import_export / dt_needed / string_ipc
+                                        --   import_export is written only for an import whose
+                                        --   library Ghidra named (imports.lib_soname non-empty);
+                                        --   one resolved through <EXTERNAL> has none, so a binary
+                                        --   whose imports all resolve that way has 0 such rows
+                                        --   (callees_exports carries those calls)
     confidence          REAL    DEFAULT 1.0
 );
 

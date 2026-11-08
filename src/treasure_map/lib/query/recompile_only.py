@@ -27,11 +27,16 @@ The explanations, and nothing else:
     format, or the view's own line_number_form) or an embedded version / build string — only when
     its callee sets are proven equal and both body sizes are recorded and equal (the text cannot
     show calls in code the decompiler dropped). A number after a string is a line number by
-    evidence (strong) only when the string is a source path or the function's own name, or when
-    the same or the previous line holds, on both sides, a format with a ``%s`` conversion followed
-    by a ``%d`` / ``%u`` / ``%i`` one; after any other identifier-shaped string, or through a
-    variable assigned the number, it is weak, and a pair with no strong site reads its weak ones
-    as changed constants. Every line-number site of a pair must shift by one same nonzero step;
+    evidence (strong) only when the string is a source path or the function's own name (on both
+    sides), or when, on both sides, a string literal on the number's line holds a ``%s``
+    conversion followed by a ``%d`` / ``%u`` / ``%i`` / ``%x`` one — or the line before holds one
+    and its statement continues onto the number's line (lib/query/line_format, the test the drift
+    reading shares); after any other identifier-shaped string, or through a variable assigned the
+    number, it is weak, and a pair with no strong site reads its weak ones as changed constants.
+    Every line-number site of a pair must shift by one same nonzero step; a weak site is tied to
+    the strong one by that step alone (not by call or place), so a real constant that moves by
+    exactly a line number's step in the same function reads as a line number — the accepted cost
+    of reading unlabelled line numbers at all;
   * a string pair that becomes equal once its generic date / time / version shapes are replaced by
     placeholders, or its build-environment paths (below);
   * changed bytes that lie inside a GNU build-id note's descriptor at the same place on both
@@ -71,10 +76,11 @@ from typing import Any
 
 from treasure_map.lib.query import entry_words, sameness
 from treasure_map.lib.query import patch_view as pv
+from treasure_map.lib.query.line_format import format_evidence
 from treasure_map.lib.ro_db import ro_connect
 
 # The rule version this reading follows; part of its cache key and of every answer.
-RULE = "recompile-only-v2"
+RULE = "recompile-only-v3"
 # The key a patch-view entry carries when its diff reads true (and only then).
 ENTRY_KEY = "recompile_only_diff"
 # How many characters of a firmware string an answer quotes.
@@ -407,9 +413,6 @@ _FMT_CONV = re.compile(r"%[-0-9.]*[a-zA-Z]")
 _PASSED_AFTER_NAME = (
     r'("[A-Za-z_][A-Za-z0-9_]*"|&?(?:PTR_)?DAT_[0-9a-fA-F]+|"[^"]*\.(?:c|h|cpp)")\s*,\s*'
 )
-# Format-string evidence for a line-number argument: a literal holding a ``%…s`` conversion followed
-# later by a ``%…d`` / ``%…u`` / ``%…i`` one (a name-then-line log format such as ``"%s:%d"``).
-_FMT_EVIDENCE = re.compile(r'"[^"]*%[^"%]*s[^"]*%[^"%]*[dui][^"]*"')
 # The site classes a recompile explains: a line number, a line number by the first %d of a format,
 # an embedded version / build string. ``Lw`` (a weak line number: an identifier-shaped string or an
 # assigned variable without the evidence above) counts as ``L`` only beside a strong ``L`` site of
@@ -522,9 +525,10 @@ def _same_name_string(sides: _Sides, tok_a: str | None, tok_b: str | None) -> st
     return quoted if _IDENT_STR.match(quoted) or _PATH_STR.match(quoted) else None
 
 
-def _fmt_near(lines: list[str], i: int) -> bool:
-    """Line ``i`` or the line before it holds a ``%s``-then-``%d`` format literal."""
-    return any(_FMT_EVIDENCE.search(lines[j]) for j in (i - 1, i) if 0 <= j < len(lines))
+def _fmt_near(lines: list[list[str]], i: int) -> bool:
+    """Line ``i`` (its tokens) holds a name-then-line format literal, or the line before holds one
+    and its statement continues onto line ``i`` (:func:`line_format.format_evidence`)."""
+    return format_evidence(lines[i], lines[i - 1] if i > 0 else [])
 
 
 def _strong_name(quoted: str, names: _Names) -> bool:
@@ -604,7 +608,7 @@ def _site(
     # a number after a string is a line number by evidence (L) only beside a format of the
     # name-then-line shape on both sides, or after a source path / the function's own name; after
     # any other identifier-shaped string it is weak (Lw)
-    fmt = _fmt_near(la, x) and _fmt_near(lb, y)
+    fmt = _fmt_near(ta, x) and _fmt_near(tb, y)
     if prev_a == "," and prev_b == ",":
         if (
             prev2_a

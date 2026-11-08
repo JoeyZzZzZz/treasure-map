@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """R9: the read-face signals a diff judgement leans on are part of its facts (entry_facts) —
 pair_evidence, counterpart_hint, the per-sink call-count delta, listed_as and the subclass — read
-on the write and on the re-check alike; a snapshot is compared on the keys it holds; the
-predicate version is no fact of a judgement.
+on the write and on the re-check alike, and a one-sided (P) entry's hint targets; a snapshot is
+compared on the keys it holds; the predicate version is no fact of a judgement.
 
 Zero real data: the pair-evidence World of test_pair_evidence, and the World of test_diff_review
 for bucket S."""
@@ -22,6 +22,7 @@ from tests.unit.lib.test_pair_evidence import (  # noqa: F401 — the autouse fi
     NEG,
     _evidence_world,
     _fresh,
+    _one_sided_world,
 )
 from tests.unit.lib.test_patch_view import DIFF, _pair_id
 from treasure_map.lib import overlay
@@ -135,3 +136,74 @@ def test_a_snapshot_is_compared_on_its_own_keys_and_the_predicate_is_no_fact(
     monkeypatch.setattr(ru, "PREDICATE_VERSION", "v-next")
     pv._clear_view_caches()
     assert _states(w.atlas, tdr.DX)[anchor] == "concluded"
+
+
+def _p_hint_moved(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one-sided function's hint points at another function than it did when judged."""
+    real = pv._PairEvidence.one_sided_hint
+
+    def moved(self: Any, u: Any) -> Any:
+        hint = real(self, u)
+        if u.addr != "00007000" or hint is None:
+            return hint
+        return {
+            **hint,
+            "hints": [{**h, "addr": "0002a000", "at_probe_addr": False} for h in hint["hints"]],
+        }
+
+    monkeypatch.setattr(pv._PairEvidence, "one_sided_hint", moved)
+    pv._clear_view_caches()
+
+
+def test_a_judged_one_sided_entry_re_checks_when_its_hint_points_elsewhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A P entry judged while its unique strings pointed at one function on the other side reads
+    needs_recheck once they point at another: the hint's targets are a fact of its judgement.
+    The twin P entry, whose hint did not move, stays concluded.
+
+    MUTATION (verified RED, 1 failed): leave ``counterpart_hint`` out of the P branch of
+    entry_facts -> the moved one reads concluded -> RED."""
+    w = _one_sided_world(tmp_path)
+    anchors = {}
+    for entry_id in ("a:00007000", "a:00008000"):
+        anchor = _anchor_of(w.atlas, DIFF, entry_id)
+        overlay.annotate_diff(
+            w.atlas, anchor_ref=anchor, verdict="changed_real", rationale="r", diff_id=DIFF
+        )
+        anchors[entry_id] = anchor
+    pv._clear_view_caches()
+    assert set(_states(w.atlas, DIFF).values()) == {"concluded"}
+    _p_hint_moved(monkeypatch)
+    states = _states(w.atlas, DIFF)
+    assert states[anchors["a:00007000"]] == "needs_recheck"
+    assert states[anchors["a:00008000"]] == "concluded"
+
+
+def test_a_one_sided_snapshot_without_the_hint_key_moves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A P judgement stored before the hint was a fact (its snapshot has no ``counterpart_hint``)
+    reads concluded with nothing moved, even where the hint now points elsewhere: a snapshot is
+    compared on its own keys.
+
+    MUTATION (verified RED, 1 failed): compare every key of both snapshots -> it reads
+    needs_recheck -> RED."""
+    w = _one_sided_world(tmp_path)
+    anchor = _anchor_of(w.atlas, DIFF, "a:00007000")
+    overlay.annotate_diff(
+        w.atlas, anchor_ref=anchor, verdict="changed_real", rationale="r", diff_id=DIFF
+    )
+    raw = w.atlas.execute("SELECT basis_state FROM overlay WHERE anchor_ref = ?", (anchor,))
+    snap = json.loads(raw.fetchone()[0])
+    assert snap["facts"].get("counterpart_hint") == ["00027000", "00029000"], snap["facts"]
+    del snap["facts"]["counterpart_hint"]
+    w.atlas.execute(
+        "UPDATE overlay SET basis_state = ? WHERE anchor_ref = ?", (json.dumps(snap), anchor)
+    )
+    w.atlas.commit()
+    _p_hint_moved(monkeypatch)
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    judged = pv.ViewReview(w.atlas, built).judged[anchor]
+    assert (judged.state, dict(judged.moved)) == ("concluded", {})
