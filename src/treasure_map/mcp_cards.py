@@ -438,7 +438,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "S = similarity-1 pair whose pseudocode differs), plus a blind_spots ledger — "
             "evidence, never a verdict or a score. An entry nobody judged is UNREAD, which is not "
             '"nothing found". sink_candidate_counts counts hunt candidates, not calls; '
-            "sink_callsite_counts counts calls (not deduplicated) and is never part of the order. "
+            "sink_callsite_counts counts calls (not deduplicated) and never moves attention. "
             "Default order: "
             "significance; also sort_by, the bucket / subclass / tier / blind_spot filters and "
             "limit / offset (follow next_offset). rows_limit=0 scans every entry with its summary "
@@ -567,8 +567,6 @@ TOOL_CARDS: dict[str, ToolCard] = {
     ),
     "get_function_alignment": ToolCard(
         required=("diff_id", "function"),
-        aliases={"addr": "function"},
-        note="addr is its old name, accepted for this version",
         example='get_function_alignment(diff_id="<diff_id>", function="<name_or_address>")',
         boundary=(
             "Returns an ALIGNMENT FACT, never a verdict",
@@ -583,8 +581,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "differs). A name matching several functions on a side (an import stub and its body) "
             "returns reason='ambiguous' listing every candidate, never one picked. No match here "
             "is NOT proof the function was added or removed; presence lists the side's unmatched "
-            "functions. addr is the old name of function (accepted for this version; it adds "
-            "param_renamed)."
+            "functions."
         ),
     ),
     "get_diff_capabilities": ToolCard(
@@ -734,8 +731,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
         ),
         summary=(
             "Recorded strings of one binary, or searched by value (substring) across the run with "
-            "each hit's address and binary. ``function`` does NOT scope the results (there is no "
-            "string-to-function index). Paged losslessly by byte size (offset = "
+            "each hit's address and binary. ``function`` does NOT scope the results (they are "
+            "binary-wide). Paged losslessly by byte size (offset = "
             "paging.next_offset). A binary's string export is capped: truncated / "
             "search_may_be_incomplete say so, and a string NOT found there is NOT proven absent. "
             "Without binary or value it is an error naming the run. A short binary name naming "
@@ -1090,13 +1087,6 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
         "a function's name or address, in any form",
         (*_FN_READERS, "get_function_alignment"),
         _CONSISTENT,
-    ),
-    _param(
-        "addr",
-        "the old name of function",
-        ("get_function_alignment",),
-        _KEPT,
-        "accepted for this version only, so a call written for the old name keeps working",
     ),
     _param(
         "text",

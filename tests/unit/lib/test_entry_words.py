@@ -335,6 +335,83 @@ def test_thumb_entry_words_are_read_and_flagged(tmp_path: Path) -> None:
     assert sorted(ew.word_index(b.image())[THUMB_FNS[1]]) == [0x30008]
 
 
+# ── thunks: entries the export lists apart (binaries.thunk_spans), never in functions ────────
+
+
+def _set_thunks(b: Bin, *entries: int) -> None:
+    b.conn.execute(
+        "UPDATE binaries SET thunk_spans = ? WHERE id = ?",
+        (json.dumps([[f"0x{t:x}", [[f"0x{t:x}", f"0x{t + 7:x}"]]] for t in entries]), b.bid),
+    )
+
+
+def _be32_thunk(tmp_path: Path) -> Bin:
+    """The six-record table of ``_be32``, record 2's handler a thunk (in thunk_spans only)."""
+    b = Bin(tmp_path / "be32t.db", "MIPS:BE:32:default")
+    for i, a in enumerate(BE_FNS):
+        if i != 2:
+            b.fn(a, f"fn_{i}")
+    _set_thunks(b, BE_FNS[2])
+    records = b"".join(b.w(a) + f"name_{i}_abc".encode() + b"\0\0" for i, a in enumerate(BE_FNS))
+    b.block(".data", 0x10000, b"\0" * 0x10 + records + b"\0" * 0x10)
+    return b
+
+
+def test_a_thunk_handler_does_not_cut_the_series(tmp_path: Path) -> None:
+    """A word holding a thunk's entry is an entry word: the table reads all six records at stride
+    16, the thunk's record names no function and is marked ``thunk``; the point query of a
+    neighbour reads the same series.
+
+    MUTATIONS (verified RED): skip the thunk entries in ``load_image`` -> the series breaks at
+    record 2 (2 + 3 records, both under MIN_RUN) -> ``found`` False; drop the ``thunk`` mark ->
+    the record's function differs."""
+    b = _be32_thunk(tmp_path)
+    t = _table(b, f"0x{TBL + 0x30:x}")
+    assert t["found"] is True and t["total_records"] == 6
+    assert t["table"]["stride"] == 16
+    assert t["records"][2]["entry_word"]["function"] == {
+        "name": None,
+        "address": f"{BE_FNS[2]:08x}",
+        "thunk": True,
+    }
+    assert "thunk" not in t["records"][1]["entry_word"]["function"]
+    (word,) = _point(b, "fn_1")["entry_words"]["words"]
+    assert word["run"] == {"first_word": "0x10010", "stride": 16, "records": 6, "slot": 1}
+
+
+def test_a_thunk_is_an_entry_as_well_as_a_target(tmp_path: Path) -> None:
+    """A thunk goes into ``entries`` (no name, the address as listed) as well as ``targets`` — a
+    target with no entry would leave the table's record lookup without a row — and on ARM its
+    ``entry|1`` form is a target too. A thunk that also has a functions row keeps that row and is
+    not marked; a thunk_spans value that does not parse adds nothing.
+
+    MUTATIONS (verified RED): add the thunks to ``targets`` only -> the ``entries`` assertion
+    fails; read the thunks after ``targets`` is built -> no target for the thunk; let a thunk
+    overwrite a functions row -> ``named`` is lost."""
+    image = _be32_thunk(tmp_path).image()
+    assert image.entries.get(BE_FNS[2]) == (None, f"{BE_FNS[2]:08x}")
+    assert image.thunks == frozenset({BE_FNS[2]})
+    assert image.targets.get(BE_FNS[2]) == BE_FNS[2]
+    # ARM: th_2 is a thunk, stored as entry|1 like the rest
+    arm = Bin(tmp_path / "thumbt.db", "ARM:LE:32:v7")
+    for i, a in enumerate(THUMB_FNS):
+        if i != 2:
+            arm.fn(a, f"th_{i}")
+    _set_thunks(arm, THUMB_FNS[2])
+    arm.block(".data", 0x30000, b"\0" * 4 + arm.w(*(a | 1 for a in THUMB_FNS)) + b"\0" * 4)
+    assert arm.image().targets.get(THUMB_FNS[2] | 1) == THUMB_FNS[2]
+    rec = _table(arm, "0x30004")["records"]
+    assert len(rec) == 5 and rec[2]["entry_word"]["function"].get("thunk") is True
+    # a thunk with a functions row keeps it; an unparsable thunk_spans adds no entry
+    both = Bin(tmp_path / "both.db", "MIPS:LE:32:default")
+    both.fn(0x400000, "named")
+    _set_thunks(both, 0x400000)
+    img = both.image()
+    assert img.entries[0x400000] == ("named", "00400000") and img.thunks == frozenset()
+    both.conn.execute("UPDATE binaries SET thunk_spans = '[[\"0x400100\"]]'")
+    assert 0x400100 not in both.image().entries
+
+
 # ── tbl_rx: an executable block ──────────────────────────────────────────────────────────────
 
 
@@ -911,6 +988,33 @@ def test_diff_entry_words_delta_per_case(tmp_path: Path, current: None) -> None:
     assert shape["a"]["words"][0]["run"]["slot"] != shape["b"]["words"][0]["run"]["slot"]
     assert shape["a"]["words"][0]["record_ascii_runs"] == []
     assert set(shape["a"]) >= {"state", "count", "count_by_class", "words", "words_shown"}
+
+
+def test_a_thunk_handler_mid_table_does_not_hide_a_longer_table(
+    tmp_path: Path, current: None
+) -> None:
+    """A stride-8 table of 6 records on A and 7 on B, its 5th handler a thunk on both sides (in
+    thunk_spans, not in functions): the listed pair at slot 1 reads ``run_shape_differs``. Cut at
+    the thunk, both sides would read the same 4-record series (``same_shape``) — not measured
+    read as unchanged.
+
+    MUTATION (verified RED): skip the thunk entries in ``load_image`` -> ``same_shape`` -> RED."""
+    w = DiffWorld(tmp_path)
+    fns = [0x400000 + 0x100 * i for i in range(6)]
+    thunk = 0x408000
+    for b in w.side.values():
+        for i, a in enumerate(fns):
+            b.fn(a, f"h_{i}")
+        _set_thunks(b, thunk)
+    w.pair(fns[1], fns[1], _LISTED)
+    for side, b in w.side.items():
+        handlers = [*fns[:4], thunk, fns[4], *([fns[5]] if side == "b" else [])]
+        b.block(".data", 0x10000, _table_bytes(b, handlers))
+    ew_block = _by_addr(w.view(), {"h_1": fns[1]})["h_1"]["entry_words"]
+    assert ew_block["delta"] == "run_shape_differs"
+    runs = {s: ew_block[s]["words"][0]["run"] for s in ("a", "b")}
+    assert (runs["a"]["records"], runs["b"]["records"]) == (6, 7)
+    assert runs["a"]["stride"] == runs["b"]["stride"] == 8
 
 
 def test_diff_side_truncated_is_undetermined(tmp_path: Path, current: None) -> None:

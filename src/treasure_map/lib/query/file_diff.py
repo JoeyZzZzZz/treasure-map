@@ -55,7 +55,8 @@ LIST_PAGE_ITEMS = 10
 # A file's own page, in bytes of the JSON encoding the response is measured in: one hunk piece (a
 # line, or a part of a longer one), the hunk text (or suppressed shape) of one page, and the
 # structured lists of one page. Together with the envelope they stay within the 48,000-byte
-# response.
+# response; when one structured item alone is too large for that, the text beside it takes only
+# what is left (file_diff's ``budget``).
 HUNK_PIECE_BYTES = 16_000
 HUNK_PAGE_BYTES = 28_000
 STRUCT_PAGE_BYTES = 12_000
@@ -1140,9 +1141,10 @@ def _pieces(lines: list[str]) -> list[tuple[str, bool]]:
     return out
 
 
-def hunk_page(h: Hunk, offset: int) -> dict[str, Any]:
-    """One page of a hunk's text from piece ``offset``: whole pieces within HUNK_PAGE_BYTES (always
-    one), ``cut_at`` the pieces whose line continues in the next one."""
+def hunk_page(h: Hunk, offset: int, page_bytes: int = HUNK_PAGE_BYTES) -> dict[str, Any]:
+    """One page of a hunk's text from piece ``offset``: whole pieces within ``page_bytes`` (the
+    encoded size of ``lines``; HUNK_PAGE_BYTES unless the page leaves less; always one piece),
+    ``cut_at`` the pieces whose line continues in the next one."""
     assert h.lines is not None
     pieces = _pieces(h.lines)
     if offset < 0 or (offset > 0 and offset >= len(pieces)):
@@ -1154,7 +1156,7 @@ def hunk_page(h: Hunk, offset: int) -> dict[str, Any]:
     while i < len(pieces):
         text, continues = pieces[i]
         cost = _encoded(text) + 2  # the ", " between list items
-        if page and size + cost > HUNK_PAGE_BYTES:
+        if page and size + cost > page_bytes:
             break
         page.append(text)
         if continues:
@@ -1173,8 +1175,9 @@ def hunk_page(h: Hunk, offset: int) -> dict[str, Any]:
     return out
 
 
-def shape_page(h: Hunk, offset: int) -> dict[str, Any]:
-    """One page of a suppressed hunk's shape from segment ``offset``, within HUNK_PAGE_BYTES."""
+def shape_page(h: Hunk, offset: int, page_bytes: int = HUNK_PAGE_BYTES) -> dict[str, Any]:
+    """One page of a suppressed hunk's shape from segment ``offset``: whole segments within
+    ``page_bytes`` (the encoded size of ``segments``, as ``hunk_page``; always one segment)."""
     segments = h.shape()
     if offset < 0 or (offset > 0 and offset >= len(segments)):
         raise FileDiffError(f"hunk_offset {offset} is past the hunk's {len(segments)} segments")
@@ -1183,7 +1186,7 @@ def shape_page(h: Hunk, offset: int) -> dict[str, Any]:
     i = offset
     while i < len(segments):
         cost = len(json.dumps(segments[i])) + 2
-        if page and size + cost > HUNK_PAGE_BYTES:
+        if page and size + cost > page_bytes:
             break
         page.append(segments[i])
         size += cost
@@ -1391,6 +1394,33 @@ def file_review(
     }
 
 
+def _fit_body(
+    h: Hunk, offset: int, response: dict[str, Any], entry: dict[str, Any], budget: int | None
+) -> None:
+    """Put one page of ``h`` — its text (``hunk``), or its shape (``hunk_shape``) when it is
+    suppressed — into ``entry``, which ``response`` holds: HUNK_PAGE_BYTES of it, or, when that
+    takes ``response`` past ``budget``, only what the rest of the response leaves (always one piece
+    or segment, so a response whose other parts alone are over the budget stays over it, and the
+    caller marks it). The page ends where it ends; ``next_hunk_offset`` resumes from there, so the
+    pages together hold the whole body once whatever each one's room was."""
+    key, items, page_of = (
+        ("hunk_shape", "segments", shape_page)
+        if h.suppressed is not None
+        else ("hunk", "lines", hunk_page)
+    )
+    page_bytes = HUNK_PAGE_BYTES
+    while True:
+        entry[key] = page = page_of(h, offset, page_bytes)
+        if budget is None or len(page[items]) <= 1:
+            return
+        over = len(json.dumps(response)) - budget
+        if over <= 0:
+            return
+        # The response grows with the page's list byte for byte (its encoded size is what
+        # page_bytes bounds), so this room drops at least the overshoot: the next page is shorter.
+        page_bytes = len(json.dumps(page[items])) - over
+
+
 def file_diff(
     atlas: sqlite3.Connection,
     run_a: str,
@@ -1406,6 +1436,7 @@ def file_diff(
     review: dict[str, Any] | None = None,
     pf: PairFiles | None = None,
     ko_offset: int | None = None,
+    budget: int | None = None,
 ) -> dict[str, Any]:
     """The run pair's non-binary files (see the module docstring). Without ``path``: a page of the
     files that differ (``change`` / ``kind`` filter; ``same`` only when asked for), each with its
@@ -1416,8 +1447,11 @@ def file_diff(
     state, as an unjudged entry of a binary diff does. ``pf`` is the pair's files when the caller
     has read them already. ``ko_offset`` (alone: no ``path``, ``offset``, ``hunk_offset``,
     ``change``, ``kind`` or ``detail="summary"``) reads a page of the whole-pair lists — the .ko
-    modules and the symbolic links — that the first page gives as counts. Raises FileDiffError on
-    an argument or a side it cannot read."""
+    modules and the symbolic links — that the first page gives as counts. ``budget`` is the
+    response's byte budget (None: none): with it, the line difference (or shape) on a file's own
+    page takes only what the rest of that page leaves of it, at most HUNK_PAGE_BYTES — so a large
+    structured item on the first page shortens the text there, and ``next_hunk_offset`` resumes it
+    exactly. Raises FileDiffError on an argument or a side it cannot read."""
     if detail not in DETAILS:
         raise FileDiffError(f"detail must be one of {list(DETAILS)}; got {detail!r}")
     if change is not None and change not in STATUSES:
@@ -1504,10 +1538,8 @@ def file_diff(
                 h = aligned_hunk(pf, af)
                 if h.lines is not None and offset > 0:
                     entry["hunk_on_page"] = "offset=0"
-                elif h.lines is not None and h.suppressed is not None:
-                    entry["hunk_shape"] = shape_page(h, hunk_offset)
                 elif h.lines is not None:
-                    entry["hunk"] = hunk_page(h, hunk_offset)
+                    _fit_body(h, hunk_offset, {**envelope, "entry": entry}, entry, budget)
         return {**envelope, "entry": entry}
 
     wanted = (change,) if change is not None else CHANGED_STATUSES

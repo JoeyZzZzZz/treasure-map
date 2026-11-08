@@ -1304,10 +1304,11 @@ def test_a_binary_the_running_pass_failed_on_does_not_hold_its_run_stale(
     tmp_path: Path,
 ) -> None:
     """T-M1. Every binary was attempted by the running pass; one failed and keeps an earlier
-    pass's rows, so the run reads ``mixed:2`` — and will forever, since running the same pass again
-    gives the same failure. It is not offered for re-extraction: it is up to date, and `tmap
-    rescan`, `tmap runs` (text and --json) and `tmap init` all name the kept-earlier binary in one
-    and the same sentence.
+    pass's rows, so the run reads ``mixed:2``. It is not offered for re-extraction: it is up to
+    date (the pass it would re-extract with already ran), and `tmap rescan`, `tmap runs` (text and
+    --json) and `tmap init` all name the kept-earlier binary in one and the same sentence — which
+    says the next scan retries a failure like this one (``incomplete``) by itself, and a timeout
+    only with --force-retry or a larger budget.
 
     MUTATION (verified RED): drop the attempt check (a differing hash is extraction again) -> the
     run lands in the extraction tier."""
@@ -1323,7 +1324,8 @@ def test_a_binary_the_running_pass_failed_on_does_not_hold_its_run_stale(
     atlas = _atlas_for(tmp_path, run)
     line = (
         "kept: 1 binaries keep an earlier extraction — the running pass failed on them "
-        "(svc_x: incomplete); a rescan cannot change this"
+        "(svc_x: incomplete); the next scan retries them (a timeout: only with --force-retry or "
+        "a larger budget)"
     )
 
     dry = CliRunner().invoke(rescan, ["--atlas", str(atlas), "--dry-run"])

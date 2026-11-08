@@ -45,12 +45,21 @@ def test_a_run_scanned_by_another_ghidra_is_refused(
     stale on the toolchain axis (every tool refuses it until a re-scan); an unknown on either side
     is never a refusal.
 
-    MUTATION (verified RED): drop the toolchain check from run_staleness -> served -> RED."""
+    MUTATION (verified RED): drop the toolchain check from run_staleness -> served -> RED.
+    MUTATION (verified RED, 1 failed): the refusal calling the compared Ghidra "installed" again
+    instead of the default config's -> RED."""
     monkeypatch.setattr(toolchain, "_current_ghidra", [installed])
     run = RunRow(run_id="r", ghidra_version=stored)
     st = run_staleness(run, build_hash=None, current=rescan_version.CodeStamp("h", "s"), commit="c")
     assert st.stale is stale
     assert (st.axis == "toolchain") is stale
+    if stale:
+        # The baseline is the default config's Ghidra, which a run scanned with another config's
+        # Ghidra is also compared against: the refusal names it so.
+        assert st.detail == (
+            f"scanned with Ghidra {stored}; the default config's Ghidra is {installed} — it would "
+            "extract the facts stored for this run differently."
+        )
 
 
 @pytest.mark.parametrize(

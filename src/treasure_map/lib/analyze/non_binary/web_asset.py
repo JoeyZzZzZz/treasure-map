@@ -110,7 +110,11 @@ def _extract_form_fields(text: str) -> list[tuple[str, str]]:
     reset, a JS form-value assignment, or an nvram_char_to_ascii form-fill. A
     ``<input type="hidden">`` is a read-only round-trip value (e.g. a firmware-version echo from
     nvram_get) — DELIBERATELY excluded, so a displayed-but-not-settable key never enters the
-    front-end surface. Deduped on (keyword, rule).
+    front-end surface. Known boundary: a hidden field a script fills and the form submits is
+    collected only through the two script rules here (``document.form.<name>.value =`` and
+    ``nvram_char_to_ascii``); filled any other way it is excluded with the read-only ones — an
+    under-count, so web_settable may read likely / uncertain for a settable key, never "no".
+    Deduped on (keyword, rule).
     """
     out: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()

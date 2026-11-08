@@ -501,9 +501,13 @@ def test_get_strings_byte_pagination_reaches_the_tail_losslessly(tmp_path: Path)
 
 
 def test_get_strings_function_scope_is_honest_not_applied(tmp_path: Path) -> None:
-    # ★ declared≠actual: `function` is echoed but does NOT scope strings (no string->func index;
-    # .rodata addresses fall outside code ranges). BOTH modes carry func_scope_applied:false + a
-    # note that says so, so a machine consumer never reads the echoed function as a scoping promise.
+    # ★ declared≠actual: `function` is echoed but does NOT scope strings (the strings table holds
+    # each string's data address, outside every code range). BOTH modes carry
+    # func_scope_applied:false + a note that says so, so a machine consumer never reads the echoed
+    # function as a scoping promise.
+    #
+    # MUTATION (verified RED, 1 failed): the note claiming again that no string-to-function index
+    # exists, without naming the tools that read the resolved references -> RED.
     conn = facts.open_analysis_ro(_strings_db(tmp_path))
     by_binary = facts.get_strings(conn, binary="rc", func="dispatch")
     assert by_binary["func_scope_applied"] is False
@@ -511,6 +515,12 @@ def test_get_strings_function_scope_is_honest_not_applied(tmp_path: Path) -> Non
     by_value = facts.get_strings(conn, binary="rc", func="dispatch", value="oauth")
     assert by_value["func_scope_applied"] is False
     assert "does NOT narrow" in by_value["note"]
+    # The references DO exist (string_refs): the note points at the tools that read them, and says
+    # what `function` does in value mode instead of calling it a no-op.
+    for tool in ("get_string_reference_anchors", "get_functions_referencing_string"):
+        assert tool in by_value["note"], tool
+    assert "picks the binary searched" in by_value["note"]
+    assert "picks the binary searched" in by_value["warning"]
     # a call WITHOUT function carries neither the flag nor the narrowing note (unchanged)
     plain = facts.get_strings(conn, binary="rc")
     assert "func_scope_applied" not in plain

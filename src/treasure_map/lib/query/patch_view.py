@@ -118,13 +118,16 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Generic, TypeVar
 
+from treasure_map.lib.diff.callsite_facts import _parse_stub_table
 from treasure_map.lib.diff.code_version import diff_code_version, sink_overlay_logic_version
 from treasure_map.lib.diff.layer0 import _thunk_spans, norm_hex
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE, DECOMPILE_ERROR_PLACEHOLDER
+from treasure_map.lib.facts import has_text as _has_text
 from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review, diff_sink_axes, entry_words, sameness
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN
 from treasure_map.lib.query.diff_align import diff_source_staleness, get_diff_deltas
+from treasure_map.lib.query.review_units import COMMAND_CALL_SINKS
 from treasure_map.lib.query.sink_impact import impact_tier
 from treasure_map.lib.query.sink_overlay import (
     _SENTINEL,
@@ -355,8 +358,8 @@ _CAVEATS = {
     "sink_callsite_counts": (
         "Calls of a sink name in the decompiled call tokens, a repeated call counted again. A "
         "side with no decompiled text (skipped_micro, text_unavailable) or an unreadable count is "
-        "unknown, never 0. Not part of the order: significance, attention, sort and summary do "
-        "not read it."
+        "unknown, never 0. It never moves attention; the order reads its absence only inside "
+        "attention 0."
     ),
 }
 
@@ -744,13 +747,77 @@ class _Side:
     names: dict[str, str] = field(default_factory=dict)  # addr -> function name
     by_name: dict[str, list[str]] = field(default_factory=dict)  # name -> addrs
     parsed: dict[str, _Fn | None] = field(default_factory=dict)
+    # binaries.stub_names, {entry: import}: a call the decompiler rendered as FUN_<stub addr> is
+    # counted under the import it resolves to, like every other per-call reader does. {} when the
+    # binary has no table (NULL / '{}' / not MIPS): direct-name counts are then kept as they are.
+    stubs: dict[int, str] = field(default_factory=dict)
+    # Where the pseudocode text is, read lazily and only where a reader needs it: (analysis.db
+    # path, binary id), or None when that analysis.db records no pseudocode column.
+    source: tuple[str, int] | None = None
+    addr_raw: dict[str, str] = field(default_factory=dict)  # addr -> the address as stored
+    texts: dict[str, str | None] = field(default_factory=dict)  # addr -> text (None: none to read)
 
     def fn(self, addr: str) -> _Fn | None:
         """The function at ``addr``, or None when that analysis.db does not hold it."""
         if addr not in self.parsed:
             raw = self.raw.get(addr)
-            self.parsed[addr] = None if raw is None else _parse_fn(raw)
+            self.parsed[addr] = None if raw is None else _parse_fn(raw, self.stubs)
         return self.parsed[addr]
+
+    def text_of(self, addrs: list[str]) -> dict[str, str | None] | None:
+        """Each address's pseudocode (None where there is no text to read), or None when the
+        side's text cannot be read at all."""
+        if self.source is None:
+            return None
+        want = [a for a in addrs if a not in self.texts]
+        if want:
+            path, binary_id = self.source
+            raw = [self.addr_raw[a] for a in want if a in self.addr_raw]
+            got: dict[str, str | None] = {}
+            try:
+                conn = ro_connect(path)
+                try:
+                    for i in range(0, len(raw), _REF_CHUNK):
+                        chunk = raw[i : i + _REF_CHUNK]
+                        marks = ", ".join("?" * len(chunk))
+                        for address, text in conn.execute(
+                            "SELECT address, pseudocode FROM functions "  # noqa: S608
+                            f"WHERE binary_id = ? AND address IN ({marks})",
+                            (binary_id, *chunk),
+                        ):
+                            a = norm_hex(address) if address else None
+                            if a is not None:
+                                got[a] = text if isinstance(text, str) and _has_text(text) else None
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                return None
+            for a in want:
+                self.texts[a] = got.get(a)
+        return {a: self.texts.get(a) for a in addrs}
+
+    def named_outside_a_call(self, name: str) -> bool | None:
+        """Whether ``name`` appears in some function's text other than as a call (``name(``): its
+        address taken, passed or stored as a function pointer. None when the text cannot be read."""
+        if self.source is None:
+            return None
+        path, binary_id = self.source
+        pattern = re.compile(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])(?!\s*\()")
+        try:
+            conn = ro_connect(path)
+            try:
+                for (text,) in conn.execute(
+                    "SELECT pseudocode FROM functions "
+                    "WHERE binary_id = ? AND instr(pseudocode, ?) > 0",
+                    (binary_id, name),
+                ):
+                    if isinstance(text, str) and pattern.search(text):
+                        return True
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return None
+        return False
 
 
 def _json_list(raw: Any) -> list[Any] | None:
@@ -763,9 +830,16 @@ def _json_list(raw: Any) -> list[Any] | None:
     return data if isinstance(data, list) else None
 
 
-def _sink_callsites(call_tokens_raw: Any, has_column: bool) -> dict[str, int] | None:
+def _sink_callsites(
+    call_tokens_raw: Any, has_column: bool, stubs: dict[int, str] | None = None
+) -> dict[str, int] | None:
     """Each SINK_CALLEE_NAMES callee's CALL-token count in a function's ``call_tokens`` (opcode 7,
     NOT deduplicated), or None when the count cannot be read.
+
+    A token naming a lazy-binding stub (``FUN_<addr>`` with ``addr`` in the binary's stub table) is
+    counted under the import the table resolves it to (``classes.stub_resolved_name``, the rule the
+    hunt and the callsite facts use), so a sink called through its stub on one side and by name on
+    the other counts alike. With no table the token is counted as written.
 
     None when the column is absent (an older analysis.db) or the JSON will not parse — the reader
     reports that side unknown, never 0. An empty / '[]' value parses to ``{}``: the function's
@@ -781,12 +855,14 @@ def _sink_callsites(call_tokens_raw: Any, has_column: bool) -> dict[str, int] | 
     for tok in toks:
         if isinstance(tok, dict) and tok.get("opcode") == 7:
             name = tok.get("call_token")
+            if isinstance(name, str):
+                name = classes.stub_resolved_name(name, stubs) or name
             if isinstance(name, str) and name in SINK_CALLEE_NAMES:
                 counts[name] = counts.get(name, 0) + 1
     return counts
 
 
-def _parse_fn(raw: tuple[Any, ...]) -> _Fn:
+def _parse_fn(raw: tuple[Any, ...], stubs: dict[int, str] | None = None) -> _Fn:
     (
         name,
         callees_raw,
@@ -813,7 +889,7 @@ def _parse_fn(raw: tuple[Any, ...]) -> _Fn:
         truncated=bool(truncated) if has_truncated and truncated is not None else None,
         unresolved=norm_unresolved,
         decompile=decompile if isinstance(decompile, str) else None,
-        sink_callsites=_sink_callsites(call_tokens_raw, has_call_tokens),
+        sink_callsites=_sink_callsites(call_tokens_raw, has_call_tokens, stubs),
         has_text=bool(has_text) if has_text is not None else None,
         size_bytes=int(size_bytes) if isinstance(size_bytes, int) else None,
     )
@@ -848,6 +924,12 @@ def _read_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side
         found = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", (sha,)).fetchone()
         if found is None:
             return _Side(error="the diffed binary is not in that analysis.db")
+        bcols = {r[1] for r in conn.execute("PRAGMA table_info(binaries)")}
+        stub_raw = (
+            conn.execute("SELECT stub_names FROM binaries WHERE id = ?", (found[0],)).fetchone()[0]
+            if "stub_names" in bcols
+            else None
+        )
         cols = {r[1] for r in conn.execute("PRAGMA table_info(functions)")}
         has_t, has_u = "callees_truncated" in cols, "unresolved_external_calls" in cols
         has_ct = "call_tokens" in cols
@@ -873,11 +955,15 @@ def _read_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side
         return _Side(error=f"analysis.db could not be read: {e}")
     finally:
         conn.close()
-    side = _Side()
+    side = _Side(
+        stubs=_parse_stub_table(stub_raw),
+        source=(row[0], found[0]) if "pseudocode" in cols else None,
+    )
     for address, name, callees, truncated, unresolved, decompile, ctoks, size_b, has_text in rows:
         addr = norm_hex(address) if address else None
         if addr is None:
             continue
+        side.addr_raw[addr] = address
         side.raw[addr] = (
             name,
             callees,
@@ -1189,8 +1275,9 @@ class _Entry:
     sink_candidate_counts: dict[str, Any] | None = None
     # D29: each sink's per-CALLSITE count (from call_tokens, not hunt candidates) in the two
     # functions (``_sink_callsite_counts``). An independent key, unit "callsite" — NEVER mixed into
-    # sink_candidate_counts and NEVER read by significance / _sort / attention. None when neither
-    # side names a sink call, or every named sink counts alike with nothing unknown.
+    # sink_candidate_counts and NEVER read by significance / attention; _sort reads only whether it
+    # is absent, to place a count-floated entry inside attention 0 (``_count_noise``). None when
+    # neither side names a sink call, or every named sink counts alike with nothing unknown.
     sink_callsite_counts: dict[str, Any] | None = None
     # "S" when the read face lists this entry as an aligned similarity-1 pair whose normalized
     # pseudocode differs (``listed_view``) — never written by the build, so ``bucket`` (and the
@@ -1554,9 +1641,12 @@ class _Builder:
         pseudocode AND size < _DECOMPILE_MIN_SIZE, a stub the exporter skips by design) or
         ``text_unavailable`` (empty pseudocode at a real size: a decompile that did not complete).
         An empty call_tokens read off empty text is NOT a 0, it is unknown. Last, ``call_counts_
-        incomplete`` when the function's callee list was truncated, so call_tokens may be too. The
-        decision never reads ``decompile_status`` (an r6 column): empty text + size alone decide it,
-        so a pre-r6 analysis.db is judged the same way."""
+        incomplete`` when the function's callee list was truncated, so call_tokens may be too, and
+        ``stub_call_unresolved`` when it calls a lazy-binding stub its binary's stub table could not
+        name (``unresolved_external_calls``): that call may be a sink, so its count is not read as
+        unchanged. A binary with no stub table at all is NOT unknown — its calls are counted by the
+        names the decompiler wrote. The decision never reads ``decompile_status`` (an r6 column):
+        empty text + size alone decide it, so a pre-r6 analysis.db is judged the same way."""
         s = self.sides[side]
         if s.error is not None:
             return "side_unreadable", {}
@@ -1572,6 +1662,8 @@ class _Builder:
             return "text_unavailable", {}
         if fn.truncated is True:
             return "call_counts_incomplete", counts
+        if fn.unresolved:
+            return "stub_call_unresolved", counts
         return None, counts
 
     def _sink_callsite_counts(self, p: _Pair) -> dict[str, Any] | None:
@@ -1585,7 +1677,9 @@ class _Builder:
         a bucket-S similarity-1 pair). A side whose text could not be read answers unknown for every
         sink the OTHER side names, never a count — so N->0 is never forged from a blank side. None
         when neither side names a sink call, or every named sink counts alike with nothing unknown.
-        Direction-neutral. NEVER consulted by significance / _sort / attention."""
+        Direction-neutral. Never moves an entry's attention or basis; the significance order
+        reads its absence only to place a count-floated entry inside attention 0
+        (:func:`_count_noise`)."""
         sides = {
             "a": self._callsite_side("a", p.addr_a),
             "b": self._callsite_side("b", p.addr_b),
@@ -2436,12 +2530,9 @@ def _lift_basis(e: _Entry) -> str | None:
     """Why an attention-1 entry leads its tier (``swap_lift``), or what an R entry floated by its
     supported pairing (:func:`_supported_lift`) carries: ``sink_callee_swap`` (a sink name in its
     callee-set difference), else ``sink_candidate_counts`` (a sink's candidate count differs), else
-    None. None for a proposed pairing with a ``pairing_name_conflict``: the difference read there
-    may be the pairing's, not the code's, so it does not lead the tier (the entry stays listed
-    where its basis puts it, never sunk). A ``counterpart_hint`` conflict does not reach here: it
-    only keeps the pairing from floating."""
-    if e.pair is not None and not e.pair.aligned and e.pairing_name_conflict is not None:
-        return None
+    None. A pairing in doubt keeps it: neither a ``pairing_name_conflict`` nor a
+    ``counterpart_hint`` conflict takes the lift_basis away (the difference may be the pairing's,
+    so it is read, not dropped) — they only keep the pairing from floating to attention 0."""
     if _sink_callee_swap(e) is not None:
         return "sink_callee_swap"
     counts = e.sink_candidate_counts
@@ -2460,6 +2551,12 @@ def _lift_basis(e: _Entry) -> str | None:
 # (:func:`significance`); every other one stays where it was.
 
 PAIR_SUPPORTED, PAIR_NEGATED, PAIR_NONE = "supported", "negated", "none"
+# A call through a function pointer, in the forms the decompiler prints: ``(*pcVar1)(``,
+# ``(*ppcVar[i])(``, ``(*(code *)param_1)(``, ``(**(code **)(iVar1 + 4))(``. Wider than the hunt's
+# own marker, which reads only the plain ``(*name)(`` form and misses every cast one.
+_INDIRECT_CALL = re.compile(
+    r"\(\s*\*+\s*(?:\(\s*code\s*\*+\s*\)\s*)?(?:[^;(){}]|\([^;(){}]*\)){1,80}?\)\s*\("
+)
 HINT_CONSISTENT, HINT_CONFLICT, HINT_MIXED = "consistent", "conflict", "mixed"
 # The significance basis of a floated, supported pairing, by the lift_basis it carries.
 _SUPPORTED_BASIS = {
@@ -2587,6 +2684,7 @@ class _PairEvidence:
 
     def __init__(self, atlas: sqlite3.Connection, built: BuiltDiff, builder: _Builder) -> None:
         d = built.diff
+        self.atlas = atlas
         self.diff = d
         self.builder = builder
         self.anchors = {
@@ -2609,7 +2707,10 @@ class _PairEvidence:
         """Whether the B counterparts (through aligned pairs) of a's direct callers call b:
         ``corroborated`` (one does), ``refuted`` (there are some, every list was read in full, and
         none does), else ``none`` with why. A thunk on either side is ``none``: a callee list holds
-        names, so a call to the import X cannot be told from a call to a function named X."""
+        names, so a call to the import X cannot be told from a call to a function named X.
+
+        A callee list names direct calls only, so "no B counterpart calls b" refutes the pairing
+        only where b cannot be reached another way: see :meth:`_unrefuted`."""
         if thunk_b:
             return {"state": PAIR_NONE, "reason": "b_is_thunk"}
         if thunk_a:
@@ -2648,35 +2749,101 @@ class _PairEvidence:
             return {"state": "corroborated", **counts, "calling_b": calling}
         if incomplete:
             return {"state": PAIR_NONE, "reason": "callees_may_be_truncated", **counts}
+        reason = self._unrefuted(p, mapped)
+        if reason is not None:
+            return {"state": PAIR_NONE, "reason": reason, **counts}
         return {"state": "refuted", **counts}
+
+    def _unrefuted(self, p: _Pair, mapped: list[str]) -> str | None:
+        """Why a caller anchor that found no direct call to b still does not refute the pairing,
+        else None. b may be called where a callee list cannot see it: a mapped B caller calls
+        through a function pointer (``caller_has_indirect_call``), a data word holds b's entry
+        (``b_address_stored``), or b's name appears in some function's text other than as a call
+        — its address taken or passed (``b_name_referenced``). A text or image that cannot be
+        read cannot rule these out, so it is ``none`` too (``*_unreadable``): a refutation is
+        only made on what was read."""
+        sb = self.builder.sides["b"]
+        texts = sb.text_of(mapped)
+        if texts is not None and any(_INDIRECT_CALL.search(t or "") for t in texts.values()):
+            return "caller_has_indirect_call"
+        if texts is None or any(t is None for t in texts.values()):
+            return "caller_text_unreadable"
+        image, _why = _entry_words_image(self.atlas, self.diff.run_b, self.diff.sha_b)
+        if image is None or image.unavailable is not None:
+            return "b_address_storage_unreadable"
+        if entry_words.side_words(image, int(p.addr_b, 16)):
+            return "b_address_stored"
+        referenced = sb.named_outside_a_call(sb.names.get(p.addr_b) or f"FUN_{p.addr_b}")
+        if referenced is None:
+            return "b_text_unreadable"
+        if referenced:
+            return "b_name_referenced"
+        return None
 
     def _string_and_key_hints(self, p: _Pair) -> list[dict[str, Any]]:
         """Each function the unique strings and single-handler keys of one side point to on the
         other, both ways: {direction, addr, anchor, evidence}."""
+        return self._anchor_hints("a", p.addr_a) + self._anchor_hints("b", p.addr_b)
+
+    def _anchor_hints(self, here: str, own: str) -> list[dict[str, Any]]:
+        """Each function on the other side that the unique strings and single-handler keys of
+        ``own`` (a function on ``here``) point to: {direction, addr, anchor, evidence}."""
         out: list[dict[str, Any]] = []
-        for here, there, own, direction in (
-            ("a", "b", p.addr_a, "to_b"),
-            ("b", "a", p.addr_b, "to_a"),
+        there, direction = ("b", "to_b") if here == "a" else ("a", "to_a")
+        src, dst = self.anchors[here], self.anchors[there]
+        for anchor, values, owner in (
+            (
+                "string",
+                (v for v in src.strings_of.get(own, ()) if not _format_only(v)),
+                dst.owner_of_string,
+            ),
+            ("key", iter(src.keys_of.get(own, ())), dst.handler_of_key),
         ):
-            src, dst = self.anchors[here], self.anchors[there]
-            for anchor, values, owner in (
-                (
-                    "string",
-                    (v for v in src.strings_of.get(own, ()) if not _format_only(v)),
-                    dst.owner_of_string,
-                ),
-                ("key", iter(src.keys_of.get(own, ())), dst.handler_of_key),
-            ):
-                by_target: dict[str, list[str]] = {}
-                for v in values:
-                    target = owner.get(v)
-                    if target is not None:
-                        by_target.setdefault(target, []).append(v)
-                for target, vs in by_target.items():
-                    out.append(
-                        {"direction": direction, "addr": target, "anchor": anchor, "evidence": vs}
-                    )
+            by_target: dict[str, list[str]] = {}
+            for v in values:
+                target = owner.get(v)
+                if target is not None:
+                    by_target.setdefault(target, []).append(v)
+            for target, vs in by_target.items():
+                out.append(
+                    {"direction": direction, "addr": target, "anchor": anchor, "evidence": vs}
+                )
         return out
+
+    def _hint_items(self, hints: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The hints as an entry prints them: each pointed-to function, how it is itself paired,
+        and a sample of the evidence (its count always given)."""
+        return [
+            {
+                "direction": h["direction"],
+                "addr": h["addr"],
+                "pairing_state": _pairing_state(
+                    self._pair_of("b" if h["direction"] == "to_b" else "a"), h["addr"]
+                ),
+                "anchor": h["anchor"],
+                "evidence": [
+                    v[:_HINT_EVIDENCE_CHARS] for v in sorted(h["evidence"])[:_HINT_EVIDENCE_SAMPLE]
+                ],
+                "evidence_count": len(h["evidence"]),
+            }
+            for h in sorted(hints, key=lambda h: (h["direction"], h["anchor"], h["addr"]))
+        ]
+
+    def one_sided_hint(self, u: _Unpaired) -> dict[str, Any] | None:
+        """What the unique strings and single-handler keys of a function in no pair (a P entry)
+        point to on the other side, or None when they point nowhere. No ``state``: there is no
+        pairing to agree or conflict with. ``at_probe_addr`` says whether the pointed-to function
+        is the one the counterpart probe found where this function maps. A fact beside the
+        presence_state, which it never changes: a function a hint points at is a lead to read,
+        not a counterpart found."""
+        hints = self._anchor_hints(u.side, u.addr)
+        if not hints:
+            return None
+        probe = norm_hex(u.counterpart_addr) if u.counterpart_addr else None
+        items = self._hint_items(hints)
+        for item in items:
+            item["at_probe_addr"] = probe is not None and item["addr"] == probe
+        return {"anchors": sorted({h["anchor"] for h in hints}), "hints": items}
 
     def _thunk_reading(
         self, p: _Pair, thunk_a: bool, thunk_b: bool
@@ -2776,22 +2943,7 @@ class _PairEvidence:
             h for h in hints if h["addr"] != (p.addr_b if h["direction"] == "to_b" else p.addr_a)
         ]
         if others:
-            hint["hints"] = [
-                {
-                    "direction": h["direction"],
-                    "addr": h["addr"],
-                    "pairing_state": _pairing_state(
-                        self._pair_of("b" if h["direction"] == "to_b" else "a"), h["addr"]
-                    ),
-                    "anchor": h["anchor"],
-                    "evidence": [
-                        v[:_HINT_EVIDENCE_CHARS]
-                        for v in sorted(h["evidence"])[:_HINT_EVIDENCE_SAMPLE]
-                    ],
-                    "evidence_count": len(h["evidence"]),
-                }
-                for h in sorted(others, key=lambda h: (h["direction"], h["anchor"], h["addr"]))
-            ]
+            hint["hints"] = self._hint_items(others)
         elif hint_state == HINT_CONFLICT:
             hint["reason"] = "import_names_differ"
         return evidence, hint
@@ -2802,14 +2954,16 @@ def _attach_pair_evidence(atlas: sqlite3.Connection, built: BuiltDiff) -> None:
     once per build. On a diff whose sources are not shown current, or whose analysis.db could not
     be read (the build's ``callee_block``), every such entry gets ``none`` with that reason and no
     hint: the pair's addresses are the diff's, and a re-extracted analysis.db may hold another
-    function there."""
+    function there. A P entry (a function in no pair) gets the hint alone
+    (:meth:`_PairEvidence.one_sided_hint`), and none on such a diff."""
     if built.pair_evidence_attached or built.builder is None:
         return
     built.pair_evidence_attached = True
     targets = [
         e for e in built.entries if e.bucket == "R" and e.pair is not None and not e.pair.aligned
     ]
-    if not targets:
+    one_sided = [e for e in built.entries if e.bucket == "P" and e.unpaired is not None]
+    if not targets and not one_sided:
         return
     block = built.builder.callee_block
     if block is not None:
@@ -2820,19 +2974,44 @@ def _attach_pair_evidence(atlas: sqlite3.Connection, built: BuiltDiff) -> None:
     for e in targets:
         assert e.pair is not None
         e.pair_evidence, e.counterpart_hint = reader.of(e.pair)
+    for e in one_sided:
+        assert e.unpaired is not None
+        e.counterpart_hint = reader.one_sided_hint(e.unpaired)
 
 
 def _supported_lift(e: _Entry) -> str | None:
     """The significance basis of an R entry whose undetermined pairing the evidence supports and
     that carries a lift_basis (``supported_pair_swap`` / ``supported_pair_counts``), else None. A
-    ``counterpart_hint`` conflict or mix already keeps the evidence off ``supported``; it never
-    touches the lift_basis itself."""
+    pairing in doubt never floats: a ``counterpart_hint`` conflict or mix already keeps the
+    evidence off ``supported``, and a ``pairing_name_conflict`` (one side also holds a function
+    under the other's name) keeps it here. Neither touches the lift_basis itself."""
     if e.bucket != "R" or e.pair is None or e.pair.aligned:
         return None
     if (e.pair_evidence or {}).get("state") != PAIR_SUPPORTED:
         return None
+    if e.pairing_name_conflict is not None:
+        return None
     basis = _lift_basis(e)
     return _SUPPORTED_BASIS.get(basis) if basis is not None else None
+
+
+def _count_noise(e: _Entry) -> bool:
+    """Whether an aligned entry floated to attention 0 by a sink candidate-count delta alone reads
+    as likely noise, to be read after the rest of attention 0 (still in it, still must-read): its
+    call count could not be compared (``sink_callsite_counts`` absent — the calls themselves may
+    not differ), or a row of it is ``same_callee_non_candidate`` (the call is there on both sides,
+    only not a candidate on one). Never when it shows a change beyond the count: a command sink
+    among the counted ones, a ``rematch_suspected`` row, or a callee only B calls. An order inside
+    attention 0 only: the attention, the basis and the must-read reasons do not read it."""
+    subclasses = {v["subclass"] for v in e.row_views if v["subclass"]} or {e.shown_subclass}
+    if e.sink_callsite_counts is not None and "same_callee_non_candidate" not in subclasses:
+        return False
+    counts = e.sink_candidate_counts or {}
+    if any(d.get("sink") in COMMAND_CALL_SINKS for d in counts.get("delta") or ()):
+        return False
+    if "rematch_suspected" in subclasses:
+        return False
+    return not (e.callee_set or {}).get("only_in_b")
 
 
 def _held_up(item: diff_review.Item | None) -> bool:
@@ -2974,14 +3153,18 @@ def _sort(
     swap_lift: dict[str, int] | None = None,
     mention: dict[str, int] | None = None,
     supported_last: dict[str, int] | None = None,
+    count_noise: dict[str, int] | None = None,
 ) -> list[_Entry]:
     """The candidate_tier order (``sort_by`` None or ``"candidate_tier"``), or ``sort_by`` (one
     named component) ahead of it. P stays last either way: a function with no counterpart is not
     ordered among the pairs. ``band`` maps an entry id to its judgement band
     (diff_review.band_bias); None leaves the order as it is.
 
-    ``sort_by="significance"`` orders by ``(attention, swap_lift, supported_last, read_first, band,
-    settled, similarity, candidate_tier key)`` — ``attention`` from :func:`significance`;
+    ``sort_by="significance"`` orders by ``(attention, count_noise, swap_lift, supported_last,
+    read_first, band, settled, similarity, candidate_tier key)`` — ``attention`` from
+    :func:`significance`; ``count_noise`` (1 for an attention-0 entry floated by a candidate count
+    alone that :func:`_count_noise` reads as likely noise) after every other entry of attention 0,
+    still in it;
     ``swap_lift`` (1 for an attention-1 entry carrying a :func:`_sink_callee_swap` or a
     ``sink_candidate_counts`` delta — an R entry's proposed one above all — whatever its basis or
     judgement; its ``lift_basis`` names which; 0 for an R entry its supported pairing floated to 0)
@@ -3003,6 +3186,7 @@ def _sort(
             return (
                 p_last,
                 (attention or {}).get(e.entry_id, ATTENTION_MIDDLE),
+                (count_noise or {}).get(e.entry_id, 0),
                 -(swap_lift or {}).get(e.entry_id, 0),
                 (supported_last or {}).get(e.entry_id, 0),
                 -(read_first or {}).get(e.entry_id, 0),
@@ -3110,6 +3294,8 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
             out["counterpart_overlap"] = json.loads(u.counterpart_overlap)
         if u.markup:
             out["operand_markup_incomplete"] = [u.side]
+        if e.counterpart_hint is not None:
+            out["counterpart_hint"] = e.counterpart_hint
     coclaimed = sorted(
         {f"a:{f}" for v in e.row_views for f in v["coclaimed_by"] or ()}
         | {f"b:{f}" for v in e.row_views for f in v["coclaimed_by_b"] or ()}
@@ -4677,7 +4863,8 @@ def _summary_sink_counts(counts: dict[str, Any]) -> dict[str, Any]:
 
 def _summary_pair_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
     """pair_evidence as a summary prints it: its state (and why, when the source could not be
-    read), the caller anchor's state, and the thunk fact — no counts."""
+    read), the caller anchor's state, and the thunk fact (or, with no fact, the thunk sides) — no
+    counts."""
     out: dict[str, Any] = {"state": evidence["state"]}
     if "reason" in evidence:
         out["reason"] = evidence["reason"]
@@ -4687,6 +4874,9 @@ def _summary_pair_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
     thunk = evidence.get("thunk")
     if thunk is not None and thunk.get("fact") is not None:
         out["thunk"] = thunk["fact"]
+    elif thunk is not None:
+        # a thunk whose names could not be read gives no fact; which side is a thunk still shows
+        out["thunk_sides"] = list(thunk.get("sides") or ())
     return out
 
 
@@ -4727,7 +4917,7 @@ def _summary_entry(full: dict[str, Any], *, micro_side: bool) -> dict[str, Any]:
         elif key == "counterpart_hint":
             out[key] = _kept(
                 {
-                    "state": value["state"],
+                    "state": value.get("state"),
                     "hints": len(value.get("hints", ())),
                     "reason": value.get("reason"),
                 }
@@ -5184,6 +5374,7 @@ class _OrderInputs:
     lift_basis: dict[str, str]
     read_first: dict[str, int]
     mention: dict[str, int]
+    count_noise: dict[str, int] = field(default_factory=dict)
 
 
 def _order_inputs(
@@ -5195,6 +5386,7 @@ def _order_inputs(
     swap_lift: dict[str, int] = {}
     supported_last: dict[str, int] = {}
     lift_basis: dict[str, str] = {}
+    count_noise: dict[str, int] = {}
     if significant:
         lens = {
             e.entry_id: significance(
@@ -5232,6 +5424,11 @@ def _order_inputs(
             if (e.entry_id in swap_lift or lens[e.entry_id][1] in SUPPORTED_PAIR_BASES)
             and (basis := _lift_basis(e)) is not None
         }
+        count_noise = {
+            e.entry_id: 1
+            for e in chosen
+            if lens[e.entry_id] == (ATTENTION_FLOAT, "sink_candidate_counts") and _count_noise(e)
+        }
     read_first: dict[str, int] = {}
     for e in chosen:
         if e.entry_id in proposed and (order := _read_first_order(e, proposed[e.entry_id][0])):
@@ -5246,7 +5443,15 @@ def _order_inputs(
         if e.bucket == "E"
     }
     return _OrderInputs(
-        proposed, lens, settled, swap_lift, supported_last, lift_basis, read_first, mention
+        proposed,
+        lens,
+        settled,
+        swap_lift,
+        supported_last,
+        lift_basis,
+        read_first,
+        mention,
+        count_noise,
     )
 
 
@@ -5263,6 +5468,7 @@ def _sort_with(
         inputs.swap_lift,
         inputs.mention,
         inputs.supported_last,
+        inputs.count_noise,
     )
 
 

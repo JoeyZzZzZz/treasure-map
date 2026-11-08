@@ -312,6 +312,59 @@ def _fit_string_delta(
     return result
 
 
+def _mark_over_budget(result: Any) -> None:
+    """The one fallback every tool answer passes on the MCP path: an answer larger than the
+    response budget, measured as every page fitter measures it (``json.dumps``' default form, one
+    copy), carries ``over_budget: true`` — so no tool is over it silently, whether or not it fits
+    its pages itself. An answer that already says so, or is within the budget, is left as it is.
+    Marking only: nothing is cut here (a tool that can page or withhold does that itself)."""
+    if not isinstance(result, dict) or result.get("over_budget") is True:
+        return
+    if len(json.dumps(result, default=str)) > _RESPONSE_BYTE_BUDGET:
+        result["over_budget"] = True
+
+
+# What a withheld sink-summary entry is read with: the tool and parameter names of the full record.
+_SINK_SUMMARY_READ_WITH = "get_sink_provenance(evidence_ref, sink_idx=<one of sink_idx>)"
+
+
+def _fit_sink_summary(data: dict[str, Any], budget: int | None = None) -> dict[str, Any]:
+    """An explain_candidate answer fitted to the response budget (or ``budget`` bytes) by its one
+    field that grows with the function: ``sink_arg_provenance_summary`` (one entry per sink of
+    the function). Entries are withheld from the END back, never the one flagged
+    ``is_candidate_callsite`` (the record this candidate's dimensions are read from), until the
+    answer fits; ``sink_arg_provenance_summary_withheld`` then says how many, which (their
+    ``sink_idx``, in summary order) and how each is read in full. An answer within the budget is
+    returned as it is. One still over it with nothing left to withhold says so with
+    ``over_budget: true``."""
+    limit = _RESPONSE_BYTE_BUDGET if budget is None else budget
+    summary = data.get("sink_arg_provenance_summary")
+    if not isinstance(summary, (list, tuple)) or len(json.dumps(data)) <= limit:
+        return data
+    kept = list(summary)
+    withheld_idx: list[Any] = []
+    withheld: dict[str, Any] = {
+        "count": 0,
+        "sink_idx": withheld_idx,
+        "read_with": _SINK_SUMMARY_READ_WITH,
+    }
+    data["sink_arg_provenance_summary"] = kept
+    data["sink_arg_provenance_summary_withheld"] = withheld
+    i = len(kept) - 1
+    while i >= 0 and len(json.dumps(data)) > limit:
+        entry = kept[i]
+        if not (isinstance(entry, dict) and entry.get("is_candidate_callsite") is True):
+            kept.pop(i)
+            withheld_idx.insert(0, entry.get("sink_idx") if isinstance(entry, dict) else None)
+            withheld["count"] = len(withheld_idx)
+        i -= 1
+    if not withheld_idx:
+        del data["sink_arg_provenance_summary_withheld"]
+    if len(json.dumps(data)) > limit:
+        data["over_budget"] = True
+    return data
+
+
 def _hunk_page_budget(hunk: dict[str, Any]) -> dict[str, Any]:
     """An inline_hunk that would not fit the page, as withheld (its two gate counts kept). A hunk
     already withheld stays as it is."""
@@ -648,7 +701,7 @@ _AGENT_GUIDE = (
     "Per entry, sink_candidate_counts counts hunt candidates and sink_callsite_counts counts "
     "calls (unit callsite: each call of a sink name in the decompiled call tokens, a repeated "
     "call counted again); a side with no decompiled text is unknown (skipped_micro or "
-    "text_unavailable), never 0, and sink_callsite_counts never moves the order. "
+    "text_unavailable), never 0, and sink_callsite_counts never moves attention. "
     "get_diff_string_delta(diff_id) lists the string literals one side holds and the other does "
     "not, with their reference anchors (get_diff_meta carries the counts). "
     "A P entry is a function in no matched pair: its counterpart_probe says what the other side "
@@ -659,12 +712,12 @@ _AGENT_GUIDE = (
     "unmatched_analysis_incomplete are not). Import stubs are paired by import name outside the "
     "function pairs (get_diff_meta import_stubs); the accounting covers only both sides' named "
     ".plt stubs, so when a side's complete is not 1 its a_only/b_only names are "
-    "one_sided_unconfirmed (another stub may call them). A "
-    "proposed pairing with a pairing_name_conflict is not lifted; an R entry read "
+    "one_sided_unconfirmed (another stub may call them). An R entry read "
     "identical_unique whose B side lost every direct caller keeps that basis. An R entry's "
     "pair_evidence (supported / negated / none, from its callers and the counterpart_hint "
     "anchors) floats it to attention 0 only when supported and carrying a lift_basis (basis "
-    "supported_pair_swap / supported_pair_counts); a counterpart_hint conflict keeps it in "
+    "supported_pair_swap / supported_pair_counts); a counterpart_hint or pairing_name_conflict "
+    "keeps it in "
     "attention 1 with its lift_basis, and nothing is re-paired. Unread is not 'nothing found': "
     "read every P entry, every entry with a lift_basis (a floated R entry has one too), every "
     "bucket S entry and each binary_presence binary. "
@@ -2096,7 +2149,9 @@ def make_tools(
         completeness), the lens caveats, the claim bounds, and where to verify — no score. When the
         ref carries a callsite address, the ``sink_arg_provenance_summary`` entry each dimension is
         read from is flagged ``is_candidate_callsite: true``; the flag is absent entirely for a
-        function-level anchor.
+        function-level anchor. An answer over the response budget withholds summary entries from
+        the end back (never the flagged one) and names them in
+        ``sink_arg_provenance_summary_withheld`` (count, sink_idx, read_with).
 
         Returns a not-found record when no instance carries ``evidence_ref`` (no fabrication).
         Echoes the canonical ``resolved_run`` + inline ``run_lineage``: a ref anchors ONE
@@ -2151,7 +2206,7 @@ def make_tools(
         if run is not None:
             data["resolved_run"] = run.run_id
             data["run_lineage"] = _lineage_inline(run, _current)
-        return data
+        return _fit_sink_summary(data)
 
     def get_sink_provenance(
         evidence_ref: str, sink_idx: int | None = None, dominating_only: bool = False
@@ -3232,10 +3287,10 @@ def make_tools(
         ``lift_basis`` first inside it (``rank_key.sink_callee_swap`` = 1, ``lift_basis``
         ``sink_callee_swap`` / ``sink_candidate_counts``: an R entry's proposed swap or count
         delta whose pairing is not supported, with ``swap_pairing_note``; their basis stays their
-        own; a ``counterpart_hint`` conflict or mix never takes it away; a proposed pairing that
-        carries ``pairing_name_conflict`` — two different symbol names, one side also holding a
-        function under the other's name — is not lifted, and the field is a fact on an aligned
-        pair), then the
+        own; neither a ``counterpart_hint`` conflict or mix nor a ``pairing_name_conflict`` (two
+        different symbol names, one side also holding a function under the other's name) takes it
+        away — they only keep the pairing from floating; on an aligned pair the conflict is a fact
+        only), then the
         ``anchored_differs`` pairs at or above the read-first floor, then those below it (and the
         demoted ``__FILE__``/``__LINE__`` and micro-side pairs), then the rest. Attention 0 holds
         B entries too (a row's ``sink_arg_constant_delta``) beside A. An aligned swap or count
@@ -3357,7 +3412,9 @@ def make_tools(
         undetermined pairing carries ``pair_evidence``: ``supported`` / ``negated`` / ``none``,
         read from ``caller_anchor`` (do the B counterparts, through aligned pairs, of a's direct
         callers call b: ``corroborated`` / ``refuted`` / ``none`` with why — a thunk on either side
-        is ``none``) and the anchors in ``counterpart_hint`` (``consistent`` alone supports;
+        is ``none``, and so is a pairing b could be reached in unseen: a mapped caller calls through
+        a pointer, a data word holds b's entry, a text names b outside a call, or that could not be
+        read) and the anchors in ``counterpart_hint`` (``consistent`` alone supports;
         ``refuted`` makes ``negated`` and wins; a ``conflict`` or ``mixed`` hint keeps it off
         ``supported``); ``thunk`` names a thunk side and its fact (``same_import_name``,
         ``import_names_differ``, ``same_name_function_on_thunk_side``, ``other_side_thunk``). A
@@ -3369,7 +3426,9 @@ def make_tools(
         ``hints`` — each function an anchor points to other than the paired one, with
         ``direction`` (to_a / to_b), its own ``pairing_state`` (aligned / proposed / unpaired),
         the anchor and up to three ``evidence`` values (``evidence_count`` all). Neither moves the
-        pairing: R stays R, the pairs are BinDiff's, and nothing is re-paired. A ``negated``
+        pairing: R stays R, the pairs are BinDiff's, and nothing is re-paired. A P entry carries
+        ``counterpart_hint`` too: no ``state``, each hint's ``at_probe_addr`` (the function the
+        counterpart probe found); it changes neither its presence nor its order. A ``negated``
         pairing's B function is not thereby shown to be one-sided. ``sink_candidate_counts`` (on
         a pair whose
         functions hold candidates): per sink name, how many hunt candidates each function holds —
@@ -3392,8 +3451,12 @@ def make_tools(
         with no decompiled text, ``skipped_micro`` (a micro-function the decompiler skips by
         design) or ``text_unavailable`` (a decompile with no text), whose empty call tokens are
         NOT a 0 — and ``side_unreadable``, ``function_not_in_scan_inventory``,
-        ``call_tokens_unavailable``, ``call_counts_incomplete`` (its callee list was cut). It is
-        never part of the order: no significance, attention, sort or summary reads it.
+        ``call_tokens_unavailable``, ``call_counts_incomplete`` (its callee list was cut),
+        ``stub_call_unresolved`` (it calls a stub its table could not name); a call through a
+        named stub counts as that import. It never moves attention: inside attention 0, an entry
+        floated by a candidate count alone that has no call count (or a
+        ``same_callee_non_candidate`` row) reads last, unless it shows a command sink, a
+        ``rematch_suspected`` row or a callee only B calls.
 
         Two signals BinDiff similarity is blind to, on the function-pair view: each aligned entry
         carries ``pseudocode_sameness`` — ``identical`` (address-normalised pseudocode AND callees
@@ -4273,6 +4336,7 @@ def make_tools(
                     review={a: j.state for a, j in judged.items()},
                     pf=pf,
                     ko_offset=ko_offset,
+                    budget=_RESPONSE_BYTE_BUDGET,
                 )
             except _fd.FileDiffError as exc:
                 return {"run_pair": run_pair, "error": str(exc)}
@@ -4292,7 +4356,7 @@ def make_tools(
         return result
 
     def get_function_alignment(
-        diff_id: str, function: str | None = None, side: str = "a", addr: str | None = None
+        diff_id: str, function: str | None = None, side: str = "a"
     ) -> dict[str, Any]:
         """The BinDiff-aligned counterpart of one function (name or address) in a diff.
         ``side="a"`` resolves an A-side (before) address to its B-side match; ``side="b"`` the
@@ -4306,8 +4370,7 @@ def make_tools(
         body beside it; a stub usually has a few instructions and 1 basic block) — then the answer
         is ``reason='ambiguous'``, listing every candidate, never one picked. A name with no match
         says so apart from an address with none, and either lists that side's unmatched functions
-        of that name or address under ``presence``. ``addr`` is the old name of ``function``,
-        accepted for this version only: passing it adds ``param_renamed``.
+        of that name or address under ``presence``.
 
         ★ Returns an ALIGNMENT FACT, never a verdict: ``alignment_confidence`` = trust in the
         pairing, ``similarity`` = how much the pair differs (a pair can be similarity=1.0 yet
@@ -4319,15 +4382,9 @@ def make_tools(
         if side not in ("a", "b"):
             # Anything but "b" used to be read as "a", answering for the other version unasked.
             return {"found": False, "error": f"side {side!r} does not exist; use 'a' or 'b'"}
-        has_new, has_old = _cards.is_given(function), _cards.is_given(addr)
-        if has_new and has_old:
-            return {"found": False, "error": "pass function (addr is its old name), not both"}
-        if not has_new and not has_old:
-            return {
-                "found": False,
-                "error": "pass function=<name or address> (addr is its old name)",
-            }
-        target = str(function if has_new else addr)
+        if not _cards.is_given(function):
+            return {"found": False, "error": "pass function=<name or address>"}
+        target = str(function)
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
@@ -4336,14 +4393,6 @@ def make_tools(
             result = _align_by_function(conn, diff_id, target, side)
         finally:
             conn.close()
-        if has_old:
-            result["param_renamed"] = {
-                "from": "addr",
-                "to": "function",
-                "note": "addr is the old name of function and is accepted for this version only; "
-                "a digits-only value is now tried as hex and as decimal, like the other function "
-                "tools",
-            }
         return result
 
     def get_diff_capabilities(diff_id: str) -> dict[str, Any]:
@@ -4635,16 +4684,16 @@ def make_tools(
         """Recorded strings: by binary, or searched by ``value`` (substring).
 
         ★ ``function`` does NOT scope the results — DO NOT pass it expecting a per-function slice.
-        There is no string->function index and .rodata addresses fall outside code ranges, so the
-        results are binary-wide regardless; passing it only adds a top-level ``warning`` +
-        ``func_scope_applied: false`` (and in value mode it just gates existence: bad name -> none).
+        Strings live in data, outside every function's code, so the results are binary-wide
+        regardless; passing it adds a top-level ``warning`` + ``func_scope_applied: false`` (in
+        value mode it picks the binary searched: bad name -> none).
 
         Run-aware: pass ``run_id`` (or an ``evidence_ref`` that supplies run + binary). ``value``
         searches string CONTENT and returns each hit with its address + owning binary (one-call
-        locate); reference-site (which function uses a string) is not indexed — the result says so
-        honestly. Its note names get_functions_referencing_string (the functions whose pseudocode
-        holds the text) and get_string_reference_anchors (the recorded reference anchors of an
-        exact value), which answer that. Large results are paged LOSSLESSLY by byte size under
+        locate); which function uses a string is not in this listing. Its note names
+        get_functions_referencing_string (the functions whose pseudocode holds the text) and
+        get_string_reference_anchors (the recorded reference anchors of an exact value), which
+        answer that. Large results are paged LOSSLESSLY by byte size under
         ``paging``: pass ``offset`` = ``paging.next_offset`` to page the tail (never summarized).
         HONEST BOUND: a binary's string export is capped, so results carry ``truncated`` / ``total``
         (by-binary) or ``search_may_be_incomplete`` (by-value) when a scanned binary was capped — a
@@ -4821,11 +4870,12 @@ def make_tools(
     ) -> dict[str, Any]:
         """Functions whose pseudocode TEXT contains a string (substring reverse-lookup).
 
-        Run-aware: ``run_id`` (or an ``evidence_ref``). The schema indexes no string->function link,
-        but functions.pseudocode is stored in full, so this answers "which functions mention this
-        text". ``binary`` (short name or full path) narrows the scan; omitted, it scans every
-        binary. Capped (``truncated`` when more exist). HONEST BOUND: a TEXT match, not a resolved
-        symbol reference — the text may sit in a comment or unrelated literal; confirm each hit.
+        Run-aware: ``run_id`` (or an ``evidence_ref``). functions.pseudocode is stored in full, so
+        this answers "which functions mention this text" (get_string_reference_anchors gives the
+        resolved references of an exact value). ``binary`` (short name or full path) narrows the
+        scan; omitted, it scans every binary. Capped (``truncated`` when more exist). HONEST
+        BOUND: a TEXT match, not a resolved symbol reference — the text may sit in a comment or
+        unrelated literal; confirm each hit.
 
         ``binary`` is a SELECTOR: a sha256 (a >=8-hex prefix works), a full path, or a
         short name. A short name is a label and can name several binaries in one firmware;
@@ -6277,9 +6327,10 @@ def _with_usage_hint(
     by the tool's card, lacks a parameter it needs, the answer also gets the card's first line
     (``required``), a ``minimal_call`` and the ``reference`` call. Nothing else changes: the error
     text, every other field and the order the tool checks in are the tool's own. A card that is
-    wrong costs only those three keys, never a refused call. ``functools.wraps`` keeps the
-    signature, so the schema FastMCP derives is the tool's own. ``call_log`` records the call (the
-    tool-call log, best effort: it never changes the answer or fails the call)."""
+    wrong costs only those three keys, never a refused call. Every answer, of every tool, then
+    passes ``_mark_over_budget``: one larger than the response budget says so. ``functools.wraps``
+    keeps the signature, so the schema FastMCP derives is the tool's own. ``call_log`` records the
+    call (the tool-call log, best effort: it never changes the answer or fails the call)."""
     sig = inspect.signature(fn)
 
     @functools.wraps(fn)
@@ -6296,6 +6347,7 @@ def _with_usage_hint(
                 result["required"] = _cards.render_requires(card)
                 result["minimal_call"] = card.example
                 result["reference"] = _cards.reference_call(name)
+        _mark_over_budget(result)
         if call_log is not None:
             call_log.record(name, _bound(sig, args, kwargs), result)
         return result

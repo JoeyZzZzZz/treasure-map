@@ -24,6 +24,7 @@ from tests.unit.lib.test_patch_view import _WORDS, DIFF, World, _overlay_row, _p
 from treasure_map import mcp_app, mcp_cards
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import patch_view as pv
+from treasure_map.lib.query import review_units as ru
 from treasure_map.version import UNKNOWN_VERSION
 
 
@@ -56,6 +57,17 @@ def _string(w: World, side: str, value: str, func: str | None, *, truncated: int
     )
 
 
+def _image(w: World, side: str, words: tuple[int, ...] = (0x11111111,)) -> None:
+    """Give one side a readable image: a big-endian 32-bit arch and one ``.data`` block holding
+    ``words`` (a word equal to a function's entry is that entry stored in data)."""
+    w.adb[side].execute("UPDATE binaries SET arch = 'MIPS:BE:32:default' WHERE id = 1")
+    w.adb[side].execute(
+        "INSERT INTO data_blocks (binary_id, block_name, start_addr, size, bytes, initialized) "
+        "VALUES (1, '.data', '0x00400000', ?, ?, 1)",
+        (4 * len(words), b"".join(v.to_bytes(4, "big") for v in words)),
+    )
+
+
 def _key(w: World, side: str, key: str, func: str) -> None:
     """One dispatch-table entry: ``key`` selects the handler at ``func``."""
     w.adb[side].execute(
@@ -79,10 +91,16 @@ def _swap(w: World, a: str, b: str, sim: float = 0.4, **names: str) -> None:
 
 
 def _caller(w: World, a: str, b: str, ca: str, cb: str, *, calls_b: bool) -> None:
-    """``ca`` calls a on A; its aligned counterpart ``cb`` calls b (``calls_b``) or another name."""
+    """``ca`` calls a on A; its aligned counterpart ``cb`` calls b (``calls_b``) or another name.
+    ``cb`` has ordinary text (a refutation is only made on text that was read)."""
     w.pair(ca, cb, 0.97, 0.9)
     w.fn("a", ca, [f"FUN_{a}"])
-    w.fn("b", cb, [f"FUN_{b}"] if calls_b else ["log_line"])
+    w.fn(
+        "b",
+        cb,
+        [f"FUN_{b}"] if calls_b else ["log_line"],
+        pseudocode=f"FUN_{b}();" if calls_b else "log_line();",
+    )
 
 
 SUP_CALLER = ("00001000", "00002000")  # caller corroborated -> supported, floated
@@ -100,6 +118,7 @@ OTHER_MIX = "0000c000"
 
 def _evidence_world(tmp_path: Path) -> World:
     w = World(tmp_path)
+    _image(w, "b")  # B's data words are read: none of them holds a function's entry
     _swap(w, *SUP_CALLER)
     _caller(w, *SUP_CALLER, "00011000", "00012000", calls_b=True)
     _swap(w, *NEG)
@@ -351,7 +370,216 @@ def test_a_supported_count_delta_floats_under_its_own_basis() -> None:
     named = _entry(
         sup, sink_candidate_counts=counts, pairing_name_conflict={"name_a": "f", "name_b": "g"}
     )
-    assert pv.significance(named, None, None)[0] == 1  # pairing_name_conflict: no lift_basis
+    # pairing_name_conflict: it keeps its lift_basis but never floats
+    assert pv._lift_basis(named) == "sink_candidate_counts"
+    assert pv.significance(named, None, None)[0] == 1
+
+
+def _refuted_world(
+    tmp_path: Path, caller_text: str | None, *, words: tuple[int, ...] = (0x11111111,)
+) -> World:
+    """NEG alone: a's caller's aligned B counterpart does not call b by name (its text is
+    ``caller_text``), and B's data words are ``words``. No string, so a refutation makes it
+    negated and anything else leaves it none."""
+    w = World(tmp_path)
+    _image(w, "b", words)
+    _swap(w, *NEG)
+    w.pair("00013000", "00014000", 0.97, 0.9)
+    w.fn("a", "00013000", [f"FUN_{NEG[0]}"], pseudocode=f"FUN_{NEG[0]}(1);")
+    w.fn("b", "00014000", ["log_line"], pseudocode=caller_text)
+    w.commit()
+    return w
+
+
+def _caller_anchor(w: World) -> dict[str, Any]:
+    e = _view(w, sort_by="significance")["by_id"][_pair_id(*NEG)]
+    pe = e.get("pair_evidence") or {}
+    assert pe.get("state") == ("negated" if pe["caller_anchor"]["state"] == "refuted" else "none")
+    return dict(pe["caller_anchor"])
+
+
+def test_a_plain_b_caller_still_refutes(tmp_path: Path) -> None:
+    """The control: B's caller text is read and calls nothing indirectly, no data word holds b,
+    no text names b outside a call -> refuted (negated).
+
+    MUTATION (verified RED, 1 failed): never refute (``_unrefuted`` returns a reason) -> RED."""
+    assert _caller_anchor(_refuted_world(tmp_path, "log_line();"))["state"] == "refuted"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["log_line(); (*pcVar1)(param_1);", "log_line(); (*(code *)param_1)(0);"],
+    ids=["register_form", "cast_form"],
+)
+def test_an_indirect_call_in_the_b_caller_is_no_refutation(tmp_path: Path, text: str) -> None:
+    """B's caller calls through a function pointer — the register form ``(*pcVar1)(`` and the
+    cast form ``(*(code *)param_1)(`` the decompiler prints — so it may reach b where its callee
+    list cannot show it: none (``caller_has_indirect_call``), never refuted.
+
+    MUTATION (verified RED, 1 failed each): drop the indirect-call check -> refuted (both);
+    use the hunt's plain-form marker ``\\(\\s*\\*\\s*\\w+\\s*\\)\\s*\\(`` -> cast_form refuted;
+    read only ``PTR_`` pointers -> both refuted."""
+    ca = _caller_anchor(_refuted_world(tmp_path, text))
+    assert (ca["state"], ca.get("reason")) == ("none", "caller_has_indirect_call")
+
+
+def test_b_entry_held_by_a_data_word_is_no_refutation(tmp_path: Path) -> None:
+    """A data word on B holds b's entry (a function-pointer table, a callback slot): b may be
+    called through it -> none (``b_address_stored``).
+
+    MUTATION (verified RED, 1 failed): drop the data-word check -> refuted."""
+    ca = _caller_anchor(_refuted_world(tmp_path, "log_line();", words=(int(NEG[1], 16),)))
+    assert (ca["state"], ca.get("reason")) == ("none", "b_address_stored")
+
+
+def test_b_named_outside_a_call_is_no_refutation(tmp_path: Path) -> None:
+    """Some B function names b other than as a call (``register_cb(FUN_00004000);``): its address
+    is taken -> none (``b_name_referenced``). A plain call to b elsewhere is not that.
+
+    MUTATION (verified RED, 1 failed): drop the name check -> refuted."""
+    w = _refuted_world(tmp_path, "log_line();")
+    w.fn("b", "00017000", ["register_cb"], pseudocode=f"register_cb(FUN_{NEG[1]});")
+    w.commit()
+    ca = _caller_anchor(w)
+    assert (ca["state"], ca.get("reason")) == ("none", "b_name_referenced")
+
+
+def test_a_call_to_b_elsewhere_is_not_a_name_reference(tmp_path: Path) -> None:
+    """A B function that CALLS b by its name (``FUN_00004000(1);``) is a call, not a taken
+    address: the pairing is still refuted (the B counterpart of a's caller does not call b).
+
+    MUTATION (verified RED, 1 failed): drop the ``(?!\\s*\\()`` look-ahead -> b_name_referenced."""
+    w = _refuted_world(tmp_path, "log_line();")
+    w.fn("b", "00017000", [f"FUN_{NEG[1]}"], pseudocode=f"FUN_{NEG[1]} (1);")
+    w.commit()
+    assert _caller_anchor(w)["state"] == "refuted"
+
+
+@pytest.mark.parametrize("unread", ["caller_text", "image"])
+def test_what_cannot_be_read_does_not_refute(tmp_path: Path, unread: str) -> None:
+    """A refutation is made only on what was read: B's caller has no text, or B's data words
+    cannot be read (no data block exported) -> none, with the reason naming what was unread.
+
+    MUTATION (verified RED, 1 failed each): treat an unread caller text as text with no indirect
+    call -> caller_text refuted; read an image with no blocks as holding no word -> image
+    refuted."""
+    if unread == "caller_text":
+        ca = _caller_anchor(_refuted_world(tmp_path, None))
+        assert (ca["state"], ca.get("reason")) == ("none", "caller_text_unreadable")
+    else:
+        w = _refuted_world(tmp_path, "log_line();")
+        w.adb["b"].execute("DELETE FROM data_blocks")
+        w.adb["b"].commit()
+        ca = _caller_anchor(w)
+        assert (ca["state"], ca.get("reason")) == ("none", "b_address_storage_unreadable")
+
+
+def _one_sided_world(tmp_path: Path) -> World:
+    """Two functions on A in no pair, twins but for one thing: ``a:00007000`` holds a unique string
+    that B's 00027000 also holds (a hint), ``a:00008000`` holds a string B does not. Both were
+    probed: the function found where each maps is 00027000 / 00028000."""
+    w = World(tmp_path)
+    for addr, probe, text in (
+        ("00007000", "00027000", "one sided hint text"),
+        ("00008000", "00028000", "nowhere on b text"),
+    ):
+        w.unpaired("a", addr, "unmatched_analysis_complete")
+        w.atlas.execute(
+            "UPDATE function_presence SET counterpart_probe = 'function_at_mapped_addr', "
+            "counterpart_addr = ? WHERE side = 'a' AND addr = ?",
+            (probe, addr),
+        )
+        w.fn("a", addr, ["log_line"], pseudocode="log_line();", size_bytes=64)
+        _string(w, "a", text, addr)
+        w.fn("b", probe, ["log_line"], pseudocode="log_line();", size_bytes=64)
+    _string(w, "b", "one sided hint text", "00027000")
+    w.commit()
+    return w
+
+
+def test_a_one_sided_function_carries_where_its_anchors_point(tmp_path: Path) -> None:
+    """★ A P entry whose unique string the other side holds in one function carries
+    ``counterpart_hint`` {anchors, hints} — no ``state`` (there is no pairing to agree with) —
+    and ``at_probe_addr`` says the pointed-to function is the one the probe found where it maps.
+
+    MUTATION (verified RED, 1 failed): attach no hint to P entries -> no counterpart_hint -> RED;
+    compare the probe address with the wrong field -> at_probe_addr False -> RED."""
+    v = _view(_one_sided_world(tmp_path))
+    assert "a:00007000" in v["by_id"]
+    hint = v["by_id"]["a:00007000"].get("counterpart_hint")
+    assert hint == {
+        "anchors": ["string"],
+        "hints": [
+            {
+                "direction": "to_b",
+                "addr": "00027000",
+                "pairing_state": "unpaired",
+                "anchor": "string",
+                "evidence": ["one sided hint text"],
+                "evidence_count": 1,
+                "at_probe_addr": True,
+            }
+        ],
+    }, hint
+    assert "counterpart_hint" not in v["by_id"]["a:00008000"]
+
+
+def test_a_hint_changes_nothing_else_about_a_one_sided_function(tmp_path: Path) -> None:
+    """★ The hint is a fact beside the presence: the twin P entries, one with a hint and one
+    without, read the same presence_state, counterpart probe, significance and must-read reasons
+    — nothing moves an entry because a hint exists.
+
+    MUTATION (verified RED, 1 failed): lift a hinted P entry (attention 0 when it carries a
+    hint) -> the significance differs -> RED."""
+    w = _one_sided_world(tmp_path)
+    v = _view(w, sort_by="significance")
+    hinted, plain = v["by_id"]["a:00007000"], v["by_id"]["a:00008000"]
+    assert hinted.get("counterpart_hint") is not None and "counterpart_hint" not in plain
+    for key in ("presence_state", "counterpart_probe", "significance", "bucket"):
+        assert hinted.get(key) == plain.get(key), key
+    lst = pv.significance_listing(w.atlas, DIFF)
+    assert lst is not None and not lst.withheld
+    reasons = {
+        o.entry.entry_id: ru.entry_reasons(o.entry, 99, o.attention, o.lift_basis, 0)
+        for o in lst.entries
+    }
+    assert reasons["a:00007000"] == reasons["a:00008000"]
+
+
+@pytest.mark.parametrize("stale", [True, None], ids=["stale", "unknown"])
+def test_a_one_sided_function_gets_no_hint_on_a_source_not_shown_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale: bool | None
+) -> None:
+    """A diff whose sources are not shown current gives a P entry no hint: the addresses are the
+    diff's, and a re-extracted analysis.db may hold another function there.
+
+    MUTATION (verified RED, 1 failed each): attach P hints before the callee_block check -> a
+    hint on a stale diff -> RED."""
+    w = _one_sided_world(tmp_path)
+    monkeypatch.setattr(pv, "diff_source_staleness", _staleness(stale))
+    pv._clear_view_caches()
+    e = _view(w)["by_id"]["a:00007000"]
+    assert "counterpart_hint" not in e
+
+
+def test_a_supported_pairing_with_a_name_conflict_never_floats(tmp_path: Path) -> None:
+    """★ A proposed swap pair whose caller corroborates it (pair_evidence supported) but whose B
+    side also holds a function under the A name (``pairing_name_conflict``) keeps its lift_basis
+    and stays at attention 1 — a pairing in doubt never floats to attention 0, whichever of the
+    two doubts (a counterpart_hint conflict, a name conflict) it carries.
+
+    MUTATION (verified RED, 1 failed): drop the ``pairing_name_conflict`` check from
+    ``_supported_lift`` -> basis supported_pair_swap, attention 0 -> RED."""
+    w = World(tmp_path)
+    _swap(w, "00001000", "00002000", name_a="onEventA", name_b="onEventB")
+    _caller(w, "00001000", "00002000", "00011000", "00012000", calls_b=True)
+    w.fn("b", "00003000", ["foo"], name="onEventA")  # the A name on B too -> a name conflict
+    w.commit()
+    e = _view(w, sort_by="significance")["by_id"][_pair_id("00001000", "00002000")]
+    assert (e.get("pair_evidence") or {}).get("state") == "supported"
+    assert e.get("pairing_name_conflict") is not None
+    assert e.get("lift_basis") == "sink_callee_swap"
+    assert e["significance"]["attention"] == 1
 
 
 def test_a_stale_or_unreadable_source_gives_none_and_no_hint(
@@ -593,6 +821,30 @@ def test_a_summary_entry_carries_the_evidence_as_states(tmp_path: Path) -> None:
         "hints": 0,
         "reason": "import_names_differ",
     }
+
+
+def test_a_summary_entry_of_a_thunk_with_no_readable_name_still_marks_the_thunk(
+    tmp_path: Path,
+) -> None:
+    """Two thunks whose names BinDiff made up from their addresses give no thunk fact; the summary
+    still says which sides are thunks (``thunk_sides``), so a summary reader does not take the
+    pairing for two ordinary functions.
+
+    MUTATION (verified RED, 1 failed): print the thunk only when it has a fact -> no thunk_sides
+    -> RED."""
+    w = World(tmp_path)
+    a, b = "00050000", "00051000"
+    w.pair(a, b, 0.5, 0.4, name_a=f"FUN_{a}", name_b=f"FUN_{b}")
+    _thunks(w, "a", a)
+    _thunks(w, "b", b)
+    w.commit()
+    full = _e(_view(w, sort_by="significance"), (a, b))
+    assert full["pair_evidence"]["thunk"] == {"sides": ["a", "b"], "fact": None}
+    page = pv.get_diff_patch_view(w.atlas, DIFF, detail="summary", limit=200)
+    by_id = {e["entry_id"]: e for e in page["entries"]}
+    assert _pair_id(a, b) in by_id
+    pe = by_id[_pair_id(a, b)].get("pair_evidence") or {}
+    assert pe.get("thunk_sides") == ["a", "b"] and "thunk" not in pe, pe
 
 
 def _labels(value: Any, out: set[str]) -> None:

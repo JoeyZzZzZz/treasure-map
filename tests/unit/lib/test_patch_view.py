@@ -29,6 +29,7 @@ from treasure_map.lib.diff import code_version as cv
 from treasure_map.lib.query import diff_align as da
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import patch_view as pv
+from treasure_map.lib.query import review_units as ru
 from treasure_map.lib.query import sameness
 from treasure_map.lib.query import sink_overlay as so
 from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW
@@ -7929,7 +7930,7 @@ def test_no_start_diff_review_label_says_what_a_change_means(tmp_path: Path, cur
         assert not words & _WORDS, label
 
 
-# ── W5: a proposed pairing whose symbol names provably conflict is not lifted ────────────────
+# ── W5: a proposed pairing whose symbol names provably conflict keeps its lift, never floats ──
 
 
 def _name_conflict_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
@@ -7966,18 +7967,19 @@ def _name_conflict_world(tmp_path: Path) -> tuple[World, dict[str, str]]:
     return w, ids
 
 
-def test_a_proposed_pairing_with_a_name_conflict_is_listed_but_not_lifted(
+def test_a_proposed_pairing_with_a_name_conflict_keeps_its_lift_basis(
     tmp_path: Path, current: None
 ) -> None:
-    """★ W5. r_conflict carries ``pairing_name_conflict`` (the B side's other onEventA) and is
-    not lifted (no lift_basis, swap_lift 0), still listed at attention 1; r_control and r_fun,
-    the same shape without a conflict, are lifted.
+    """★ W5. r_conflict carries ``pairing_name_conflict`` (the B side's other onEventA) and keeps
+    its lift_basis (it leads attention 1 and stays must-read, reason ``lift_basis``): the
+    difference may be the pairing's, so it is read, not dropped. It is not floated (attention 1).
+    r_control, r_fun and r_same_name, the same shape without a conflict, lift alike.
 
-    MUTATION (verified RED, 1 failed each): drop the conflict check from ``_lift_basis`` ->
-    r_conflict is lifted again -> RED; read FUN_ names as symbols (``_real_symbol`` returns
-    ``bool(name)``) -> r_fun carries a conflict and is not lifted -> RED; drop the
+    MUTATION (verified RED, 1 failed each): put the conflict check back in ``_lift_basis`` ->
+    r_conflict loses its lift_basis and its must-read reason -> RED; read FUN_ names as symbols
+    (``_real_symbol`` returns ``bool(name)``) -> r_fun carries a conflict -> RED; drop the
     ``name_a == name_b`` exclusion in ``_pairing_name_conflict`` -> r_same_name carries a conflict
-    (its B-side namesake) and is not lifted -> RED."""
+    (its B-side namesake) -> RED."""
     w, ids = _name_conflict_world(tmp_path)
     v = _view(w, sort_by="significance")
     for k in ids.values():
@@ -7993,7 +7995,14 @@ def test_a_proposed_pairing_with_a_name_conflict_is_listed_but_not_lifted(
     }
     assert conflict["sink_callee_swap"]["pairing"] == "proposed"
     assert conflict["significance"]["attention"] == 1
-    assert (conflict["lift_basis"], conflict["rank_key"]["sink_callee_swap"]) == (None, 0)
+    assert (conflict.get("lift_basis"), conflict["rank_key"]["sink_callee_swap"]) == (
+        "sink_callee_swap",
+        1,
+    )
+    lst = pv.significance_listing(w.atlas, DIFF)
+    assert lst is not None and not lst.withheld
+    (o,) = [o for o in lst.entries if o.entry.entry_id == ids["r_conflict"]]
+    assert "lift_basis" in ru.entry_reasons(o.entry, o.position, o.attention, o.lift_basis, 0)
     # r_control (different names, no duplicate), r_fun (FUN_ names excluded) and r_same_name
     # (name_a == name_b, so a duplicate on B is not a conflict) all lift.
     for key in ("r_control", "r_fun", "r_same_name"):
@@ -8082,3 +8091,52 @@ def test_an_r_entry_read_identical_unique_keeps_its_lost_caller_basis_and_its_pl
     assert order.index(ids["r_lost"]) < order.index(ids["r_plain"])
     assert order.index(ids["r_plain"]) < order.index(ids["r_kept"])
     assert order.index(ids["r_plain"]) < order.index(ids["r_settled"])
+
+
+# ── the R close and the caller-set edge: each condition of the lost-caller exception ─────────
+
+
+def test_an_identical_unique_reading_with_an_undetermined_b_caller_closes_the_tier(
+    tmp_path: Path, current: None
+) -> None:
+    """An R entry read identical_unique whose B callers are undetermined (a B callee list is cut,
+    so a caller may be hidden) keeps the R close (``undetermined_never_sunk``): only a PROVEN
+    none_found B side earns the lost-caller basis.
+
+    MUTATION (verified RED, 1 failed): drop the ``none_found`` test from the exception ->
+    lost_every_direct_caller_never_sunk -> RED."""
+    w = World(tmp_path)
+    w.pair("00005000", "00006000", 0.5, 0.2, name_a="tgt", name_b="tgt")
+    w.fn("a", "00005000", ["foo"], name="tgt", pseudocode="x = foo(5);", size_bytes=16)
+    w.fn("b", "00006000", ["foo"], name="tgt", pseudocode="x = foo(5);", size_bytes=16)
+    w.fn("a", "00000100", ["tgt"], name="a_caller")
+    w.fn("b", "00000200", ["bar"], name="b_wide", truncated=1)  # B lists may be incomplete
+    w.commit()
+    v = _view(w, sort_by="significance")
+    pid = _pair_id("00005000", "00006000")
+    assert _reading(v, pid)["state"] == "identical_unique"
+    assert v["by_id"][pid]["callers_b"]["state"] == "undetermined"
+    assert v["by_id"][pid]["significance"] == {"attention": 1, "basis": "undetermined_never_sunk"}
+
+
+def test_an_aligned_r_entry_with_no_b_caller_keeps_the_r_close(
+    tmp_path: Path, current: None
+) -> None:
+    """An ALIGNED pair sitting in R through its row's landing (``degenerate_block``), its text
+    identical (no proposed reading: it is not an undetermined pairing) and its B side a proven
+    none_found, keeps the R close (``undetermined_never_sunk``): the lost-caller exception is for
+    an identical_unique reading, not for every R entry with no B caller.
+
+    MUTATION (verified RED, 1 failed): drop the ``identical_unique`` test from the exception ->
+    lost_every_direct_caller_never_sunk -> RED."""
+    w = World(tmp_path)
+    w.pair("00001000", "00002000", 0.97, 0.9, gap_a="degenerate_block")
+    w.inst("a", _ref("runA", "00001000", "cmd", "0x10"), "cmd", "system")
+    w.fn("a", "00001000", ["system"], name="tgt", pseudocode="system(c);")
+    w.fn("b", "00002000", ["system"], name="tgt", pseudocode="system(c);")
+    w.fn("a", "00000100", ["tgt"], name="a_caller")
+    w.commit()
+    e = _entry(w, _pair_id("00001000", "00002000"), sort_by="significance")
+    assert e["bucket"] == "R" and e["pseudocode_sameness"] == "identical"
+    assert e["callers_b"] == {"state": "none_found"}
+    assert e["significance"] == {"attention": 1, "basis": "undetermined_never_sunk"}

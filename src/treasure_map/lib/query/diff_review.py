@@ -259,6 +259,10 @@ def entry_facts(e: _Entry) -> dict[str, Any]:
         "presence_state": u.presence_state,
         "export_gap": u.export_gap,
         "bucket": e.bucket or None,
+        # what the function's unique strings / keys point to on the other side (added after the
+        # first snapshots: facts_delta compares a snapshot on its own keys, so it moves none)
+        "counterpart_hint": sorted(h["addr"] for h in (e.counterpart_hint or {}).get("hints", ()))
+        or None,
     }
 
 

@@ -32,21 +32,32 @@ def _warn_incomplete(incomplete: list[str], no_functions: list[str] | None = Non
     Of the four analysis states only ``ok`` and ``ok_empty`` are clean. ``no_functions`` (the
     extraction finished on a binary that has code, and recovered no function) is incomplete too,
     but re-running the same pass gives the same answer, so those are named on a line of their own
-    that says what WOULD change it instead of advising a retry."""
+    that says what WOULD change it instead of advising a retry — and the retry advice counts and
+    names only the others. A plain scan after a Ghidra, pass or architecture-detection change
+    re-extracts a ``no_functions`` binary by itself (it no longer reads as done), so that line
+    needs no flag."""
     no_functions = no_functions or []
     if not incomplete:
         return
-    click.echo(
+    settled = set(no_functions)
+    retry = [n for n in incomplete if n not in settled]
+    head = (
         f"\n⚠ {len(incomplete)} binaries produced no functions "
-        f"(analysis incomplete, NOT clean): {_shown(incomplete)}\n"
-        "  rerun with --reanalyze (or --reanalyze <name>) to retry them.",
-        err=True,
+        f"(analysis incomplete, NOT clean): {_shown(incomplete)}"
     )
+    if retry and len(retry) < len(incomplete):
+        head += (
+            f"\n  rerun with --reanalyze (or --reanalyze <name>) to retry {len(retry)} of them: "
+            f"{_shown(retry)}."
+        )
+    elif retry:
+        head += "\n  rerun with --reanalyze (or --reanalyze <name>) to retry them."
+    click.echo(head, err=True)
     if no_functions:
         click.echo(
             f"  {len(no_functions)} binaries have executable code but Ghidra recovered no function "
-            "from it — re-running with the same pass does not change this; after a Ghidra or "
-            "architecture-detection change, --reanalyze <name> retries it: "
+            "from it — re-running the same pass gives the same answer; a scan after a Ghidra, "
+            "pass or architecture-detection change re-extracts it by itself: "
             f"{_shown(no_functions)}",
             err=True,
         )

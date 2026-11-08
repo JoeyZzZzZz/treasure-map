@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tests.unit.lib.test_patch_view import World, _entry, _pair_id
 from treasure_map.lib.query import patch_view as pv
+from treasure_map.lib.query import review_units as ru
 
 A, B = "00001000", "00002000"
 PID = _pair_id(A, B)
@@ -247,3 +249,93 @@ def test_a_truncated_callee_list_reports_the_side_unknown(tmp_path: Path, curren
     scc = _scc(w)
     assert {"sink": "_eval", "side": "b", "reason": "call_counts_incomplete"} in scc["unknown"]
     assert scc["delta"] == []
+
+
+# ── calls through a lazy-binding stub: counted under the import the stub table names ─────────
+
+
+def _stubs(w: World, side: str, table: dict[str, str] | None) -> None:
+    """Set one side's ``binaries.stub_names`` (None = no table recorded)."""
+    w.adb[side].execute(
+        "UPDATE binaries SET stub_names = ? WHERE id = 1",
+        (json.dumps(table) if table is not None else None,),
+    )
+    w.adb[side].commit()
+
+
+def _fewer(scc: dict[str, object] | None) -> bool:
+    """Whether the must-read clause for fewer command calls reads ``scc`` as fewer on B."""
+    entry = SimpleNamespace(pair=SimpleNamespace(aligned=True), sink_callsite_counts=scc)
+    return ru._command_calls_fewer(entry)
+
+
+def test_calls_through_a_stub_are_counted_as_the_import(tmp_path: Path, current: None) -> None:
+    """A calls system twice through its stub, B once through its own stub (another address): the
+    stub tables name both, so it is system 2 -> 1, and the must-read clause reads it as fewer.
+
+    MUTATION (verified RED, 1 failed): count the raw token (drop the stub_resolved_name line) ->
+    neither side names a sink -> no sink_callsite_counts."""
+    w = _pair(tmp_path, ["FUN_00000400"] * 2, ["FUN_00000500"])
+    _stubs(w, "a", {"400": "system"})
+    _stubs(w, "b", {"500": "system"})
+    scc = _entry(w, PID).get("sink_callsite_counts")
+    assert scc is not None
+    assert scc["delta"] == [{"sink": "system", "a": 2, "b": 1}]
+    assert scc["unknown"] == []
+    assert _fewer(scc)
+
+
+def test_a_call_by_name_and_one_through_a_stub_count_alike(tmp_path: Path, current: None) -> None:
+    """A writes the call by name, B through a stub of the same import: 1 = 1, so there is no delta
+    and no "fewer command calls" reason (today that reads as a forged 1 -> 0).
+
+    MUTATION (verified RED, 1 failed): count the raw token -> system 1 -> 0 delta."""
+    w = _pair(tmp_path, ["system"], ["FUN_00000500"])
+    _stubs(w, "b", {"500": "system"})
+    scc = _entry(w, PID).get("sink_callsite_counts")
+    assert scc is None
+    assert not _fewer(scc)
+
+
+def test_a_call_through_an_unnamed_stub_is_unknown(tmp_path: Path, current: None) -> None:
+    """B also calls a stub its table could not name (``unresolved_external_calls``): that call may
+    be a sink, so B's count is unknown (``stub_call_unresolved``), never a determined 2 -> 1.
+
+    MUTATION (verified RED, 1 failed): drop the ``fn.unresolved`` check in _callsite_side ->
+    delta system 2 -> 1."""
+    w = World(tmp_path)
+    w.pair(A, B, 0.97, 0.6, name_a="f", name_b="f")
+    w.fn("a", A, ["system"], pseudocode="f();", size_bytes=200, calls=["system", "system"])
+    w.fn(
+        "b",
+        B,
+        ["system", "FUN_00000600"],
+        pseudocode="f();",
+        size_bytes=200,
+        calls=["system", "FUN_00000600"],
+        unresolved=["0x600"],
+    )
+    w.commit()
+    scc = _scc(w)
+    assert scc["delta"] == []
+    assert {"sink": "system", "side": "b", "reason": "stub_call_unresolved"} in scc["unknown"]
+    assert not _fewer(scc)
+
+
+@pytest.mark.parametrize("table", [None, {}], ids=["null_table", "empty_table"])
+def test_no_stub_table_keeps_the_counts_by_name(
+    tmp_path: Path, current: None, table: dict[str, str] | None
+) -> None:
+    """A binary with no stub table (NULL, or '{}' = read and resolved nothing) keeps the counts the
+    decompiler's names give: system 2 -> 1 stays a delta and the "fewer" reason stays. Reading
+    every FUN_ call of such a side as unknown would erase real deltas on binaries with no table.
+
+    MUTATION (verified RED, 2 failed): in _callsite_side treat a side with no stub table that
+    makes a FUN_ call as ``stub_call_unresolved`` -> the delta is erased."""
+    w = _pair(tmp_path, ["system", "system", "FUN_00000700"], ["system", "FUN_00000700"])
+    _stubs(w, "a", table)
+    _stubs(w, "b", table)
+    scc = _scc(w)
+    assert scc["delta"] == [{"sink": "system", "a": 2, "b": 1}]
+    assert scc["unknown"] == []
+    assert _fewer(scc)

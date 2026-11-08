@@ -382,7 +382,7 @@ def test_the_guide_explains_string_delta_and_callsite_counts() -> None:
         in guide
     )
     assert "a side with no decompiled text is unknown" in guide
-    assert "sink_callsite_counts never moves the order" in guide
+    assert "sink_callsite_counts never moves attention" in guide
     assert (
         "get_diff_string_delta(diff_id) lists the string literals one side holds and the other "
         "does not" in guide

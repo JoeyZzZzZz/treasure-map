@@ -2714,7 +2714,8 @@ def _kept_earlier_line(run_id: str, kept: list[dict[str, Any]]) -> str:
     named = ", ".join(f"{k['binary']}: {k.get('reason') or 'unknown'}" for k in kept)
     return (
         f"{run_id}: {len(kept)} binaries keep an earlier extraction — the running pass failed on "
-        f"them ({named}); a rescan cannot change this"
+        f"them ({named}); the next scan retries them (a timeout: only with --force-retry or a "
+        "larger budget)"
     )
 
 

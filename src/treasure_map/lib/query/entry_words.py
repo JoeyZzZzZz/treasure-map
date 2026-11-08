@@ -27,7 +27,9 @@ THE SERIES (``run_around``) is an arrangement fact: the smallest stride at which
 a reading that the series is a dispatch table.
 
 Words are read only at word-aligned absolute addresses (``scope``), only for the functions the
-analysis recorded, and labels only where the analysis recorded an address-taken site. A block whose
+analysis recorded and the thunks its export listed apart (``binaries.thunk_spans``; a thunk has no
+name there, so it is marked ``thunk`` with no name, never given one), and labels only where the
+analysis recorded an address-taken site. A block whose
 stored bytes fall short of its size makes the image incomplete: a search that finds nothing there
 is ``undetermined``, never ``none_found``.
 """
@@ -45,6 +47,7 @@ from itertools import compress
 from typing import Any, Literal
 
 from treasure_map.lib.binary_id import resolve_binary
+from treasure_map.lib.diff.layer0 import _thunk_spans
 from treasure_map.lib.facts import (
     _RX_BYTES_WARNING,
     _hex_addr_int,
@@ -66,7 +69,7 @@ DELTA_CLASSES = frozenset({"data", "unnamed", "init_fini"})
 
 SCOPE = {
     "words": "aligned_words_only",
-    "functions": "functions_table_only",
+    "functions": "functions_table_and_thunk_spans",
     "labels": "address_taken_sites_only",
 }
 
@@ -137,6 +140,7 @@ class Image:
     strings: dict[int, str]  # string start -> value
     string_ranges: tuple[tuple[int, int], ...]  # merged [start, end) of the stored strings
     complete: bool  # no initialized block's stored bytes fall short of its size
+    thunks: frozenset[int] = frozenset()  # the entries read from thunk_spans (no recorded name)
     # the word index (``word_index``) and the series memo, built on first use
     _index: dict[int, list[int]] | None = None
     _sorted_words: dict[int, list[int]] = field(default_factory=dict)  # block idx -> addresses
@@ -244,6 +248,26 @@ def _labels(conn: sqlite3.Connection, binary_id: int) -> tuple[tuple[int, str], 
     return tuple(sorted(found.items()))
 
 
+def _thunk_entries(
+    conn: sqlite3.Connection, binary_id: int, entries: dict[int, tuple[str | None, str]]
+) -> frozenset[int]:
+    """Add the thunks the export listed apart (``binaries.thunk_spans``, never in ``functions``) to
+    ``entries`` with no name, so a word holding a thunk's entry is an entry word like any other and
+    a series does not break at it. Returns the entries so added. A thunk already in ``functions``
+    keeps its row; a column that is missing or unreadable adds none (not recorded, never "none")."""
+    try:
+        row = conn.execute("SELECT thunk_spans FROM binaries WHERE id = ?", (binary_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return frozenset()
+    added: set[int] = set()
+    for address in _thunk_spans(row[0] if row else None):
+        value = _hex_addr_int(address)
+        if value and value not in entries:
+            entries[value] = (None, address)
+            added.add(value)
+    return frozenset(added)
+
+
 def load_image(conn: sqlite3.Connection, binary_id: int) -> Image:
     """Read one binary's image (blocks, entries, labels, strings) from its analysis.db."""
     meta = conn.execute("SELECT arch, sha256 FROM binaries WHERE id = ?", (binary_id,)).fetchone()
@@ -256,6 +280,7 @@ def load_image(conn: sqlite3.Connection, binary_id: int) -> Image:
         # An entry of 0 would equal every zeroed word: it is left out of the reading.
         if value:
             entries.setdefault(value, (name, address))
+    thunks = _thunk_entries(conn, binary_id, entries)
     try:
         rows = conn.execute(
             "SELECT block_name, start_addr, size, bytes, initialized, executable, truncated "
@@ -327,6 +352,7 @@ def load_image(conn: sqlite3.Connection, binary_id: int) -> Image:
         strings=strings,
         string_ranges=_merged(ranges),
         complete=not any(b.truncated for b in blocks if b.initialized),
+        thunks=thunks,
     )
 
 
@@ -819,6 +845,18 @@ def _record_bytes(block: Block, start: int, length: int) -> bytes:
     return block.data[lo - block.start : hi - block.start]
 
 
+def _function_ref(image: Image, entry: int, *, address: bool) -> dict[str, Any]:
+    """The function an entry word holds: its recorded name (None for a thunk, which has none) and,
+    when asked, its address as stored; a thunk is marked ``thunk``."""
+    name, stored = image.entries[entry]
+    out: dict[str, Any] = {"name": name}
+    if address:
+        out["address"] = stored
+    if entry in image.thunks:
+        out["thunk"] = True
+    return out
+
+
 def _word_holds(image: Image, value: int) -> dict[str, Any] | None:
     """What a word's value equals, mechanically: a function entry, a stored string's start, or an
     address inside an exported block. None for anything else (0 included)."""
@@ -826,7 +864,7 @@ def _word_holds(image: Image, value: int) -> dict[str, Any] | None:
         return None
     entry = image.targets.get(value)
     if entry is not None:
-        return {"holds": "function_entry", "name": image.entries[entry][0]}
+        return {"holds": "function_entry", **_function_ref(image, entry, address=False)}
     text = image.strings.get(value)
     if text is not None:
         return {"holds": "stored_string", "text": text[:_STRING_TEXT_SHOWN]}
@@ -845,11 +883,10 @@ def _record(
     value = image.word_at(entry_addr, block)
     assert value is not None
     entry = image.targets[value]
-    name, address = image.entries[entry]
     entry_word: dict[str, Any] = {
         "offset": field_offset,
         "value_hex": f"{value:0{ws * 2}x}",
-        "function": {"name": name, "address": address},
+        "function": _function_ref(image, entry, address=True),
     }
     if value != entry:
         entry_word["thumb_bit"] = True

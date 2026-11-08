@@ -778,6 +778,108 @@ def test_a_suppressed_shape_pages_and_both_offsets_are_refused(fw: FW) -> None:
     assert "error" in both and "not both" in both["error"]
 
 
+def _big_item_world(fw: FW, item_bytes: int, *, suppressed: bool = False) -> list[str]:
+    """etc/init.sh with one recorded line of ``item_bytes`` characters (the file's one structured
+    item, alone near or over a structured page) and a line difference far longer than one text
+    page (or, ``suppressed``, a secret-bearing one: its shape pages instead). Returns the
+    difference's lines as difflib gives them."""
+    if suppressed:  # one changed line in every eight: many segments
+        a_lines = [f"k{i}=1" if i % 8 == 0 else f"# {i}" for i in range(9600)]
+        b_lines = [line.replace("=1", "=2") for line in a_lines] + [_PEM]
+    else:
+        a_lines = [f"/usr/sbin/tool --set opt_{i} {'v' * 60} &" for i in range(600)]
+        b_lines = [f"/usr/sbin/tool --set opt_{i} {'w' * 60} &" for i in range(600)]
+    fw.file("a", "etc/init.sh", "shell_script", "\n".join(a_lines) + "\n")
+    b = fw.file("b", "etc/init.sh", "shell_script", "\n".join(b_lines) + "\n")
+    fw.row(
+        "b", "script_calls", b, command="/usr/sbin/big", raw_line="b" * item_bytes, line_number=1
+    )
+    return list(difflib.unified_diff(a_lines, b_lines, n=3, lineterm=""))[2:]
+
+
+def _walk_body(tools: dict[str, Any], path: str, key: str) -> list[dict[str, Any]]:
+    """Every page of one file's body (``hunk`` lines or ``hunk_shape`` segments) by
+    hunk_offset, through the MCP tool, from the first page."""
+    pages = []
+    hunk_offset: int | None = 0
+    while hunk_offset is not None:
+        page = tools["get_file_diff"](PAIR, path=path, hunk_offset=hunk_offset)
+        assert "error" not in page, page
+        pages.append(page)
+        hunk_offset = page["entry"][key]["next_hunk_offset"]
+    return pages
+
+
+@pytest.mark.parametrize("item_kb", [17, 19, 20, 25])
+def test_a_large_structured_item_shortens_the_text_beside_it_on_the_first_page(
+    fw: FW, item_kb: int
+) -> None:
+    """One structured item of 17-25 KB and a text difference longer than a text page: the first
+    page's text takes only what the item and the envelope leave, so the page stays within the
+    response budget and is not marked; the text pages on by hunk_offset and the pages together
+    are exactly the difflib difference, each line once.
+
+    MUTATION (verified RED, 4 failed): the text page back to the fixed HUNK_PAGE_BYTES
+    (``_fit_body`` returning after its first page) -> first page over the budget -> RED."""
+    expected = _big_item_world(fw, item_kb * 1000)
+    pages = _walk_body(fw.tools(), "etc/init.sh", "hunk")
+    first = pages[0]
+    assert len(first["entry"]["structured"]["commands_b_only"][0]["raw_line"]) == item_kb * 1000
+    assert len(json.dumps(first)) <= mcp_app._RESPONSE_BYTE_BUDGET
+    assert first.get("over_budget") is None
+    assert all(len(json.dumps(p)) <= mcp_app._RESPONSE_BYTE_BUDGET for p in pages)
+    assert [x for p in pages for x in p["entry"]["hunk"]["lines"]] == expected
+    # only the first page yields: a later page is the fixed text page it always was
+    later = pages[1]["entry"]["hunk"]
+    assert len(json.dumps(later["lines"])) > fd.HUNK_PAGE_BYTES - 200
+
+
+def test_a_large_structured_item_shortens_the_shape_beside_it(fw: FW) -> None:
+    """The same for a suppressed difference: its shape yields on the first page, then pages on
+    by hunk_offset to every segment once.
+
+    MUTATION (verified RED): the shape page back to the fixed HUNK_PAGE_BYTES -> RED."""
+    _big_item_world(fw, 20_000, suppressed=True)
+    pages = _walk_body(fw.tools(), "etc/init.sh", "hunk_shape")
+    assert pages[0]["entry"].get("hunk_suppressed") == "embedded_secret"
+    assert len(pages) > 2
+    assert len(json.dumps(pages[0])) <= mcp_app._RESPONSE_BYTE_BUDGET
+    assert pages[0].get("over_budget") is None
+    total = pages[0]["entry"]["hunk_shape"]["total_segments"]
+    starts = [p["entry"]["hunk_shape"]["hunk_offset"] for p in pages]
+    counts = [len(p["entry"]["hunk_shape"]["segments"]) for p in pages]
+    assert sum(counts) == total and starts == [sum(counts[:i]) for i in range(len(pages))]
+
+
+def test_a_structured_item_over_the_budget_alone_is_marked_with_one_line_beside_it(
+    fw: FW,
+) -> None:
+    """A structured item of 60 KB is over the budget by itself: the page still gives it whole and
+    one text line beside it (never none, never a dropped item), and says so with over_budget;
+    the text still pages on to the whole difference.
+
+    MUTATION (verified RED): drop the get_file_diff over_budget mark -> RED (the tool's own mark,
+    read through make_tools, without the server's fallback)."""
+    expected = _big_item_world(fw, 60_000)
+    pages = _walk_body(fw.tools(), "etc/init.sh", "hunk")
+    assert len(json.dumps(pages[0])) > mcp_app._RESPONSE_BYTE_BUDGET
+    assert pages[0].get("over_budget") is True
+    assert len(pages[0]["entry"]["hunk"]["lines"]) == 1
+    assert [x for p in pages for x in p["entry"]["hunk"]["lines"]] == expected
+
+
+def test_without_a_budget_the_lib_pages_the_text_as_before(fw: FW) -> None:
+    """The lib read without ``budget`` (the hand-off and unit material read it so) keeps the
+    fixed text page: only the MCP tool, which passes its budget, shortens it.
+
+    MUTATION (verified RED): ``_fit_body`` never refits -> the fitted page is as long -> RED."""
+    _big_item_world(fw, 20_000)
+    plain = fw.diff(path="etc/init.sh")["entry"]["hunk"]
+    assert len(json.dumps(plain["lines"])) > fd.HUNK_PAGE_BYTES - 200
+    fitted = fw.diff(path="etc/init.sh", budget=48_000)["entry"]["hunk"]
+    assert len(fitted["lines"]) < len(plain["lines"])
+
+
 def test_a_list_page_cuts_each_list_to_ten_and_says_so(fw: FW) -> None:
     """On a list page each structured list keeps 10 items, its total under lists_cut; the file's
     own page holds them all.

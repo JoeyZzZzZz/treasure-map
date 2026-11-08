@@ -12,6 +12,7 @@ analysis.db); every address and name is synthetic.
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query import diff_annotations as dann
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import patch_view as pv
+from treasure_map.lib.query import review_units as ru
 from treasure_map.lib.query import sink_overlay as so
 from treasure_map.version import UNKNOWN_VERSION
 
@@ -869,3 +871,120 @@ def test_a_recomputed_overlay_is_computed_once_per_inputs(
     monkeypatch.setattr(pv, "diff_code_version", lambda: "src-newer")  # newer diff code
     pv.get_diff_patch_view(w.atlas, DIFF, limit=1)
     assert len(calls) == before + 1
+
+
+# ── inside attention 0: an entry floated by a candidate count alone, likely noise, reads last ──
+
+# Aligned pairs, each floated to attention 0 by a sink candidate-count delta (A 2, B 1), lowest
+# similarity first so that without the noise order the noise entries would lead:
+N_G1 = ("00051000", "00052000")  # no call count to compare (no call tokens): noise
+N_G3 = ("00053000", "00054000")  # call counts differ, but a row is same_callee_non_candidate
+G_CMD = ("00055000", "00056000")  # noise shape, but the counted sink is a command sink
+G_ONLY_B = ("00057000", "00058000")  # noise shape, but B calls a callee A does not
+G_REMATCH = ("00059000", "0005a000")  # noise shape, but a row is rematch_suspected
+REAL = ("0005b000", "0005c000")  # call counts differ 2 -> 1, same text: not noise
+NOISE_ORDER = {N_G1: 0.30, N_G3: 0.32, G_CMD: 0.34, G_ONLY_B: 0.36, G_REMATCH: 0.38, REAL: 0.90}
+
+
+def _noise_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
+    w = World(tmp_path)
+    rows: list[so.SinkOverlayRow] = []
+    for (a, b), sim in NOISE_ORDER.items():
+        sink = "system" if (a, b) == G_CMD else "strcpy"
+        cls = "cmd" if sink == "system" else "copy"
+        w.pair(a, b, 0.97, sim)
+        calls = (a, b) in (N_G3, REAL)
+        w.fn(
+            "a",
+            a,
+            [sink],
+            pseudocode="f();" if calls else None,
+            size_bytes=200,
+            calls=[sink, sink] if calls else None,
+        )
+        w.fn(
+            "b",
+            b,
+            [sink, "helper"] if (a, b) == G_ONLY_B else [sink],
+            pseudocode="f();" if calls else None,
+            size_bytes=200,
+            calls=[sink] if calls else None,
+        )
+        refs = []
+        for side, f, at in (("a", a, "0x10"), ("a", a, "0x14"), ("b", b, "0x10")):
+            ref = _ref("runA" if side == "a" else "runB", f, cls, at)
+            w.inst(side, ref, cls, sink)
+            refs.append(ref)
+        rows.append(_overlay_row(refs[0], refs[2], "callsite", cls))
+        odd = _overlay_row(refs[1], None, "callsite", cls)
+        if (a, b) == N_G3:
+            odd = replace(
+                odd, presence="presence_undetermined", presence_reason="counterpart_same_callee"
+            )
+        elif (a, b) == G_REMATCH:
+            odd = replace(
+                odd,
+                presence="presence_undetermined",
+                presence_reason="counterpart_different_callee",
+                counterpart_call="present_different_callee",
+                counterpart_callee={
+                    "matched_addr": "0x10",
+                    "callees": ["memcpy"],
+                    "same_callee_candidate_elsewhere": True,
+                },
+            )
+        rows.append(odd)
+    w.commit()
+    _rows(monkeypatch, rows)
+    return w
+
+
+def test_count_noise_reads_last_inside_attention_0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Every entry here floats to attention 0 on its candidate count and stays there, must-read.
+    Inside attention 0 the two noise shapes — no call count to compare, a row whose call is the
+    same on both sides — read after the rest: after the entry whose call count really fell (REAL,
+    despite its higher similarity) and after the three that show a change beyond the count (a
+    command sink, a callee only B calls, a rematch_suspected row), which keep their place.
+
+    MUTATION (verified RED, 1 failed each): drop the count_noise key from the order -> the noise
+    entries lead (lowest similarity) -> RED; drop the command-sink guard -> G_CMD sinks -> RED;
+    drop the B-only-callee guard -> G_ONLY_B sinks -> RED; drop the rematch guard -> G_REMATCH
+    sinks -> RED; widen the gate past its two noise shapes -> REAL sinks -> RED; read only
+    the absent call count (drop the same_callee_non_candidate clause) -> N_G3 stays -> RED."""
+    w = _noise_world(tmp_path, monkeypatch)
+    v = _view(w, sort_by="significance")
+    ids = {k: _pair_id(*k) for k in NOISE_ORDER}
+    for k, eid in ids.items():
+        assert eid in v["by_id"], k
+        assert v["by_id"][eid]["significance"] == {
+            "attention": 0,
+            "basis": "sink_candidate_counts",
+        }, k
+    assert v["by_id"][ids[N_G1]].get("sink_callsite_counts") is None
+    assert v["by_id"][ids[REAL]].get("sink_callsite_counts", {}).get("delta") == [
+        {"sink": "strcpy", "a": 2, "b": 1}
+    ]
+    assert "same_callee_non_candidate" in v["by_id"][ids[N_G3]]["subclasses"]
+    assert "rematch_suspected" in v["by_id"][ids[G_REMATCH]]["subclasses"]
+    order = [e["entry_id"] for e in v["entries"] if e["entry_id"] in ids.values()]
+    assert order == [ids[k] for k in (G_CMD, G_ONLY_B, G_REMATCH, REAL, N_G1, N_G3)], order
+
+
+def test_count_noise_moves_nothing_but_the_order_inside_attention_0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The noise order changes no attention, basis or lift_basis, and takes no entry out of the
+    must-read set: every entry keeps ``attention_0`` (k=0, so top_k plays no part).
+
+    MUTATION (verified RED, 1 failed): sink a noise entry to attention 1 instead -> it loses
+    attention_0 -> RED."""
+    w = _noise_world(tmp_path, monkeypatch)
+    lst = pv.significance_listing(w.atlas, DIFF)
+    assert lst is not None and not lst.withheld
+    got = {o.entry.entry_id: o for o in lst.entries}
+    for k in NOISE_ORDER:
+        o = got[_pair_id(*k)]
+        assert (o.attention, o.basis) == (0, "sink_candidate_counts"), k
+        assert "attention_0" in ru.entry_reasons(o.entry, o.position, o.attention, o.lift_basis, 0)

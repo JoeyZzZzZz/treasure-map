@@ -532,8 +532,10 @@ CREATE TABLE IF NOT EXISTS function_presence (
                                     -- | 'unmatched_analysis_incomplete' = a real gap (decompile
                                     --   failed, or size unknown) -> existence UNDETERMINED, NEVER
                                     --   read as add/delete
-                                    -- | 'inventory_mismatch'            = the other side's baseline
-                                    --   lacks this address
+                                    -- | 'counterpart_suspected'         = a counterpart may sit
+                                    --   unpaired at the mapped address (counterpart_probe
+                                    --   'unpaired') -> existence UNDETERMINED, NEVER add/delete
+                                    -- ('inventory_mismatch' is reserved: never written)
     decompiled     INTEGER,         -- 1 / 0 / NULL(unknown): was this side's decompile a success?
                                     --   NULL when size_bytes is unrecorded (cannot classify)
     export_gap     TEXT,            -- NULL, or why this function is not represented faithfully
@@ -551,7 +553,11 @@ CREATE TABLE IF NOT EXISTS function_presence (
     -- 'unmatched_analysis_incomplete'). NULL = not probed.
     counterpart_probe TEXT,
     counterpart_addr TEXT,          -- the other side's function at the mapped address
-    presence_reason TEXT,           -- why the probe left existence undetermined; NULL otherwise
+    presence_reason TEXT,           -- why the probe left existence undetermined; NULL otherwise:
+                                    --   counterpart_unpaired_at_mapped_address /
+                                    --   other_side_code_outside_functions /
+                                    --   other_side_bytes_not_disassembled /
+                                    --   other_side_coverage_unknown / counterpart_unmappable
     counterpart_overlap TEXT,       -- JSON [["0x<lo>","0x<hi>"], ...] leftover-code ranges met
     UNIQUE(diff_id, side, addr)
 );
@@ -620,8 +626,9 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     unmatched_b             INTEGER,
     out_of_inventory_a      INTEGER,         -- matched A addr NOT in baseline_a (thunk/extern/micro)
     out_of_inventory_b      INTEGER,
-    inventory_mismatch_a    INTEGER,         -- baseline_a addr the other side's baseline lacks
-    inventory_mismatch_b    INTEGER,
+    inventory_mismatch_a    INTEGER,         -- RESERVED, always 0: no diff path derives it (a
+    inventory_mismatch_b    INTEGER,         --   cross-side domain state the per-side count
+                                             --   cannot reach); never read it as "none lacking"
     functions_empty_a       INTEGER,         -- REAL decompile failures (size >= MIN, no pseudocode)
                                              --   — same meaning as run.functions_empty; does NOT
                                              --   include design-skipped micro-functions

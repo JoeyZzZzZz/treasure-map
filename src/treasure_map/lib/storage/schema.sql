@@ -275,7 +275,7 @@ CREATE TABLE IF NOT EXISTS xrefs (
     caller_func_id      INTEGER,        -- NULL = a library-level reference
     callee_binary_id    INTEGER,
     callee_func_id      INTEGER,        -- NULL = a library-level reference
-    xref_type           TEXT,           -- import_export / dt_needed / string_ipc
+    xref_type           TEXT,           -- callees_exports / import_export / dt_needed / string_ipc
     confidence          REAL    DEFAULT 1.0
 );
 
@@ -564,7 +564,11 @@ CREATE INDEX IF NOT EXISTS idx_web_endpoints_file ON web_endpoints(file_id);
 -- expose (<input> non-hidden / <textarea> / <select> / a JS form-value assignment / an
 -- nvram_char_to_ascii form-fill). field_keyword is the asset's OWN content (evidence), never
 -- generated. A read-only round-trip field (<input type=hidden> populated from nvram_get, e.g. a
--- firmware-version echo) is DELIBERATELY excluded: it is displayed, not settable. web_settable
+-- firmware-version echo) is DELIBERATELY excluded: it is displayed, not settable. Known boundary:
+-- a hidden field a script fills and the form submits is collected only when the script writes it
+-- as document.form.<name>.value (js_assign) or fills it with nvram_char_to_ascii (nvram_ascii);
+-- filled any other way it is excluded with the read-only ones — an under-count, so web_settable
+-- may read 'likely' / 'uncertain' for a key that is in fact settable, never 'no'. web_settable
 -- crosses these against the back-end nvram_key_flow constant keys to tell an editable web key from a
 -- read-only display key. NO rows for a run means the front-end was not collected (web_settable then
 -- reads 'uncertain', NEVER 'not settable' — the false-negative red line).

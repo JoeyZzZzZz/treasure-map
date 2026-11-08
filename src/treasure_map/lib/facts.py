@@ -929,34 +929,36 @@ def _binary_name_path_by_id(
     return (r["name"], r["path"]) if r else (None, None)
 
 
-# The schema records each string's own location, never which function references it (Ghidra does
-# not export string xrefs). Said honestly on every result so a consumer does not assume a reverse
-# lookup the substrate cannot back.
+# A strings listing gives each string's own location, not which function references it: the
+# resolved references live in string_refs (read by get_string_reference_anchors), and a pseudocode
+# text match is get_functions_referencing_string. Said on every result so a consumer does not read
+# this listing as answering that question.
 _STRING_REF_NOTE = (
     "string reference sites (which function uses this string) are not indexed in this listing; "
-    "get_functions_referencing_string (run_id, value) finds the functions whose pseudocode holds "
+    "get_functions_referencing_string (run_id, text) finds the functions whose pseudocode holds "
     "the text, and get_string_reference_anchors the recorded reference anchors of an exact value"
 )
 
-# ★ Honesty (declared≠actual): `function` is ECHOED on a strings result but does NOT scope it. A
-# differential test confirmed results are binary-wide in BOTH modes: there is no string->function
-# reference index, and code-range address filtering cannot reach .rodata string constants (their
-# addresses fall outside any code function's range). Surfaced as this note PLUS a machine-readable
-# ``func_scope_applied: false`` whenever `function` is passed, so a consumer (machine, which skims
-# prose) never reads the echoed `function` field as a scoping guarantee.
+# ★ Honesty (declared≠actual): `function` is ECHOED on a strings result but does NOT scope it to
+# that function. A differential test confirmed results are binary-wide in BOTH modes: the listing
+# reads the strings table, which holds each string's own (data) address, and a code-range filter
+# cannot reach .rodata string constants (their addresses fall outside any code function's range).
+# In value mode `function` picks the binary searched (the function's own), so a name that does not
+# resolve answers found:false; in by-binary mode it is only echoed. Surfaced as this note PLUS a
+# machine-readable ``func_scope_applied: false`` whenever `function` is passed, so a consumer
+# (machine, which skims prose) never reads the echoed `function` field as a scoping guarantee.
 _STRING_FUNC_SCOPE_NOTE = (
-    "`function` does NOT narrow string results in EITHER mode (by-binary or value). There is no "
-    "string->function reference index, and code-range address filtering cannot reach .rodata "
-    "string constants — results are binary-wide regardless of `function`. `function` currently "
-    "only gates existence in value mode (unresolvable name -> found:false). To scope strings to a "
-    "function, resolve the address in a disassembler's xref view."
+    "`function` does NOT narrow string results in EITHER mode (by-binary or value): they are "
+    "binary-wide. In value mode it picks the binary searched, the function's own (unresolvable "
+    "name -> found:false). Which functions reference a string: get_string_reference_anchors "
+    "(resolved references of an exact value) and get_functions_referencing_string (text match)."
 )
 # A SHORT, top-level alert that repeats the note's headline where a consumer skimming the response
 # keys sees it (the full detail stays in ``note``). Prominence, not new information — raised because
-# the reported pain point was "you must read to the bottom note to learn `function` is a no-op".
+# the reported pain point was "you must read to the bottom note to learn `function` does not scope".
 _STRING_FUNC_SCOPE_WARNING = (
     "`function` was passed but does NOT scope these strings — results are binary-wide "
-    "(func_scope_applied=false; see note). It only gates existence in value mode."
+    "(func_scope_applied=false; see note). In value mode it picks the binary searched."
 )
 
 
@@ -1114,13 +1116,14 @@ def get_strings(
     Two modes: (1) ``value`` searches by string CONTENT (substring), returning every hit with its
     address + owning binary so a consumer locates "this string lives in <binary> at <address>" in
     one call — optionally narrowed to ``binary``; (2) without ``value``, lists a binary's strings.
-    ★ ``func`` does NOT scope the results (there is no string->func index and .rodata addresses fall
-    outside code ranges): results are binary-wide, flagged honestly with ``func_scope_applied:
-    false`` + a note, and in value mode ``func`` only gates existence (unresolvable name ->
-    found:false). Large results are paged LOSSLESSLY by byte size under ``paging`` (``offset`` /
-    ``next_offset``) — the tail is reachable, never summarized. The ``note`` also states that the
-    reverse "which function references this string" lookup is NOT provided (that index does not
-    exist, and we do not fake it)."""
+    ★ ``func`` does NOT scope the results to the function (strings sit at data addresses, outside
+    every function's code range): results are binary-wide, flagged honestly with
+    ``func_scope_applied: false`` + a note. In value mode ``func`` picks the binary searched — the
+    function's own (unresolvable name -> found:false); in by-binary mode it is only echoed. Large
+    results are paged LOSSLESSLY by byte size under ``paging`` (``offset`` / ``next_offset``) — the
+    tail is reachable, never summarized. The ``note`` also states that this listing does not answer
+    "which function references this string" and names the two tools that do
+    (get_string_reference_anchors, get_functions_referencing_string)."""
     if value is not None:
         # ``func`` picks the binary searched — the function's own — and a func that does not
         # resolve is SURFACED (not-found / ambiguous), never ignored. It does not narrow to the
@@ -1178,8 +1181,9 @@ def get_strings(
             },
             "strings": page,
             "paging": paging,
-            # ★ 3.1 declared≠actual: `func` is echoed but does NOT scope strings (see the note). The
-            # boolean is the machine-readable guarantee — false whenever `func` was passed.
+            # ★ declared≠actual: `func` picks the binary searched but does NOT scope strings to the
+            # function (see the note). The boolean is the machine-readable guarantee — false
+            # whenever `func` was passed.
             "note": _STRING_FUNC_SCOPE_NOTE if func is not None else _STRING_REF_NOTE,
         }
         if func is not None:
@@ -1217,7 +1221,7 @@ def get_strings(
     ).fetchone()
     truncated = bool(meta and meta["strings_truncated"])
     total = int(meta["strings_total"]) if meta and meta["strings_total"] is not None else len(rows)
-    # ★ byte-paginate the (func-narrowed) items so a huge by-binary listing (a wide dispatcher's
+    # ★ byte-paginate the items so a huge by-binary listing (a wide dispatcher's
     # 400k+ of strings) is reachable page by page. ``paging.truncated`` (byte-paging) is DISTINCT
     # from the top-level ``truncated`` below (the export-cap prefix flag) — both can hold at once.
     page_items, paging = _byte_page(items, offset, max_chars)
@@ -1227,10 +1231,10 @@ def get_strings(
         "function": func,
         "strings": page_items,
         "paging": paging,
-        "stored": len(rows),  # strings held for this binary (before any func-range narrowing)
+        "stored": len(rows),  # strings held for this binary (``func`` narrows nothing)
         "total": total,  # true count of matching defined strings in the binary
         "truncated": truncated,  # EXPORT-CAP prefix flag (not the byte-paging one in ``paging``)
-        # ★ 3.1 declared≠actual: `func` is echoed above but does NOT scope strings (see the note).
+        # ★ declared≠actual: `func` is only echoed above; it does NOT scope strings (see the note).
         "note": _STRING_FUNC_SCOPE_NOTE if func is not None else _STRING_REF_NOTE,
     }
     if func is not None:
@@ -1247,11 +1251,12 @@ def get_strings(
     return out
 
 
-# A pseudocode substring search is a TEXT match, not a resolved symbol/xref reference: the schema
-# indexes no string->function link (Ghidra exports no string xrefs), but functions.pseudocode is
-# stored in full, so "which functions mention this text" is answerable by scanning that text. Said
-# honestly on every result — the text may occur in a comment or an unrelated string literal, so
-# each hit is a lead to confirm, not a proven reference.
+# A pseudocode substring search is a TEXT match, not a resolved symbol/xref reference (the resolved
+# references are string_refs, read by get_string_reference_anchors — defined strings and recovered
+# references only, matched exactly): functions.pseudocode is stored in full, so "which functions
+# mention this text" is answerable by scanning that text. Said honestly on every result — the text
+# may occur in a comment or an unrelated string literal, so each hit is a lead to confirm, not a
+# proven reference.
 _PSEUDO_TEXT_NOTE = (
     "MATCHES BY PSEUDOCODE TEXT SUBSTRING, not a resolved symbol/xref reference: the text may "
     "appear in a comment or an unrelated string literal — confirm each hit in the pseudocode"
@@ -1283,10 +1288,11 @@ def get_functions_referencing_string(
 ) -> dict[str, Any]:
     """Functions whose pseudocode TEXT contains ``text`` (a substring reverse-lookup).
 
-    The schema stores no string->function link, but functions.pseudocode is kept in full, so this
-    answers "which functions mention this text" by scanning that pseudocode — the same manual
-    ``LIKE`` reverse-lookup a reviewer runs by hand, wrapped as one call. ``binary`` (short name,
-    full path, sha256 or sha256 prefix) narrows to one binary; omitted, it scans every binary.
+    The wide-and-noisy sibling of ``get_string_reference_anchors`` (resolved references of an exact
+    value): functions.pseudocode is kept in full, so this answers "which functions mention this
+    text" by scanning that pseudocode — the same manual ``LIKE`` reverse-lookup a reviewer runs by
+    hand, wrapped as one call. ``binary`` (short name, full path, sha256 or sha256 prefix) narrows
+    to one binary; omitted, it scans every binary.
     Capped at ``limit`` hits (default 50); the result carries ``truncated`` when more exist.
     HONEST BOUND: this is a TEXT match, not a resolved symbol reference — the ``note`` says so; the
     text can occur in a comment or an unrelated string literal, so each hit is a lead to confirm.

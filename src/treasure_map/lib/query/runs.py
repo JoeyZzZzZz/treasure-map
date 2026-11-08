@@ -244,9 +244,8 @@ def run_staleness(
         return Staleness(
             True,
             "toolchain",
-            f"scanned with Ghidra {run.ghidra_version}, Ghidra {local_ghidra} is installed — the "
-            "decompiler that produced the facts stored for this run is not the one answering you "
-            "now, and would extract them differently.",
+            f"scanned with Ghidra {run.ghidra_version}; the default config's Ghidra is "
+            f"{local_ghidra} — it would extract the facts stored for this run differently.",
             _remedy_for(run),
         )
     if run.hunt_code_version is None:
@@ -337,8 +336,9 @@ class ExtractionAttempts:
     ``not_attempted`` names the binaries whose last attempt was not made by the running pass (or
     that were never attempted); a rescan decompiles exactly those. ``kept_earlier`` is the binaries
     the running pass DID attempt and failed on while they still carry an earlier pass's
-    ``pass_version``: their rows (``has_rows``) are that earlier extraction's, and running the same
-    pass again will not replace them. ``db_build_hash`` is the analysis.db's own build hash now."""
+    ``pass_version``: their rows (``has_rows``) are that earlier extraction's until an attempt
+    succeeds (a scan retries them; one that timed out only with --force-retry or a larger
+    budget). ``db_build_hash`` is the analysis.db's own build hash now."""
 
     total: int
     not_attempted: list[str] = field(default_factory=list)

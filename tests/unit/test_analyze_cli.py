@@ -192,7 +192,9 @@ def test_analyze_names_no_functions_kept_earlier_and_an_unfinished_reanalyze(
     binaries with code and no function recovered (and what would change that), the binaries that
     kept an earlier pass's extraction, and an interrupted --reanalyze this run did not continue.
 
-    MUTATION (verified RED): drop ``report_extraction_state`` from the command -> none printed."""
+    MUTATION (verified RED): drop ``report_extraction_state`` from the command -> none printed.
+    MUTATION (verified RED, 1 failed): the retry line counting the no_functions binary again
+    ("to retry them") -> RED."""
     _patch_pipeline(
         monkeypatch,
         tmp_path / "analysis.db",
@@ -212,10 +214,13 @@ def test_analyze_names_no_functions_kept_earlier_and_an_unfinished_reanalyze(
     assert result.exit_code == 0, result.output
     out = result.output
     assert "Ghidra OK: 4 (of which 1 no_functions)" in out
+    # Only the binary a retry can change is offered one: svc_b is no_functions.
+    assert "rerun with --reanalyze (or --reanalyze <name>) to retry 1 of them: svc_c." in out
+    assert "to retry them" not in out
     assert (
         "1 binaries have executable code but Ghidra recovered no function from it — re-running "
-        "with the same pass does not change this; after a Ghidra or architecture-detection "
-        "change, --reanalyze <name> retries it: svc_b"
+        "the same pass gives the same answer; a scan after a Ghidra, pass or "
+        "architecture-detection change re-extracts it by itself: svc_b"
     ) in out
     assert (
         "⚠ 1 binaries kept their earlier extraction because this pass failed on them: "
@@ -225,6 +230,31 @@ def test_analyze_names_no_functions_kept_earlier_and_an_unfinished_reanalyze(
         "⚠ an interrupted --reanalyze left 3 binaries not yet re-extracted; run the same command "
         "with --reanalyze to finish it."
     ) in out
+
+
+def test_no_retry_is_offered_when_every_incomplete_binary_is_no_functions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no_functions binary gives the same answer to the same pass, so when it is the only
+    incomplete one no retry is advised — only the line saying what would change it; with none of
+    them, every incomplete binary is offered the retry.
+
+    MUTATION (verified RED, 1 failed): print the retry line whatever is left to retry -> RED."""
+    _patch_pipeline(
+        monkeypatch,
+        tmp_path / "analysis.db",
+        [],
+        incomplete_binaries=["svc_b"],
+        no_functions_binaries=["svc_b"],
+        ghidra_ok=1,
+        ghidra_no_functions=1,
+    )
+    fs_root = tmp_path / "fs"
+    fs_root.mkdir()
+    out = CliRunner().invoke(analyze, [str(fs_root), "--workspace", "ws"]).output
+    assert "1 binaries produced no functions (analysis incomplete, NOT clean): svc_b" in out
+    assert "--reanalyze" not in out
+    assert "re-extracts it by itself: svc_b" in out
 
 
 def test_a_bare_reanalyze_run_does_not_point_at_itself(

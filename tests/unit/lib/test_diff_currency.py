@@ -1875,13 +1875,18 @@ def test_the_cli_says_a_failed_diff_leaves_the_pair_uncovered(
 
 def test_the_diff_listing_counts_functions_and_leaves_edges_to_their_view(tmp_path: Path) -> None:
     """The listing leads with functions, says similarity 1 is not 'unchanged', and points at
-    get_diff_deltas for the string-keyed edges rather than counting them.
+    get_diff_deltas for the string-keyed edges rather than counting them. Its starting point is
+    the whole pair, the call review_pairs names, not one binary.
 
-    MUTATION: describe the rows as edge counts again -> RED."""
+    MUTATION: describe the rows as edge counts again -> RED.
+    MUTATION (verified RED, 1 failed): the note's "Pick a binary, then start with
+    start_diff_review" sentence back -> RED."""
     from treasure_map import mcp_app
 
     note = diff_align._LIST_DIFFS_NOTE
     assert "FUNCTIONS" in note and "Similarity 1 is NOT 'unchanged'" in note
+    assert "start_diff_review(run_pair=...), as review_pairs names it" in note
+    assert "Pick a binary" not in note
     assert "get_diff_deltas" in note and "switchable view" in note and "layer_changed" not in note
     doc = mcp_app.make_tools(tmp_path / "x.db")["list_diffs"].__doc__ or ""
     assert "get_diff_deltas" in doc and "switchable view" in doc

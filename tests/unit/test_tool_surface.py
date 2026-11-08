@@ -210,9 +210,7 @@ EXPECTED_FIRST_LINES = {
     "get_diff_meta": "Required: diff_id.",
     "get_diff_string_delta": "Required: diff_id.",
     "get_diff_handoff": "Required: run_pair.",
-    "get_function_alignment": (
-        "Required: diff_id, function (addr is its old name, accepted for this version)."
-    ),
+    "get_function_alignment": "Required: diff_id, function.",
     "get_diff_capabilities": "Required: diff_id.",
     "list_diffs": "Required: none.",
     "list_diff_blindspots": "Required: none.",
@@ -620,7 +618,7 @@ _PLAIN_REF = (
 )
 APPENDIX_A: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     ("addr", ("address",), ("get_data_bytes", "get_data_table")),
-    ("addr", ("function",), _SEL),
+    ("addr", ("function",), _FN_TOOLS),
     ("address", ("function",), _FN_TOOLS),
     ("anchor", ("anchor_ref",), ("annotate_diff", "clear_overlay")),
     ("anchor", ("candidate_anchor",), ("same_shape_siblings",)),
@@ -721,7 +719,7 @@ def test_appendix_a_is_what_the_refusal_offers_and_nothing_outside_it_offers_any
     MUTATION (verified RED, 1 failed): drop the (stride, side) veto -> RED."""
     accepted = _accepted()
     want = {(w, t): offer for w, offer, ts in APPENDIX_A for t in ts}
-    assert len(want) == 258
+    assert len(want) == 259
     inputs = {p for ps in accepted.values() for p in ps} | set(cards._PARAM_SYNONYMS) | set(_TYPOS)
     seen = 0
     for wrong in sorted(inputs):
@@ -848,8 +846,6 @@ def test_a_missing_parameter_reaches_the_tool_and_its_error_gains_a_minimal_call
     )
     assert str(res.get("error")).startswith("rationale is required for changed_real")
     assert "minimal_call" in res
-    res = _reached(server, "get_function_alignment", {"diff_id": _DIFF, "addr": "uniq_fn"})
-    assert res.get("found") is True and "param_renamed" in res
     res = _reached(server, "get_pseudocode", {"run_id": "run_m", "function": "handle_req"})
     assert "error" not in res and "minimal_call" not in res
 
@@ -991,6 +987,26 @@ REPLACED = {
         "When ``function`` resolves, ITS binary is used and ``binary`` does not re-select.": (
             "true in value mode only; listing a binary's strings needs binary, which function "
             "does not supply — the sentence now says both"
+        ),
+        "There is no string->function index and .rodata addresses fall outside code ranges, so "
+        "the results are binary-wide regardless; passing it only adds a top-level ``warning`` + "
+        "``func_scope_applied: false`` (and in value mode it just gates existence: bad name -> "
+        "none).": (
+            "resolved string references are recorded (get_string_reference_anchors reads them), "
+            "and in value mode function picks the binary searched; the sentence gives the real "
+            "reason the listing is binary-wide"
+        ),
+        "``value`` searches string CONTENT and returns each hit with its address + owning binary "
+        "(one-call locate); reference-site (which function uses a string) is not indexed — the "
+        "result says so honestly.": (
+            "the references are indexed, just not in this listing; the sentence says that"
+        ),
+    },
+    "get_functions_referencing_string": {
+        "The schema indexes no string->function link, but functions.pseudocode is stored in "
+        'full, so this answers "which functions mention this text".': (
+            "the schema does record resolved string references (string_refs); the sentence names "
+            "get_string_reference_anchors, which reads them"
         ),
     },
 }
@@ -1259,7 +1275,7 @@ def test_the_new_texts_are_neutral(tools: dict[str, Callable[..., Any]]) -> None
         for n in cards.TOOL_CARDS
     ]
     texts.append(json.dumps(tools["get_tool_reference"]()))
-    texts.append(" ".join(("required", "minimal_call", "reference", "param_renamed")))
+    texts.append(" ".join(("required", "minimal_call", "reference")))
     texts.append(json.dumps(sorted(tools["get_tool_reference"](name="get_strings"))))
     for text in texts:
         assert not listed_words_in(text)
@@ -1384,22 +1400,25 @@ def test_a_name_with_no_match_says_so_apart_from_an_address_with_none(
     assert align(_DIFF, "0x7000")["presence"] == one_sided["presence"]
 
 
-def test_the_old_name_addr_still_works_once_and_says_so(
-    tools: dict[str, Callable[..., Any]],
+def test_the_old_name_addr_is_refused_and_the_refusal_names_function(
+    atlas: Path, tools: dict[str, Callable[..., Any]]
 ) -> None:
-    """MUTATION (verified RED, 2 failed): stop accepting addr -> RED."""
+    """``addr`` was the old name of ``function``; it is no longer accepted, and a call still
+    written with it is refused by the hook with the new name offered, never run with the target
+    dropped.
+
+    MUTATION (verified RED, 1 failed): drop "addr" from the parameter-synonym table -> RED (the
+    refusal offers nothing)."""
+    server = mcp_app.build_server(atlas)
+    with pytest.raises(ToolError) as old:
+        _call(server, "get_function_alignment", {"diff_id": _DIFF, "addr": "0x1000"})
+    first = str(old.value).split("\n", 1)[0]
+    assert "unknown parameter 'addr'" in first and first.endswith("did you mean 'function'?")
+    assert "addr" not in inspect.signature(tools["get_function_alignment"]).parameters
     align = tools["get_function_alignment"]
-    old = align(_DIFF, addr="0x1000")
-    new = align(_DIFF, function="0x1000")
-    assert old.get("param_renamed", {}).get("to") == "function" and "param_renamed" not in new
-    old.pop("param_renamed")
-    assert old == new
-    both = align(_DIFF, function="uniq_fn", addr="0x1000")
-    assert "not both" in both["error"]
-    neither = align(_DIFF)
-    assert "pass function=" in neither["error"]
+    assert "pass function=" in align(_DIFF)["error"]
     assert "pass function=" in align(_DIFF, function="  ")["error"]
-    side = align(_DIFF, function="uniq_fn", addr="0x1000", side="B")
+    side = align(_DIFF, function="uniq_fn", side="B")
     assert "'a' or 'b'" in side["error"]  # side is still checked first
 
 

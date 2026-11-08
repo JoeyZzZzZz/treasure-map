@@ -565,18 +565,34 @@ def test_unfinished_decompiles_are_named_with_what_remains(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize(
-    ("status", "error", "cause"),
-    [("timeout", None, "timeout"), ("error", "payload_exceeded", "payload_exceeded")],
+    ("status", "error", "cause", "said"),
+    [
+        ("timeout", None, "timeout", "its decompile did not finish either (timeout)"),
+        (
+            "error",
+            "payload_exceeded",
+            "payload_exceeded",
+            "its decompile did not finish either (payload_exceeded)",
+        ),
+        # A design-skipped micro-function never ran a decompile: no pseudocode, and not "did not
+        # finish" either.
+        ("skipped_micro", None, "skipped_micro", "it has no pseudocode either (skipped_micro)"),
+    ],
 )
-def test_a_counterpart_whose_decompile_did_not_finish_either_has_no_count(
-    tmp_path: Path, status: str, error: str | None, cause: str
+def test_a_counterpart_with_no_pseudocode_has_no_count(
+    tmp_path: Path, status: str, error: str | None, cause: str, said: str
 ) -> None:
-    """★ The same function did not finish on the other side either: it has no pseudocode there,
-    so its 0 is not measured — no candidate count is given, the cause is named, and the line never
-    says it holds 0 (even with no instance on that side).
+    """★ The same function has no pseudocode on the other side either (its decompile did not
+    finish, or a micro-function was skipped by design): its 0 is not measured — no candidate count
+    is given, the cause is named, and the line never says it holds 0 (even with no instance on
+    that side).
 
     MUTATION (verified RED): count the candidates whatever the other side's decompile -> 0 ->
-    "holds 0" -> RED."""
+    "holds 0" -> RED.
+    MUTATION (verified RED, 1 failed): withhold the count only for a decompile that ran and did
+    not finish (skipped_micro counted) -> "holds 0" -> RED.
+    MUTATION (verified RED, 1 failed): word a skipped_micro counterpart like an unfinished one
+    ("did not finish either") -> RED."""
     db, atlas = _gap_world(tmp_path, other_status=status, other_error=error)
     atlas.execute("DELETE FROM instance")
     got = gaps.unfinished_decompiles(db, atlas=atlas, run_id="new")
@@ -587,7 +603,7 @@ def test_a_counterpart_whose_decompile_did_not_finish_either_has_no_count(
     assert c.get("counterpart_decompile") == cause
     line = gaps.describe(big)
     assert "holds 0" not in line and "candidate(s)" not in line
-    assert f"did not finish either ({cause})" in line
+    assert f"(00400a00, aligned): {said} — no candidate count" in line
 
 
 def test_a_counterpart_whose_decompile_cannot_be_read_keeps_its_count_and_says_so(
