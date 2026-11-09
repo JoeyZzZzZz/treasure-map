@@ -952,7 +952,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "or anchor_unresolved; a promoted one carries promoted_from. Stale rows are surfaced, "
             "never dropped. These are AGENT decisions on the overlay, not tool facts. "
             "anchor_kind='diff_subject' lists your diff judgments instead (run_id is then a run "
-            "pair, with review_progress)."
+            "pair, with review_progress). Paged (limit / offset; follow next_offset until null), "
+            "in the order the judgments were first written; the counts cover every row."
         ),
     ),
     "clear_overlay": ToolCard(
