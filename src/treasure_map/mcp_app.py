@@ -3204,11 +3204,14 @@ def make_tools(
             holder["upstream"] = lab
 
     def _start_pair_review(
-        run_pair: str, limit: Any, worker: Any, workers: Any, unit: Any, k: Any
+        run_pair: str, limit: Any, worker: Any, workers: Any, unit: Any, k: Any, sweep: Any
     ) -> dict[str, Any]:
         bad = _pair_review_args(limit, worker, workers, unit, k)
+        if bad is None and sweep is not None and not isinstance(sweep, bool):
+            bad = f"sweep must be true or false, got {sweep!r}"
         if bad is not None:
             return {"run_pair": run_pair, "error": bad}
+        sweeping = bool(sweep)
         kk = _ru.DEFAULT_K if k is None else int(k)
         server, _moved = _server_block()
         atlas = open_atlas(atlas_path)
@@ -3281,11 +3284,12 @@ def make_tools(
                 if workers is not None
                 else None
             )
-            nxt = review.next_unit(worker, workers, session=_session_id())
+            nxt = review.next_unit(worker, workers, session=_session_id(), sweep=sweeping)
             out["workflow"] = _PAIR_WORKFLOW
             out["full_list"] = f"tmap review report {run_pair} --md -o <file>.md"
             if nxt is None:
                 out["next_unit"] = None
+                out["coverage_offer"] = _coverage_offer(review, worker, workers, sweeping)
                 return out
             out["next_unit"] = {
                 **_unit_head(nxt, states),
@@ -3313,6 +3317,7 @@ def make_tools(
         workers: int | None = None,
         unit: str | None = None,
         k: int | None = None,
+        sweep: bool | None = None,
     ) -> dict[str, Any]:
         """START HERE for the whole pair with ``run_pair`` (exactly one of diff_id / run_pair): its
         review cut into work units (below). START HERE for one diff: the entries to read first and
@@ -3362,6 +3367,14 @@ def make_tools(
         change_inconclusive or concluded), with its ``unit_id`` and its ``material``. Units are
         handed out round robin by position: round r takes the r-th entry of every diff (each in
         its own default order), of the binary_presence binaries and of the changed files.
+        By default ``next_unit`` is drawn from the must-read units only (the reduce among them):
+        once none is left in the shard, ``next_unit`` is null and ``coverage_offer`` says, as
+        facts, how much of the second tier is unread (``second_tier``: its units, members and
+        members by bucket), what no unit can reach, ``basis_incomplete``,
+        ``evidence_reads_cut`` (this session's fact-tool readings left on a cut page, per
+        session) and the reduce still owed in this shard. ``sweep=true`` hands out the second
+        tier too, after the must-read units; a write naming its unit hands on the next unit as
+        the session's last start_diff_review(run_pair) asked.
         ``worker`` / ``workers`` (both or neither) keep one shard: the units whose id's first 8 hex
         digits, as an integer, are worker modulo workers. ``unit=<unit_id>`` returns that one unit:
         its members with their review state and verdict, and its material. Judge each member with
@@ -3412,12 +3425,12 @@ def make_tools(
                 "run_pair": run_pair,
             }
         if run_pair is not None:
-            return _start_pair_review(run_pair, limit, worker, workers, unit, k)
+            return _start_pair_review(run_pair, limit, worker, workers, unit, k, sweep)
         assert diff_id is not None
-        if any(v is not None for v in (worker, workers, unit, k)):
+        if any(v is not None for v in (worker, workers, unit, k, sweep)):
             return {
                 "diff_id": diff_id,
-                "error": "worker, workers, unit and k apply to run_pair only",
+                "error": "worker, workers, unit, k and sweep apply to run_pair only",
             }
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
             return {
@@ -5862,13 +5875,19 @@ def make_tools(
                 extra["shard"] = {"worker": worker, "workers": workers, "inferred": True}
         elif workers is not None:
             extra["shard"] = {"worker": worker, "workers": workers}
+        sweeping, why = _session_sweep(pair)
+        if sweeping:
+            extra["sweep"] = {"on": True, "inferred": True}
+        elif why is not None:
+            extra["sweep"] = {"on": False, "why": why}
         used += len(json.dumps(extra))
-        nxt = review.next_unit(worker, workers, session=_session_id())
+        nxt = review.next_unit(worker, workers, session=_session_id(), sweep=sweeping)
         if nxt is None:
             return {
                 **extra,
                 "next_unit": None,
                 "coverage_statement": review.report["coverage_statement"],
+                "coverage_offer": _coverage_offer(review, worker, workers, sweeping),
             }
         states = review.progress.states
         head: dict[str, Any] = {
@@ -5890,6 +5909,34 @@ def make_tools(
             atlas, review, nxt, head, lambda: used + len(json.dumps({"next_unit": head})), room
         )
         return {**extra, "next_unit": head}
+
+    def _session_sweep(pair: str) -> tuple[bool, str | None]:
+        """Whether this session's last answered start_diff_review(run_pair=pair) asked for the
+        second tier (``sweep``) — a write naming its unit hands on the next unit of the same
+        reading — and, when there is no tool-call log to read it from, why the default (the
+        must-read units only) is used."""
+        from treasure_map.lib.query import read_basis as _rb
+
+        lines = _rb.session_lines(call_log)
+        if lines is None:
+            return False, "no tool-call log for this session: the must-read units only (default)"
+        for ln in reversed(lines):
+            params = ln.get("params") or {}
+            if ln.get("tool") != "start_diff_review" or ln.get("error"):
+                continue
+            if params.get("run_pair") != pair or params.get("unit") is not None:
+                continue
+            return params.get("sweep") is True, None
+        return False, None
+
+    def _coverage_offer(review: Any, worker: Any, workers: Any, sweeping: bool) -> dict[str, Any]:
+        """The review's coverage at its stop (review_units.coverage_offer), with this session's
+        evidence reads left cut (read from the tool-call log, so only here)."""
+        from treasure_map.lib.query import read_basis as _rb
+
+        offer = _ru.coverage_offer(review, worker=worker, workers=workers, sweep=sweeping)
+        offer["evidence_reads_cut"] = _rb.evidence_reads_cut(_rb.session_lines(call_log))
+        return offer
 
     def _session_shard(pair: str) -> tuple[int | None, int | None]:
         """The shard this session's last answered start_diff_review(run_pair=pair) call asked for

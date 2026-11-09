@@ -584,6 +584,15 @@ def worksheet(conn: sqlite3.Connection, reading: Any, run_pair: str) -> dict[str
     help="How many first entries of each diff are must-read (default 4).",
 )
 @click.option(
+    "--until",
+    "until",
+    default="must_read",
+    show_default=True,
+    type=click.Choice(["must_read", "complete"]),
+    help="must_read: hand out the must-read units only, then stop and say how much of the second "
+    "tier is unread; complete: the second tier too, after them.",
+)
+@click.option(
     "--handoff",
     "handoff_out",
     default=None,
@@ -603,12 +612,14 @@ def run(
     worker: int | None,
     workers: int | None,
     k: int | None,
+    until: str,
     handoff_out: str | None,
     atlas_db: str | None,
 ) -> None:
     """Review RUN_PAIR unit by unit, one launch of your agent per unit: tmap runs the loop and
     calls no model itself. A unit counts only when the overlay's history holds a judgement naming
-    it for every member. Ends when no unit is left, or at a limit."""
+    it for every member. Ends when no unit is left, or at a limit. By default only the must-read
+    units are handed out (--until must_read); --until complete hands out the second tier too."""
     import tempfile
 
     from treasure_map.lib import review_driver as rd
@@ -670,6 +681,7 @@ def run(
         retries=rd.DEFAULT_RETRIES if retries is None else retries,
         pair_staleness=staleness,
         echo=click.echo,
+        until=until,
     )
     click.echo(
         f"units tried {result.units_tried}, done {result.units_done}, failed "
@@ -679,8 +691,17 @@ def run(
         click.echo(f"  failed {f['unit_id']} ({f['kind']}): {f['written']}/{f['members']} written")
     if result.statement:
         click.echo(result.statement)
+    if result.offer is not None:
+        second = result.offer["second_tier"]
+        click.echo(
+            f"second tier: {second['members']} member(s) in {second['units']} unit(s) not judged "
+            f"(by bucket {second['by_bucket']})"
+            + (" — read them with --until complete" if result.offer["continue_with"] else "")
+            + f"; must_read_complete {result.offer['must_read_complete']}, complete "
+            f"{result.offer['complete']}"
+        )
     if handoff_out is not None:
-        if result.stopped != "no unit left" or result.failed:
+        if not result.finished or result.failed:
             click.echo(
                 f"hand-off skipped: the review is not done ({result.stopped}); re-run without a "
                 "limit, then write the hand-off"

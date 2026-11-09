@@ -1644,7 +1644,11 @@ def _patch_run(
     def drive(*a: Any, **k: Any) -> rd.DriveResult:
         calls["drive"].append(a)
         return rd.DriveResult(
-            units_tried=1, units_done=1, stopped=stopped, failed=list(failed or [])
+            units_tried=1,
+            units_done=1,
+            stopped=stopped,
+            failed=list(failed or []),
+            finished=stopped in ("no unit left", "no must-read unit left"),
         )
 
     def run_handoff(*a: Any, **k: Any) -> dict[str, Any]:

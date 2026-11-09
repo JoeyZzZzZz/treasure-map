@@ -85,6 +85,8 @@ def _agent(w: Any, judge: str = "all", calls: list[list[str]] | None = None) -> 
 
 
 def _drive(w: Any, tmp: Path, runner: Any, **kw: Any) -> rd.DriveResult:
+    """A drive over every unit (``until="complete"``) unless the test asks otherwise: these tests
+    are of the loop itself, written when every unit was handed out."""
     return rd.drive(
         w.path,
         "runA",
@@ -94,7 +96,7 @@ def _drive(w: Any, tmp: Path, runner: Any, **kw: Any) -> rd.DriveResult:
         k=50,
         runner=runner,
         echo=lambda s: None,
-        **kw,
+        **{"until": "complete", **kw},
     )
 
 
@@ -208,6 +210,7 @@ def test_a_unit_judged_one_member_per_launch_is_handed_out_until_disposed(
         retries=0,
         runner=_one_listed_member_agent(w, 0, launches),
         echo=lambda s: None,
+        until="complete",  # its batch is second tier (k=0)
     )
     assert result.failed == [] and result.stopped == "no unit left", result
     assert launches[batch.unit_id] == len(batch.members)
@@ -263,6 +266,7 @@ def test_a_unit_handed_out_again_is_not_launched_past_max_minutes(
         max_minutes=1,
         runner=slow,
         echo=lambda s: None,
+        until="complete",  # its batch is second tier (k=0)
     )
     assert launches == {batch.unit_id: 1}, launches
     assert result.stopped == "max_minutes 1 reached", result
@@ -314,6 +318,7 @@ def test_a_unit_written_but_read_as_needs_recheck_is_not_done(
         retries=1,
         runner=unread,
         echo=lambda s: None,
+        until="complete",  # its batch is second tier (k=0)
     )
     assert result.units_done == 0 and len(calls) == 2
     assert [f["unit_id"] for f in result.failed] == [batch.unit_id]

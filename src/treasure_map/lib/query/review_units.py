@@ -31,10 +31,15 @@ judgement written having read only part of them is counted under ``basis_incompl
 written having read the subject itself only in part by a tool that pages it (a function's
 pseudocode, disassembly or callees, a file's line difference: ``read_partial``). The listed
 entries
-outside the set are the second tier, handed out in batches per diff and bucket: the set orders
-what is read first and says when the must-read part is done; it is not a part that may be skipped.
+outside the set are the second tier, cut into batches per diff and bucket. By default only the
+must-read units are handed out (with the reduce, and the audits as they are): the review stops when
+no must-read unit is left, and the report says how much of the second tier is unread
+(``coverage_offer``) — it is not read as "nothing found". The second tier is handed out on request
+(``sweep``, the command line's ``--until complete``), only after every must-read unit, in the same
+order (``dispatch_order``); asking for it moves no entry into or out of either part.
 
-Order (dispatch): round robin by position. Each diff is a stream of its entries in its own default
+Order (dispatch): the must-read units first, then (on request) the second tier; within each, round
+robin by position. Each diff is a stream of its entries in its own default
 (significance) order; the binary_presence binaries and the changed files are two more streams.
 Round r hands out the r-th item of every stream before any (r+1)-th — no significance is compared
 across diffs, so the order is computable and deterministic. A unit takes the position of its first
@@ -918,22 +923,101 @@ def unit_disposed(u: Unit, states: dict[str, str]) -> bool:
     return all(disposed(states.get(m.anchor_ref)) for m in u.members)
 
 
+def dispatch_order(units: list[Unit], *, sweep: bool) -> list[Unit]:
+    """The units handed out, in the order they are: the must-read units (the reduce included) and
+    the audits, as they are handed out either way, in ``Unit.order``; then — only with ``sweep`` —
+    the second tier, in the same order. A second-tier unit never comes before a must-read one
+    that is still owed: the second tier is read once the must-read part is done."""
+    first = [u for u in units if u.must_read or u.kind == AUDIT]
+    if not sweep:
+        return first
+    return first + [u for u in units if not (u.must_read or u.kind == AUDIT)]
+
+
 def next_unit(
     units: list[Unit],
     states: dict[str, str],
     worker: int | None = None,
     workers: int | None = None,
     skip: frozenset[str] = frozenset(),
+    *,
+    sweep: bool,
 ) -> Unit | None:
     """The first unit, in the order they are handed out, of this shard with a member not yet
     disposed — ``skip`` names units not to hand out here (the audits of the asking session's own
-    judgements, which it cannot read blind)."""
-    for u in units:
+    judgements, which it cannot read blind). Without ``sweep`` the second tier is not handed out;
+    with it, only after every must-read unit (``dispatch_order``). Every caller says which."""
+    for u in dispatch_order(units, sweep=sweep):
         if u.unit_id in skip:
             continue
         if in_shard(u.unit_id, worker, workers) and not unit_disposed(u, states):
             return u
     return None
+
+
+def coverage_offer(
+    review: PairReview,
+    *,
+    worker: int | None,
+    workers: int | None,
+    sweep: bool,
+) -> dict[str, Any]:
+    """What a review stopped at its last unit hands over (facts only, no prediction): the stop's
+    ``scope`` (this shard, or the whole pair), how many listed subjects are disposed and unjudged
+    (the pair's ``all_listed``), the second tier of the scope still to read (its undisposed units
+    and members, by bucket — what ``sweep`` would hand out; none left once it was handed out),
+    what no unit can reach, the judgements written on a basis read in part, and the reduce still
+    owed. The reduce is one unit of the pair, held by one shard: with shards, only the shard that
+    holds it says how much it owes (``reduce_owed_in_this_shard``), every other one says null."""
+    rep = review.report
+    states = review.progress.states
+    second = [
+        u
+        for u in review.units
+        if u.kind == SECOND_TIER
+        and in_shard(u.unit_id, worker, workers)
+        and not unit_disposed(u, states)
+    ]
+    members = [m for u in second for m in u.members if not disposed(states.get(m.anchor_ref))]
+    by_bucket: dict[str, int] = {}
+    for m in members:
+        by_bucket[m.bucket or "-"] = by_bucket.get(m.bucket or "-", 0) + 1
+    reduce_id = unit_id(REDUCE, [dr.run_pair(review.facts.run_a, review.facts.run_b)])
+    owed = rep["reduce"]["owed"]
+    holds_reduce = in_shard(reduce_id, worker, workers)
+    nr = rep["not_reachable"]
+    return {
+        "scope": "shard" if workers is not None else "pair",
+        "disposed": rep["all_listed"]["disposed"],
+        "unseen": rep["all_listed"]["unjudged"],
+        "second_tier": {
+            "units": len(second),
+            "members": len(members),
+            "by_bucket": dict(sorted(by_bucket.items())),
+            "why": (
+                "the listed entries the must-read predicate "
+                f"({PREDICATE_VERSION}, k={review.k}) did not select, cut into batches per diff "
+                "and bucket"
+            ),
+            "handed_out": sweep,
+        },
+        "not_reachable": {
+            "failed_diffs": len(nr["failed_diffs"]),
+            "withheld_diffs": len(nr["withheld_diffs"]),
+            "not_diffed_binaries": bool(nr["not_diffed_binaries"]),
+            "non_binary_files_unavailable": nr["non_binary_files_unavailable"],
+        },
+        "basis_incomplete": rep["basis_incomplete"]["count"],
+        "reduce_owed_in_this_shard": owed if holds_reduce else None,
+        "reduce_note": (
+            "the reduce is one unit of the pair; with shards only the shard holding it counts it"
+        ),
+        "must_read_complete": rep["must_read_complete"],
+        "complete": rep["complete"],
+        "continue_with": None
+        if sweep or not second
+        else "sweep=true (start_diff_review) / --until complete (tmap review run)",
+    }
 
 
 # ── the report ──────────────────────────────────────────────────────────────────────────────
@@ -1201,15 +1285,17 @@ class PairReview:
         worker: int | None = None,
         workers: int | None = None,
         session: str | None = None,
+        *,
+        sweep: bool,
     ) -> Unit | None:
         """The next unit of the shard; an audit of a judgement ``session`` wrote is not handed
-        back to it (it cannot read it blind)."""
+        back to it (it cannot read it blind). ``sweep`` hands out the second tier too."""
         skip = frozenset(
             a.unit.unit_id
             for a in self.audits.open
             if session is not None and a.write_session == session
         )
-        return next_unit(self.units, self.progress.states, worker, workers, skip)
+        return next_unit(self.units, self.progress.states, worker, workers, skip, sweep=sweep)
 
 
 def review_pair(
@@ -1256,9 +1342,14 @@ def review_pair(
     owed = read_reduce(atlas, facts, units)
     extra = [a.unit for a in audits.open]
     if owed and all(
-        unit_disposed(u, progress.states) for u in units if u.kind not in (AUDIT, REDUCE)
+        unit_disposed(u, progress.states)
+        for u in units
+        if u.kind not in (AUDIT, REDUCE) and u.must_read
     ):
-        # Handed out once every other unit is disposed (the must-read set and the second tier).
+        # Handed out once every must-read subject unit is disposed (a callee group is one), the
+        # second tier or not: the second tier is handed out only on request, so a gate waiting
+        # on it would leave the must-read part never complete. With the second tier asked for,
+        # the reduce still comes after it (its position is past every other unit's).
         # Its id is the pair's (and the predicate's), not its owed members': judging one of them
         # leaves the same unit, so its other members — of any diff — are written with the id it
         # was handed out with.

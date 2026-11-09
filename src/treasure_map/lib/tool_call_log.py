@@ -79,6 +79,7 @@ KEY_PARAMS: frozenset[str] = frozenset(
         "hunk_offset",
         "ko_offset",
         "members_offset",
+        "sweep",
     }
 )
 

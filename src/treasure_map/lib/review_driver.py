@@ -44,6 +44,8 @@ from treasure_map.lib import tool_call_log as tcl
 from treasure_map.lib.query import review_report as _rr
 from treasure_map.lib.query import review_units as ru
 
+# How far a drive goes: the must-read units (the default), or every unit (the second tier too).
+UNTIL = ("must_read", "complete")
 DEFAULT_TIMEOUT = 15 * 60
 DEFAULT_RETRIES = 2
 SERVER_NAME = "treasure-map"
@@ -377,6 +379,10 @@ class DriveResult:
     failed: list[dict[str, Any]] = field(default_factory=list)
     stopped: str | None = None
     statement: str | None = None
+    # No unit of the asked-for scope is left to hand out (``until``): the review is done there.
+    finished: bool = False
+    # The coverage at the stop (review_units.coverage_offer), when the drive read one.
+    offer: dict[str, Any] | None = None
 
 
 def _log(path: Path, line: dict[str, Any]) -> None:
@@ -416,12 +422,17 @@ def drive(
     pair_staleness: dict[str, Any] | None = None,
     runner: Callable[..., Launch] = run_agent,
     echo: Callable[[str], None] = print,
+    until: str = "must_read",
 ) -> DriveResult:
     """Hand the pair's units out until none is left (or a limit is reached): a unit is launched
     again while each launch disposes a new member, and retried only on a launch that disposes
-    none; see the module docstring."""
+    none; see the module docstring. ``until`` = ``must_read`` (the default) hands out the
+    must-read units only (and the reduce); ``complete`` the second tier too, after them."""
     from treasure_map.lib.atlas.connection import open_atlas
 
+    if until not in UNTIL:
+        raise ValueError(f"until must be one of {list(UNTIL)}, got {until!r}")
+    sweep = until == "complete"
     run_pair = f"{run_a}::{run_b}"
     log_path = tcl.log_path_for(atlas_path).with_name(DRIVER_LOG)
     out = DriveResult()
@@ -444,7 +455,7 @@ def drive(
             nxt = next(
                 (
                     u
-                    for u in review.units
+                    for u in ru.dispatch_order(review.units, sweep=sweep)
                     if u.unit_id not in skip
                     and ru.in_shard(u.unit_id, worker, workers)
                     and not ru.unit_disposed(u, review.progress.states)
@@ -453,7 +464,9 @@ def drive(
             )
             out.statement = review.report["coverage_statement"]
             if nxt is None:
-                out.stopped = "no unit left"
+                out.stopped = "no unit left" if sweep else "no must-read unit left"
+                out.finished = True
+                out.offer = ru.coverage_offer(review, worker=worker, workers=workers, sweep=sweep)
                 break
             mark = history_mark(atlas)
         finally:

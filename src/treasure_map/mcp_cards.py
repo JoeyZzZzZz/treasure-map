@@ -1412,6 +1412,7 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             ("anchored_micro_side", "only the anchored micro-side pairs", "get_diff_patch_view"),
             ("unit", "one work unit's unit_id", "start_diff_review"),
             ("k", "how many first entries per diff are must-read", "start_diff_review"),
+            ("sweep", "hand out the second tier too", "start_diff_review"),
             ("rows_limit", "how many rows an entry carries inline", "get_diff_patch_view"),
             ("dimension", "a delta dimension", "get_diff_deltas"),
             ("delta_kind", "a delta kind", "get_diff_deltas"),

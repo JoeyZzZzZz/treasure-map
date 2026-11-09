@@ -418,7 +418,7 @@ def test_a_judged_member_is_disposed_and_the_next_unit_moves_on(
     open audit leave must_read_complete true -> RED."""
     monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
     r = _review(world, k=0)
-    first = r.next_unit()
+    first = r.next_unit(sweep=True)
     assert first is not None and first.members[0].entry_id == "pair:00001000:00001000"
     assert r.report["must_read_complete"] is False
     writer = overlay.WriteContext(channel="mcp", session="writer")
@@ -427,9 +427,9 @@ def test_a_judged_member_is_disposed_and_the_next_unit_moves_on(
     r = _review(world, k=0)
     # Its audit follows it at once — but not for the session that wrote it (it cannot read it
     # blind): that session moves on.
-    audit = r.next_unit()
+    audit = r.next_unit(sweep=True)
     assert audit is not None and audit.kind == ru.AUDIT
-    nxt = r.next_unit(session="writer")
+    nxt = r.next_unit(session="writer", sweep=True)
     assert nxt is not None and nxt.members[0].entry_id != first.members[0].entry_id
     must = [m for u in r.units if u.must_read and u.kind != ru.AUDIT for m in u.members]
     for m in must:
@@ -1623,9 +1623,9 @@ def test_a_refused_k_is_not_the_sessions_k(tmp_path: Path, monkeypatch: pytest.M
     unit is still an entry -> RED."""
     w = _wide_world(tmp_path, monkeypatch, 8)
     server = mcp_app.build_server(w.path)
-    bad = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 201})
+    bad = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 201})
     assert "error" in bad, bad
-    nxt = _server_call(server, "start_diff_review", {"run_pair": PAIR})["next_unit"]
+    nxt = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True})["next_unit"]
     for _ in range(4):
         assert nxt is not None and nxt["kind"] == "entry"
         _read_unit(server, nxt["unit_id"], None)
@@ -1906,7 +1906,9 @@ def test_a_cut_batch_reads_only_the_members_its_material_showed(
     w = _hex_world(tmp_path, monkeypatch, 60)
     monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 12_000)
     server = mcp_app.build_server(w.path)
-    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 0})[
+        "next_unit"
+    ]
     listed = {e["entry_id"] for e in nu["material"]["entries"]}
     unit = _review(w, k=0).unit(nu["unit_id"])
     assert unit is not None
@@ -1975,7 +1977,9 @@ def test_every_answer_carrying_a_units_material_keeps_to_the_byte_budget(
     monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", page)
     server = mcp_app.build_server(w.path)
     budget = mcp_app._RESPONSE_BYTE_BUDGET
-    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 1})["next_unit"]
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 1})[
+        "next_unit"
+    ]
     args = {**_judge_args(nu["members"][0], nu["unit_id"])}
     sizes: dict[str, int] = {}
     for kind in ("write", "overwrite"):
@@ -1995,13 +1999,15 @@ def test_every_answer_carrying_a_units_material_keeps_to_the_byte_budget(
     alone = _server_call(
         server,
         "start_diff_review",
-        {"run_pair": PAIR, "unit": batch["next_unit"]["unit_id"], "k": 1},
+        {"run_pair": PAIR, "sweep": True, "unit": batch["next_unit"]["unit_id"], "k": 1},
     )
     assert "material" in alone, alone
     _assert_page_members(alone)
     sizes["unit"] = len(json.dumps(alone))
     sizes["start"] = len(
-        json.dumps(_server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 1}))
+        json.dumps(
+            _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 1})
+        )
     )
     assert all(size <= budget for size in sizes.values()), sizes
 
@@ -2068,9 +2074,11 @@ def test_a_refused_call_asking_an_in_range_k_sets_nothing(
     read at k=8 -> the fifth unit is still an entry -> RED."""
     w = _wide_world(tmp_path, monkeypatch, 8)
     server = mcp_app.build_server(w.path)
-    bad = _server_call(server, "start_diff_review", {"run_pair": PAIR, "unit": "nope", "k": 8})
+    bad = _server_call(
+        server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "unit": "nope", "k": 8}
+    )
     assert "error" in bad, bad
-    nxt = _server_call(server, "start_diff_review", {"run_pair": PAIR})["next_unit"]
+    nxt = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True})["next_unit"]
     for _ in range(4):
         assert nxt is not None and nxt["kind"] == "entry"
         _read_unit(server, nxt["unit_id"], None)
@@ -2274,11 +2282,13 @@ def test_every_hand_out_of_a_batch_names_the_members_its_page_shows(
     w = _hex_world(tmp_path, monkeypatch, 200)
     monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", budget)
     server = mcp_app.build_server(w.path)
-    head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
+    head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 0})
     nu = head["next_unit"]
     assert nu["kind"] == ru.SECOND_TIER and nu["members_total"] == ru.BATCH_UNIT_MAX
     alone = _server_call(
-        server, "start_diff_review", {"run_pair": PAIR, "unit": nu["unit_id"], "k": 0}
+        server,
+        "start_diff_review",
+        {"run_pair": PAIR, "sweep": True, "unit": nu["unit_id"], "k": 0},
     )
     wrote = _server_call(server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"]))
     for answer, holder in ((head, nu), (alone, alone), (wrote, wrote["next_unit"])):
@@ -2580,13 +2590,17 @@ def test_a_batch_member_whose_hunk_was_withheld_is_not_read_whole_and_counts_inc
     target = unit.members[0]
     _withhold_hunk(monkeypatch, str(target.entry_id))
     server = mcp_app.build_server(w.path)
-    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 0})[
+        "next_unit"
+    ]
     assert nu["unit_id"] == unit.unit_id
     assert target.entry_id in {m["entry_id"] for m in nu["members"]}  # listed
     m = {"anchor_ref": target.anchor_ref}
     got = _server_call(server, "annotate_diff", _judge_args(m, nu["unit_id"]))
     assert got["read_basis"] == {"basis": "none", "unread_before_verdict": False}
-    rep = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["report"]
+    rep = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 0})[
+        "report"
+    ]
     assert rep["basis_incomplete"]["count"] == 1
     assert rep["basis_incomplete"]["subjects"] == [target.anchor_ref]
     assert "basis incomplete 1;" in rep["coverage_statement"]
@@ -2642,7 +2656,7 @@ def test_a_write_naming_no_shard_hands_on_the_shard_its_session_asked_for(
     the next unit may fall outside the shard -> RED."""
     w = _hex_world(tmp_path, monkeypatch, 200)
     server = mcp_app.build_server(w.path)
-    start = {"run_pair": PAIR, "k": 0, "worker": 1, "workers": 3}
+    start = {"run_pair": PAIR, "sweep": True, "k": 0, "worker": 1, "workers": 3}
     nu = _server_call(server, "start_diff_review", start)["next_unit"]
     assert ru.in_shard(nu["unit_id"], 1, 3)
     got = _server_call(server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"]))
@@ -2663,11 +2677,13 @@ def test_a_unit_read_between_the_sharded_overview_and_the_write_keeps_the_shard(
     RED."""
     w = _hex_world(tmp_path, monkeypatch, 200)
     server = mcp_app.build_server(w.path)
-    start = {"run_pair": PAIR, "k": 0, "worker": 1, "workers": 3}
+    start = {"run_pair": PAIR, "sweep": True, "k": 0, "worker": 1, "workers": 3}
     nu = _server_call(server, "start_diff_review", start)["next_unit"]
     assert nu is not None and ru.in_shard(nu["unit_id"], 1, 3)
     alone = _server_call(
-        server, "start_diff_review", {"run_pair": PAIR, "unit": nu["unit_id"], "k": 0}
+        server,
+        "start_diff_review",
+        {"run_pair": PAIR, "sweep": True, "unit": nu["unit_id"], "k": 0},
     )
     assert "material" in alone and alone.get("members"), sorted(alone)
     got = _server_call(server, "annotate_diff", _judge_args(alone["members"][0], nu["unit_id"]))

@@ -301,6 +301,41 @@ def infer(
     return {"basis": "none"}
 
 
+# The evidence reads ``evidence_reads_cut`` counts: the fact tools about a subject (not the reads of
+# a subject itself, which the read basis weighs), and the diff's row overlay.
+_EVIDENCE_TOOLS = (BLIND_SAFE_TOOLS | {"get_diff_sink_overlay"}) - _FETCH_BY_FUNCTION
+# A page's own place in its reading — not what the reading is of.
+_PAGE_PARAMS = frozenset(
+    {"offset", "limit", "members_offset", "hunk_offset", "ko_offset", "rows_offset", "rows_limit"}
+)
+
+
+def evidence_reads_cut(lines: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """How many of this session's evidence readings were left on a cut page: a reading is one
+    fact tool's calls with the same parameters but for the page's own place (offset and the like);
+    it is left cut when every page of it this session read came back cut (a continuation, or cut
+    to fit) — none reached its end. Counted per session, never per pair or subject: a log line
+    names no run pair. None when there is no log (unknown, never 0)."""
+    if lines is None:
+        return None
+    readings: dict[tuple[Any, ...], bool] = {}
+    for ln in lines:
+        tool = ln.get("tool")
+        if tool not in _EVIDENCE_TOOLS or ln.get("error"):
+            continue
+        params = ln.get("params") or {}
+        key = (tool, *sorted((k, str(v)) for k, v in params.items() if k not in _PAGE_PARAMS))
+        readings[key] = readings.get(key, True) and bool(ln.get("truncated"))
+    return {
+        "count": sum(1 for cut in readings.values() if cut),
+        "readings": len(readings),
+        "scope": (
+            "this server session's fact-tool readings (a reading is read on once a page of it "
+            "came back uncut); a log line names no run pair, so this is per session"
+        ),
+    }
+
+
 def blind(
     lines: list[dict[str, Any]] | None,
     write_session: str | None,

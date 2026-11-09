@@ -105,7 +105,7 @@ def test_a_unit_handed_out_again_lists_only_the_members_still_owed(
     ones (``found.sort`` by disposed, as before) -> sixteen listed -> RED."""
     w = _world(tmp_path, monkeypatch, 20, {})
     server = mcp_app.build_server(w.path)
-    nu = _call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    nu = _call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 0})["next_unit"]
     assert nu["kind"] == ru.SECOND_TIER and nu["members_total"] == ru.BATCH_UNIT_MAX
     assert len(nu["members"]) == ru.BATCH_UNIT_MAX  # the precondition: one page holds them all
     uid = nu["unit_id"]
@@ -116,8 +116,12 @@ def test_a_unit_handed_out_again_lists_only_the_members_still_owed(
         wrote = _judge(server, anchor, uid)
     owed = [by_anchor[a] for a in members[10:]]
     again = wrote.get("next_unit") or {}
-    head = _call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
-    alone = _call(server, "start_diff_review", {"run_pair": PAIR, "unit": uid, "k": 0})
+    head = _call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 0})[
+        "next_unit"
+    ]
+    alone = _call(
+        server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "unit": uid, "k": 0}
+    )
     for label, holder in (("write", again), ("overview", head), ("unit", alone)):
         assert holder.get("unit_id", uid) == uid, label
         assert _ids(holder) == owed, (label, _ids(holder))
@@ -128,7 +132,9 @@ def test_a_unit_handed_out_again_lists_only_the_members_still_owed(
         assert holder["material"]["entries_truncated"] is False, label
     for anchor in members[10:]:
         _judge(server, anchor, uid)
-    done = _call(server, "start_diff_review", {"run_pair": PAIR, "unit": uid, "k": 0})
+    done = _call(
+        server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "unit": uid, "k": 0}
+    )
     assert sorted(_ids(done)) == sorted(by_anchor.values())
 
 
@@ -149,7 +155,7 @@ def test_a_batch_material_carries_its_members_candidate_rows(
     alone read partial -> RED."""
     w = _world(tmp_path, monkeypatch, 20, {"00000003": 35, "00000004": 5})
     server = mcp_app.build_server(w.path)
-    nu = _call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    nu = _call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 0})["next_unit"]
     big, small = "pair:00000003:00000003", "pair:00000004:00000004"
     assert _ids(nu) == [big, small], _ids(nu)  # the precondition: one batch holds the two
     entries = {e["entry_id"]: e for e in nu["material"]["entries"]}
@@ -245,7 +251,7 @@ def test_a_batch_member_read_on_only_for_its_first_page_reads_rows_partial(
     check (``if False:``) -> RED."""
     w = _world(tmp_path, monkeypatch, 20, {"00000003": 35, "00000004": 5})
     server = mcp_app.build_server(w.path)
-    nu = _call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    nu = _call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 0})["next_unit"]
     big = "pair:00000003:00000003"
     assert big in _ids(nu), _ids(nu)  # the precondition: the batch holds the 35-row member
     anchors = {m["entry_id"]: m["anchor_ref"] for m in nu["members"]}
