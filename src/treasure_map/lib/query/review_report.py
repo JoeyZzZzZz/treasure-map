@@ -26,6 +26,7 @@ from treasure_map.lib.query import dispatch_groups as dg
 from treasure_map.lib.query import review_navigation as _rn
 from treasure_map.lib.query import review_units as ru
 from treasure_map.lib.query import upstream_version as uv
+from treasure_map.lib.query.diff_workflow import PAIR_SIDES
 
 if TYPE_CHECKING:
     from treasure_map.lib.query.same_shape_siblings import SameShapeReads
@@ -1303,6 +1304,7 @@ def handoff_header(run_pair: str, n_findings: int) -> str:
         f"# Findings hand-off for {run_pair}\n\n"
         f"_{n_findings} changed_real finding(s). Each block carries tmap's facts and the "
         f"recorded judgment; the analysis is for a person to fill. {HANDOFF_BOUNDARY}_\n\n"
+        f"_{PAIR_SIDES}_\n\n"
     )
 
 

@@ -89,7 +89,17 @@ CHANGE_KINDS = (
     "constant_changed",
     "restructured",
     "unknown",
+    "feature_added",
+    "feature_removed",
 )
+
+# The reasons one class basis may give a batch of no_real_change judgements (annotate_diff_batch's
+# ``class_basis``): a closed set of mechanism names, so what a class says is neutral by
+# construction — no free text and no list of a vendor's strings decides it.
+CLASS_REASONS = ("date_literal", "version_literal", "build_path", "recompile_only")
+# What a class basis puts into each item's ``checked``: a plain-text note (not anchor-shaped, so it
+# is kept and does not count toward the anchor threshold).
+CLASS_CHECKED_PREFIX = "class:"
 
 # The base-map dimensions an annotation rests on. Snapshotted per sibling instance so a later read
 # can report which fact moved under a standing annotation. pattern_id keys the sibling: it is
@@ -232,6 +242,79 @@ def _validate_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | No
     if vb is not None:
         raise ConfigError(f"verdict_basis applies to safe / exploitable only, not {verdict!r}")
     return None
+
+
+def apply_class_basis(
+    items: list[Any], class_basis: Any
+) -> tuple[list[Any], list[tuple[int, str]]]:
+    """A batch's items with one ``class_basis`` applied — ``(items, errors)``; nothing applied when
+    there is any error. ``class_basis`` is ``{reason, why_unchanged, checked_text?}``: ``reason``
+    one of ``CLASS_REASONS``, ``why_unchanged`` non-blank, ``checked_text`` a list of non-blank
+    plain-text notes. It applies to ``no_real_change`` items only: an item of any other verdict is
+    refused, named, and so is the whole batch (a class shared by a changed_real is far likelier a
+    misread class than a slip). Into each item:
+
+    * ``why_unchanged`` — the class's, unless the item gives its own (the item's wins);
+    * ``checked`` — the item's own items, then ``class:<reason>``, then ``checked_text``, each
+      once: merged, never replaced. The class items are plain text, so each item still needs an
+      anchor of its own that resolves in its diff — the threshold is the write path's, unchanged.
+
+    What is stored is the ordinary ``{kind, checked, why_unchanged}``: a judgement written this way
+    reads like any other, its class named in its ``checked``. ``(i, message)`` errors carry the
+    item's index; an error about the class basis itself has index -1."""
+    if not isinstance(class_basis, dict):
+        return items, [(-1, f"class_basis must be an object; got {type(class_basis).__name__}")]
+    keys = {"reason", "why_unchanged", "checked_text"}
+    unknown = set(class_basis) - keys
+    if unknown:
+        return items, [(-1, f"class_basis takes {sorted(keys)} only; got {sorted(unknown)}")]
+    reason = class_basis.get("reason")
+    if reason not in CLASS_REASONS:
+        return items, [
+            (-1, f"class_basis.reason must be one of {list(CLASS_REASONS)}; got {reason!r}")
+        ]
+    why = class_basis.get("why_unchanged")
+    if not (isinstance(why, str) and why.strip()):
+        return items, [(-1, "class_basis.why_unchanged must be non-blank")]
+    text = class_basis.get("checked_text")
+    if text is None:
+        text = []
+    if not (isinstance(text, list) and all(isinstance(c, str) and c.strip() for c in text)):
+        return items, [(-1, "class_basis.checked_text must be a list of non-blank notes")]
+    errors = [
+        (
+            i,
+            "class_basis applies to no_real_change items only; this item is "
+            f"{item.get('verdict')!r}",
+        )
+        for i, item in enumerate(items)
+        if isinstance(item, dict) and item.get("verdict") != "no_real_change"
+    ]
+    if errors:
+        return items, errors
+    added = [CLASS_CHECKED_PREFIX + str(reason), *(c.strip() for c in text)]
+    out: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        own = item.get("checked")
+        merged = dict(item)
+        if own is None or isinstance(own, list):
+            seen: set[str] = set()
+            checked = []
+            for c in [*(own or []), *added]:
+                key = c.strip() if isinstance(c, str) else None
+                if key is None or key not in seen:  # a non-text item is the write path's to refuse
+                    if key is not None:
+                        seen.add(key)
+                    checked.append(c)
+            merged["checked"] = checked
+        own_why = item.get("why_unchanged")
+        if not (isinstance(own_why, str) and own_why.strip()):
+            merged["why_unchanged"] = why.strip()
+        out.append(merged)
+    return out, []
 
 
 def _validate_diff_verdict_basis(
@@ -1046,6 +1129,7 @@ def annotate_diff(
     run_pair: str | None = None,
     ctx: WriteContext | None = None,
     shadow: bool = False,
+    view_out: dict[str, Any] | None = None,
 ) -> UpsertResult:
     """Write (or overwrite) the judgement on one entry of a diff's function-level view, on one
     non-binary file of a run pair, or on one binary only one run of the pair holds. Every write,
@@ -1078,7 +1162,11 @@ def annotate_diff(
     about this entry (hold a call of it, or be a shape this candidate has) or the write is refused.
     A snapshot of the group is stored beside the facts, and get_diff_patch_view re-checks it: a
     member moving, joining or leaving puts the judgement back in needs_recheck. Overwriting the
-    judgement without ``group_ref`` again drops the group — pass it each time to keep it."""
+    judgement without ``group_ref`` again drops the group — pass it each time to keep it.
+
+    ``view_out``: a dict the caller passes to be handed the binary diff's built view and meta
+    (``built`` / ``meta``) the write was checked against, so its answer reads that same view
+    without building it again; left untouched for a file or binary_presence anchor."""
     from treasure_map.lib.query import diff_review as dr
     from treasure_map.lib.query.diff_annotations import (
         _binary_diff,
@@ -1138,6 +1226,8 @@ def annotate_diff(
     meta = _binary_diff(atlas, diff_id)
     built = _built(atlas, diff_id)
     side_meta = _side_meta(atlas, diff_id)
+    if view_out is not None:
+        view_out.update(built=built, meta=meta)
     prepared = prepare_diff_annotation(
         atlas,
         built,

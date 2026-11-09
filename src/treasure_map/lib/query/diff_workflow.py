@@ -8,6 +8,8 @@ imports nothing, so any module may import it.
   closing lines, get_diff_meta's note and the agent skill.
 * ``PAIR_WORKFLOW`` — what start_diff_review(run_pair) hands back as its ``workflow``: how to work
   through its units. The agent skill quotes it too.
+* ``PAIR_SIDES`` — that both sides of a change are read, and how a side's rows are read: the
+  close of ``PAIR_WORKFLOW`` and a line of the findings hand-off's header.
 * ``DIFF_ONE_DIFF`` — the earlier one-diff sentence, kept word for word for the full guide only:
   the guide must keep every sentence of the instructions as they were frozen at a671109
   (tests/fixtures/tool_descriptions_a671109.json), and these two were among them."""
@@ -32,6 +34,13 @@ DIFF_WORKFLOW = (
     "onto a candidate. get_diff_handoff(run_pair) pages the hand-off."
 )
 
+# Both sides of a change are read: said in PAIR_WORKFLOW and in the hand-off's header.
+PAIR_SIDES = (
+    "Both sides are material to read: a hunk's '-' lines are the A side and its '+' lines the B "
+    "side; an entry's candidate rows with a ref on one side only are read by entry — "
+    "get_diff_patch_view(diff_id=<its diff>, entry_id=<its entry_id>, rows_offset=<offset>)."
+)
+
 PAIR_WORKFLOW = (
     "Read next_unit.material (start_diff_review(run_pair, unit=<unit_id>) reads one unit alone), "
     "judge each member with annotate_diff(anchor_ref, verdict, ..., diff_id=<its diff>, "
@@ -41,5 +50,5 @@ PAIR_WORKFLOW = (
     "UNREAD, which is not 'nothing found'; a judgment written before its subject's material was "
     "read reads needs_recheck (not disposed) until judged again after reading. Once the review "
     "is done, get_diff_handoff(run_pair) pages a standardized hand-off of the changed_real "
-    "findings."
+    "findings. " + PAIR_SIDES
 )

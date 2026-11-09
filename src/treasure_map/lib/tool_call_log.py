@@ -12,7 +12,9 @@ Each line records: the time, the server session (an id fixed at startup, the pro
 start time), the tool, its key parameters (identifiers and paging only — never free text such as a
 rationale), the size of the response in bytes, whether the response is a cut page, and its error;
 for a review work unit handed out with its material, the unit, whether that material was cut and
-which of its members it listed (identifiers only). The response itself is never stored.
+which of its members it listed (identifiers only); for a read of one function's pseudocode,
+disassembly or callees, or of one non-binary file's line difference, the window of it the page
+held (``page_rows``). The response itself is never stored.
 """
 
 from __future__ import annotations
@@ -178,6 +180,15 @@ def build_line(
                 partial = partial_rows(material)
                 if partial:
                     line["unit_rows"] = partial
+        # One subject read by a tool that pages it (a function's pseudocode / disassembly /
+        # callees, a file's line difference): the window of it this page held, and — callees —
+        # whether the scan itself stored only part of the list.
+        if tool in PAGED_SUBJECT_READS:
+            window = page_window(tool, arguments, result)
+            if window is not None:
+                line["page_rows"] = window
+            if tool == "get_callees" and result.get("callees_truncated"):
+                line["extraction_cap"] = True
         # One entry read with its entry_id: the window of its candidate rows this page held.
         if tool == "get_diff_patch_view" and arguments.get("entry_id") is not None:
             entries = result.get("entries")
@@ -186,6 +197,59 @@ def build_line(
                 if window is not None:
                     line["rows_read"] = window
     return line
+
+
+# The reads of one subject whose answer is a page of it: what ``page_rows`` is recorded for.
+PAGED_SUBJECT_READS = frozenset(
+    {"get_pseudocode", "get_disassembly", "get_callees", "get_file_diff"}
+)
+
+
+def _window(start: Any, size: Any, total: Any) -> list[int] | None:
+    """``[start, start + size, total]`` when all three are integers, else None."""
+    if all(isinstance(v, int) and not isinstance(v, bool) for v in (start, size, total)):
+        return [start, start + size, total]
+    return None
+
+
+def page_window(tool: str, arguments: dict[str, Any], result: dict[str, Any]) -> list[int] | None:
+    """The part of one subject a page held, as ``[start, end, total]`` in the unit the tool pages
+    it by — pseudocode lines (``paging.total_lines``), disassembly instructions
+    (``paging.total_matched``), callees (one page, the whole stored list), a file's hunk pieces or
+    suppressed segments (``total_pieces`` / ``total_segments``) — or None when the page held no
+    part of it to window (an error, a listing not available, a file page whose text is on another
+    page or that was read as a summary): such a read says nothing of how much was read. A file
+    with no line difference to read (its two sides the same, or the difference unavailable) is the
+    empty window ``[0, 0, 0]`` — read whole, nothing to page."""
+    if tool in ("get_pseudocode", "get_disassembly"):
+        pg = result.get("paging")
+        if not isinstance(pg, dict):
+            # a listing that is there and holds no instruction: nothing to page, read whole
+            empty = tool == "get_disassembly" and result.get("available") is True
+            return [0, 0, 0] if empty and result.get("total") == 0 else None
+        total = pg.get("total_lines" if tool == "get_pseudocode" else "total_matched")
+        return _window(pg.get("offset"), pg.get("returned"), total)
+    if tool == "get_callees":
+        callees = result.get("callees")
+        return [0, len(callees), len(callees)] if isinstance(callees, list) else None
+    if tool == "get_file_diff":
+        entry = result.get("entry")
+        if arguments.get("path") is None or not isinstance(entry, dict):
+            return None
+        for key, items, total_key in (
+            ("hunk", "lines", "total_pieces"),
+            ("hunk_shape", "segments", "total_segments"),
+        ):
+            body = entry.get(key)
+            if isinstance(body, dict):
+                part = body.get(items)
+                if not isinstance(part, list):
+                    return None
+                return _window(body.get("hunk_offset"), len(part), body.get(total_key))
+        if entry.get("hunk_unavailable") is not None or entry.get("change") == "same":
+            return [0, 0, 0]
+        return None
+    return None
 
 
 def rows_window(entry: dict[str, Any]) -> list[int] | None:

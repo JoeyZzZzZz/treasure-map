@@ -27,7 +27,9 @@ whatever verdict, cites every candidate of its subject (``presence_citations_sho
 candidate row of a must-read entry is read with it: its unit's material carries up to a page of
 its rows (an entry alone, or each entry of a batch or group), the rest read on by entry_id and
 rows_offset; a member whose rows were not all delivered is not read whole by the material, and a
-judgement written having read only part of them is counted under ``basis_incomplete``. The listed
+judgement written having read only part of them is counted under ``basis_incomplete`` — as is one
+written having read the subject itself only in part by a tool that pages it (a function's
+pseudocode, disassembly or callees, a file's line difference: ``read_partial``). The listed
 entries
 outside the set are the second tier, handed out in batches per diff and bucket: the set orders
 what is read first and says when the must-read part is done; it is not a part that may be skipped.
@@ -870,7 +872,9 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
             ):
                 out.needs_recheck.append(m.anchor_ref)
             elif last is not None and (
-                last["read_basis"].get("basis") == "none" or last["read_basis"].get("rows_partial")
+                last["read_basis"].get("basis") == "none"
+                or last["read_basis"].get("rows_partial")
+                or last["read_basis"].get("read_partial")
             ):
                 out.basis_incomplete.append(m.anchor_ref)
             # Below: the blind audit unit. Sealed off by default (A-1); produced only when the

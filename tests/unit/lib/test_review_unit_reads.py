@@ -284,7 +284,8 @@ def test_an_entry_read_that_logged_no_row_window_reads_partial() -> None:
     """FAIL-CLOSED: an entry read by entry id whose log line holds no ``rows_read`` window says
     nothing of the rows it held, so the read basis carries ``rows_partial`` — never "every row
     read". A window logged beside it that holds every row settles it; nothing read by entry id
-    says nothing.
+    says nothing of the rows (no ``rows_partial``) — a pseudocode read that logged no page window
+    is ``read_partial`` instead (lib/query/read_basis, FAIL-CLOSED the same way).
 
     MUTATION (verified RED, 1 failed): in _rows_partial return False when no window was logged
     (the old default) -> RED."""
@@ -300,5 +301,6 @@ def test_an_entry_read_that_logged_no_row_window_reads_partial() -> None:
     assert rb.infer(whole, anchor_ref="a", entry_id="e") == {"basis": "fetched"}
     other: list[dict[str, Any]] = [{"tool": "get_pseudocode", "params": {"function": "1000"}}]
     assert rb.infer(other, anchor_ref="r#x#function_00001000", entry_id=None) == {
-        "basis": "fetched"
+        "basis": "fetched",
+        "read_partial": "pages",
     }

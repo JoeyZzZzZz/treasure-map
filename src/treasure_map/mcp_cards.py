@@ -1429,6 +1429,7 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             ("why_unchanged", "why the change does nothing real", "annotate_diff"),
             ("evidence", "the anchors a changed_real rests on", "annotate_diff"),
             ("annotations", "the items of a batch", "annotate_diff_batch"),
+            ("class_basis", "one reason for a batch's no_real_change items", "annotate_diff_batch"),
             ("allow_stale_source", "promote from a diff that is not current", "promote"),
             ("clear_all", "delete every annotation of the kind", "clear_overlay"),
             ("reveal", "return the full exploit notes", "list_verified_exploits"),

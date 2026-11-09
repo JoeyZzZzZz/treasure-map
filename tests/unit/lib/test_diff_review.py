@@ -1426,8 +1426,14 @@ def test_batch_writes_every_valid_entry_and_echoes_compactly(world: World) -> No
     assert {r["index"] for r in out["results"]} == set(range(50))
     assert all(r["action"] == "inserted" for r in out["results"])
     assert _overlay_rows(world) == 50
-    # each plain result is small (no verdict / id echoed back)
-    assert all(len(json.dumps(r)) <= 160 for r in out["results"])
+    # each plain result is small (no verdict / id echoed back); beside it only what the write
+    # points to (lib/query/write_hints: the entry's rows by side)
+    hints = ("other_direction", "other_direction_unavailable")
+    assert all(
+        len(json.dumps({k: v for k, v in r.items() if k not in hints})) <= 160
+        for r in out["results"]
+    )
+    assert all(set(r) - {"index", "anchor_ref", "action"} <= set(hints) for r in out["results"])
     assert len(json.dumps(out)) <= mcp_app._RESPONSE_BYTE_BUDGET
 
 

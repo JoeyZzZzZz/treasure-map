@@ -148,6 +148,14 @@ def test_a_shadow_judgement_is_kept_beside_the_current_one(judged: tuple[World, 
         ({"change_kind": ["guard_added", "guard_added"]}, False),
         ({"change_kind": ["made_up"]}, False),
         ({"change_kind": []}, False),
+        # T-K8a / T-K8c: the two kinds that name what a change brings in or takes out are accepted
+        # (alone or beside an older kind), once each; a build-metadata-only change is no change
+        # kind of a changed_real (it is a no_real_change).
+        ({"change_kind": ["feature_added"]}, True),
+        ({"change_kind": ["feature_removed"]}, True),
+        ({"change_kind": ["feature_added", "sink_replaced"]}, True),
+        ({"change_kind": ["feature_added", "feature_added"]}, False),
+        ({"change_kind": ["build_metadata_only"]}, False),
     ],
 )
 def test_changed_real_carries_its_change_kind(
@@ -157,7 +165,10 @@ def test_changed_real_carries_its_change_kind(
     with its basis; anything else is refused.
 
     MUTATION (verified RED): accept any string -> made_up -> RED; drop the duplicate check ->
-    RED."""
+    RED.
+    MUTATION (verified RED, 3 failed): drop feature_added / feature_removed from CHANGE_KINDS ->
+    the three accepted feature rows RED.
+    MUTATION (verified RED, 1 failed): add build_metadata_only to CHANGE_KINDS -> RED."""
     w, anchor = judged
     if not ok:
         with pytest.raises(ConfigError, match="change_kind"):
@@ -171,7 +182,12 @@ def test_changed_real_carries_its_change_kind(
     assert stored["change_kind"] == want
 
 
-def test_change_kind_belongs_to_changed_real_only(judged: tuple[World, str]) -> None:
+@pytest.mark.parametrize("kind", ["guard_added", "feature_added", "feature_removed"])
+def test_change_kind_belongs_to_changed_real_only(judged: tuple[World, str], kind: str) -> None:
+    """T-K8b: a change kind, the two new ones included, is refused on any other verdict.
+
+    MUTATION (verified RED, 3 failed): skip the "change_kind applies to changed_real only" check
+    -> RED."""
     w, anchor = judged
     with pytest.raises(ConfigError, match="change_kind applies to changed_real only"):
         w.judge(
@@ -181,6 +197,38 @@ def test_change_kind_belongs_to_changed_real_only(judged: tuple[World, str]) -> 
             verdict_basis={
                 "checked": [anchor],
                 "why_unchanged": "w",
-                "change_kind": ["guard_added"],
+                "change_kind": [kind],
             },
         )
+    with pytest.raises(ConfigError, match="change_kind applies to changed_real only"):
+        w.judge(DX, anchor, "change_inconclusive", verdict_basis={"change_kind": [kind]})
+
+
+def test_a_row_stored_with_an_older_kind_reads_back_and_the_column_has_no_check(
+    judged: tuple[World, str],
+) -> None:
+    """T-K8d: the two new kinds are a superset — no migration. A row whose basis names one of the
+    first six kinds (written before them) is read back unchanged after the overlay is opened again
+    (its migration runs on open), and the overlay's verdict_basis column carries no CHECK: the
+    closed set lives in the write path (CHANGE_KINDS), never in the schema, so no stored row can
+    become unreadable when the set grows.
+
+    MUTATION (verified RED, 1 failed): add ``CHECK (verdict_basis IS NULL OR json_valid(
+    verdict_basis))`` to the overlay's verdict_basis column -> RED (the DDL names a CHECK on it)."""
+    from treasure_map.lib.atlas import overlay_schema
+
+    w, anchor = judged
+    w.judge(DX, anchor, "changed_real", verdict_basis={"change_kind": ["restructured"]})
+    raw = '{"kind": "changed_real", "change_kind": ["sink_replaced", "unknown"]}'
+    w.atlas.execute("UPDATE overlay SET verdict_basis = ? WHERE anchor_ref = ?", (raw, anchor))
+    w.atlas.commit()
+    overlay_schema.ensure(w.atlas)
+    assert json.loads(_overlay_row(w, anchor)["verdict_basis"])["change_kind"] == [
+        "sink_replaced",
+        "unknown",
+    ]
+    ddl = w.atlas.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'overlay'"
+    ).fetchone()[0]
+    col = next(c for c in ddl.split(",") if "verdict_basis" in c)
+    assert "CHECK" not in col.upper(), col

@@ -30,6 +30,18 @@ rows this session read only part of — the windows its unit's material and its 
 entry id with no window logged at all (fail-closed). The judgement still counts as disposed; the
 report counts it under ``basis_incomplete``.
 
+``read_partial`` (with ``unit_delivered`` or ``fetched``, when the read that made it count was of
+the subject itself by a tool that pages it — a function's pseudocode, disassembly or callees, a
+file's line difference): ``"pages"`` — no one of those reads (one tool, one function or file, one
+run) was read whole: the windows its pages held (``page_rows`` in the log) leave part of its total
+unread, read by coverage, not by which page came last (the last page alone is not the whole), and
+a read of it that logged no window at all counts as partial (FAIL-CLOSED, as ``rows_partial``).
+``"extraction_cap"`` — the only read whole is a callee list the scan stored cut short
+(``callees_truncated``): reading on cannot complete it; another whole read (its pseudocode) does.
+Like ``rows_partial``, the judgement still counts as disposed and the report counts it under
+``basis_incomplete``; a later judgement written after a whole read clears it. ``rows_partial``
+stays about an entry's candidate rows only.
+
 LIMIT, stated wherever this is reported: a subagent shares its parent's MCP connection, so in
 serial use "the same session" is the same window, not the same context — there ``unit_delivered``
 is a floor, not proof the deciding context read it. Only where each unit runs in a process of its
@@ -140,6 +152,52 @@ def _fetched(line: dict[str, Any], anchor_ref: str, entry_id: str | None) -> boo
     return False
 
 
+def _stream(line: dict[str, Any]) -> tuple[Any, ...]:
+    """What one paged read is a page OF: the tool, the function (normalised) or file, and the run /
+    binary it was asked in — pages of the same stream add up, other streams do not."""
+    params = line.get("params") or {}
+    subject = (
+        params.get("path")
+        if line.get("tool") == "get_file_diff"
+        else _norm_addr(params.get("function"))
+    )
+    return (line.get("tool"), subject, params.get("run_id"), params.get("binary"))
+
+
+def _read_partial(lines: list[dict[str, Any]], anchor_ref: str, entry_id: str | None) -> str | None:
+    """Whether the reads of the subject itself in ``lines`` read it only in part (see
+    ``read_partial`` in the module docstring): None when one read — one stream of pages — covers
+    its whole total, or when the subject was read as an entry (its rows are ``rows_partial``'s);
+    ``"extraction_cap"`` when the only whole stream is a callee list the scan cut short; else
+    ``"pages"`` (FAIL-CLOSED: a stream with no window logged covers nothing)."""
+    hits = [ln for ln in lines if _fetched(ln, anchor_ref, entry_id)]
+    if not hits or any(ln.get("tool") == "get_diff_patch_view" for ln in hits):
+        return None
+    windows: dict[tuple[Any, ...], list[list[int]]] = {}
+    capped: set[tuple[Any, ...]] = set()
+    for ln in hits:
+        key = _stream(ln)
+        if _is_window(ln.get("page_rows")):
+            windows.setdefault(key, []).append(ln["page_rows"])
+        if ln.get("extraction_cap"):
+            capped.add(key)
+    whole = [key for key, ws in windows.items() if _covers(ws)]
+    if any(key not in capped for key in whole):
+        return None
+    return "extraction_cap" if whole else "pages"
+
+
+def _covers(windows: list[list[int]]) -> bool:
+    """Whether ``[start, end, total]`` windows, together, hold every item from 0 to the total."""
+    total = max(w[2] for w in windows)
+    reach = 0
+    for start, end, _ in sorted(windows):
+        if start > reach:
+            break
+        reach = max(reach, end)
+    return reach >= total
+
+
 def _explained_all(lines: list[dict[str, Any]], candidates: frozenset[str] | None) -> bool:
     """Whether ``lines`` hold an answered explain_candidate for every one of ``candidates`` (a
     one-sided binary's function: its candidates' evidence_refs); never for an empty or absent
@@ -179,13 +237,7 @@ def _rows_partial(
                 unlogged = True
     if not windows:
         return unlogged
-    total = max(w[2] for w in windows)
-    reach = 0
-    for start, end, _ in sorted(windows):
-        if start > reach:
-            break
-        reach = max(reach, end)
-    return reach < total
+    return not _covers(windows)
 
 
 def _is_window(value: Any) -> bool:
@@ -232,11 +284,19 @@ def infer(
                 out: dict[str, Any] = {"basis": "unit_delivered", "material_cut": not whole}
                 if not whole and _rows_partial(lines, anchor_ref, entry_id, delivered):
                     out["rows_partial"] = True
+                if not whole and not _explained_all(after, candidates):
+                    partial = _read_partial(after, anchor_ref, entry_id)
+                    if partial is not None:
+                        out["read_partial"] = partial
                 return out
     if any(_fetched(ln, anchor_ref, entry_id) for ln in lines) or _explained_all(lines, candidates):
         got: dict[str, Any] = {"basis": "fetched"}
         if _rows_partial(lines, anchor_ref, entry_id, []):
             got["rows_partial"] = True
+        if not _explained_all(lines, candidates):
+            partial = _read_partial(lines, anchor_ref, entry_id)
+            if partial is not None:
+                got["read_partial"] = partial
         return got
     return {"basis": "none"}
 

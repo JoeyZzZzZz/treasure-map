@@ -100,6 +100,7 @@ from treasure_map.lib.query import state_value_label as _state_value_label
 from treasure_map.lib.query import triage as _triage
 from treasure_map.lib.query import unknown_dimension_refusal as _unknown_dim_refusal
 from treasure_map.lib.query import upstream_version as _uv
+from treasure_map.lib.query import write_hints as _wh
 from treasure_map.lib.query.diff_align import align_by_function as _align_by_function
 from treasure_map.lib.query.diff_align import diff_source_staleness as _diff_source_staleness
 from treasure_map.lib.query.diff_align import diffs_source_staleness as _diffs_source_staleness
@@ -174,6 +175,10 @@ _MAX_LIMIT = 200
 # of those is what this constant is set against, and it does not promise that every client keeps
 # a page inline.
 _RESPONSE_BYTE_BUDGET = 48_000
+# A write's answer within this many bytes of the budget keeps its same-shape groups' counts and
+# calls only (their by_landing withheld), and a batch's echo is cut: the rest of the page is left
+# to the note, the groups and the next unit's material.
+_ECHO_RESERVE = 8_000
 
 # The findings hand-off blocks of a run pair, cached in the process so paging get_diff_handoff does
 # not rebuild every diff's view per page (B-4). Keyed by (the atlas's resolved path, the pair); the
@@ -5925,6 +5930,79 @@ def make_tools(
             )
         return out
 
+    def _write_hints_pass() -> Any:
+        """One write call's pass over its same-shape groups (lib/query/write_hints)."""
+        return _wh.SameShapePass(
+            build_hash=_current_pass_version(),
+            current=_current,
+            commit=_installed_commit(),
+            seconds=_wh.SAME_SHAPE_SECONDS,
+        )
+
+    def _write_hints(
+        atlas: sqlite3.Connection,
+        diff_id: str | None,
+        view: dict[str, Any],
+        anchor_ref: str,
+        verdict: str,
+        basis: dict[str, Any] | None,
+        group_ref: Any,
+        ss: Any,
+    ) -> dict[str, Any]:
+        """What a written judgement's answer points to (lib/query/write_hints): the entry's rows
+        by side on every diff verdict, its calls' same-shape groups on a changed_real that names a
+        sink removed or replaced. ``view`` holds the binary diff's built view and meta the write
+        was checked against (empty for a file or a binary one run holds alone)."""
+        subject = None
+        if view.get("built") is not None:
+            subject = _wh.entry_subject(atlas, view["built"], view["meta"], anchor_ref)
+        why = (
+            "the anchor names a non-binary file or a binary one run holds alone, not an entry "
+            "of a binary diff: it has no candidate rows by side"
+        )
+        out = _wh.other_direction(diff_id, subject, why)
+        if diff_id is not None and _wh.wants_same_shape(verdict, basis, group_ref):
+            try:
+                out.update(_wh.same_shape(atlas, diff_id, subject, ss))
+            except Exception as exc:  # noqa: BLE001 — the judgement is written; never fail it
+                out["same_shape_unavailable"] = f"could not be read: {type(exc).__name__}: {exc}"
+        return out
+
+    def _compact_item_hints(r: dict[str, Any]) -> dict[str, Any]:
+        """One batch item's write hints, cut for a batch whose echo nears the page: the two row
+        counts by side (the call is said once, ``other_direction_read_with``), the same-shape
+        groups without their by_landing, the deferred ones as they are."""
+        out: dict[str, Any] = {}
+        od = r.get("other_direction")
+        if od is not None:
+            out["other_direction"] = {
+                k: od[k] for k in ("a_side_only_rows", "b_side_only_rows") if k in od
+            }
+        if "same_shape" in r:
+            out["same_shape"] = _wh.withhold_by_landing(r["same_shape"])
+        if "same_shape_deferred" in r:
+            out["same_shape_deferred"] = r["same_shape_deferred"]
+        return out
+
+    def _compact_hints(results: list[dict[str, Any]], diff_id: str | None) -> dict[str, Any]:
+        """What a cut batch echo says once of its items' write hints: why an item has no rows by
+        side or no same-shape group (each reason with its indexes), and the call that reads an
+        item's rows by side."""
+        out: dict[str, Any] = {}
+        for key in ("other_direction_unavailable", "same_shape_unavailable"):
+            by: dict[str, list[int]] = {}
+            for r in results:
+                if key in r:
+                    by.setdefault(str(r[key]), []).append(r["index"])
+            if by:
+                out[f"{key}_indexes"] = by
+        if any("other_direction" in r for r in results) and diff_id is not None:
+            out["other_direction_read_with"] = (
+                f"get_diff_patch_view(diff_id={json.dumps(diff_id)}, entry_id=<the item's entry "
+                "id>, rows_offset=0)"
+            )
+        return out
+
     def annotate_diff(
         anchor_ref: str,
         verdict: str,
@@ -5999,14 +6077,25 @@ def make_tools(
         at once, use annotate_diff_batch.
 
         ``change_kind`` (changed_real only): what the change does, one or more of sink_removed /
-        sink_replaced / guard_added / constant_changed / restructured / unknown. ``unit_id`` (from
+        sink_replaced / guard_added / constant_changed / restructured / unknown / feature_added /
+        feature_removed. ``unit_id`` (from
         start_diff_review(run_pair)) names the work unit this judges — every anchor written must be
         its member; the answer then carries the next unit of the shard (``worker`` / ``workers``),
         or the coverage_statement when none is left, read at the session's k. Every write is
         recorded in the overlay's history with what this session read before it (``read_basis``); a
         judgment written before anything of its subject was read reads ``needs_recheck`` (re-read,
         not disposed) until a later one written after reading it.
-        ``attributed_to='human-via-agent'`` marks a person's judgment you write down for them."""
+        ``attributed_to='human-via-agent'`` marks a person's judgment you write down for them.
+
+        The answer also points to what the view holds about the subject, read when written and
+        never stored: on every verdict, ``other_direction`` — the entry's candidate rows with a
+        ref on the A side only and on the B side only, and the call that reads them by entry
+        (``other_direction_unavailable`` says why there is none); on a changed_real naming
+        sink_removed or sink_replaced without a same-shape group_ref, ``same_shape`` — each
+        same-shape group of its A-side calls in this diff (``group_ref``, ``member_count``,
+        ``by_landing``), its members outside this diff across the run pair, and the calls that
+        read it, computed for up to ~10 s per write call (the rest ``same_shape_deferred`` with
+        their calls; ``same_shape_unavailable`` when no row is a group's member)."""
         supplied = {
             "checked": checked,
             "why_unchanged": why_unchanged,
@@ -6022,6 +6111,7 @@ def make_tools(
             }
         atlas = open_atlas(atlas_path)
         group_echo: dict[str, Any] | None = None
+        view: dict[str, Any] = {}
         try:
             if diff_id is not None:
                 refusal = _refuse_stale_diff(atlas, diff_id)
@@ -6055,6 +6145,7 @@ def make_tools(
                     group_ref=group_ref,
                     ctx=ctxs[anchor_ref],
                     shadow=shadow,
+                    view_out=view,
                 )
             except ConfigError as exc:
                 return {"written": False, "error": str(exc)}
@@ -6099,6 +6190,25 @@ def make_tools(
                 and _dr_mod.is_binary_presence_anchor(anchor_ref)
             ):
                 result.update(_presence_citations(atlas, run_pair, anchor_ref, given or None))
+            # Read when written, before the answer's size is taken: the next unit's material is fit
+            # in what this leaves.
+            result.update(
+                _write_hints(
+                    atlas,
+                    diff_id,
+                    view,
+                    anchor_ref,
+                    verdict,
+                    given or None,
+                    group_ref,
+                    _write_hints_pass(),
+                )
+            )
+            if (
+                "same_shape" in result
+                and len(json.dumps(result)) > _RESPONSE_BYTE_BUDGET - _ECHO_RESERVE
+            ):
+                result["same_shape"] = _wh.withhold_by_landing(result["same_shape"])
             if unit_id is not None:
                 result.update(
                     _after_unit_write(atlas, runs, worker, workers, unit_k, len(json.dumps(result)))
@@ -6115,6 +6225,7 @@ def make_tools(
         worker: int | None = None,
         workers: int | None = None,
         attributed_to: str | None = None,
+        class_basis: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record YOUR judgments on many entries of one diff at once — all of them or none.
 
@@ -6140,8 +6251,17 @@ def make_tools(
         says the rest once: ``needs_recheck_indexes``, ``overwrote_by``. An item may carry
         ``change_kind`` (changed_real). ``unit_id`` / ``worker`` /
         ``workers`` / ``attributed_to`` as in annotate_diff: every item must be a member of the
-        unit, and the answer carries the next unit."""
+        unit, and the answer carries the next unit.
+
+        ``class_basis`` = ``{reason, why_unchanged, checked_text}`` gives a batch of no_real_change
+        items one shared class: ``reason`` one of date_literal / version_literal / build_path /
+        recompile_only, ``why_unchanged`` the default for an item that gives none,
+        ``checked_text`` optional plain-text notes. Each item's ``checked`` becomes its own items,
+        then ``class:<reason>``, then those notes — merged, never replaced — and each item still
+        needs an anchor of its own that resolves in its diff. An item of any other verdict
+        refuses the whole batch, named. The judgments are stored as any no_real_change is."""
         from treasure_map.lib.overlay import (
+            apply_class_basis,
             prepare_diff_annotation,
             prepare_file_annotation,
             prepare_presence_annotation,
@@ -6168,6 +6288,12 @@ def make_tools(
                 "error": "pass exactly one of diff_id (one binary's diff, from list_diffs) or "
                 "run_pair ({run_a}::{run_b}, for non-binary files' anchors)",
             }
+        if class_basis is not None:
+            annotations, class_errors = apply_class_basis(annotations, class_basis)
+            if class_errors:
+                whole = [{"error": m, "indexes": []} for i, m in class_errors if i < 0]
+                each = _merge_batch_errors([(i, m) for i, m in class_errors if i >= 0])
+                return {"written": False, "count": 0, "errors": [*whole, *each]}
         atlas = open_atlas(atlas_path)
         try:
             if diff_id is not None:
@@ -6360,10 +6486,27 @@ def make_tools(
                         {"error": f"a write failed, so nothing was written: {exc}", "indexes": []}
                     ],
                 }
+            # What each written item points to (lib/query/write_hints), read once written; one
+            # pass for the batch, so a same-shape group is computed once whichever items share it.
+            hints_pass = _write_hints_pass()
+            batch_view = {"built": built, "meta": meta} if meta is not None else {}
+            for (_i, p, item), echo in zip(prepared, results, strict=True):
+                echo.update(
+                    _write_hints(
+                        atlas,
+                        diff_id,
+                        batch_view,
+                        p.anchor_ref,
+                        str(item.get("verdict")),
+                        _diff_verdict_basis(item),
+                        item.get("group_ref"),
+                        hints_pass,
+                    )
+                )
             pair = run_pair if meta is None else f"{meta['run_a_id']}::{meta['run_b_id']}"
             unread_at = [r["index"] for r in results if "needs_recheck" in r]
             extra: dict[str, Any] = {}
-            if len(json.dumps(results)) > _RESPONSE_BYTE_BUDGET - 8_000:
+            if len(json.dumps(results)) > _RESPONSE_BYTE_BUDGET - _ECHO_RESERVE:
                 # A full batch's per-item echo alone nears the page: each result keeps its index
                 # (the item's place in the call) and action; what repeats is said once.
                 overwrote_by: dict[str, int] = {}
@@ -6371,8 +6514,13 @@ def make_tools(
                     if "overwrote" in r:
                         who = str(r["overwrote"].get("attributed_to"))
                         overwrote_by[who] = overwrote_by.get(who, 0) + 1
+                extra.update(_compact_hints(results, diff_id))
                 results = [
-                    {k: r[k] for k in ("index", "action", "group_ref") if k in r} for r in results
+                    {
+                        **{k: r[k] for k in ("index", "action", "group_ref") if k in r},
+                        **_compact_item_hints(r),
+                    }
+                    for r in results
                 ]
                 if unread_at:
                     extra["needs_recheck_indexes"] = unread_at

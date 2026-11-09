@@ -2173,7 +2173,9 @@ def test_a_file_whose_difference_continues_reads_as_a_cut_material(
     """A file unit's line difference and structured lists live inside its ``entry``: when they
     continue on another page the material is cut, so a named write before anything else is read
     is judged unread, and one after the file was read on its own reads ``unit_delivered``
-    (``material_cut``).
+    (``material_cut``) — with ``read_partial`` while only the first page of its line difference
+    was read, without it once every page was (lib/query/read_basis: a paged read counts whole by
+    the windows its pages held).
 
     MUTATION (verified RED, 2 failed): read the continuation off the material's top level, as
     before -> material_cut False, the first write unit_delivered -> RED."""
@@ -2198,7 +2200,19 @@ def test_a_file_whose_difference_continues_reads_as_a_cut_material(
     read = _server_call(server, "get_file_diff", {"run_pair": PAIR, "path": path})
     assert "error" not in read, read
     again = _server_call(server, "annotate_diff", args)
-    assert again["read_basis"] == {"basis": "unit_delivered", "material_cut": True}
+    assert again["read_basis"] == {
+        "basis": "unit_delivered",
+        "material_cut": True,
+        "read_partial": "pages",
+    }
+    offset = read["entry"]["hunk"]["next_hunk_offset"]
+    while offset is not None:
+        more = _server_call(
+            server, "get_file_diff", {"run_pair": PAIR, "path": path, "hunk_offset": offset}
+        )
+        offset = more["entry"]["hunk"]["next_hunk_offset"]
+    whole = _server_call(server, "annotate_diff", args)
+    assert whole["read_basis"] == {"basis": "unit_delivered", "material_cut": True}
 
 
 def test_a_file_material_over_its_room_withholds_inside_its_entry_and_is_built_once(
@@ -2334,7 +2348,10 @@ def test_a_batch_echo_within_the_reserve_below_the_budget_is_compacted(
     size = len(json.dumps(whole["results"]))
     monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", size + 4_000)
     cut = _server_call(server, "annotate_diff_batch", args)
-    assert set(cut["results"][0]) <= {"index", "action", "group_ref"}, cut["results"][0]
+    # what a write points to stays, cut (lib/query/write_hints): the counts by side only
+    kept = {"index", "action", "group_ref", "other_direction", "same_shape", "same_shape_deferred"}
+    assert set(cut["results"][0]) <= kept, cut["results"][0]
+    assert "anchor_ref" not in cut["results"][0]
     assert cut["overwrote_by"] == {"agent-via-mcp": len(items)}
 
 
