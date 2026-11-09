@@ -16,7 +16,7 @@ FILE = "a::b#non_binary#etc/rc"
 
 
 def _line(tool: str, **params: Any) -> dict[str, Any]:
-    lifted = ("unit", "unit_material_cut", "error", "rows_read")
+    lifted = ("unit", "unit_material_cut", "error", "rows_read", "code_shown")
     extra = {k: params.pop(k) for k in lifted if k in params}
     return {"tool": tool, "params": params, **extra}
 
@@ -105,9 +105,13 @@ def _batch(*whole: str, cut: bool = True) -> dict[str, Any]:
             [_batch("pair:1:2"), _line("get_diff_patch_view", entry_id="pair:1:2")],
             {"basis": "none"},
         ),
-        # fetching this one after it does (logged with the row window it held, as a real read is)
+        # fetching this one after it does (logged with the row window it held and whether it
+        # showed the code, as a real read is)
         (
-            [_batch("pair:1:2"), _line("get_diff_patch_view", entry_id=ENTRY, rows_read=[0, 0, 0])],
+            [
+                _batch("pair:1:2"),
+                _line("get_diff_patch_view", entry_id=ENTRY, rows_read=[0, 0, 0], code_shown=True),
+            ],
             {"basis": "unit_delivered", "material_cut": True},
         ),
         # a later delivery that lists it counts (any delivery before the write)

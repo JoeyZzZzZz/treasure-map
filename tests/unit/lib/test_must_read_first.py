@@ -48,6 +48,7 @@ OFFER_KEYS = {
     "must_read_complete",
     "complete",
     "continue_with",
+    "pair_wide",
 }
 FAILED_DIFF = (
     "INSERT INTO diff_meta (diff_id, run_a_id, run_b_id, binary_a, binary_b, sha256_a, sha256_b, "
@@ -412,3 +413,99 @@ def test_the_evidence_reads_left_cut_are_counted_per_reading() -> None:
     assert got is not None and (got["count"], got["readings"]) == (1, 2), got
     assert "per session" in got["scope"]
     assert rb.evidence_reads_cut(None) is None
+
+
+def test_a_sweep_stop_offers_no_continuation_and_says_where_the_unreachable_are(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-7: at a sweep's stop there is nothing more to hand out — ``continue_with`` is null
+    (the default stop names the sweep) — and the unreachable counts say which call lists them
+    (``see``), on every stop: start_diff_review's and a write's answer alike.
+
+    MUTATION (verified RED, 1 failed): give ``continue_with`` whatever the mode -> the sweep stop
+    names a sweep -> RED. MUTATION (verified RED, 1 failed): drop ``see`` from the offer -> RED."""
+    w = _mixed(tmp_path, monkeypatch, failed=True)
+    _loop(w, sweep=True)
+    r = _review(w, k=0)
+    assert r.next_unit(sweep=True) is None
+    swept = ru.coverage_offer(r, worker=None, workers=None, sweep=True)
+    assert swept["continue_with"] is None
+    assert swept["second_tier"]["members"] == 0  # the precondition: the sweep read it all
+    w2 = _mixed(tmp_path / "default", monkeypatch, failed=True)
+    _loop(w2, sweep=False)
+    default = ru.coverage_offer(_review(w2, k=0), worker=None, workers=None, sweep=False)
+    assert default["continue_with"] and "sweep=true" in default["continue_with"]
+    for offer in (swept, default):
+        assert offer["not_reachable"]["failed_diffs"] == 1
+        assert str(offer["not_reachable"].get("see")).startswith("list_diff_blindspots(")
+
+
+def test_a_shards_offer_says_which_counts_are_the_pairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR 13: a shard's offer is scoped "shard" (its second tier, its reduce) while
+    ``disposed`` / ``unseen`` / ``basis_incomplete`` are the whole pair's — every shard gives the
+    same numbers there, and ``pair_wide`` names them.
+
+    MUTATION (verified RED, 1 failed): drop ``pair_wide`` -> RED."""
+    w = _mixed(tmp_path, monkeypatch)
+    r = _review(w, k=0)
+    offers = [ru.coverage_offer(r, worker=i, workers=3, sweep=False) for i in range(3)]
+    for key in ("disposed", "unseen", "basis_incomplete"):
+        assert len({json.dumps(o[key]) for o in offers}) == 1, key
+    assert all(o.get("pair_wide") == ["disposed", "unseen", "basis_incomplete"] for o in offers)
+    assert {o["scope"] for o in offers} == {"shard"}
+
+
+def test_by_default_an_open_audit_is_still_handed_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-8: the default hand-out (no sweep) hands out an open audit as it does a must-read
+    unit — the audits are in the default dispatch order, not only the sweep's. (Blind auditing is
+    sealed by default; this turns it on.)
+
+    MUTATION (verified RED, 1 failed): leave the audits out of the default dispatch order ->
+    the change_inconclusive's audit is never handed out -> RED."""
+    monkeypatch.setattr(ru, "BLIND_AUDIT_ENABLED", True)
+    w = _mixed(tmp_path, monkeypatch)
+    first = _review(w, k=0).next_unit(sweep=False)
+    assert first is not None and first.must_read
+    writer = overlay.WriteContext(channel="mcp", session="writer")
+    for m in first.members:
+        w.judge(m.stream, m.anchor_ref, "change_inconclusive", ctx=writer)
+    r = _review(w, k=0)
+    assert any(u.kind == ru.AUDIT for u in r.units)  # the precondition: an audit is open
+    audit = r.next_unit(sweep=False)
+    assert audit is not None and audit.kind == ru.AUDIT, audit
+
+
+def test_the_report_lists_the_units_as_they_are_handed_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-5: the Markdown and HTML reports list every must-read unit before the first
+    second-tier one (the hand-out order, where ``Unit.order`` interleaves them) and say the second
+    tier is handed out only on request; the terminal's next units are the default hand-out's (no
+    second tier).
+
+    MUTATION (verified RED, 1 failed): list the units in ``Unit.order`` (Markdown and HTML) -> a
+    second-tier unit before a must-read one -> RED. MUTATION (verified RED, 1 failed):
+    list the terminal's pending units with the second tier -> RED."""
+    from treasure_map.lib.query import review_report as rr
+
+    w = _mixed(tmp_path, monkeypatch)
+    r = _review(w, k=0)
+    kinds = [u.must_read for u in r.units]
+    assert kinds.index(False) < len(kinds) - 1 - kinds[::-1].index(True)  # interleaved
+    second = {u.unit_id for u in r.units if u.kind == ru.SECOND_TIER}
+    must = {u.unit_id for u in r.units if u.must_read}
+    for text in (rr.markdown(r), rr.html_page(r)):
+        assert "handed out only with sweep=true" in text
+        order = [uid for uid in re.findall(r"\b[0-9a-f]{16}\b", text) if uid in second | must]
+        firsts = list(dict.fromkeys(order))
+        assert set(firsts) == second | must, (len(firsts), len(second | must))
+        last_must = max(i for i, uid in enumerate(firsts) if uid in must)
+        first_second = min(i for i, uid in enumerate(firsts) if uid in second)
+        assert last_must < first_second, firsts
+    terminal = rr.terminal(r)
+    shown = set(re.findall(r"\b[0-9a-f]{16}\b", terminal.split("next units", 1)[1]))
+    assert shown and not shown & second, shown

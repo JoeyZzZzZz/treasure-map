@@ -104,10 +104,23 @@ def terminal(review: ru.PairReview, *, header: dict[str, Any] | None = None) -> 
         f"{nr['non_binary_files_unavailable'] or 'read'}"
     )
     out.append("not seen: " + ", ".join(rep["not_seen"]))
-    pending = [u for u in review.units if not ru.unit_disposed(u, states)]
-    out.append(f"next units ({len(pending)} with a member not disposed):")
+    pending = [
+        u for u in ru.dispatch_order(review.units, sweep=False) if not ru.unit_disposed(u, states)
+    ]
+    out.append(
+        f"next units ({len(pending)} with a member not disposed; the second tier is handed out "
+        "only with --until complete):"
+    )
     out += ["  " + _unit_line(u, states) for u in pending[:TERMINAL_NEXT]]
     return "\n".join(out)
+
+
+# Under the report's list of units: the second tier is listed after every must-read unit, as it is
+# handed out — and only on request.
+_SECOND_TIER_NOTE = (
+    "Every must-read unit first (the reduce and the audits among them), then the second tier — "
+    "handed out only with sweep=true (start_diff_review) or --until complete (tmap review run)."
+)
 
 
 def _md_cell(text: Any) -> str:
@@ -304,8 +317,8 @@ def markdown(review: ru.PairReview, *, header: dict[str, Any] | None = None) -> 
         if jnl["count"] > listed:
             out.append(f"  - … {jnl['count'] - listed} more")
     out += _navigation_md(review)
-    out += ["", "## Units in hand-out order", ""]
-    for u in review.units:
+    out += ["", "## Units in hand-out order", "", f"_{_SECOND_TIER_NOTE}_", ""]
+    for u in ru.dispatch_order(review.units, sweep=True):
         done = sum(1 for m in u.members if ru.disposed(states.get(m.anchor_ref)))
         tag = "must-read" if u.must_read else "second tier"
         out.append(
@@ -461,7 +474,8 @@ def html_page(review: ru.PairReview, *, header: dict[str, Any] | None = None) ->
     out.append("</ul>")
     out += _navigation_html(review)
     out.append("<h2>Units in hand-out order</h2>")
-    for u in review.units:
+    out.append(f"<p><em>{e(_SECOND_TIER_NOTE)}</em></p>")
+    for u in ru.dispatch_order(review.units, sweep=True):
         done = sum(1 for m in u.members if ru.disposed(states.get(m.anchor_ref)))
         cls = "done" if done == len(u.members) else "open"
         tag = "must-read" if u.must_read else "second tier"

@@ -1684,6 +1684,15 @@ def test_the_handoff_is_skipped_while_the_review_is_not_done(
         review_cli.review, ["run", PAIR, "--agent", "claude-code", "--handoff", str(out)]
     )
     assert len(calls["handoff"]) == 1, res.output
+    # The default stop (the must-read part done, the second tier left unread) is a finished
+    # review too: its hand-off is written. MUTATION (verified RED, 1 failed): skip the hand-off
+    # unless the drive stopped "no unit left" -> RED.
+    calls = _patch_run(monkeypatch, "no must-read unit left")
+    res = CliRunner().invoke(
+        review_cli.review, ["run", PAIR, "--agent", "claude-code", "--handoff", str(out)]
+    )
+    assert "hand-off skipped" not in res.output, res.output
+    assert len(calls["handoff"]) == 1, res.output
 
 
 def test_handoff_with_an_experimental_preset_is_refused_before_driving(

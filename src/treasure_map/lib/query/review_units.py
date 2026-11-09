@@ -968,7 +968,9 @@ def coverage_offer(
     and members, by bucket — what ``sweep`` would hand out; none left once it was handed out),
     what no unit can reach, the judgements written on a basis read in part, and the reduce still
     owed. The reduce is one unit of the pair, held by one shard: with shards, only the shard that
-    holds it says how much it owes (``reduce_owed_in_this_shard``), every other one says null."""
+    holds it says how much it owes (``reduce_owed_in_this_shard``), every other one says null.
+    ``disposed``, ``unseen`` and ``basis_incomplete`` are the whole pair's counts, also in a shard
+    (``pair_wide`` names them)."""
     rep = review.report
     states = review.progress.states
     second = [
@@ -1006,8 +1008,10 @@ def coverage_offer(
             "withheld_diffs": len(nr["withheld_diffs"]),
             "not_diffed_binaries": bool(nr["not_diffed_binaries"]),
             "non_binary_files_unavailable": nr["non_binary_files_unavailable"],
+            "see": "list_diff_blindspots(run_a, run_b); tmap review report for the lists",
         },
         "basis_incomplete": rep["basis_incomplete"]["count"],
+        "pair_wide": ["disposed", "unseen", "basis_incomplete"],
         "reduce_owed_in_this_shard": owed if holds_reduce else None,
         "reduce_note": (
             "the reduce is one unit of the pair; with shards only the shard holding it counts it"
@@ -1348,8 +1352,9 @@ def review_pair(
     ):
         # Handed out once every must-read subject unit is disposed (a callee group is one), the
         # second tier or not: the second tier is handed out only on request, so a gate waiting
-        # on it would leave the must-read part never complete. With the second tier asked for,
-        # the reduce still comes after it (its position is past every other unit's).
+        # on it would leave the must-read part never complete. The reduce is must-read, so with
+        # the second tier asked for it still comes BEFORE the second tier (dispatch_order); its
+        # position, past every other unit's, orders it only among the must-read units.
         # Its id is the pair's (and the predicate's), not its owed members': judging one of them
         # leaves the same unit, so its other members — of any diff — are written with the id it
         # was handed out with.

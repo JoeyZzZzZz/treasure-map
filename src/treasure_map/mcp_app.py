@@ -5995,19 +5995,20 @@ def make_tools(
         basis: dict[str, Any] | None,
         group_ref: Any,
         ss: Any,
+        subjects: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """What a written judgement's answer points to (lib/query/write_hints): the entry's rows
         by side on every diff verdict, its calls' same-shape groups on a changed_real that names a
         sink removed or replaced. ``view`` holds the binary diff's built view and meta the write
-        was checked against (empty for a file or a binary one run holds alone)."""
+        was checked against (empty for a file or a binary one run holds alone); ``subjects``, its
+        subjects by anchor_ref when the caller already built them (a batch, once). The run-pair
+        part of the same-shape groups is read after, by ``_wh.finish`` (once per write call)."""
         subject = None
-        if view.get("built") is not None:
+        if subjects is not None:
+            subject = subjects.get(anchor_ref)
+        elif view.get("built") is not None:
             subject = _wh.entry_subject(atlas, view["built"], view["meta"], anchor_ref)
-        why = (
-            "the anchor names a non-binary file or a binary one run holds alone, not an entry "
-            "of a binary diff: it has no candidate rows by side"
-        )
-        out = _wh.other_direction(diff_id, subject, why)
+        out = _wh.other_direction(diff_id, subject, _wh.no_entry_why(anchor_ref))
         if diff_id is not None and _wh.wants_same_shape(verdict, basis, group_ref):
             try:
                 out.update(_wh.same_shape(atlas, diff_id, subject, ss))
@@ -6016,19 +6017,15 @@ def make_tools(
         return out
 
     def _compact_item_hints(r: dict[str, Any]) -> dict[str, Any]:
-        """One batch item's write hints, cut for a batch whose echo nears the page: the two row
-        counts by side (the call is said once, ``other_direction_read_with``), the same-shape
-        groups without their by_landing, the deferred ones as they are."""
+        """One batch item's row counts by side, cut for a batch whose echo nears the page (the
+        call is said once, ``other_direction_read_with``); its same-shape groups are said once
+        for the batch (``_wh.batch_same_shape``)."""
         out: dict[str, Any] = {}
         od = r.get("other_direction")
         if od is not None:
             out["other_direction"] = {
                 k: od[k] for k in ("a_side_only_rows", "b_side_only_rows") if k in od
             }
-        if "same_shape" in r:
-            out["same_shape"] = _wh.withhold_by_landing(r["same_shape"])
-        if "same_shape_deferred" in r:
-            out["same_shape_deferred"] = r["same_shape_deferred"]
         return out
 
     def _compact_hints(results: list[dict[str, Any]], diff_id: str | None) -> dict[str, Any]:
@@ -6136,13 +6133,17 @@ def make_tools(
 
         The answer also points to what the view holds about the subject, read when written and
         never stored: on every verdict, ``other_direction`` — the entry's candidate rows with a
-        ref on the A side only and on the B side only, and the call that reads them by entry
-        (``other_direction_unavailable`` says why there is none); on a changed_real naming
-        sink_removed or sink_replaced without a same-shape group_ref, ``same_shape`` — each
-        same-shape group of its A-side calls in this diff (``group_ref``, ``member_count``,
-        ``by_landing``), its members outside this diff across the run pair, and the calls that
-        read it, computed for up to ~10 s per write call (the rest ``same_shape_deferred`` with
-        their calls; ``same_shape_unavailable`` when no row is a group's member)."""
+        ref on the A side only and on the B side only (the whole entry's, a candidate anchor's
+        too), and the call that reads them by entry (``other_direction_unavailable`` says why
+        there is none); on a changed_real naming sink_removed or sink_replaced without a
+        same-shape group_ref, ``same_shape`` — each same-shape group of its A-side calls in this
+        diff (``group_ref``, ``member_count``, ``by_landing``), its members outside this diff
+        across the run pair, and the calls that read it. Each group's one-diff facts are computed
+        within ~10 s per write call (groups past it ``same_shape_deferred`` with their calls); the
+        run pair's members outside this diff in the time left, smallest group first (one not
+        reached: ``members_outside_deferred``, read with its run_pair call) — a large group's
+        run-pair read, once begun, can take the call past 10 s by itself.
+        ``same_shape_unavailable`` when no row is a group's member."""
         supplied = {
             "checked": checked,
             "why_unchanged": why_unchanged,
@@ -6239,6 +6240,7 @@ def make_tools(
                 result.update(_presence_citations(atlas, run_pair, anchor_ref, given or None))
             # Read when written, before the answer's size is taken: the next unit's material is fit
             # in what this leaves.
+            hints_pass = _write_hints_pass()
             result.update(
                 _write_hints(
                     atlas,
@@ -6248,9 +6250,10 @@ def make_tools(
                     verdict,
                     given or None,
                     group_ref,
-                    _write_hints_pass(),
+                    hints_pass,
                 )
             )
+            _wh.finish(atlas, hints_pass)
             if (
                 "same_shape" in result
                 and len(json.dumps(result)) > _RESPONSE_BYTE_BUDGET - _ECHO_RESERVE
@@ -6295,7 +6298,10 @@ def make_tools(
         ``{index, anchor_ref, action}`` (an overwrite adds ``overwrote``); an entry that leaned on
         a group carries its ``group_ref``, and each distinct group is echoed once under top-level
         ``groups``. A batch whose echo would near the page keeps ``{index, action}`` per entry and
-        says the rest once: ``needs_recheck_indexes``, ``overwrote_by``. An item may carry
+        says the rest once: ``needs_recheck_indexes``, ``overwrote_by``; its items' same-shape
+        groups are listed once for the batch (``same_shape_groups`` / ``same_shape_deferred_groups``
+        by group_ref), each item naming its group refs — or, still near the page, their counts
+        (``same_shape_withheld`` says so). An item may carry
         ``change_kind`` (changed_real). ``unit_id`` / ``worker`` /
         ``workers`` / ``attributed_to`` as in annotate_diff: every item must be a member of the
         unit, and the answer carries the next unit.
@@ -6537,6 +6543,11 @@ def make_tools(
             # pass for the batch, so a same-shape group is computed once whichever items share it.
             hints_pass = _write_hints_pass()
             batch_view = {"built": built, "meta": meta} if meta is not None else {}
+            batch_subjects = (
+                _wh.entry_subjects(atlas, built, meta)
+                if meta is not None and built is not None
+                else None
+            )
             for (_i, p, item), echo in zip(prepared, results, strict=True):
                 echo.update(
                     _write_hints(
@@ -6548,8 +6559,10 @@ def make_tools(
                         _diff_verdict_basis(item),
                         item.get("group_ref"),
                         hints_pass,
+                        batch_subjects,
                     )
                 )
+            _wh.finish(atlas, hints_pass)
             pair = run_pair if meta is None else f"{meta['run_a_id']}::{meta['run_b_id']}"
             unread_at = [r["index"] for r in results if "needs_recheck" in r]
             extra: dict[str, Any] = {}
@@ -6562,13 +6575,37 @@ def make_tools(
                         who = str(r["overwrote"].get("attributed_to"))
                         overwrote_by[who] = overwrote_by.get(who, 0) + 1
                 extra.update(_compact_hints(results, diff_id))
+                shapes, shape_extra = _wh.batch_same_shape(results)
                 results = [
                     {
                         **{k: r[k] for k in ("index", "action", "group_ref") if k in r},
                         **_compact_item_hints(r),
+                        **shape,
                     }
-                    for r in results
+                    for r, shape in zip(results, shapes, strict=True)
                 ]
+                extra.update(shape_extra)
+                room = _RESPONSE_BYTE_BUDGET - _ECHO_RESERVE
+                if shape_extra and len(json.dumps([results, extra])) > room:
+                    # Still near the page: each item's groups by count, the groups listed once.
+                    _wh.count_same_shape(
+                        results,
+                        extra,
+                        "page_budget: each item's same-shape groups are given by count, the "
+                        "groups listed once in same_shape_groups / same_shape_deferred_groups; an "
+                        "item's own groups read with same_shape_siblings(diff_id, evidence_ref=<a "
+                        "call of the item's entry>)",
+                        listings=False,
+                    )
+                    if len(json.dumps([results, extra])) > room:
+                        _wh.count_same_shape(
+                            results,
+                            extra,
+                            "page_budget: the batch's same-shape groups are given by count; an "
+                            "item's groups read with same_shape_siblings(diff_id, evidence_ref=<a "
+                            "call of the item's entry>)",
+                            listings=True,
+                        )
                 if unread_at:
                     extra["needs_recheck_indexes"] = unread_at
                     extra["needs_recheck_means"] = _JUDGED_UNREAD
@@ -7016,7 +7053,12 @@ def _with_usage_hint(
             result = fn(*args, **kwargs)
         except Exception as exc:
             if call_log is not None:
-                call_log.record(name, _bound(sig, args, kwargs), error=str(exc) or repr(exc))
+                call_log.record(
+                    name,
+                    _bound(sig, args, kwargs),
+                    error=str(exc) or repr(exc),
+                    reading_args=_bound(sig, args, kwargs, defaults=True),
+                )
             raise
         if isinstance(result, dict) and "error" in result:
             bound = sig.bind_partial(*args, **kwargs).arguments
@@ -7026,17 +7068,33 @@ def _with_usage_hint(
                 result["reference"] = _cards.reference_call(name)
         _mark_over_budget(result)
         if call_log is not None:
-            call_log.record(name, _bound(sig, args, kwargs), result)
+            call_log.record(
+                name,
+                _bound(sig, args, kwargs),
+                result,
+                reading_args=_bound(sig, args, kwargs, defaults=True),
+            )
         return result
 
     return call
 
 
-def _bound(sig: inspect.Signature, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+def _bound(
+    sig: inspect.Signature,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    defaults: bool = False,
+) -> dict[str, Any]:
+    """The call's arguments by name — those passed, or with ``defaults`` every one the tool takes
+    (the ones left out at their defaults)."""
     try:
-        return dict(sig.bind_partial(*args, **kwargs).arguments)
+        bound = sig.bind_partial(*args, **kwargs)
     except TypeError:
         return dict(kwargs)
+    if defaults:
+        bound.apply_defaults()
+    return dict(bound.arguments)
 
 
 def build_server(

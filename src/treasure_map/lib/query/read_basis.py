@@ -31,16 +31,24 @@ entry id with no window logged at all (fail-closed). The judgement still counts 
 report counts it under ``basis_incomplete``.
 
 ``read_partial`` (with ``unit_delivered`` or ``fetched``, when the read that made it count was of
-the subject itself by a tool that pages it — a function's pseudocode, disassembly or callees, a
-file's line difference): ``"pages"`` — no one of those reads (one tool, one function or file, one
-run) was read whole: the windows its pages held (``page_rows`` in the log) leave part of its total
-unread, read by coverage, not by which page came last (the last page alone is not the whole), and
-a read of it that logged no window at all counts as partial (FAIL-CLOSED, as ``rows_partial``).
-``"extraction_cap"`` — the only read whole is a callee list the scan stored cut short
-(``callees_truncated``): reading on cannot complete it; another whole read (its pseudocode) does.
+the subject itself — a function's pseudocode, disassembly or callees, a file's line difference,
+an entry by its entry_id): ``"pages"`` — no one read of its code (one tool, one function or file,
+one run) was read whole: the windows its pages held (``page_rows`` in the log) leave part of its
+total unread, read by coverage, not by which page came last (the last page alone is not the
+whole), and a read of it that logged no window at all counts as partial (FAIL-CLOSED, as
+``rows_partial``). The code is a function's pseudocode or disassembly (or a file's difference):
+where any of those was read, a callee list read whole does not make it whole (every pseudocode
+page carries the callees already). An entry read by its entry_id reads the code whole only when
+it showed the code difference whole (``code_shown`` true in the log: its inline hunk not held
+back, a layout-only delta, two texts that match); otherwise the code's own reads decide. With no
+read of the code at all, an entry that held its hunk back (``code_shown`` false) is ``"pages"``,
+and one that carried no hunk either way is read as the entry it is (no flag).
+``"extraction_cap"`` — only a callee list was read, whole as the scan stored it but cut short
+there (``callees_truncated``): reading on cannot complete it; a whole read of the code does.
 Like ``rows_partial``, the judgement still counts as disposed and the report counts it under
 ``basis_incomplete``; a later judgement written after a whole read clears it. ``rows_partial``
-stays about an entry's candidate rows only.
+stays about an entry's candidate rows only; the two can stand together (an entry whose rows and
+whose code were both read in part).
 
 LIMIT, stated wherever this is reported: a subagent shares its parent's MCP connection, so in
 serial use "the same session" is the same window, not the same context — there ``unit_delivered``
@@ -55,6 +63,7 @@ import re
 from typing import Any
 
 from treasure_map.lib import tool_call_log as tcl
+from treasure_map.lib.tool_call_log import PAGE_PARAMS
 
 # Blind-read whitelist (G): the ONLY tools whose answer does not change with the verdicts recorded
 # — no verdict, review_state, verdict_shape or annotation block; a count of what is judged or not
@@ -113,6 +122,8 @@ def _blind_safe(line: dict[str, Any], audit_unit: str | None) -> bool:
 
 
 _FETCH_BY_FUNCTION = frozenset({"get_pseudocode", "get_disassembly", "get_callees"})
+# A read of the callee list alone: no part of the code itself.
+_CALLEES = "get_callees"
 _HEX = re.compile(r"(?<![0-9A-Za-z])(?:0x)?([0-9a-fA-F]{4,})(?![0-9A-Za-z])")
 
 
@@ -165,23 +176,38 @@ def _stream(line: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _read_partial(lines: list[dict[str, Any]], anchor_ref: str, entry_id: str | None) -> str | None:
-    """Whether the reads of the subject itself in ``lines`` read it only in part (see
-    ``read_partial`` in the module docstring): None when one read — one stream of pages — covers
-    its whole total, or when the subject was read as an entry (its rows are ``rows_partial``'s);
-    ``"extraction_cap"`` when the only whole stream is a callee list the scan cut short; else
-    ``"pages"`` (FAIL-CLOSED: a stream with no window logged covers nothing)."""
+    """Whether the reads of the subject itself in ``lines`` read its code only in part (see
+    ``read_partial`` in the module docstring): None when an entry read showed its code difference
+    whole, or one read of the code — one stream of pages — covers its whole total (with no read of
+    the code, one whole callee list not cut by the scan); ``"extraction_cap"`` when only callee
+    lists were read and the whole one is cut short by the scan; else ``"pages"`` (FAIL-CLOSED: a
+    stream with no window logged covers nothing; an entry that held its hunk back read none of the
+    code)."""
     hits = [ln for ln in lines if _fetched(ln, anchor_ref, entry_id)]
-    if not hits or any(ln.get("tool") == "get_diff_patch_view" for ln in hits):
+    if not hits:
         return None
+    entries = [ln for ln in hits if ln.get("tool") == "get_diff_patch_view"]
+    if any(ln.get("code_shown") is True for ln in entries):
+        return None
+    held_back = any(ln.get("code_shown") is False for ln in entries)
     windows: dict[tuple[Any, ...], list[list[int]]] = {}
     capped: set[tuple[Any, ...]] = set()
     for ln in hits:
+        if ln.get("tool") == "get_diff_patch_view":
+            continue
         key = _stream(ln)
+        ws = windows.setdefault(key, [])
         if _is_window(ln.get("page_rows")):
-            windows.setdefault(key, []).append(ln["page_rows"])
+            ws.append(ln["page_rows"])
         if ln.get("extraction_cap"):
             capped.add(key)
-    whole = [key for key, ws in windows.items() if _covers(ws)]
+    code = [key for key in windows if key[0] != _CALLEES]
+    if code or held_back:
+        # The code was read, or an entry held it back: only a whole read of the code is whole.
+        return None if any(windows[k] and _covers(windows[k]) for k in code) else "pages"
+    if not windows:
+        return None  # read as an entry only, which carried no hunk either way
+    whole = [key for key, ws in windows.items() if ws and _covers(ws)]
     if any(key not in capped for key in whole):
         return None
     return "extraction_cap" if whole else "pages"
@@ -301,37 +327,65 @@ def infer(
     return {"basis": "none"}
 
 
-# The evidence reads ``evidence_reads_cut`` counts: the fact tools about a subject (not the reads of
-# a subject itself, which the read basis weighs), and the diff's row overlay.
-_EVIDENCE_TOOLS = (BLIND_SAFE_TOOLS | {"get_diff_sink_overlay"}) - _FETCH_BY_FUNCTION
-# A page's own place in its reading — not what the reading is of.
-_PAGE_PARAMS = frozenset(
-    {"offset", "limit", "members_offset", "hunk_offset", "ko_offset", "rows_offset", "rows_limit"}
+# The evidence reads ``evidence_reads_cut`` counts: the fact tools about a subject that page their
+# answer (not the reads of a subject itself, which the read basis weighs), and the diff's row
+# overlay. A tool that takes no page parameter has no page to be left on; tests/unit/lib/
+# test_read_basis_pages.py holds this set to the tools' own signatures.
+PAGED_EVIDENCE_TOOLS = frozenset(
+    {
+        "cross_firmware_patterns",
+        "get_data_table",
+        "get_diff_deltas",
+        "get_diff_sink_overlay",
+        "get_diff_string_delta",
+        "get_function_alignment",
+        "get_functions_referencing_string",
+        "get_imports_exports",
+        "get_nvram_key_flow",
+        "get_script_callsites",
+        "get_sink_provenance",
+        "get_string_keyed_edges",
+        "get_string_reference_anchors",
+        "get_strings",
+        "get_xrefs",
+        "launched_by",
+        "pattern_density",
+        "same_shape_siblings",
+    }
 )
 
 
 def evidence_reads_cut(lines: list[dict[str, Any]] | None) -> dict[str, Any] | None:
     """How many of this session's evidence readings were left on a cut page: a reading is one
-    fact tool's calls with the same parameters but for the page's own place (offset and the like);
-    it is left cut when every page of it this session read came back cut (a continuation, or cut
-    to fit) — none reached its end. Counted per session, never per pair or subject: a log line
-    names no run pair. None when there is no log (unknown, never 0)."""
+    paged fact tool's calls with the same arguments but for the page's own place (offset and the
+    like) — read by the line's ``reading`` digest of every argument (a line logged before it, by
+    its recorded parameters); it is left cut when every page of it this session read came back cut
+    (a continuation, or cut to fit). A reading counts as read on once ANY page of it came back
+    uncut — the last page alone included, though it leaves the pages before it unread: this counts
+    readings stopped on a cut page, not readings read whole. Counted per session, never per pair or
+    subject: a log line names no run pair. None when there is no log (unknown, never 0)."""
     if lines is None:
         return None
     readings: dict[tuple[Any, ...], bool] = {}
     for ln in lines:
         tool = ln.get("tool")
-        if tool not in _EVIDENCE_TOOLS or ln.get("error"):
+        if tool not in PAGED_EVIDENCE_TOOLS or ln.get("error"):
             continue
-        params = ln.get("params") or {}
-        key = (tool, *sorted((k, str(v)) for k, v in params.items() if k not in _PAGE_PARAMS))
+        digest = ln.get("reading")
+        if isinstance(digest, str):
+            key: tuple[Any, ...] = (tool, digest)
+        else:
+            params = ln.get("params") or {}
+            key = (tool, *sorted((k, str(v)) for k, v in params.items() if k not in PAGE_PARAMS))
         readings[key] = readings.get(key, True) and bool(ln.get("truncated"))
     return {
         "count": sum(1 for cut in readings.values() if cut),
         "readings": len(readings),
         "scope": (
-            "this server session's fact-tool readings (a reading is read on once a page of it "
-            "came back uncut); a log line names no run pair, so this is per session"
+            "this server session's paged fact-tool readings stopped on a cut page (a reading is "
+            "read on once any page of it came back uncut — the last page alone too, so this is "
+            "not a count of readings read whole); a log line names no run pair, so this is per "
+            "session"
         ),
     }
 

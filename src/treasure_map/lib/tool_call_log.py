@@ -14,11 +14,16 @@ rationale), the size of the response in bytes, whether the response is a cut pag
 for a review work unit handed out with its material, the unit, whether that material was cut and
 which of its members it listed (identifiers only); for a read of one function's pseudocode,
 disassembly or callees, or of one non-binary file's line difference, the window of it the page
-held (``page_rows``). The response itself is never stored.
+held (``page_rows``); for one entry read by its entry_id, whether its code difference was shown
+whole or held back (``code_shown``, absent when the entry carried no hunk either way). Each line
+also carries ``reading``: a digest of every argument of the call but the page's own place (offset
+and the like) — what tells two readings of one tool apart without storing the arguments
+themselves. The response itself is never stored.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -83,9 +88,23 @@ KEY_PARAMS: frozenset[str] = frozenset(
     }
 )
 
+# The parameters that place a page within its reading — not what the reading is of.
+PAGE_PARAMS: frozenset[str] = frozenset(
+    {"offset", "limit", "members_offset", "hunk_offset", "ko_offset", "rows_offset", "rows_limit"}
+)
+
 # Keys that say a response is one page of more (a continuation offset) or was cut to fit.
 _CONTINUATION_KEYS = ("next_offset", "next_hunk_offset", "next_rows_offset", "next_members_offset")
-_CUT_KEYS = ("truncated", "over_budget", "truncated_by_bytes", "entries_truncated")
+_CUT_KEYS = (
+    "truncated",
+    "over_budget",
+    "truncated_by_bytes",
+    "entries_truncated",
+    "values_truncated",
+)
+# A block holding several paging blocks side by side (get_diff_string_delta's ``sides``, one per
+# side): each of them is read as a paging block of the answer itself.
+_PAGED_SIDES = "sides"
 
 
 def log_path_for(atlas_db: Path | str) -> Path:
@@ -119,7 +138,8 @@ def key_params(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def _is_cut(result: Any, depth: int = 0) -> bool:
     """Whether a response is a page that continues or was cut to fit — read from its own fields,
-    at the top level and one level down (a paging block)."""
+    at the top level and one level down (a paging block; the blocks under ``sides`` count as that
+    level too)."""
     if not isinstance(result, dict) or depth > 1:
         return False
     for k in _CONTINUATION_KEYS:
@@ -128,7 +148,24 @@ def _is_cut(result: Any, depth: int = 0) -> bool:
     for k in _CUT_KEYS:
         if result.get(k):
             return True
-    return any(_is_cut(v, depth + 1) for v in result.values() if isinstance(v, dict))
+    for k, v in result.items():
+        if not isinstance(v, dict):
+            continue
+        if k == _PAGED_SIDES and depth == 0:
+            if any(_is_cut(side, 1) for side in v.values()):
+                return True
+        elif _is_cut(v, depth + 1):
+            return True
+    return False
+
+
+def reading_digest(arguments: dict[str, Any]) -> str:
+    """A digest of a call's arguments but the page's own place (``PAGE_PARAMS``): equal for the
+    pages of one reading, different for two readings that differ in any other argument — free
+    text included, which is never stored itself."""
+    rest = {k: v for k, v in arguments.items() if k not in PAGE_PARAMS}
+    text = json.dumps(rest, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def response_bytes(result: Any) -> int | None:
@@ -145,9 +182,12 @@ def build_line(
     arguments: dict[str, Any],
     result: Any = None,
     error: str | None = None,
+    reading_args: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The log line of one call. ``error`` is a raised error's text; a returned ``{"error": …}``
-    result is read for its own error."""
+    result is read for its own error. ``reading_args``: the arguments the ``reading`` digest is
+    taken of (the call's, its defaults filled in, so an argument left at its default and the same
+    value passed read alike), else ``arguments``."""
     if error is None and isinstance(result, dict) and result.get("error"):
         error = str(result["error"])
     line = {
@@ -160,6 +200,7 @@ def build_line(
         "response_bytes": None if result is None else response_bytes(result),
         "truncated": _is_cut(result),
         "error": None if error is None else _value(error),
+        "reading": reading_digest(arguments if reading_args is None else reading_args),
     }
     # A work unit handed out with its material (start_diff_review(run_pair=...), or a write's
     # answer naming the next unit): which, whether its material was cut, and — for a material
@@ -197,7 +238,40 @@ def build_line(
                 window = rows_window(entries[0])
                 if window is not None:
                     line["rows_read"] = window
+                shown = code_shown(entries[0])
+                if shown is not None:
+                    line["code_shown"] = shown
     return line
+
+
+# The pair states whose two texts match: the entry shows the code difference whole — there is none.
+IDENTICAL_TEXT_STATES = frozenset(
+    {
+        "identical",
+        "identical_text_unverified",
+        "identical_callee_unverified",
+        "identical_unique",
+        "identical_not_unique",
+    }
+)
+
+
+def code_shown(entry: dict[str, Any]) -> bool | None:
+    """Whether one rendered entry showed its code difference whole: True when its pseudocode delta
+    carries an inline hunk with nothing held back or cut (``part_cut``), or there is nothing to
+    show (a ``layout_only`` delta, two texts that match); False when a hunk was held back (over
+    its gate, too large, the page budget); None when the entry carried no hunk either way (no
+    delta computed, a function with no counterpart, a text not available, a summary)."""
+    delta = entry.get("pseudocode_delta")
+    if isinstance(delta, dict):
+        hunk = delta.get("inline_hunk")
+        if isinstance(hunk, dict):
+            return not part_cut(hunk)
+        if delta.get("kind") == "layout_only":
+            return True
+    if entry.get("pseudocode_sameness") in IDENTICAL_TEXT_STATES:
+        return True
+    return None
 
 
 # The reads of one subject whose answer is a page of it: what ``page_rows`` is recorded for.
@@ -368,10 +442,11 @@ class ToolCallLog:
         arguments: dict[str, Any],
         result: Any = None,
         error: str | None = None,
+        reading_args: dict[str, Any] | None = None,
     ) -> None:
         """Record one call; never raises."""
         try:
-            line = build_line(self.session, tool, arguments, result, error)
+            line = build_line(self.session, tool, arguments, result, error, reading_args)
         except Exception:  # noqa: BLE001 — the log never fails a tool call
             return
         append(self.path, line)

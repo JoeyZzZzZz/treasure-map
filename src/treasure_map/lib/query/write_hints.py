@@ -7,6 +7,8 @@ nothing here moves a judgement, its review state, a bucket, an attention or an o
 ``other_direction`` — on a judgement of ANY diff verdict about an entry of a binary diff: how many
 of the entry's candidate rows carry a ref on the A side only, and how many on the B side only,
 with the call that reads them (the entry by its ``entry_id``, its rows paged by ``rows_offset``).
+It counts the whole entry's rows also when the anchor is one candidate row of it (``same_shape``
+reads that row alone).
 Both directions are always given, the same way. It counts the rows the view holds (each row's
 ``a_ref`` / ``b_ref``); it says nothing of what a one-sided row means — a row with a ref on one
 side only is not a call gone or new (the view never says that: a function with no counterpart is
@@ -21,10 +23,17 @@ ref at a call's own address, that call's same-shape group in this diff (lib/quer
 same_shape_siblings) — ``group_ref``, ``member_count``, ``by_landing`` — once per group, with the
 group's members outside this diff across the run pair (``members_outside_input_diff``) and the two
 calls that read it. Where a member landed is its own diff's answer: no ``by_landing`` is given
-across the run pair. Computed for at most ``SAME_SHAPE_SECONDS`` per write call (a group already
-begun finishes); the groups left are ``same_shape_deferred`` with their calls. A row with only a
-function-level ref (no call address of its own) is no group's member: an entry with no other row
-gets ``same_shape_unavailable`` with why.
+across the run pair. A row with only a function-level ref (no call address of its own) is no
+group's member: an entry with no other row gets ``same_shape_unavailable`` with why.
+
+Time: one write call (one judgement, or every item of a batch) spends about
+``SAME_SHAPE_SECONDS`` on the groups, in two parts. First each group's one-diff facts (its ref,
+member count and by_landing — cheap once the side's calls are read): a group not begun when the
+time is up is ``same_shape_deferred`` with its calls. Then, in the time left, the run pair's
+members outside this diff, the smallest groups first (:func:`finish`): a group not reached reads
+``members_outside_input_diff`` null with ``members_outside_deferred`` true (its ``read_with``
+``run_pair`` call reads it). A run-pair read once begun finishes, so one large group can take the
+call past the time by itself.
 """
 
 from __future__ import annotations
@@ -45,16 +54,39 @@ SAME_SHAPE_SECONDS = 10.0
 _SAME_SHAPE_GROUP_MARK = "#f2:"
 
 
+def entry_subjects(
+    atlas: sqlite3.Connection, built: Any, meta: dict[str, Any]
+) -> dict[str, dr.Subject]:
+    """The subjects of a built diff's listed view by anchor_ref (its entries, and the candidate
+    rows of each) — built once per write call, a batch's items all read from it."""
+    from treasure_map.lib.query.patch_view import listed_view
+
+    entries = listed_view(atlas, built).entries
+    return dr.subjects_of(entries, meta["run_a_id"], meta["run_b_id"], meta["binary_a"])
+
+
 def entry_subject(
     atlas: sqlite3.Connection, built: Any, meta: dict[str, Any], anchor_ref: str
 ) -> dr.Subject | None:
     """The subject ``anchor_ref`` names in a built diff's listed view (an entry, or a candidate
     row of one), or None."""
-    from treasure_map.lib.query.patch_view import listed_view
+    return entry_subjects(atlas, built, meta).get(anchor_ref)
 
-    entries = listed_view(atlas, built).entries
-    subjects = dr.subjects_of(entries, meta["run_a_id"], meta["run_b_id"], meta["binary_a"])
-    return subjects.get(anchor_ref)
+
+def no_entry_why(anchor_ref: str) -> str:
+    """Why an anchor that names no entry of a binary diff has no rows by side: a binary one run
+    holds alone has every candidate on that side; a non-binary file has no candidate rows."""
+    if dr.is_binary_presence_anchor(anchor_ref):
+        return (
+            "the anchor names a binary one run holds alone, not an entry of a binary diff: every "
+            "candidate is on that side"
+        )
+    if "#non_binary#" in anchor_ref:
+        return (
+            "the anchor names a non-binary file, not an entry of a binary diff: it has no "
+            "candidate rows"
+        )
+    return "the anchor names no entry of a binary diff: it has no candidate rows by side"
 
 
 def other_direction(diff_id: str | None, subject: dr.Subject | None, why: str) -> dict[str, Any]:
@@ -103,7 +135,8 @@ def wants_same_shape(verdict: str, basis: dict[str, Any] | None, group_ref: str 
 class SameShapePass:
     """What one write call (one judgement, or every item of a batch) reads its same-shape groups
     through: the reads shared by its calls, the groups already computed by group_ref (each group
-    once), how many groups were computed, and the call's deadline."""
+    once), how many groups were computed, the call's deadline, and the groups whose run-pair part
+    is still to read (``pending``, read by :func:`finish`)."""
 
     build_hash: str | None
     current: Any
@@ -114,6 +147,7 @@ class SameShapePass:
     computed: int = 0
     reads: Any = None
     sides: dict[tuple[str, str], dict[str, list[Any]]] = field(default_factory=dict)
+    pending: list[tuple[str, str, str]] = field(default_factory=list)
 
     def over(self) -> bool:
         return time.monotonic() - self.started >= self.seconds
@@ -202,6 +236,8 @@ def same_shape(
                 continue
             ss.groups[gref] = _compute(atlas, ss, diff_id, pair, run_a, run_b, r)
             ss.computed += 1
+            if "members_outside_input_diff" in ss.groups[gref]:
+                ss.pending.append((gref, pair, _anchor_of(run_a, run_b, r)))
         groups.append(ss.groups[gref])
     out: dict[str, Any] = {}
     if groups:
@@ -220,6 +256,16 @@ def same_shape(
     return out
 
 
+def _anchor_of(run_a: str, run_b: str, r: Any) -> str:
+    from treasure_map.lib.query.sink_overlay import _subject_key
+
+    return dr.candidate_anchor(run_a, run_b, _subject_key(r))
+
+
+def _stamps(ss: SameShapePass) -> dict[str, Any]:
+    return {"build_hash": ss.build_hash, "current": ss.current, "commit": ss.commit}
+
+
 def _compute(
     atlas: sqlite3.Connection,
     ss: SameShapePass,
@@ -229,14 +275,14 @@ def _compute(
     run_b: str,
     r: Any,
 ) -> dict[str, Any]:
-    """One group's entry in ``same_shape``: the one-diff group object's counts, and the run
-    pair's members outside this diff."""
+    """One group's entry in ``same_shape``: the one-diff group object's counts, with the run
+    pair's members outside this diff still to read (null, filled in by :func:`finish`)."""
     from treasure_map.lib.query import same_shape_siblings as sss
-    from treasure_map.lib.query.sink_overlay import _subject_key
 
-    anchor = dr.candidate_anchor(run_a, run_b, _subject_key(r))
-    stamps = {"build_hash": ss.build_hash, "current": ss.current, "commit": ss.commit}
-    one = sss.same_shape_siblings(atlas, diff_id, candidate_anchor=anchor, reads=ss.reads, **stamps)
+    anchor = _anchor_of(run_a, run_b, r)
+    one = sss.same_shape_siblings(
+        atlas, diff_id, candidate_anchor=anchor, reads=ss.reads, **_stamps(ss)
+    )
     entry: dict[str, Any] = {"read_with": _read_with(diff_id, pair, r.a_ref)}
     if "error" in one or one.get("not_a_member"):
         entry["unavailable"] = one.get("error") or "not_a_member"
@@ -246,15 +292,42 @@ def _compute(
             "group_ref": one.get("group_ref"),
             "member_count": one.get("member_count"),
             "by_landing": one.get("by_landing"),
+            "members_outside_input_diff": None,
         }
     )
-    whole = sss.same_shape_siblings(atlas, pair, candidate_anchor=anchor, **stamps)
-    if "error" in whole:
-        entry["members_outside_input_diff"] = None
-        entry["run_pair_unavailable"] = whole["error"]
-    else:
-        entry["members_outside_input_diff"] = whole.get("members_outside_input_diff")
     return {k: entry[k] for k in _GROUP_KEYS if k in entry}
+
+
+def finish(atlas: sqlite3.Connection, ss: SameShapePass) -> None:
+    """The second part of a write call's same-shape groups (see the module docstring): each
+    computed group's members outside this diff across the run pair, the smallest groups first, in
+    the time the call has left — filled into the group's own entry, which every item holding the
+    group shares. A group not reached in time says ``members_outside_deferred``. Called once per
+    write call, after every item's groups were computed and before the answer's size is taken."""
+    from treasure_map.lib.query import same_shape_siblings as sss
+
+    def size(item: tuple[str, str, str]) -> tuple[int, str]:
+        count = ss.groups[item[0]].get("member_count")
+        return (count if isinstance(count, int) else 1 << 30, item[0])
+
+    pending, ss.pending = sorted(ss.pending, key=size), []
+    for gref, pair, anchor in pending:
+        entry = ss.groups[gref]
+        if ss.over():
+            entry["members_outside_deferred"] = True
+        else:
+            try:
+                whole = sss.same_shape_siblings(atlas, pair, candidate_anchor=anchor, **_stamps(ss))
+            except Exception as exc:  # noqa: BLE001 — the judgement is written; never fail it
+                whole = {"error": f"could not be read: {type(exc).__name__}: {exc}"}
+            if "error" in whole:
+                entry["run_pair_unavailable"] = whole["error"]
+            else:
+                entry["members_outside_input_diff"] = whole.get("members_outside_input_diff")
+        # In place, in the block's key order: every item holding the group holds this object.
+        ordered = {k: entry[k] for k in _GROUP_KEYS if k in entry}
+        entry.clear()
+        entry.update(ordered)
 
 
 _GROUP_KEYS = (
@@ -262,17 +335,74 @@ _GROUP_KEYS = (
     "member_count",
     "by_landing",
     "members_outside_input_diff",
+    "members_outside_deferred",
     "run_pair_unavailable",
     "unavailable",
     "read_with",
 )
 
 
+_WITHHELD_KEYS = ("group_ref", "member_count", "members_outside_deferred", "read_with")
+
+
 def withhold_by_landing(block: dict[str, Any]) -> dict[str, Any]:
     """A ``same_shape`` block cut to what an answer near its byte budget keeps: each group's ref,
     member count and calls, ``by_landing_withheld``."""
-    groups = [
-        {k: g[k] for k in ("group_ref", "member_count", "read_with") if k in g}
-        for g in block.get("groups", [])
-    ]
+    groups = [{k: g[k] for k in _WITHHELD_KEYS if k in g} for g in block.get("groups", [])]
     return {"groups": groups, "by_landing_withheld": True}
+
+
+def batch_same_shape(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """A cut batch echo's same-shape groups said once: each item's ``same_shape`` /
+    ``same_shape_deferred`` become the lists of its group refs, and the groups themselves —
+    computed ones as :func:`withhold_by_landing` keeps them, deferred ones by their calls — are
+    listed once for the batch (``same_shape_groups`` / ``same_shape_deferred_groups``, by
+    group_ref). Returns (each item's part, the batch's part)."""
+    groups: dict[str, dict[str, Any]] = {}
+    deferred: dict[str, Any] = {}
+    why: str | None = None
+    items: list[dict[str, Any]] = []
+    for r in results:
+        item: dict[str, Any] = {}
+        block = r.get("same_shape")
+        if block is not None:
+            refs = []
+            for g in withhold_by_landing(block)["groups"]:
+                ref = g.get("group_ref") or json.dumps(g.get("read_with"), sort_keys=True)
+                groups.setdefault(ref, {k: v for k, v in g.items() if k != "group_ref"})
+                refs.append(ref)
+            item["same_shape"] = refs
+        late = r.get("same_shape_deferred")
+        if late is not None:
+            refs = []
+            for g in late.get("groups", []):
+                deferred.setdefault(g["group_ref"], g.get("read_with"))
+                refs.append(g["group_ref"])
+            item["same_shape_deferred"] = refs
+            why = late.get("why", why)
+        items.append(item)
+    batch: dict[str, Any] = {}
+    if groups:
+        batch["same_shape_groups"] = groups
+        batch["same_shape_by_landing_withheld"] = True
+    if deferred:
+        batch["same_shape_deferred_groups"] = deferred
+        batch["same_shape_deferred_why"] = why
+    return items, batch
+
+
+def count_same_shape(
+    items: list[dict[str, Any]], batch: dict[str, Any], why: str, *, listings: bool
+) -> None:
+    """A cut of a batch echo still near the page after :func:`batch_same_shape`, in place: each
+    item's group lists become their counts — and with ``listings`` the batch's group listings
+    too — and ``why`` says so (``same_shape_withheld``)."""
+    for item in items:
+        for key in ("same_shape", "same_shape_deferred"):
+            if isinstance(item.get(key), list):
+                item[key] = len(item[key])
+    if listings:
+        for key in ("same_shape_groups", "same_shape_deferred_groups"):
+            if isinstance(batch.get(key), dict):
+                batch[key] = len(batch[key])
+    batch["same_shape_withheld"] = why
