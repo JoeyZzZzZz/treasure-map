@@ -2516,6 +2516,8 @@ def test_the_judgement_facts_of_an_r_entry_do_not_carry_its_reading(
         "pair_evidence": None,
         "counterpart_hint": None,
         "sink_callsite_delta": None,
+        # alt_pairings: no string / key reading is attached by a build either
+        "alt_pairings": None,
     }
 
 
@@ -4221,6 +4223,7 @@ def test_the_judgement_basis_rests_on_every_row_of_the_entry(
         "pair_evidence",
         "counterpart_hint",
         "sink_callsite_delta",
+        "alt_pairings",
     ):
         assert key in got["facts"], key
         del got["facts"][key]
@@ -4797,6 +4800,7 @@ def test_the_wider_identified_difference_moves_no_judgement_basis(
         "pair_evidence": None,
         "counterpart_hint": None,
         "sink_callsite_delta": None,
+        "alt_pairings": None,
     }
     assert (e.bucket, e.subclass) == ("C", "no_sink_candidate")
     assert e.callee_set is not None and e.callee_set["state"] == "undetermined"
@@ -5218,6 +5222,7 @@ def test_the_edge_is_never_a_judgement_basis(tmp_path: Path, current: None) -> N
         "pair_evidence",
         "counterpart_hint",
         "sink_callsite_delta",
+        "alt_pairings",
     }
 
 

@@ -44,7 +44,10 @@ anchor reads it alike.
 THE BASIS is the entry's own diff facts at write time — for a pair its alignment state,
 similarity, export gaps, bucket and the (a_ref, b_ref, presence, reason, counterpart call) of every
 candidate row; for a function with no counterpart its presence state, export gap and bucket; for a
-candidate row its presence, reason, counterpart call and where it lands. A later read re-derives
+candidate row its presence, reason, counterpart call and where it lands. Beside them, the
+read-face signals a judgement leans on (the pair evidence and counterpart hint states, the sink
+call-count delta, and which string / key readings point the entry's functions elsewhere,
+``alt_pairings``). A later read re-derives
 them: any that moved puts the judgement in ``needs_recheck``. An anchor whose subject is gone (the
 diff paired the functions differently, or a candidate was re-keyed) is not a row state; it is
 reported beside the counts as dangling, and reads ``needs_recheck``. An anchor whose subject still
@@ -252,6 +255,7 @@ def entry_facts(e: _Entry) -> dict[str, Any]:
                 if callsites is not None
                 else None
             ),
+            "alt_pairings": _alt_pairings(e),
         }
     assert e.unpaired is not None
     u = e.unpaired
@@ -263,7 +267,15 @@ def entry_facts(e: _Entry) -> dict[str, Any]:
         # first snapshots: facts_delta compares a snapshot on its own keys, so it moves none)
         "counterpart_hint": sorted(h["addr"] for h in (e.counterpart_hint or {}).get("hints", ()))
         or None,
+        "alt_pairings": _alt_pairings(e),
     }
+
+
+def _alt_pairings(e: _Entry) -> list[list[str]] | None:
+    """The published string / key readings pointing elsewhere (alt_pairings), as [via, direction,
+    target]; None when there is none. Never the same-body ones: whether those were read in a call
+    depends on a cache, and the facts a judgement is checked against must not."""
+    return sorted([i["via"], i["direction"], i["target_addr"]] for i in e.alt_anchor) or None
 
 
 def row_facts(view: dict[str, Any]) -> dict[str, Any]:

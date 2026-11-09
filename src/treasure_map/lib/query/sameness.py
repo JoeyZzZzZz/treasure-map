@@ -725,6 +725,19 @@ def pseudocode_delta_and_guards(
     return delta, _guard_scan(blocks, 0, la, lb, sides)
 
 
+def delta_ratio(
+    a: str, b: str, ranges_a: ImageRanges, ranges_b: ImageRanges, addr_a: str, addr_b: str
+) -> float:
+    """The line-level match ratio (0..1) of the normalised lines pseudocode_delta compares, for the
+    pair (``addr_a``, ``addr_b``): the try/catch annotation's addresses blanked under that pair's
+    own entry offset, the matcher's junk heuristic off (so a long body reads the same every time).
+    A text measure of how alike two bodies read, never a verdict and never an order."""
+    blank_try = try_shift_consistent(a, b, _hex_int(addr_a), _hex_int(addr_b))
+    la, _ra, _na = _delta_lines(a, ranges_a, blank_try)
+    lb, _rb, _nb = _delta_lines(b, ranges_b, blank_try)
+    return SequenceMatcher(None, la, lb, autojunk=False).ratio()
+
+
 # ── inline_hunk: the changed blocks themselves, read from the original text ──────────────────
 
 # The hunk is given only while the change itself is small: structural lines (both sides) plus

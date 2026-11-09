@@ -72,6 +72,10 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
   undetermined pair carries ``proposed_pair_reading`` instead — the same reading as if it were
   paired, with whether its body is unique on each side — beside the entry, never its pairing; it
   moves no entry between buckets.
+  ``alt_pairings`` (every placed entry, listed or not) — where its functions' counterparts may be
+  other than the diff puts them, by unique strings, a dispatch key or the same body found once
+  elsewhere (lib/query/alt_pairings): counted on a page, read in full by ``entry_id``, in a fixed
+  order, never chosen between; nothing is re-paired and no bucket, order or significance reads it.
   ``sink_arg_constant_delta`` — a persisted candidate whose size constant moved (0x40 -> 0x3f),
   with the callee and from/to, direction-neutral. A changed size KIND is the weaker
   ``size_kind_shifted``.
@@ -125,7 +129,7 @@ from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE, DECOMPILE_ERROR_PLACEHOL
 from treasure_map.lib.facts import has_text as _has_text
 from treasure_map.lib.hunt.downweight import _address_taken
 from treasure_map.lib.pattern import classes
-from treasure_map.lib.query import diff_review, diff_sink_axes, entry_words, sameness
+from treasure_map.lib.query import alt_pairings, diff_review, diff_sink_axes, entry_words, sameness
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN
 from treasure_map.lib.query.diff_align import diff_source_staleness, get_diff_deltas
 from treasure_map.lib.query.review_units import COMMAND_CALL_SINKS
@@ -1297,13 +1301,24 @@ class _Entry:
     # same-name functions. A fact on any pair; on a proposed pairing it also keeps the entry out
     # of the swap lift (``_lift_basis``). None when there is no such conflict.
     pairing_name_conflict: dict[str, Any] | None = None
-    # A read-face reading of an undetermined pairing (``_attach_pair_evidence``), never part of
-    # diff_review.entry_facts: ``pair_evidence`` (supported / negated / none, from the callers and
-    # the anchors below) and ``counterpart_hint`` (what the unique strings, dispatch keys and
-    # import names point to, set only when one points anywhere). None until attached, and on every
-    # entry that is not an R entry on an undetermined pair.
+    # A read-face reading of an undetermined pairing (``_attach_pair_evidence``): ``pair_evidence``
+    # (supported / negated / none, from the callers and the anchors below) and
+    # ``counterpart_hint`` (what the unique strings, dispatch keys and import names point to, set
+    # only when one points anywhere). None until attached, and on every entry that is not an R
+    # entry on an undetermined pair — except a P entry's ``counterpart_hint``. Their states are
+    # part of diff_review.entry_facts, so a judgement that read them is re-checked when they move.
     pair_evidence: dict[str, Any] | None = None
     counterpart_hint: dict[str, Any] | None = None
+    # Where this entry's functions' counterparts may be other than where the diff puts them
+    # (``_attach_pair_evidence``, lib/query/alt_pairings), on EVERY placed entry: the published
+    # string / key readings that point elsewhere, each {via, direction, target_addr,
+    # target_pairing_state, evidence_count, evidence}; empty when none. ``alt_withheld`` names why
+    # none could be read (the build's callee_block). The same-body readings (``via="twin"``) need
+    # the pseudocode and are joined at render time only (``_alt_items``). Which string / key
+    # readings there are is part of diff_review.entry_facts; the same-body ones never are (whether
+    # they were read in a call depends on a cache, and a judgement's facts must not).
+    alt_anchor: list[dict[str, Any]] = field(default_factory=list)
+    alt_withheld: str | None = None
 
     @property
     def shown_bucket(self) -> str:
@@ -1543,6 +1558,14 @@ class _Builder:
         return out
 
     def _sink_candidate_counts(self, p: _Pair) -> dict[str, Any] | None:
+        """:meth:`_sink_candidate_counts_for` the pair's two functions."""
+        return self._sink_candidate_counts_for(
+            p.addr_a, p.addr_b, "aligned" if p.aligned else "proposed"
+        )
+
+    def _sink_candidate_counts_for(
+        self, addr_a: str, addr_b: str, pairing: str
+    ) -> dict[str, Any] | None:
         """Per sink name, the hunt candidates each function of the pair holds: ``delta`` the sinks
         both sides count and count differently, ``unknown`` the side / sink pairs that cannot be
         counted, with why. None when neither function holds a candidate, or every sink counts
@@ -1556,17 +1579,19 @@ class _Builder:
         missing, never 0), then per sink ``granularity_not_per_call`` (the
         side holds a function-level key of that sink), then ``sink_ambiguous`` (a candidate of the
         function whose sink name cannot be read: every sink of that side is unknown, and a side
-        with no named sink at all says so with ``sink: null``). Direction-neutral."""
+        with no named sink at all says so with ``sink: null``). Direction-neutral. ``pairing`` is
+        what the answer says the two functions are: ``aligned``, ``proposed`` or ``alternative``
+        (another function than the diff pairs it with, alt_pairings)."""
         refs = {
-            "a": self._refs_of("a").get(p.addr_a, {}),
-            "b": self._refs_of("b").get(p.addr_b, {}),
+            "a": self._refs_of("a").get(addr_a, {}),
+            "b": self._refs_of("b").get(addr_b, {}),
         }
         if not refs["a"] and not refs["b"]:
             # No candidate either side — unless a side's decompile did not complete: its candidates
             # are then missing, and "none either side" would read as a count.
             gaps = [
                 {"sink": None, "side": side, "reason": f"decompile_{gap}"}
-                for side, addr in (("a", p.addr_a), ("b", p.addr_b))
+                for side, addr in (("a", addr_a), ("b", addr_b))
                 if self.sides[side].error is None
                 and (gap := _decompile_gap(self.sides[side].fn(addr))) is not None
             ]
@@ -1574,13 +1599,13 @@ class _Builder:
                 return None
             return {
                 "unit": SINK_COUNTS_UNIT,
-                "pairing": "aligned" if p.aligned else "proposed",
+                "pairing": pairing,
                 "delta": [],
                 "unknown": gaps,
             }
         sides: dict[str, tuple[str | None, dict[str, int], set[str], bool, set[str]]] = {}
         names: set[str] = set()
-        for side, addr in (("a", p.addr_a), ("b", p.addr_b)):
+        for side, addr in (("a", addr_a), ("b", addr_b)):
             counts: dict[str, int] = {}
             coarse: set[str] = set()
             named: set[str] = set()
@@ -1633,7 +1658,7 @@ class _Builder:
             return None
         return {
             "unit": SINK_COUNTS_UNIT,
-            "pairing": "aligned" if p.aligned else "proposed",
+            "pairing": pairing,
             "delta": delta,
             "unknown": unknown,
         }
@@ -1677,6 +1702,14 @@ class _Builder:
         return None, counts
 
     def _sink_callsite_counts(self, p: _Pair) -> dict[str, Any] | None:
+        """:meth:`_sink_callsite_counts_for` the pair's two functions."""
+        return self._sink_callsite_counts_for(
+            p.addr_a, p.addr_b, "aligned" if p.aligned else "proposed"
+        )
+
+    def _sink_callsite_counts_for(
+        self, addr_a: str, addr_b: str, pairing: str
+    ) -> dict[str, Any] | None:
         """Per sink name, how many times each function of the pair CALLS it (``call_tokens``,
         opcode-7 tokens, not deduplicated — unlike the callee SET, this catches a repeated call
         appearing or disappearing). ``delta`` the sinks both sides count and count differently,
@@ -1689,10 +1722,10 @@ class _Builder:
         when neither side names a sink call, or every named sink counts alike with nothing unknown.
         Direction-neutral. Never moves an entry's attention or basis; the significance order
         reads its absence only to place a count-floated entry inside attention 0
-        (:func:`_count_noise`)."""
+        (:func:`_count_noise`). ``pairing`` as in :meth:`_sink_candidate_counts_for`."""
         sides = {
-            "a": self._callsite_side("a", p.addr_a),
-            "b": self._callsite_side("b", p.addr_b),
+            "a": self._callsite_side("a", addr_a),
+            "b": self._callsite_side("b", addr_b),
         }
         names: set[str] = set(sides["a"][1]) | set(sides["b"][1])
         if not names:
@@ -1715,7 +1748,7 @@ class _Builder:
             return None
         return {
             "unit": "callsite",
-            "pairing": "aligned" if p.aligned else "proposed",
+            "pairing": pairing,
             "delta": delta,
             "unknown": unknown,
         }
@@ -2857,6 +2890,40 @@ class _PairEvidence:
             item["at_probe_addr"] = probe is not None and item["addr"] == probe
         return {"anchors": sorted({h["anchor"] for h in hints}), "hints": items}
 
+    def alt_anchor_items(self, e: _Entry) -> list[dict[str, Any]]:
+        """The entry's published string / key readings pointing elsewhere than its own partner (on
+        a function in no pair, anywhere on the other side), one per (source, direction, target)
+        and in that order (lib/query/alt_pairings). Reads the same anchors as
+        :meth:`_anchor_hints`; what is published is decided here, never there, so neither
+        ``pair_evidence`` nor ``counterpart_hint`` moves because of it."""
+        if e.pair is not None:
+            p = e.pair
+            hints = self._anchor_hints("a", p.addr_a) + self._anchor_hints("b", p.addr_b)
+            own = {"to_b": p.addr_b, "to_a": p.addr_a}
+        elif e.unpaired is not None:
+            hints = self._anchor_hints(e.unpaired.side, e.unpaired.addr)
+            own = {}
+        else:
+            return []
+        items = [
+            {
+                "via": h["anchor"],
+                "direction": h["direction"],
+                "target_addr": h["addr"],
+                "target_pairing_state": _pairing_state(
+                    self._pair_of("b" if h["direction"] == "to_b" else "a"), h["addr"]
+                ),
+                "evidence_count": len(h["evidence"]),
+                "evidence": [
+                    v[:_HINT_EVIDENCE_CHARS] for v in sorted(h["evidence"])[:_HINT_EVIDENCE_SAMPLE]
+                ],
+            }
+            for h in hints
+            if h["addr"] != own.get(h["direction"])
+            and alt_pairings.anchor_published(h["anchor"], len(h["evidence"]))
+        ]
+        return sorted(items, key=alt_pairings.order_key)
+
     def _thunk_reading(
         self, p: _Pair, thunk_a: bool, thunk_b: bool
     ) -> tuple[str | None, bool, list[dict[str, Any]]]:
@@ -2967,7 +3034,11 @@ def _attach_pair_evidence(atlas: sqlite3.Connection, built: BuiltDiff) -> None:
     be read (the build's ``callee_block``), every such entry gets ``none`` with that reason and no
     hint: the pair's addresses are the diff's, and a re-extracted analysis.db may hold another
     function there. A P entry (a function in no pair) gets the hint alone
-    (:meth:`_PairEvidence.one_sided_hint`), and none on such a diff."""
+    (:meth:`_PairEvidence.one_sided_hint`), and none on such a diff.
+
+    Every PLACED entry — listed or not, of any bucket — also gets its published string / key
+    readings pointing elsewhere (``alt_anchor``, :meth:`_PairEvidence.alt_anchor_items`), or, on
+    such a diff, ``alt_withheld`` with the reason: none could be read, which is not "none"."""
     if built.pair_evidence_attached or built.builder is None:
         return
     built.pair_evidence_attached = True
@@ -2975,12 +3046,14 @@ def _attach_pair_evidence(atlas: sqlite3.Connection, built: BuiltDiff) -> None:
         e for e in built.entries if e.bucket == "R" and e.pair is not None and not e.pair.aligned
     ]
     one_sided = [e for e in built.entries if e.bucket == "P" and e.unpaired is not None]
-    if not targets and not one_sided:
+    if not built.placed:
         return
     block = built.builder.callee_block
     if block is not None:
         for e in targets:
             e.pair_evidence, e.counterpart_hint = {"state": PAIR_NONE, "reason": block}, None
+        for e in built.placed:
+            e.alt_withheld = block
         return
     reader = _PairEvidence(atlas, built, built.builder)
     for e in targets:
@@ -2989,6 +3062,8 @@ def _attach_pair_evidence(atlas: sqlite3.Connection, built: BuiltDiff) -> None:
     for e in one_sided:
         assert e.unpaired is not None
         e.counterpart_hint = reader.one_sided_hint(e.unpaired)
+    for e in built.placed:
+        e.alt_anchor = reader.alt_anchor_items(e)
 
 
 def _supported_lift(e: _Entry) -> str | None:
@@ -3641,6 +3716,10 @@ class _Readings:
     # The B-side addresses of the E entries' functions that ANOTHER B function's pseudocode mentions
     # by name (the caller-set edge's no-mention ordering key); empty when the diff has no E entry.
     b_mentions: frozenset[str] = frozenset()
+    # Every function's same-body reading on the other side (alt_pairings.twin_readings), by
+    # (side, address): read per FUNCTION, never per entry, so an entry a re-hunt adds or removes
+    # (a P entry made from a candidate row) finds its function's reading under this key.
+    twins: alt_pairings.TwinReadings = alt_pairings.TwinReadings({})
 
 
 # Process-wide caches of the expensive read, per (diff_id, sha_a, sha_b, build_hash_a,
@@ -3666,6 +3745,12 @@ _SINK_AXIS_CACHE: _BoundedCache[tuple[str, ...], tuple[diff_sink_axes.RowAxes, .
 # covers (they move with the candidate rows, which that key does not hold): computed when the B
 # bodies are read, so every page of one diff reads the same set in the same order.
 _B_MENTIONS_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(32)
+# Every function's same-body reading (alt_pairings.twin_readings), on the pseudocode readings' key:
+# it reads the diff's pairs and both sides' bodies, which that key holds; never the entries.
+_TWIN_CACHE: _BoundedCache[tuple[str, ...], alt_pairings.TwinReadings] = _BoundedCache(32)
+# An alternative pairing's text reading (its delta as counts and its line ratio), and a current
+# pairing's line ratio, per (the readings' key, addr_a, addr_b): read for one entry at a time.
+_ALT_TEXT_CACHE: _BoundedCache[tuple[str, ...], dict[str, Any]] = _BoundedCache(4096)
 _ELSEWHERE_SAMPLE = 3  # addresses shown of a body found elsewhere
 
 
@@ -3679,6 +3764,8 @@ def _clear_view_caches() -> None:
     _DRIFT_CACHE.clear()
     _SINK_AXIS_CACHE.clear()
     _B_MENTIONS_CACHE.clear()
+    _TWIN_CACHE.clear()
+    _ALT_TEXT_CACHE.clear()
     _SIZE_FACT_CACHE.clear()
     _CANDIDATE_ENTRY_CACHE.clear()
     _ANCHOR_SIDE_CACHE.clear()
@@ -3746,12 +3833,13 @@ def _read_undetermined(
     pairs: list[_Pair],
     ra: sameness.ImageRanges,
     rb: sameness.ImageRanges,
+    index: dict[str, dict[str, list[str]]] | None = None,
 ) -> _PairReads:
     """Each undetermined pair read like an aligned one, plus — when both bodies were read — how
     often each body occurs on each side and where else it is. The skeleton index over both sides'
-    functions is built only when some pair has two bodies to look up, and never kept."""
+    functions (``index``, when the caller already built it) is built only when some pair has two
+    bodies to look up, and never kept."""
     out: _PairReads = {}
-    index: dict[str, dict[str, list[str]]] | None = None
     for p in pairs:
         read = _read_pair(ba, bb, p, ra, rb)
         if read.matches is not None and ba is not None and bb is not None:
@@ -3810,24 +3898,54 @@ def _pseudo_readings(atlas: sqlite3.Connection, built: BuiltDiff) -> _Readings:
     targets = _e_targets(built)
     mention_key = (*key, *(f"{addr}={name or ''}" for addr, name in targets))
     mentions = _B_MENTIONS_CACHE.get(mention_key) if targets else frozenset()
-    if aligned is None or undetermined is None or mentions is None:
+    twins = _TWIN_CACHE.get(key)
+    if aligned is None or undetermined is None or mentions is None or twins is None:
         ba = sameness.read_function_bodies(pa, d.sha_a)
         bb = sameness.read_function_bodies(pb, d.sha_b)
         ra = sameness.read_image_ranges(pa, d.sha_a)
         rb = sameness.read_image_ranges(pb, d.sha_b)
         pairs = [e.pair for e in built.placed if e.pair is not None]
+        # Both sides' skeleton index, built once for the same-body readings and the undetermined
+        # pairs' occurrences alike, and never kept.
+        prebuilt = (
+            {"a": alt_pairings.skeleton_index(ba), "b": alt_pairings.skeleton_index(bb)}
+            if twins is None and ba is not None and bb is not None
+            else None
+        )
         if aligned is None:
             aligned = {
                 (p.addr_a, p.addr_b): _read_pair(ba, bb, p, ra, rb) for p in pairs if p.aligned
             }
             _PSEUDO_READING_CACHE[key] = aligned
         if undetermined is None:
-            undetermined = _read_undetermined(ba, bb, [p for p in pairs if not p.aligned], ra, rb)
+            undetermined = _read_undetermined(
+                ba,
+                bb,
+                [p for p in pairs if not p.aligned],
+                ra,
+                rb,
+                {s: prebuilt[s][1] for s in ("a", "b")} if prebuilt is not None else None,
+            )
             _UNDETERMINED_READING_CACHE[key] = undetermined
         if mentions is None:
             mentions = _b_other_fn_mentions(bb, targets)
             _B_MENTIONS_CACHE[mention_key] = mentions
-    return _Readings(key, ((pa, d.sha_a), (pb, d.sha_b)), aligned, undetermined, mentions)
+        if twins is None:
+            twins = alt_pairings.twin_readings(
+                {"a": ba, "b": bb},
+                {"a": ra, "b": rb},
+                {
+                    "a": {p.addr_a: p.addr_b for p in d.pairs},
+                    "b": {p.addr_b: p.addr_a for p in d.pairs},
+                },
+                {
+                    "a": {p.addr_a: p.addr_b for p in d.pairs if p.aligned},
+                    "b": {p.addr_b: p.addr_a for p in d.pairs if p.aligned},
+                },
+                prebuilt,
+            )
+            _TWIN_CACHE[key] = twins
+    return _Readings(key, ((pa, d.sha_a), (pb, d.sha_b)), aligned, undetermined, mentions, twins)
 
 
 def _e_targets(built: BuiltDiff) -> list[tuple[str, str | None]]:
@@ -4439,20 +4557,222 @@ def _proposed_json(
     return out
 
 
+# ── alt_pairings: where a function's counterpart may be other than the diff puts it ─────────
+#
+# A fact beside every placed entry (lib/query/alt_pairings): the published string / key readings
+# pointing elsewhere (``_Entry.alt_anchor``, from the build) and the same-body readings (from the
+# pseudocode readings), joined here, at render time. Never a re-pairing, never a choice between
+# them, never read by a bucket, an order, a significance or a must-read set. A listed page gives
+# each entry its count and sources; unit material and a not-listed row give the readings without
+# their text and sink reading (``alt_delta_withheld`` says where that is); one entry read by
+# ``entry_id`` gives everything, each alternative pairing read as the current one is.
+
+ALT_READ_WITH_ENTRY_ID = "read_with_entry_id"
+ALT_NOT_LISTED = "not_listed_no_drilldown"
+ALT_TEXT_UNAVAILABLE = "text_unavailable"
+ALT_TWIN_UNREADABLE = "twin_unreadable"
+_ALT_DRILL_FIELDS = ("alt_delta_summary", "alt_sink_counts", "alt_text_ratio", "current_text_ratio")
+
+
+def _alt_ends(e: _Entry) -> list[tuple[str, str]]:
+    """The entry's functions, as (side, address): both of a pair, the one of an unpaired entry."""
+    if e.pair is not None:
+        return [("a", e.pair.addr_a), ("b", e.pair.addr_b)]
+    if e.unpaired is not None:
+        return [(e.unpaired.side, e.unpaired.addr)]
+    return []
+
+
+def _twin_items(
+    built: BuiltDiff, readings: _Readings, e: _Entry
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(the entry's same-body targets as alt_pairings items, its ``twin_not_given`` by direction),
+    looked up by the entry's functions in the readings."""
+    items: list[dict[str, Any]] = []
+    held: list[dict[str, Any]] = []
+    d = built.diff
+    for side, addr in _alt_ends(e):
+        twin = readings.twins.facts.get((side, addr))
+        if twin is None:
+            continue
+        if twin.target is None:
+            held.append({"direction": twin.direction, "count": twin.count, "basis": twin.basis})
+            continue
+        items.append(
+            {
+                "via": alt_pairings.VIA_TWIN,
+                "direction": twin.direction,
+                "target_addr": twin.target,
+                "target_pairing_state": _pairing_state(
+                    d.pair_of_b if side == "a" else d.pair_of_a, twin.target
+                ),
+                # the one same body there is on each side; the body is the evidence
+                "evidence_count": twin.count,
+            }
+        )
+    return items, sorted(held, key=lambda h: str(h["direction"]))
+
+
+def _alt_readings(
+    built: BuiltDiff, readings: _Readings, e: _Entry
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """(every published alternative of the entry, in the fixed order; its twin_not_given), or None
+    when none could be read (``alt_withheld``). The items are new objects, never the entry's."""
+    if e.alt_withheld is not None:
+        return None
+    twins, held = _twin_items(built, readings, e)
+    items = [{**i, "evidence": list(i["evidence"])} for i in e.alt_anchor] + twins
+    return sorted(items, key=alt_pairings.order_key), held
+
+
+def _alt_summary(
+    built: BuiltDiff, readings: _Readings, e: _Entry, items: list[dict[str, Any]] | None
+) -> dict[str, Any]:
+    """The entry's ``alt_pairing_count`` / ``alt_pairing_sources`` (absent at 0), or
+    ``alt_pairings_withheld`` with why none, or why the same-body readings could not be read."""
+    if items is None:
+        return {"alt_pairings_withheld": e.alt_withheld}
+    out: dict[str, Any] = {}
+    if items:
+        out["alt_pairing_count"] = len(items)
+        out["alt_pairing_sources"] = sorted({str(i["via"]) for i in items})
+    if readings.twins.unreadable:
+        out["alt_pairings_withheld"] = ALT_TWIN_UNREADABLE
+    return out
+
+
+def _alt_fields(
+    built: BuiltDiff, readings: _Readings, e: _Entry, mode: str, cheap_reason: str = ""
+) -> dict[str, Any]:
+    """The alt_pairings fields of one rendered entry. ``mode``: ``count`` (a listed page: the
+    summary fields only), ``cheap`` (the readings too, their text and sink fields null with
+    ``alt_delta_withheld`` = ``cheap_reason``) or ``drill`` (one entry read by entry_id: each
+    alternative read as the current pairing is, and ``twin_not_given``)."""
+    found = _alt_readings(built, readings, e)
+    items = found[0] if found is not None else None
+    out = _alt_summary(built, readings, e, items)
+    if found is None or mode == "count":
+        return out
+    items, held = found
+    if mode == "drill":
+        _alt_drill(built, readings, e, items)
+        if held:
+            out["twin_not_given"] = held
+    else:
+        for i in items:
+            i.update({k: None for k in _ALT_DRILL_FIELDS})
+            i["alt_delta_withheld"] = cheap_reason
+    if items:
+        out["alt_pairings"] = items
+    return out
+
+
+def _alt_pair(e: _Entry, item: dict[str, Any]) -> tuple[str, str]:
+    """(addr_a, addr_b) of the alternative pairing an item reads: the entry's function on the
+    item's source side, with the target on the other."""
+    to_b = item["direction"] == "to_b"
+    if e.pair is not None:
+        return (
+            (e.pair.addr_a, item["target_addr"]) if to_b else (item["target_addr"], e.pair.addr_b)
+        )
+    assert e.unpaired is not None
+    return (
+        (e.unpaired.addr, item["target_addr"]) if to_b else (item["target_addr"], e.unpaired.addr)
+    )
+
+
+def _alt_drill(
+    built: BuiltDiff, readings: _Readings, e: _Entry, items: list[dict[str, Any]]
+) -> None:
+    """Fill each item's text and sink reading, in place: the alternative pairing's
+    pseudocode_delta as counts (``_summary_delta``), its sink candidate and call counts, its line
+    ratio and the current pairing's (``sameness.delta_ratio``, one rule for both; null on a
+    function in no pair). Texts are read for these functions only, results cached per pair."""
+    bld = built.builder
+    if bld is None or not items:
+        return
+    pairs = [_alt_pair(e, i) for i in items]
+    want = {"a": {a for a, _b in pairs}, "b": {b for _a, b in pairs}}
+    if e.pair is not None:
+        want["a"].add(e.pair.addr_a)
+        want["b"].add(e.pair.addr_b)
+    texts: dict[str, dict[str, str | None] | None] = {}
+    ranges: dict[str, sameness.ImageRanges] = {}
+
+    def text_of(side: str, addr: str) -> str | None:
+        if side not in texts:
+            texts[side] = bld.sides[side].text_of(sorted(want[side]))
+            path, sha = readings.sources[0 if side == "a" else 1]
+            ranges[side] = sameness.read_image_ranges(path, sha)
+        got = texts[side]
+        return got.get(addr) if got is not None else None
+
+    def name_of(side: str, addr: str) -> str | None:
+        n = bld.sides[side].names.get(addr)
+        return n if n and not _is_synthetic_name(n, addr) else None
+
+    def reading(a: str, b: str, with_delta: bool) -> dict[str, Any] | None:
+        key = (*readings.key, "alt" if with_delta else "ratio", a, b)
+        hit = _ALT_TEXT_CACHE.get(key)
+        if hit is not None:
+            return hit
+        ta, tb = text_of("a", a), text_of("b", b)
+        if not ta or not tb:
+            return None
+        found: dict[str, Any] = {
+            "ratio": round(sameness.delta_ratio(ta, tb, ranges["a"], ranges["b"], a, b), 3)
+        }
+        if with_delta:
+            delta = sameness.pseudocode_delta(
+                ta, tb, ranges["a"], ranges["b"], a, b, name_of("a", a), name_of("b", b)
+            )
+            found["summary"] = _summary_delta(delta)
+        _ALT_TEXT_CACHE[key] = found
+        return found
+
+    current = None
+    if e.pair is not None:
+        cur = reading(e.pair.addr_a, e.pair.addr_b, False)
+        current = cur["ratio"] if cur is not None else None
+    for i, (a, b) in zip(items, pairs, strict=True):
+        alt = reading(a, b, True)
+        i["alt_delta_summary"] = alt["summary"] if alt is not None else None
+        i["alt_sink_counts"] = {
+            "callsite": bld._sink_callsite_counts_for(a, b, "alternative"),
+            "candidate": bld._sink_candidate_counts_for(a, b, "alternative"),
+        }
+        i["alt_text_ratio"] = alt["ratio"] if alt is not None else None
+        i["current_text_ratio"] = current
+        i["alt_delta_withheld"] = None if alt is not None else ALT_TEXT_UNAVAILABLE
+
+
+def _has_alt(built: BuiltDiff, readings: _Readings, e: _Entry) -> bool:
+    found = _alt_readings(built, readings, e)
+    return found is not None and bool(found[0])
+
+
 def _not_listed_counts(built: BuiltDiff, readings: _Readings) -> dict[str, dict[str, Any]]:
     """The aligned, similarity-1 pairs that place no entry, counted by pseudocode_sameness — after
     listed_view, which lists the ones reading differs as bucket S. That category keeps its key with
     a count of 0 and says where its pairs are (``listed_as``, read with ``bucket="S"``), so the
-    listed entries and these counts still add up to every placed pair."""
+    listed entries and these counts still add up to every placed pair. ``with_alt_pairings``
+    (absent at 0): how many of a category's pairs carry an alternative pairing (alt_pairings)."""
     tally: dict[str, int] = {}
+    with_alt: dict[str, int] = {}
     for e in built.placed:
         if e.listed:
             continue
         state = _sameness_of(e, readings)
         if state is not None:
             tally[state] = tally.get(state, 0) + 1
+            if _has_alt(built, readings, e):
+                with_alt[state] = with_alt.get(state, 0) + 1
     out: dict[str, dict[str, Any]] = {
-        name: {"count": tally.get(state, 0)} for state, name in sameness.NOT_LISTED_NAME.items()
+        name: {
+            "count": tally.get(state, 0),
+            **({"with_alt_pairings": with_alt[state]} if with_alt.get(state) else {}),
+        }
+        for state, name in sameness.NOT_LISTED_NAME.items()
     }
     differs = sameness.NOT_LISTED_NAME[sameness.DIFFERS]
     out[differs].update(_S_LISTED_AS)
@@ -4641,6 +4961,8 @@ def _not_listed_page(
             # The guard scan follows its delta; these pairs carry no candidate row to link.
             scan = scans[(e.pair.addr_a, e.pair.addr_b)]
             row.update(_entry_guards(e, scan, [], {})[0])
+        # Not an entry, so never read by entry_id: its alternatives without their text reading.
+        row.update(_alt_fields(built, readings, e, "cheap", ALT_NOT_LISTED))
         rows.append(row)
     out: dict[str, Any] = {
         "entries": rows,
@@ -4683,6 +5005,7 @@ _SUMMARY_COUNTS = frozenset(
         "markers",
         "a_body_elsewhere_in_b_count",
         "b_body_elsewhere_in_a_count",
+        "alt_pairing_count",
     }
 )
 # The entry fields a summary copies as the full entry has them.
@@ -4717,6 +5040,9 @@ _SUMMARY_COPY = frozenset(
         "swap_pairing_note",
         "rows_total",
         "rows_by_presence",
+        "alt_pairing_count",
+        "alt_pairing_sources",
+        "alt_pairings_withheld",
     }
 )
 # The facts a summary drops because another of its fields already says them: a source gap is in
@@ -4742,6 +5068,9 @@ _NOT_LISTED_COPY = (
     "pseudocode_sameness",
     "body",
     "text_unverified_reasons",
+    "alt_pairing_count",
+    "alt_pairing_sources",
+    "alt_pairings_withheld",
 )
 
 
@@ -5968,8 +6297,13 @@ def get_diff_patch_view(
     windows = {e.entry_id: _rows_window(e.row_views, rows_offset or 0, inline) for e in page}
     page_axes = _page_axes(atlas, built.diff, page, windows, page_guards, one is not None)
 
+    # alt_pairings: one entry read by entry_id in full, a unit's members (entry_ids) without their
+    # text and sink reading, every other listed page as counts.
+    alt_mode = "drill" if one is not None else "cheap" if entry_ids is not None else "count"
+
     def _render(e: _Entry) -> dict[str, Any]:
         out = review.entry_json(e, band)
+        out.update(_alt_fields(built, readings, e, alt_mode, ALT_READ_WITH_ENTRY_ID))
         # out["rows"] IS e.row_views (the entry's own list, which promote and the judgement basis
         # read whole): it is REPLACED by the window's new list, never cut or sorted in place, and a
         # row given guard_links / sink_axes is a copy (_rendered_rows).

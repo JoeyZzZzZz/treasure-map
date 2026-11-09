@@ -559,7 +559,9 @@ def _entry_within_budget(
     withheld (``page_budget``) from the LAST row of the window backwards, re-measured after each,
     stopping as soon as it fits (``sink_axes_withheld_rows`` counts them; guard_links stay); only
     when every row's axes are withheld and it still does not fit are its inline_hunks withheld
-    too. The rows and objects it came from are never written."""
+    too, and then its ``alt_pairings`` cut from the last one back (``alt_pairings_cut`` says how
+    many are shown of how many; ``alt_pairing_count`` keeps the whole count). The rows and objects
+    it came from are never written."""
     limit = _RESPONSE_BYTE_BUDGET if budget is None else budget
     if base + len(json.dumps(entry)) <= limit:
         return entry
@@ -578,7 +580,25 @@ def _entry_within_budget(
         out["sink_axes_withheld_rows"] = withheld
         if base + len(json.dumps(out)) <= limit:
             return out
-    return _entry_without_hunks(out)
+    return _entry_without_alt_pairings(_entry_without_hunks(out), base, limit)
+
+
+def _entry_without_alt_pairings(entry: dict[str, Any], base: int, limit: int) -> dict[str, Any]:
+    """``entry`` with its ``alt_pairings`` cut from the end until it fits beside ``base`` bytes
+    (at least one kept), marked ``alt_pairings_cut`` {shown, of}; as it is when it fits or has
+    none. The list it came from is never written."""
+    items = entry.get("alt_pairings")
+    if not isinstance(items, list) or len(items) < 2 or base + len(json.dumps(entry)) <= limit:
+        return entry
+    out = dict(entry)
+    kept = list(items)
+    while len(kept) > 1:
+        kept.pop()
+        out["alt_pairings"] = kept
+        out["alt_pairings_cut"] = {"shown": len(kept), "of": len(items)}
+        if base + len(json.dumps(out)) <= limit:
+            break
+    return out
 
 
 def _fit_entries(result: dict[str, Any], offset: int, budget: int | None = None) -> dict[str, Any]:
@@ -3462,7 +3482,26 @@ def make_tools(
         pairing: R stays R, the pairs are BinDiff's, and nothing is re-paired. A P entry carries
         ``counterpart_hint`` too: no ``state``, each hint's ``at_probe_addr`` (the function the
         counterpart probe found); it changes neither its presence nor its order. A ``negated``
-        pairing's B function is not thereby shown to be one-sided. ``sink_candidate_counts`` (on
+        pairing's B function is not thereby shown to be one-sided. EVERY entry, of any bucket
+        (not-listed pairs too), may carry where its functions' counterparts may be other than the
+        diff puts them: ``alt_pairing_count`` and ``alt_pairing_sources`` (``string``: at least five
+        unique strings point to one function elsewhere; ``key``: a single-handler dispatch key
+        does; ``twin``: its body occurs exactly once elsewhere on the other side and passes the
+        same-body gates), or ``alt_pairings_withheld`` with why none could be read (a stale or
+        unreadable source; ``twin_unreadable``: only the bodies were not read). Read by
+        ``entry_id``, ``alt_pairings`` lists each — ``via``, ``direction``, ``target_addr``, its
+        ``target_pairing_state``, ``evidence_count`` and up to three ``evidence`` values — with the
+        alternative pairing read as the current one is: ``alt_delta_summary``, ``alt_sink_counts``
+        {callsite, candidate} (``pairing`` ``alternative``), ``alt_text_ratio`` beside
+        ``current_text_ratio`` (one line-ratio rule; null on a function in no pair), and
+        ``twin_not_given`` per direction: a same-body count with the gate that held its target
+        back (``decompile_incomplete``, ``not_unique``, ``short_body``,
+        ``callee_identity_elsewhere``, ``literal_values_differ``). A unit's material and a
+        ``not_listed_page`` row give them without those reading fields (``alt_delta_withheld``
+        says where they are). In a fixed order (via, direction, target), never ranked, never
+        chosen between: nothing is re-paired, and no bucket, order, significance or must-read
+        set reads them; ``pair_evidence`` and ``counterpart_hint`` keep their own rules.
+        ``sink_candidate_counts`` (on
         a pair whose
         functions hold candidates): per sink name, how many hunt candidates each function holds —
         ``unit`` says it: callsite / wrapper_callsite keys, NOT every call of the name, so 0 means
