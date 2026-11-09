@@ -33,6 +33,33 @@ from treasure_map.version import UNKNOWN_VERSION
 
 XrefDirection = Literal["callers", "callees", "address_taken"]
 
+
+def page_list(rows: list[Any], offset: int, limit: int | None) -> tuple[list[Any], int]:
+    """``rows[offset : offset + limit]`` (to the end when ``limit`` is None) and the whole list's
+    length — the one row-page cut every paged fact reader shares. The list must already be in one
+    TOTAL order: rows that tie on the order trade places between two calls, and a reader walking
+    ``offset = next_offset`` reads one twice and misses the other. ``offset`` past the end gives an
+    empty page, never an error."""
+    lo = max(0, offset)
+    page = rows[lo:] if limit is None else rows[lo : lo + max(0, limit)]
+    return page, len(rows)
+
+
+def xref_key(edge: dict[str, Any]) -> tuple[str, str, str, str, bool]:
+    """The total order of callers / callees edges. Path and address sit inside the edge's
+    ``anchor``; a library-level edge (no function row) has ``function`` and ``address`` None, so
+    each part falls back to "" — a None beside a string would not compare. Two edges equal on this
+    key are equal in every field, so which comes first changes nothing a reader sees."""
+    a = edge["anchor"]
+    return (
+        a.get("binary_path") or "",
+        a.get("address") or "",
+        a.get("function") or "",
+        edge.get("xref_type") or "",
+        bool(edge.get("library_level")),
+    )
+
+
 # The iron-law note on every address-taken result: it is a FACT (F's entry is referenced as a
 # data/pointer value here), NEVER a dispatch/reachability verdict. Whether/how F is then called
 # through that stored pointer is the consumer's to trace.
@@ -724,8 +751,17 @@ def get_xrefs(
     func: str,
     direction: XrefDirection = "callers",
     binary: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Cross-reference edges for one function.
+
+    Paged when ``limit`` (or a non-zero ``offset``) is given: ``edges`` holds ``limit`` edges from
+    ``offset`` and ``total_edges`` counts them all. callers / callees edges come from the xrefs
+    table AND (callers) the reverse scan of callee lists, in no stated order, so a paged answer
+    sorts the merged list by ``xref_key`` first — only the merged list has one order across both
+    sources; address_taken edges keep the stored export's order, which is fixed. Unpaged, the
+    answer is the whole list in the order it was read, without ``total_edges``.
 
     direction='callers' returns the functions that reference this one; 'callees' returns the
     functions it references; 'address_taken' returns where this function's ENTRY is referenced as a
@@ -744,7 +780,7 @@ def get_xrefs(
         assert miss is not None
         return miss
     if direction == "address_taken":
-        return _address_taken_xrefs(conn, row)
+        return _page_xrefs(_address_taken_xrefs(conn, row), offset, limit)
     fid = row["id"]
     if direction == "callers":
         match_col, other_func, other_bin = "callee_func_id", "caller_func_id", "caller_binary_id"
@@ -824,6 +860,17 @@ def get_xrefs(
     }
     if notes:
         result["note"] = " | ".join(notes)
+    return _page_xrefs(result, offset, limit)
+
+
+def _page_xrefs(result: dict[str, Any], offset: int, limit: int | None) -> dict[str, Any]:
+    """``result`` as one page of its edges (see get_xrefs); unchanged when not paged."""
+    if limit is None and offset == 0:
+        return result
+    edges = result["edges"]
+    if result["direction"] in ("callers", "callees"):
+        edges = sorted(edges, key=xref_key)
+    result["edges"], result["total_edges"] = page_list(edges, offset, limit)
     return result
 
 
@@ -1284,7 +1331,12 @@ def _first_match_line(pseudocode: str | None, text: str) -> str | None:
 
 
 def get_functions_referencing_string(
-    conn: sqlite3.Connection, *, text: str, binary: str | None = None, limit: int = 50
+    conn: sqlite3.Connection,
+    *,
+    text: str,
+    binary: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Functions whose pseudocode TEXT contains ``text`` (a substring reverse-lookup).
 
@@ -1293,16 +1345,20 @@ def get_functions_referencing_string(
     text" by scanning that pseudocode — the same manual ``LIKE`` reverse-lookup a reviewer runs by
     hand, wrapped as one call. ``binary`` (short name, full path, sha256 or sha256 prefix) narrows
     to one binary; omitted, it scans every binary.
-    Capped at ``limit`` hits (default 50); the result carries ``truncated`` when more exist.
+    Paged: ``limit`` hits from ``offset`` (every hit when ``limit`` is None), by binary name and
+    address with the function id last, so the order is total (two binaries sharing a short name
+    can each hold a hit at one address). ``total_functions`` counts every hit and ``truncated``
+    says more follow this page. The hits are counted by id alone and only this page's pseudocode
+    is read: a substring as common as ``if (`` matches most functions of a large firmware, well
+    over 100 MB of text.
     HONEST BOUND: this is a TEXT match, not a resolved symbol reference — the ``note`` says so; the
     text can occur in a comment or an unrelated string literal, so each hit is a lead to confirm.
     Each hit carries its anchor (binary + function + address) and the first matching pseudocode
     line."""
     if not text.strip():
         return {"found": False, "reason": "empty search text", "query": {"text": text}}
-    lim = max(1, limit)
     sql = (
-        "SELECT f.name, f.address, f.pseudocode, b.name AS binary_name, b.path AS binary_path "
+        "SELECT f.id, f.name, f.address, b.name AS binary_name, b.path AS binary_path "
         f"FROM functions f JOIN {_CURRENT_BINARIES} b ON b.id = f.binary_id "  # noqa: S608
         "WHERE f.pseudocode LIKE ? ESCAPE '\\'"
     )
@@ -1311,16 +1367,26 @@ def get_functions_referencing_string(
         clause, bparams = _binary_selector(binary)
         sql += f" AND {clause}"
         params.extend(bparams)
-    sql += " ORDER BY b.name, f.address LIMIT ?"
-    params.append(lim + 1)  # fetch one extra to detect truncation without a second COUNT query
-    rows = conn.execute(sql, params).fetchall()
-    truncated = len(rows) > lim
+    sql += " ORDER BY b.name, f.address, f.id"
+    page, total = page_list(conn.execute(sql, params).fetchall(), offset, limit)
+    marks = ", ".join("?" * len(page))
+    text_of = (
+        {
+            r[0]: r[1]
+            for r in conn.execute(
+                f"SELECT id, pseudocode FROM functions WHERE id IN ({marks})",  # noqa: S608
+                [r["id"] for r in page],
+            )
+        }
+        if page
+        else {}
+    )
     functions = [
         {
             **_anchor(r["binary_name"], r["binary_path"], r["name"], r["address"]),
-            "match_line": _first_match_line(r["pseudocode"], text),
+            "match_line": _first_match_line(text_of.get(r["id"]), text),
         }
-        for r in rows[:lim]
+        for r in page
     ]
     return {
         "found": True,
@@ -1328,8 +1394,9 @@ def get_functions_referencing_string(
         "match_kind": "pseudocode_text_substring",  # honest: a text match, not a symbol reference
         "functions": functions,
         "returned": len(functions),
-        "limit": lim,
-        "truncated": truncated,
+        "limit": limit,
+        "truncated": max(0, offset) + len(functions) < total,
+        "total_functions": total,
         "note": _PSEUDO_TEXT_NOTE,
     }
 
@@ -1381,7 +1448,12 @@ def _string_refs_exported(conn: sqlite3.Connection, bid: int | None) -> bool:
 
 
 def get_string_reference_anchors(
-    conn: sqlite3.Connection, *, text: str, binary: str | None = None, limit: int = 50
+    conn: sqlite3.Connection,
+    *,
+    text: str,
+    binary: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Where a string is REFERENCED, by resolved Ghidra data references (the parsed sibling of
     ``get_functions_referencing_string``).
@@ -1403,10 +1475,15 @@ def get_string_reference_anchors(
     HONEST BOUNDARIES: ``no_resolved_dataref`` means the export ran and resolved nothing here — the
     same "empty set is not a proof" shape as an empty caller list, NOT "this string is
     unreferenced". ``string_refs_not_exported`` means this scope has no export at all (an older
-    analysis.db, or a binary not re-scanned) — UNKNOWN, not "no references"."""
+    analysis.db, or a binary not re-scanned) — UNKNOWN, not "no references".
+
+    Paged: ``limit`` anchors from ``offset`` (every anchor when ``limit`` is None), by binary name,
+    string address and referencing address with the row id last, so the order is total;
+    ``total_anchors`` counts them all. ``export_truncated`` is read over EVERY reference (the
+    export capped this string's list), ``response_truncated`` says this page is not the last one,
+    ``truncated`` either."""
     if not text:
         return {"found": False, "reason": "empty search text", "query": {"text": text}}
-    lim = max(1, limit)
     bid = None
     if binary is not None:
         brow, miss = resolve_binary(conn, binary)
@@ -1425,8 +1502,7 @@ def get_string_reference_anchors(
     if bid is not None:
         sql += " AND r.binary_id = ?"
         params.append(bid)
-    sql += " ORDER BY b.name, r.string_addr, r.ref_at LIMIT ?"
-    params.append(lim + 1)  # one extra row detects truncation without a second COUNT
+    sql += " ORDER BY b.name, r.string_addr, r.ref_at, r.id"
     try:
         rows = conn.execute(sql, params).fetchall()
     except sqlite3.OperationalError:
@@ -1448,7 +1524,8 @@ def get_string_reference_anchors(
             "note": "no_resolved_dataref",
             "detail": _STRING_REF_UNRESOLVED_NOTE,
         }
-    over_limit = len(rows) > lim
+    page, total = page_list(rows, offset, limit)
+    over_limit = max(0, offset) + len(page) < total
     anchors = [
         {
             "binary": r["binary_name"],
@@ -1458,17 +1535,18 @@ def get_string_reference_anchors(
             "ref_in_func_addr": _norm_addr(r["ref_in_func_addr"]),
             "segment": r["segment"],
         }
-        for r in rows[:lim]
+        for r in page
     ]
     # Two independent shortfalls, kept apart: the EXPORT capped this string's reference list, and/or
-    # this RESPONSE capped the rows. Either way the set is a prefix, never "all of them".
-    export_truncated = any(r["truncated"] for r in rows[:lim])
+    # this RESPONSE is not the last page. Either way the set is a prefix, never "all of them".
+    export_truncated = any(r["truncated"] for r in rows)
     return {
         "found": True,
         "query": query,
         "anchors": anchors,
         "returned": len(anchors),
-        "limit": lim,
+        "limit": limit,
+        "total_anchors": total,
         "truncated": bool(export_truncated or over_limit),
         "export_truncated": bool(export_truncated),
         "response_truncated": over_limit,
@@ -1476,8 +1554,19 @@ def get_string_reference_anchors(
     }
 
 
-def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, Any]:
-    """The import and export symbol tables of one binary (the cross-binary edge endpoints)."""
+# The lists of a get_imports_exports answer, paged together at one index.
+IMPORTS_EXPORTS_LISTS = ("imports", "exports", "dt_needed_unresolved")
+
+
+def get_imports_exports(
+    conn: sqlite3.Connection, *, binary: str, limit: int | None = None, offset: int = 0
+) -> dict[str, Any]:
+    """The import and export symbol tables of one binary (the cross-binary edge endpoints).
+
+    Paged when ``limit`` (or a non-zero ``offset``) is given: the three lists are cut at ONE
+    shared index — ``limit`` rows of each from ``offset`` — each with its ``total_<list>``
+    (``total_imports`` None when ``imports`` is not determined); each list is in one total order
+    (its name, then the row id). Unpaged, the lists are whole, without the totals."""
     brow, miss = resolve_binary(conn, binary)
     if brow is None:
         assert miss is not None
@@ -1489,14 +1578,14 @@ def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, A
         for r in conn.execute(
             "SELECT func_name, lib_soname, "
             + ("source" if has_source else "NULL AS source")
-            + " FROM imports WHERE binary_id = ? ORDER BY func_name",
+            + " FROM imports WHERE binary_id = ? ORDER BY func_name, id",
             (bid,),
         )
     ]
     exports = [
         {"func_name": r["func_name"], "address": r["address"]}
         for r in conn.execute(
-            "SELECT func_name, address FROM exports WHERE binary_id = ? ORDER BY func_name",
+            "SELECT func_name, address FROM exports WHERE binary_id = ? ORDER BY func_name, id",
             (bid,),
         )
     ]
@@ -1517,6 +1606,13 @@ def get_imports_exports(conn: sqlite3.Connection, *, binary: str) -> dict[str, A
         out["imports"] = None
         out["imports_state"] = "undetermined"
         out["imports_note"] = IMPORTS_UNDETERMINED_NOTE
+    if limit is not None or offset:
+        for name in IMPORTS_EXPORTS_LISTS:
+            rows = out[name]
+            if isinstance(rows, list):
+                out[name], out[f"total_{name}"] = page_list(rows, offset, limit)
+            else:
+                out[f"total_{name}"] = None
     return out
 
 

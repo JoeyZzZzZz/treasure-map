@@ -398,8 +398,17 @@ def _web_settable(conn: sqlite3.Connection, key: str, run_id: str | None = None)
     }
 
 
+# The lists of a get_nvram_key_flow answer, paged together at one index.
+NVRAM_LISTS = ("writers", "readers", "template_matches")
+
+
 def get_nvram_key_flow(
-    conn: sqlite3.Connection, key: str, *, run_id: str | None = None
+    conn: sqlite3.Connection,
+    key: str,
+    *,
+    run_id: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Assemble the cross-binary read/write graph for one concrete nvram key.
 
@@ -418,6 +427,12 @@ def get_nvram_key_flow(
     unresolved keys make it ``may_be_incomplete``, and even a populated graph is ``direct_only``
     because wrapper-indirect access is not resolved. Absence is NEVER "the key is unused". A fact,
     never a verdict.
+
+    Paged when ``limit`` (or a non-zero ``offset``) is given: the three lists are cut at ONE shared
+    index — ``limit`` rows of each from ``offset`` — each with its ``total_<list>``. Each list is
+    in one total order (binary, function, row id). ``found``, ``match``, ``completeness`` and the
+    notes are read from the whole lists, before the cut. Unpaged, the lists are whole, without the
+    totals.
     """
     # One scope clause, applied to ALL THREE reads below. Narrowing only some of them would mix
     # this run's exact hits with another firmware's templates and unresolved count — a scoped answer
@@ -429,7 +444,7 @@ def get_nvram_key_flow(
         "SELECT source_run_id, key, key_kind, binary, func, op, value_source, api, via_wrapper "
         "FROM nvram_key_flow WHERE key_kind = 'constant' AND key = ?"
         + scope_sql
-        + " ORDER BY binary, func",
+        + " ORDER BY binary, func, id",
         (key, *scope_args),
     ).fetchall()
     writers = [_entry(r) for r in exact_rows if r["op"] == "write"]
@@ -439,7 +454,7 @@ def get_nvram_key_flow(
         "SELECT source_run_id, key, key_kind, binary, func, op, value_source, api, via_wrapper "
         "FROM nvram_key_flow WHERE key_kind = 'parametric' AND key IS NOT NULL"
         + scope_sql
-        + " ORDER BY binary, func",
+        + " ORDER BY binary, func, id",
         scope_args,
     ).fetchall()
     template_matches = [
@@ -504,4 +519,13 @@ def get_nvram_key_flow(
         "completeness": completeness,
         "notes": notes,
     }
+    if limit is not None or offset:
+        # The page cut, at one shared index. Written out here rather than shared with the other
+        # paged readers: this module is hashed whole into the hunt code stamp, so importing a
+        # helper would pull that helper's module into the stamp too.
+        lo = max(0, offset)
+        for name in NVRAM_LISTS:
+            rows = result[name]
+            result[f"total_{name}"] = len(rows)
+            result[name] = rows[lo:] if limit is None else rows[lo : lo + max(0, limit)]
     return result

@@ -3403,7 +3403,8 @@ def test_empty_edges_result_carries_static_table_status(tmp_path: Path) -> None:
     st = res["static_string_table_status"]
     assert st["mechanism_scope"] == "static_string_table"  # ★ scoped: NOT strcmp_gate / detector B
     (s,) = st["statuses"]
-    assert (s["scanned"], s["cap_hit"], s["supported_scope"]) == (1, False, "absolute_2field_only")
+    # the scope describes the pass, so it is given once for the block, not per row
+    assert (s["scanned"], s["cap_hit"], st["supported_scope"]) == (1, False, "absolute_2field_only")
     atlas.close()
 
 

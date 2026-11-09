@@ -131,6 +131,25 @@ def test_a_candidate_overlay_page_does_not_move_when_a_judgement_is_rewritten(
     assert sorted(o["anchor_ref"] for o in seen) == sorted(refs)
 
 
+def test_a_candidate_overlay_page_cut_by_bytes_says_what_it_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A list_overlays page the response budget ended sooner than ``limit``: returned is the rows
+    it holds (fewer than total_overlays), next_offset resumes right after them.
+
+    MUTATION (verified RED, 1 failed): skip the tool's ``returned = len(overlays)`` after
+    _fit_page -> returned still counts the uncut page -> RED."""
+    path, _refs_ = _overlay_atlas(tmp_path, 6)
+    tool = mcp_app.make_tools(path)["list_overlays"]
+    whole = tool(limit=200)
+    assert whole["returned"] == 6 and whole["truncated_by_bytes"] is False
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", len(json.dumps(whole)) - 300)
+    got = tool(limit=200)
+    assert got["truncated_by_bytes"] is True and 0 < len(got["overlays"]) < 6
+    assert got["returned"] == len(got["overlays"]) < got["total_overlays"] == 6
+    assert got["next_offset"] == len(got["overlays"])
+
+
 def test_a_candidate_overlay_page_counts_over_every_row(tmp_path: Path) -> None:
     """T-J24 (evidence_ref path): on a page of two, count and counts_by_verdict are over all
     five rows, returned is the page's rows and total_overlays all of them.

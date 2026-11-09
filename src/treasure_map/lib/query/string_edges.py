@@ -93,13 +93,26 @@ def edges_reaching_callee(
 
 
 def _static_table_status(
-    conn: sqlite3.Connection, run_id: str | None, binary: str | None
+    conn: sqlite3.Connection,
+    run_id: str | None,
+    binary: str | None,
+    *,
+    offset: int = 0,
+    limit: int | None = None,
 ) -> dict[str, Any]:
     """The static-string-table detector's honesty status for the queried scope, so an EMPTY edge
     result carries whether the miss is trustworthy. ★ Scoped to the ``static_string_table``
     mechanism ONLY -- it says NOTHING about ``strcmp_gate`` (detector B, whose own 0-row honesty is
     a separate item). An empty result is a confident 'none' ONLY when a status has scanned=1,
-    cap_hit=0, and the form is within supported_scope; otherwise the miss is UNKNOWN, not none."""
+    cap_hit=0, and the form is within supported_scope; otherwise the miss is UNKNOWN, not none.
+
+    There is one status row per scanned binary, so over a whole run (or the whole atlas) the rows
+    outgrow any answer. They come in pages — ``limit`` rows from ``offset``, in one total order
+    (run, binary, row id), the page the edges beside them are cut at — with ``total_statuses``. The
+    reading needs no page: ``supported_scope`` / ``unsupported_note`` describe the PASS, not a
+    binary, so they are given once for the block (joined when runs of different tmap versions
+    disagree, never one picked); ``status_rows``, ``by_state``, ``found_total`` and
+    ``binaries_without_status`` count every row of the scope."""
     where = ["detector = 'string_tables'"]
     params: list[Any] = []
     for col, val in (("source_run_id", run_id), ("binary", binary)):
@@ -107,36 +120,77 @@ def _static_table_status(
             where.append(f"{col} = ?")
             params.append(val)
     sql = (
-        "SELECT source_run_id, binary, scanned, supported_scope, unsupported_note, cap_hit, "
-        "found_count FROM detector_scan_status WHERE " + " AND ".join(where)  # noqa: S608 -- literal
+        "SELECT source_run_id, binary, binary_path, scanned, supported_scope, unsupported_note, "
+        "cap_hit, found_count FROM detector_scan_status WHERE "
+        + " AND ".join(where)  # noqa: S608 -- literal
+        + " ORDER BY source_run_id, binary, id"
     )
     try:
         rows = conn.execute(sql, params).fetchall()
     except sqlite3.OperationalError:
         rows = []  # pre-feature atlas / not re-hunted -> no status recorded (also UNKNOWN)
+    scopes = {r["supported_scope"] for r in rows if r["supported_scope"]}
+    notes = {r["unsupported_note"] for r in rows if r["unsupported_note"]}
     statuses = [
         {
             "run_id": r["source_run_id"],
             "binary": r["binary"],
+            "binary_path": r["binary_path"],
             "scanned": r["scanned"],
-            "supported_scope": r["supported_scope"],
-            "unsupported_note": r["unsupported_note"],
             "cap_hit": bool(r["cap_hit"]),
             "found_count": r["found_count"],
         }
         for r in rows
     ]
+    lo = max(0, offset)
     return {
         "mechanism_scope": "static_string_table",  # ★ NOT strcmp_gate (detector B) -- no overclaim
-        "statuses": statuses,
+        "supported_scope": " | ".join(sorted(scopes)) or None,
+        "unsupported_note": " | ".join(sorted(notes)) or None,
+        "status_rows": len(rows),
+        "by_state": {
+            "scanned": sum(1 for r in rows if r["scanned"]),
+            "cap_hit": sum(1 for r in rows if r["cap_hit"]),
+            "not_scanned": sum(1 for r in rows if not r["scanned"]),
+        },
+        "found_total": sum(r["found_count"] or 0 for r in rows),
+        "binaries_without_status": _binaries_without_status(conn, run_id, binary, rows),
+        "statuses": statuses[lo:] if limit is None else statuses[lo : lo + max(0, limit)],
+        "total_statuses": len(statuses),
         "note": (
             "Honesty status for the static_string_table mechanism ONLY (NOT strcmp_gate / detector "
             "B). An EMPTY static-table result is a confident 'none' ONLY when a status has "
             "scanned=1, cap_hit=0, and your table form is within supported_scope. scanned=0, "
             "cap_hit=1, or an unsupported form => UNKNOWN, not none. No statuses => no status "
-            "recorded (older atlas or not re-hunted) => also UNKNOWN."
+            "recorded (older atlas or not re-hunted) => also UNKNOWN. The counts are over the "
+            "whole scope; the per-binary rows page with the edges (next_offset), and "
+            "binaries_without_status counts the binaries a run recorded that have no row."
         ),
     }
+
+
+def _binaries_without_status(
+    conn: sqlite3.Connection, run_id: str | None, binary: str | None, rows: list[sqlite3.Row]
+) -> int | None:
+    """How many binaries the runs in scope recorded that have no status row: each run's binary
+    count less its rows (one row per binary). None when the scope names one binary (a short name
+    is no count of files) or a run's binary count is not recorded."""
+    if binary is not None:
+        return None
+    sql = "SELECT run_id, binaries FROM run" + (" WHERE run_id = ?" if run_id is not None else "")
+    try:
+        runs = conn.execute(sql, (run_id,) if run_id is not None else ()).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    per_run: dict[str, int] = {}
+    for r in rows:
+        per_run[r["source_run_id"]] = per_run.get(r["source_run_id"], 0) + 1
+    missing = 0
+    for rid, count in runs:
+        if count is None:
+            return None
+        missing += max(0, int(count) - per_run.get(rid, 0))
+    return missing
 
 
 def get_string_keyed_edges(
@@ -157,7 +211,8 @@ def get_string_keyed_edges(
     ``offset`` (every edge when ``limit`` is None), in one total order (the row id breaks a tie;
     a static table's edges have no from_function). ``count`` is the edges returned and
     ``truncated`` that the page reached ``limit``, as before; ``total_edges`` counts every edge
-    the filters match. Each edge carries the callee
+    the filters match; the static-table status rows beside them are cut at the same index, so one
+    ``offset`` pages both. Each edge carries the callee
     anchor (name + addr + kind — BinDiff-alignable, not a bare address) and its fine-grained
     completeness. ★ These are enumerated FACTS, never reachability verdicts.
     """
@@ -195,7 +250,9 @@ def get_string_keyed_edges(
             "truncated": False,
             "total_edges": 0,
             "note": "string_keyed_edge table absent (older atlas or not re-hunted yet)",
-            "static_string_table_status": _static_table_status(conn, run_id, binary),
+            "static_string_table_status": _static_table_status(
+                conn, run_id, binary, offset=offset, limit=limit
+            ),
         }
     edges = [_row_to_edge(r) for r in rows]
     return {
@@ -205,7 +262,9 @@ def get_string_keyed_edges(
         "total_edges": total,
         # ★ static-table honesty travels WITH the result so an EMPTY one is not read as a confident
         # 'none' (scoped to the static_string_table mechanism; strcmp_gate/detector B is separate).
-        "static_string_table_status": _static_table_status(conn, run_id, binary),
+        "static_string_table_status": _static_table_status(
+            conn, run_id, binary, offset=offset, limit=limit
+        ),
         "note": (
             "Enumerated string-keyed edges (a string key gates/dispatches to a callee). A FACT, "
             "NOT a reachability verdict: a candidate that is an edge callee stays reachability="

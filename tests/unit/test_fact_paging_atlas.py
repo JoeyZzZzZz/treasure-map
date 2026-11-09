@@ -30,21 +30,24 @@ import pytest
 
 from tests.unit.lib.test_sink_provenance import _addr_ref, _seed
 from treasure_map import mcp_app
+from treasure_map.lib import facts
 from treasure_map.lib import tool_call_log as tcl
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import (
+    DetectorScanStatusRow,
     DimensionDeltaRow,
     ExecEdgeRow,
     NvramFlowRow,
     StringKeyedEdgeRow,
 )
 from treasure_map.lib.atlas.writer import (
+    add_detector_status,
     add_dimension_deltas,
     add_exec_edges,
     add_nvram_flow_rows,
     add_string_keyed_edges,
 )
-from treasure_map.lib.query import exec_edges, paging, string_edges
+from treasure_map.lib.query import exec_edges, string_edges
 from treasure_map.lib.query.nvram import get_nvram_key_flow
 from treasure_map.lib.query.triage import get_sink_provenance as lib_provenance
 
@@ -276,25 +279,30 @@ def test_the_nvram_lists_page_at_one_index_each_in_its_place(tmp_path: Path) -> 
         assert len(rows) == len({json.dumps(r) for r in rows}), name
 
 
-def test_the_nvram_page_order_is_the_rows_not_their_storage(tmp_path: Path) -> None:
-    """T-J15: the writers all tie on (binary, func); two atlases holding the same rows inserted in
-    opposite order give the same pages, row for row — the order is total on the rows themselves,
-    so no tie depends on how the rows happen to be stored.
+def test_the_nvram_pages_read_ties_in_row_id_order(tmp_path: Path) -> None:
+    """T-J15: the writers all tie on (binary, func); the order is total by the row id the query
+    ends on, so two atlases holding the same rows written in opposite order each page their ties
+    in the order they were written — and the pages joined are the library's whole list.
 
-    MUTATION (verified RED, 1 failed): drop the content part of page_lists' sort key (order by
-    the displayed fields only) -> the ties keep their storage order -> RED."""
-    pages = []
+    MUTATION (verified RED, 1 failed): have the tool not pass offset to the library -> RED.
+    Not constructible: dropping ``id`` from the ORDER BY stays GREEN (SQLite reads the tie by
+    rowid already); the order asserted is the documented one either way."""
     for order, where in ((1, "fwd"), (-1, "rev")):
-        tools = _tools(_nvram_atlas(tmp_path / where, order))
+        atlas = _nvram_atlas(tmp_path / where, order)
+        conn = open_atlas(atlas)
+        try:
+            whole = [w["api"] for w in get_nvram_key_flow(conn, _KEY)["writers"]]
+        finally:
+            conn.close()
+        tools = _tools(atlas)
         writers = []
         offset: int | None = 0
         while offset is not None:
             page = tools["get_nvram_key_flow"](key=_KEY, limit=6, offset=offset)
             writers += [w["api"] for w in page["writers"]]
             offset = page["next_offset"]
-        pages.append(writers)
-    assert pages[0] == pages[1]
-    assert sorted(pages[0]) == [f"nvram_set_{i:02d}" for i in range(30)]
+        written = [f"nvram_set_{i:02d}" for i in range(30)][::order]
+        assert writers == whole == written, where
 
 
 # ── get_string_keyed_edges: the old row-cap fields beside the new paging fields ──────────────
@@ -477,6 +485,39 @@ def test_launched_by_cuts_a_huge_limit_says_so_and_pages_to_the_end(
     assert last["launcher_binaries"] == ["busybox", "zz_init"]
     exact = tools["launched_by"](target="tgt", limit=50, offset=200)
     assert exact["next_offset"] is None and "limit_clamped" not in exact
+
+
+def test_a_page_past_the_last_edge_keeps_the_answered_status(tmp_path: Path) -> None:
+    """The per-binary scan rows ride only with an EMPTY answer — empty meaning no edge at all, not
+    a page past the last one: the status of ``offset = total_edges`` is the first page's, with no
+    per-binary rows.
+
+    MUTATION (verified RED, 1 failed): decide per_binary from the page's edges (``not edges``)
+    instead of every edge in exec_edges.launched_by -> the page past the end carries the rows ->
+    RED."""
+    atlas = _exec_atlas(tmp_path, n_a=6, n_z=2)
+    conn = open_atlas(atlas)
+    try:
+        add_detector_status(
+            conn,
+            [
+                DetectorScanStatusRow("run_x", name, "exec_argv", 1, "scope", "note", 0, n)
+                for name, n in (("busybox", 6), ("zz_init", 2), ("quiet", 0))
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    tools = _tools(atlas)
+    first = tools["launched_by"](target="tgt")
+    assert first["total_edges"] == 8 and "statuses" not in first["exec_argv_status"]
+    past = tools["launched_by"](target="tgt", offset=first["total_edges"])
+    assert past["edges"] == [] and past["next_offset"] is None
+    assert "statuses" not in past["exec_argv_status"]
+    assert past["exec_argv_status"] == first["exec_argv_status"]
+    # the empty answer does carry them: the precondition that there are rows to withhold
+    none = tools["launched_by"](target="nothing_launches_this")
+    assert none["exec_argv_status"].get("total_statuses") == 3
 
 
 def test_launched_by_pages_tied_launchers_once_each(tmp_path: Path) -> None:
@@ -873,6 +914,6 @@ def test_one_row_over_the_budget_is_a_page_of_one_marked(tmp_path: Path) -> None
 def test_paging_module_page_list_contract() -> None:
     """page_list: the slice and the whole length; None limit = to the end; past the end = []."""
     rows = list(range(10))
-    assert paging.page_list(rows, 3, 4) == ([3, 4, 5, 6], 10)
-    assert paging.page_list(rows, 8, None) == ([8, 9], 10)
-    assert paging.page_list(rows, 12, 4) == ([], 10)
+    assert facts.page_list(rows, 3, 4) == ([3, 4, 5, 6], 10)
+    assert facts.page_list(rows, 8, None) == ([8, 9], 10)
+    assert facts.page_list(rows, 12, 4) == ([], 10)

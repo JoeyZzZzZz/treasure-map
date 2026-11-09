@@ -20,8 +20,6 @@ import posixpath
 import sqlite3
 from typing import Any
 
-from treasure_map.lib.query.paging import page_list
-
 _COLS = (
     "source_run_id, launcher_binary, launcher_function, launcher_addr, exec_api, sink_addr, "
     "target_layer, shell_wrapped, piped, inner_command_visible, argv_visibility, argv_template, "
@@ -77,7 +75,13 @@ def _row_to_edge(r: sqlite3.Row) -> dict[str, Any]:
 
 
 def _exec_scan_status(
-    conn: sqlite3.Connection, run_id: str | None, binary: str | None, *, per_binary: bool
+    conn: sqlite3.Connection,
+    run_id: str | None,
+    binary: str | None,
+    *,
+    per_binary: bool,
+    offset: int = 0,
+    limit: int | None = None,
 ) -> dict[str, Any]:
     """The launch-edge pass's honesty status for the queried scope, so an EMPTY result carries
     whether the silence can be trusted.
@@ -96,7 +100,11 @@ def _exec_scan_status(
     firmware produces roughly two thousand) to bury the answer they annotate.
 
     The rows are never SUMMARISED away, only withheld when unread: the totals are an addition, not
-    a replacement, and asking a question that comes back empty always returns the full list."""
+    a replacement, and asking a question that comes back empty always returns the full list — in
+    pages: across every run of an atlas the rows outgrow any answer, so they come ``limit`` from
+    ``offset`` in one total order (run, binary, row id), the page the edges beside them are cut at,
+    with ``total_statuses``. ``by_state`` and ``binaries_without_status`` (the binaries of a run,
+    counted by short name as the rows are, that have no row) ride with them, over every row."""
     where = ["detector = 'exec_argv'"]
     params: list[Any] = []
     for col, val in (("source_run_id", run_id), ("binary", binary)):
@@ -104,8 +112,10 @@ def _exec_scan_status(
             where.append(f"{col} = ?")
             params.append(val)
     sql = (
-        "SELECT source_run_id, binary, scanned, supported_scope, unsupported_note, cap_hit, "
-        "found_count FROM detector_scan_status WHERE " + " AND ".join(where)  # noqa: S608 -- literal
+        "SELECT source_run_id, binary, binary_path, scanned, supported_scope, unsupported_note, "
+        "cap_hit, found_count FROM detector_scan_status WHERE "
+        + " AND ".join(where)  # noqa: S608 -- literal
+        + " ORDER BY source_run_id, binary, id"
     )
     try:
         rows = conn.execute(sql, params).fetchall()
@@ -139,18 +149,66 @@ def _exec_scan_status(
         ),
     }
     if per_binary:
+        lo = max(0, offset)
+        page = rows[lo:] if limit is None else rows[lo : lo + max(0, limit)]
+        status["by_state"] = {
+            "scanned": sum(1 for r in rows if r["scanned"]),
+            "cap_hit": sum(1 for r in rows if r["cap_hit"]),
+            "not_scanned": sum(1 for r in rows if not r["scanned"]),
+        }
+        status["binaries_without_status"] = _binaries_without_status(conn, run_id, binary, rows)
+        status["total_statuses"] = len(rows)
         status["statuses"] = [
             {
+                "run_id": r["source_run_id"],
                 "binary": r["binary"],
+                "binary_path": r["binary_path"],
                 "scanned": r["scanned"],
                 # KEPT even though a real atlas has never seen it set: this is the honest-degrade
                 # channel, and a channel that has not fired is not a channel to delete.
                 "cap_hit": bool(r["cap_hit"]),
                 "found_count": r["found_count"],
             }
-            for r in rows
+            for r in page
         ]
     return status
+
+
+def _binaries_without_status(
+    conn: sqlite3.Connection, run_id: str | None, binary: str | None, rows: list[sqlite3.Row]
+) -> int | None:
+    """How many binaries of the runs in scope have no exec_argv status row, counted by SHORT NAME
+    as the rows are (one row per name, so two files sharing a name share a row): the names in each
+    run's analysis.db less the names with a row. None when the scope names one binary, or a run's
+    analysis.db cannot be read — a count that is not known is not a zero."""
+    if binary is not None:
+        return None
+    from treasure_map.lib.ro_db import ro_connect  # here: kept off this module's import surface
+
+    sql = "SELECT run_id, analysis_db_path FROM run" + (
+        " WHERE run_id = ?" if run_id is not None else ""
+    )
+    try:
+        runs = conn.execute(sql, (run_id,) if run_id is not None else ()).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    named: dict[str, set[str]] = {}
+    for r in rows:
+        named.setdefault(r["source_run_id"], set()).add(r["binary"])
+    missing = 0
+    for rid, path in runs:
+        if not path:
+            return None
+        try:
+            db = ro_connect(path)
+            try:
+                names = {n for (n,) in db.execute("SELECT DISTINCT name FROM binaries")}
+            finally:
+                db.close()
+        except sqlite3.Error:
+            return None
+        missing += len(names - named.get(rid, set()))
+    return missing
 
 
 def launched_by(
@@ -240,8 +298,12 @@ def launched_by(
             "total_edges": 0,
             "note": "exec_edge table absent (older atlas or not re-hunted yet)",
             # No table at all is the emptiest answer there is: give the rows.
-            "exec_argv_status": _exec_scan_status(conn, run_id, None, per_binary=True),
+            "exec_argv_status": _exec_scan_status(
+                conn, run_id, None, per_binary=True, offset=offset, limit=limit
+            ),
         }
+    from treasure_map.lib.facts import page_list  # here: facts imports this package
+
     every = [_row_to_edge(r) for r in rows]
     edges, total = page_list(every, offset, limit)
     return {
@@ -253,7 +315,9 @@ def launched_by(
         "launcher_binaries": sorted({str(e["launcher"]["binary"]) for e in every if e["launcher"]}),
         # ★ The pass's honesty travels WITH the result so an EMPTY one is never read as
         # 'nothing launches this' on its own — and the per-binary rows come with it precisely then.
-        "exec_argv_status": _exec_scan_status(conn, run_id, None, per_binary=not every),
+        "exec_argv_status": _exec_scan_status(
+            conn, run_id, None, per_binary=not every, offset=offset, limit=limit
+        ),
         "note": (
             "Enumerated cross-binary launch edges (A's code calls a command/exec sink whose "
             "argument names B). A FACT, NOT a reachability verdict: an edge does not say the "

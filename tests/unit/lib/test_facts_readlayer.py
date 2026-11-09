@@ -746,7 +746,7 @@ def test_referencing_string_limit_and_truncation(tmp_path: Path) -> None:
         "VALUES (1, 'webd', 'sbin/webd', ?, '2026-01-01T00:00:00')",
         ("a" * 64,),
     )
-    for i in range(60):  # 60 functions all mentioning the marker -> default cap of 50 truncates
+    for i in range(60):  # 60 functions all mentioning the marker; the library no longer caps
         conn.execute(
             "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
             "VALUES (?, 1, ?, ?, ?, '[]')",
@@ -756,12 +756,17 @@ def test_referencing_string_limit_and_truncation(tmp_path: Path) -> None:
     conn.close()
     ro = facts.open_analysis_ro(db)
     try:
-        capped = facts.get_functions_referencing_string(ro, text="common_marker")
+        whole = facts.get_functions_referencing_string(ro, text="common_marker")
         small = facts.get_functions_referencing_string(ro, text="common_marker", limit=5)
+        tail = facts.get_functions_referencing_string(ro, text="common_marker", limit=5, offset=58)
     finally:
         ro.close()
-    assert capped["returned"] == 50 and capped["limit"] == 50 and capped["truncated"] is True
-    assert small["returned"] == 5 and small["truncated"] is True
+    # no limit reads every hit (the MCP tool pages them); a limit cuts a page and says more follow
+    assert whole["returned"] == whole["total_functions"] == 60 and whole["limit"] is None
+    assert whole["truncated"] is False
+    assert small["returned"] == 5 and small["truncated"] is True and small["total_functions"] == 60
+    assert [f["function"] for f in tail["functions"]] == ["fn_58", "fn_59"]
+    assert tail["truncated"] is False
 
 
 def test_referencing_string_empty_text_is_rejected(tmp_path: Path) -> None:

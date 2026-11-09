@@ -72,7 +72,7 @@ from treasure_map.lib.query import coverage_report as _coverage_report
 from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import diff_review as _dr_mod
 from treasure_map.lib.query import effective_float_filters as _effective_float_filters
-from treasure_map.lib.query import entry_words, paging
+from treasure_map.lib.query import entry_words
 from treasure_map.lib.query import explain_candidate as _explain_candidate
 from treasure_map.lib.query import extraction_gaps as _gaps
 from treasure_map.lib.query import file_diff as _fd
@@ -116,6 +116,7 @@ from treasure_map.lib.query.diff_align import staleness_summary as _staleness_su
 from treasure_map.lib.query.diff_align import toolchain_checked as _toolchain_checked
 from treasure_map.lib.query.diff_workflow import DIFF_ONE_DIFF, DIFF_WORKFLOW
 from treasure_map.lib.query.diff_workflow import PAIR_WORKFLOW as _PAIR_WORKFLOW
+from treasure_map.lib.query.nvram import NVRAM_LISTS as _NVRAM_LISTS
 from treasure_map.lib.query.patch_view import ROWS_INLINE_LIMIT as _ROWS_INLINE_LIMIT
 from treasure_map.lib.query.patch_view import get_diff_patch_view as _get_diff_patch_view
 from treasure_map.lib.query.recompile_only import label_entries as _label_recompile_only
@@ -365,42 +366,58 @@ def _offset_error(offset: Any) -> dict[str, Any] | None:
     return None
 
 
+# A list _fit_lists cuts: a top-level key, or (block, key) for a list inside a top-level block.
+_ListPath = str | tuple[str, str]
+
+
+def _list_home(result: dict[str, Any], path: _ListPath) -> tuple[dict[str, Any] | None, str]:
+    """The dict that holds the list ``path`` names (None when it is missing), and the list's key.
+    Its total, ``total_<key>``, sits beside it in the same dict."""
+    if isinstance(path, str):
+        return result, path
+    block = result.get(path[0])
+    return (block if isinstance(block, dict) else None), path[1]
+
+
 def _fit_lists(
-    result: dict[str, Any], offset: int, lists: tuple[str, ...], budget: int | None = None
+    result: dict[str, Any], offset: int, lists: tuple[_ListPath, ...], budget: int | None = None
 ) -> dict[str, Any]:
-    """An answer whose ``lists`` share one ``offset`` (each with its ``total_<list>``) fitted to
-    the response budget (or ``budget`` bytes) at ONE index: rows are taken index by index — the
-    i-th row of every list that has one, together — while the answer fits, so the next page
-    resumes every list from the same index. Each list stays where it is in the answer; the paging
-    fields are top-level: ``next_offset`` (null only when every list is read to its end) and
+    """An answer whose ``lists`` share one ``offset`` (each with its ``total_<list>`` beside it)
+    fitted to the response budget (or ``budget`` bytes) at ONE index: rows are taken index by
+    index — the i-th row of every list that has one, together — while the answer fits, so the next
+    page resumes every list from the same index. A list is a top-level key or one inside a
+    top-level block (``(block, key)``), and each stays where it is in the answer; the paging fields
+    are top-level: ``next_offset`` (null only when every list is read to its end) and
     ``truncated_by_bytes``. Both are set to placeholders at least as wide as their final values
     before the envelope is measured, as in ``_fit_page``. At least one index is kept; a page still
-    over the budget says so with ``over_budget: true``. A list that is None (not determined) is
-    left alone; an answer without the lists (an error, a not-found) is returned as it is."""
-    present = [name for name in lists if isinstance(result.get(name), list)]
+    over the budget says so with ``over_budget: true``. A list that is None or absent (not
+    determined, not given) is left alone; an answer with none of the lists (an error, a not-found)
+    is returned as it is."""
+    homes = [_list_home(result, path) for path in lists]
+    present = [
+        (home, key) for home, key in homes if home is not None and isinstance(home.get(key), list)
+    ]
     if "error" in result or not present:
         return result
     limit = _RESPONSE_BYTE_BUDGET if budget is None else budget
-    totals = [int(result[f"total_{name}"]) for name in present]
+    totals = [int(home[f"total_{key}"]) for home, key in present]
     widest = max(totals)
     result["next_offset"] = widest if len(json.dumps(widest)) > len(json.dumps(None)) else None
     result["truncated_by_bytes"] = False
-    full = {name: list(result[name]) for name in present}
-    for name in present:
-        result[name] = []
+    full = [list(home[key]) for home, key in present]
+    for home, key in present:
+        home[key] = []
     running = len(json.dumps(result))
-    width = max(len(rows) for rows in full.values())
+    width = max(len(rows) for rows in full)
     kept = 0
     for i in range(width):
-        cost = sum(
-            len(json.dumps(rows[i])) + (2 if i else 0) for rows in full.values() if i < len(rows)
-        )
+        cost = sum(len(json.dumps(rows[i])) + (2 if i else 0) for rows in full if i < len(rows))
         if kept and running + cost > limit:
             break
         running += cost
         kept += 1
-    for name in present:
-        result[name] = full[name][:kept]
+    for (home, key), rows in zip(present, full, strict=True):
+        home[key] = rows[:kept]
     end = offset + kept
     result["next_offset"] = end if any(end < n for n in totals) else None
     result["truncated_by_bytes"] = kept < width
@@ -2397,7 +2414,9 @@ def make_tools(
         ``next_offset`` (null on the last page); follow ``next_offset`` until null to read every
         record. ``limit`` is not a size guarantee: a page whose records do not fit the response
         budget ends sooner, with ``truncated_by_bytes: true``, and the rest is on the next page. A
-        single record (``sink_idx``) is never cut."""
+        single record (``sink_idx``) is never cut. A ``sink_idx`` the function does not have is
+        answered with ``available_sink_idx``, every index it does have, unpaged: one small integer
+        per sink."""
         refused = _page_args_error(limit, offset)
         if refused is not None:
             return refused
@@ -2482,13 +2501,11 @@ def make_tools(
             )
             if refusal is not None:
                 return refusal
-            result = paging.page_nvram_key_flow(
-                _get_nvram_key_flow(conn, key, run_id=run_id), offset, limit
-            )
+            result = _get_nvram_key_flow(conn, key, run_id=run_id, limit=limit, offset=offset)
         finally:
             conn.close()
         result["note"] = _DERIVED_SIGNAL_NOTE
-        return _fit_lists(result, offset, paging.NVRAM_LISTS)
+        return _fit_lists(result, offset, _NVRAM_LISTS)
 
     def get_string_keyed_edges(
         binary: str | None = None,
@@ -2519,7 +2536,12 @@ def make_tools(
         order, with ``total_edges`` (every edge the filters match) and ``next_offset`` (null on
         the last page); follow ``next_offset`` until null. ``count`` is the edges on this page and
         ``truncated`` that the page reached ``limit``; ``truncated_by_bytes`` says the response
-        budget ended it sooner — ``limit`` is not a size guarantee."""
+        budget ended it sooner — ``limit`` is not a size guarantee. The per-binary rows of
+        ``static_string_table_status`` are paged at the same index as the edges (one row per
+        scanned binary, so over a run they outgrow an answer), with ``total_statuses`` beside them;
+        ``next_offset`` is null only when the edges and the rows are both read to the end. The
+        block's ``supported_scope``, ``status_rows``, ``by_state``, ``found_total`` and
+        ``binaries_without_status`` are over the whole scope, readable from the first page."""
         refused = _page_args_error(limit, offset)
         if refused is not None:
             return refused
@@ -2542,14 +2564,7 @@ def make_tools(
             )
         finally:
             conn.close()
-        result = _fit_page(
-            result,
-            offset,
-            rows="edges",
-            total="total_edges",
-            next_offset="next_offset",
-            truncated="truncated_by_bytes",
-        )
+        result = _fit_lists(result, offset, ("edges", ("static_string_table_status", "statuses")))
         if isinstance(result.get("edges"), list):
             result["count"] = len(result["edges"])
         return result
@@ -2587,7 +2602,10 @@ def make_tools(
         ``total_edges`` and ``next_offset`` (null on the last page); follow ``next_offset`` until
         null. ``count`` is the edges on this page and ``truncated`` that the page reached
         ``limit``; ``truncated_by_bytes`` says the response budget ended it sooner — ``limit`` is
-        not a size guarantee. ``launcher_binaries`` is read from every edge, not this page's."""
+        not a size guarantee. ``launcher_binaries`` is read from every edge, not this page's. On an
+        empty answer the per-binary rows of ``exec_argv_status`` are paged at the same index (one
+        row per binary name of every run in scope), with ``total_statuses``; its ``by_state`` and
+        ``binaries_without_status`` are over the whole scope, readable from the first page."""
         clamped = _clamped_limit(limit, 0)
         if isinstance(clamped, dict):
             return clamped
@@ -2605,14 +2623,7 @@ def make_tools(
             conn.close()
         if asked is not None:
             result["limit_clamped"] = asked
-        result = _fit_page(
-            result,
-            offset,
-            rows="edges",
-            total="total_edges",
-            next_offset="next_offset",
-            truncated="truncated_by_bytes",
-        )
+        result = _fit_lists(result, offset, ("edges", ("exec_argv_status", "statuses")))
         if isinstance(result.get("edges"), list):
             result["count"] = len(result["edges"])
         return result
@@ -4812,7 +4823,7 @@ def make_tools(
             out = _list_diffs(conn, run_a_id, run_b_id, file_staleness=_file_staleness(conn))
             out.update(_reverse_hint(conn, run_a_id, run_b_id, ("run_a_id", "run_b_id")))
             every = out.get("diffs") or []
-            out["diffs"], out["total_diffs"] = paging.page_list(every, offset, limit)
+            out["diffs"], out["total_diffs"] = facts.page_list(every, offset, limit)
             # First key: the answer can run long, and the whole-pair entry must not sit past it.
             return _fit_page(
                 {"review_pairs": _review_pairs(every), **out},
@@ -5018,7 +5029,7 @@ def make_tools(
         )
         result = _fact(
             lambda c, fn, bn: entry_words.xrefs_with_entry_words(
-                c, func=fn or "", direction=d, binary=bn
+                c, func=fn or "", direction=d, binary=bn, limit=limit, offset=offset
             ),
             run_id=run_id,
             evidence_ref=evidence_ref,
@@ -5031,7 +5042,7 @@ def make_tools(
         if isinstance(step, dict) and result.get("resolved_run"):
             step["args"]["run_id"] = result["resolved_run"]
         return _fit_page(
-            paging.page_xrefs(result, offset, limit),
+            result,
             offset,
             rows="edges",
             total="total_edges",
@@ -5119,8 +5130,8 @@ def make_tools(
         if refused is not None:
             return refused
         result = _fact(
-            lambda c, fn, bn: paging.page_imports_exports(
-                facts.get_imports_exports(c, binary=bn or ""), offset, limit
+            lambda c, fn, bn: facts.get_imports_exports(
+                c, binary=bn or "", limit=limit, offset=offset
             ),
             run_id=run_id,
             evidence_ref=evidence_ref,
@@ -5128,7 +5139,7 @@ def make_tools(
             needs_binary=True,
             binary_error=_needs_binary("get_imports_exports"),
         )
-        return _fit_lists(result, offset, paging.IMPORTS_EXPORTS_LISTS)
+        return _fit_lists(result, offset, facts.IMPORTS_EXPORTS_LISTS)
 
     def get_data_bytes(
         address: str,
@@ -5278,8 +5289,8 @@ def make_tools(
         if refused is not None:
             return refused
         result = _fact(
-            lambda c, fn, bn: paging.functions_referencing_string(
-                c, text=text, binary=bn, offset=offset, limit=limit
+            lambda c, fn, bn: facts.get_functions_referencing_string(
+                c, text=text, binary=bn, limit=limit, offset=offset
             ),
             run_id=run_id,
             evidence_ref=evidence_ref,
@@ -5350,8 +5361,8 @@ def make_tools(
         if refused is not None:
             return refused
         result = _fact(
-            lambda c, fn, bn: paging.string_reference_anchors(
-                c, text=text, binary=bn, offset=offset, limit=used
+            lambda c, fn, bn: facts.get_string_reference_anchors(
+                c, text=text, binary=bn, limit=used, offset=offset
             ),
             run_id=run_id,
             evidence_ref=evidence_ref,

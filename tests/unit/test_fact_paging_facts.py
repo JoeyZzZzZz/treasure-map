@@ -27,7 +27,7 @@ from treasure_map.lib import facts
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.writer import begin_run, finish_run
-from treasure_map.lib.query import entry_words, paging
+from treasure_map.lib.query import entry_words
 from treasure_map.lib.storage.connection import open_db
 
 RUN = "run_f"
@@ -87,6 +87,13 @@ def _build(tmp: Path) -> Path:
             "INSERT INTO xrefs (caller_binary_id, caller_func_id, callee_binary_id, "
             "callee_func_id, xref_type) VALUES (1, ?, 3, 10, 'callees_exports')",
             (caller_fid,),
+        )
+    # zfun's callees, stored the reverse of their documented order (app, lib/b, then lib/a)
+    for callee_bin, callee_fid in ((2, 20), (1, 21)):
+        conn.execute(
+            "INSERT INTO xrefs (caller_binary_id, caller_func_id, callee_binary_id, "
+            "callee_func_id, xref_type) VALUES (1, 22, ?, ?, 'callees_exports')",
+            (callee_bin, callee_fid),
         )
     # a function with more than 100 callers (the CLI must still print every one)
     fn(11, 3, "hub", "00001100")
@@ -239,7 +246,27 @@ def test_xref_callees_and_address_taken_page_too(world: Any) -> None:
     callees = _walk(
         tools["get_xrefs"], "edges", 1, run_id=RUN, function="zfun", direction="callees"
     )
-    assert [e["anchor"]["function"] for e in callees] == ["target"]
+    assert [e["anchor"]["function"] for e in callees] == ["callr", "callr", "target"]
+
+
+def test_xref_callees_page_in_the_documented_order(world: Any) -> None:
+    """The callees direction is sorted too, not only callers: zfun's three callee edges are
+    stored the reverse of the documented order, and every page size walks them sorted by
+    ``xref_key`` (lib/a before lib/b before the app).
+
+    MUTATION (verified RED, 1 failed): sort the callers direction only in facts._page_xrefs ->
+    the callees keep their stored order -> RED."""
+    db, tools = world
+    conn = _ro(db)
+    raw = facts.get_xrefs(conn, func="zfun", direction="callees")["edges"]
+    conn.close()
+    assert len(raw) == 3 and raw != sorted(raw, key=facts.xref_key)  # the stored order is not it
+    for limit in (1, 2):
+        got = _walk(
+            tools["get_xrefs"], "edges", limit, run_id=RUN, function="zfun", direction="callees"
+        )
+        assert got == sorted(raw, key=facts.xref_key), limit
+        assert [e["anchor"]["binary_path"] for e in got] == [LIB_A, LIB_B, APP]
 
 
 def test_xref_pages_fit_the_byte_budget_and_still_walk_to_the_whole_set(
@@ -291,14 +318,20 @@ def test_import_export_lists_page_at_one_index_with_one_next_offset(world: Any) 
 
     MUTATION (verified RED, 1 failed): _fit_lists' next_offset needs EVERY list to remain
     (``any`` -> ``all``) -> null once exports run out -> RED.
-    MUTATION (verified RED, 1 failed): drop the imports sort key in paging -> the func_name tie
-    stays in its stored order -> RED."""
+    The func_name tie is in row-id order (the query ends on the id), in the library read whole and
+    in the pages alike. Not constructible: dropping that ``id`` stays GREEN, as SQLite already
+    reads the tied rows by rowid; the order asserted is the documented one either way.
+    MUTATION (verified RED, 1 failed): have the tool not pass offset to the library -> RED."""
     db, tools = world
     conn = _ro(db)
     raw = facts.get_imports_exports(conn, binary="app")
     conn.close()
-    # a real func_name tie, stored the other way round
-    assert raw["imports"] != sorted(raw["imports"], key=_imp_key)
+    # a real func_name tie, in row-id order (libz.so was written first)
+    assert [(r["func_name"], r["lib_soname"]) for r in raw["imports"]][3:6] == [
+        ("ddd", "libc.so"),
+        ("dup", "libz.so"),
+        ("dup", "liba.so"),
+    ]
     tool = tools["get_imports_exports"]
     first = tool(run_id=RUN, binary="app", limit=2)
     assert list(first)[:6] == list(raw)[:6]  # the lists keep their places
@@ -320,8 +353,8 @@ def test_import_export_lists_page_at_one_index_with_one_next_offset(world: Any) 
         for name in seen:
             seen[name] += page[name]
         offset = page["next_offset"]
-    assert seen["imports"] == sorted(raw["imports"], key=_imp_key)
-    assert seen["exports"] == sorted(raw["exports"], key=_imp_key)
+    assert seen["imports"] == raw["imports"]
+    assert seen["exports"] == raw["exports"] == sorted(raw["exports"], key=_imp_key)
     assert seen["dt_needed_unresolved"] == raw["dt_needed_unresolved"]
 
 
@@ -342,8 +375,8 @@ def test_undetermined_imports_stay_null_with_a_null_total(world: Any) -> None:
 
 
 def test_text_hits_page_past_fifty_through_a_tie(world: Any) -> None:
-    """T-J15 / the >50 reach: 62 hits (the library caps at 50), two of them at the same name and
-    address in two same-named binaries; every page size walks to all 62 in one order.
+    """T-J15 / the >50 reach: 62 hits (the library used to cap at 50), two of them at the same
+    name and address in two same-named binaries; every page size walks to all 62 in one order.
 
     Not constructible: dropping ``f.id`` from the paged query's ORDER BY stays GREEN here. The
     plan scans ``functions`` by rowid (= f.id) into a sort that keeps equal keys in scan order, so
@@ -352,9 +385,9 @@ def test_text_hits_page_past_fifty_through_a_tie(world: Any) -> None:
     MUTATION (verified RED, 1 failed): page_list ignores offset (always from 0) -> RED."""
     db, tools = world
     conn = _ro(db)
-    capped = facts.get_functions_referencing_string(conn, text=NEEDLE)
+    unbounded = facts.get_functions_referencing_string(conn, text=NEEDLE)
     conn.close()
-    assert capped["returned"] == 50 and capped["truncated"] is True
+    assert unbounded["returned"] == APP_HITS + 2 and unbounded["truncated"] is False
     tool = tools["get_functions_referencing_string"]
     whole = tool(run_id=RUN, text=NEEDLE, limit=200)
     assert whole["total_functions"] == APP_HITS + 2 == len(whole["functions"])
@@ -364,24 +397,23 @@ def test_text_hits_page_past_fifty_through_a_tie(world: Any) -> None:
         assert _walk(tool, "functions", limit, run_id=RUN, text=NEEDLE) == whole["functions"]
 
 
-def test_the_first_page_is_what_the_library_gives(world: Any) -> None:
-    """Drift guard: with no tie (one binary), the first page of N is the library's own N hits,
-    field for field.
+def test_the_library_read_whole_is_the_tool_read_page_by_page(world: Any) -> None:
+    """One source: the library called directly with no limit gives every hit, and the MCP tool's
+    pages joined are that list, hit for hit, in its order — the tool pages the library's own
+    query, it does not run a second one. Through the tie of two same-named binaries.
 
-    MUTATION (verified RED, 1 failed): read the match line from the last line of the pseudocode
-    instead of _first_match_line -> RED."""
-    db, _tools = world
+    MUTATION (verified RED, 1 failed): give the library a default limit of 50 -> RED.
+    MUTATION (verified RED, 1 failed): have the tool not pass offset to the library -> RED."""
+    db, tools = world
     conn = _ro(db)
     try:
-        for n in (1, 10, 50):
-            lib = facts.get_functions_referencing_string(conn, text=NEEDLE, binary="app", limit=n)
-            ours = paging.functions_referencing_string(
-                conn, text=NEEDLE, binary="app", offset=0, limit=n
-            )
-            assert ours["functions"] == lib["functions"], n
-            assert ours["truncated"] is lib["truncated"] is True
+        whole = facts.get_functions_referencing_string(conn, text=NEEDLE)
     finally:
         conn.close()
+    assert whole["total_functions"] == APP_HITS + 2 == len(whole["functions"])
+    tool = tools["get_functions_referencing_string"]
+    for limit in (1, 9, 50):
+        assert _walk(tool, "functions", limit, run_id=RUN, text=NEEDLE) == whole["functions"]
 
 
 def test_text_hit_counts_follow_the_byte_cut(world: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -427,13 +459,22 @@ def test_anchor_pages_walk_the_whole_set_and_name_the_export_cap(world: Any) -> 
     page (no capped reference on it) still says the export capped one; response_truncated and
     truncated follow next_offset.
 
-    MUTATION (verified RED, 1 failed): read the library with the page's limit instead of every
-    reference -> later pages miss references (and page one's export_truncated reads the page
-    only) -> RED."""
+    The tie (same binary name, string and reference address, in two same-named binaries) reads in
+    row-id order, the one written first ahead. Not constructible: dropping ``r.id`` from the
+    ORDER BY stays GREEN, as SQLite already reads the tied rows by rowid; the order asserted is the
+    documented one either way.
+    MUTATION (verified RED, 1 failed): read export_truncated over the page's rows only (in
+    facts.get_string_reference_anchors) -> page one has no capped reference -> RED.
+    MUTATION (verified RED, 1 failed): have the tool not pass offset to the library (always 0) ->
+    the walk repeats page one -> RED.
+    MUTATION (verified RED, 1 failed): set the tool's truncated from response_truncated alone
+    (drop export_truncated) -> the last page reads untruncated -> RED."""
     _db, tools = world
     tool = tools["get_string_reference_anchors"]
     whole = tool(run_id=RUN, text="KEY", limit=200)
     assert [a["binary"] for a in whole["anchors"]] == ["app"] * 3 + ["libdup.so"] * 2
+    # the tie, in the order its rows were written (fb first)
+    assert [a["ref_in_func"] for a in whole["anchors"]][3:] == ["fb", "fa"]
     for limit in (1, 2, 4):
         assert _walk(tool, "anchors", limit, run_id=RUN, text="KEY") == whole["anchors"]
     first = tool(run_id=RUN, text="KEY", limit=2)
@@ -443,3 +484,25 @@ def test_anchor_pages_walk_the_whole_set_and_name_the_export_cap(world: Any) -> 
     assert first["returned"] == 2 and first["next_offset"] == 2
     last = tool(run_id=RUN, text="KEY", limit=2, offset=4)
     assert last["response_truncated"] is False and last["next_offset"] is None
+    # the export capped one reference, so even the last page is a prefix of what exists
+    assert last["export_truncated"] is True and last["truncated"] is True
+
+
+def test_an_anchor_page_cut_by_bytes_says_what_it_holds(
+    world: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page the response budget ended sooner than ``limit``: returned is the anchors it holds,
+    response_truncated says more follow, next_offset resumes right after them.
+
+    MUTATION (verified RED, 1 failed): skip the tool's update of returned / response_truncated /
+    truncated after _fit_page -> they still describe the uncut page -> RED."""
+    _db, tools = world
+    tool = tools["get_string_reference_anchors"]
+    whole = tool(run_id=RUN, text="KEY", limit=200)
+    assert whole["returned"] == 5 and whole["response_truncated"] is False
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", len(json.dumps(whole)) - 200)
+    got = tool(run_id=RUN, text="KEY", limit=200)
+    assert got["truncated_by_bytes"] is True and 0 < len(got["anchors"]) < 5
+    assert got["returned"] == len(got["anchors"])
+    assert got["response_truncated"] is True and got["truncated"] is True
+    assert got["next_offset"] == len(got["anchors"])

@@ -777,16 +777,22 @@ def test_status_detail_rides_only_with_an_empty_answer(tmp_path: Path) -> None:
         assert answered["exec_argv_status"]["unsupported_note"] == "note"
 
         assert empty["count"] == 0
+        # by run, then binary name (one total order, so the rows page)
         assert [s["binary"] for s in empty["exec_argv_status"]["statuses"]] == [
-            "web_daemon",
             "quiet_lib",
+            "web_daemon",
         ]
         assert empty["exec_argv_status"]["scanned_total"] == 2
         # a scanned-but-found-nothing binary is still listed: that is the evidence that an empty
         # answer about it is trustworthy, and dropping it would erase the distinction
-        assert {"binary": "quiet_lib", "scanned": 1, "cap_hit": False, "found_count": 0} in empty[
-            "exec_argv_status"
-        ]["statuses"]
+        assert {
+            "run_id": "run1",
+            "binary": "quiet_lib",
+            "binary_path": None,
+            "scanned": 1,
+            "cap_hit": False,
+            "found_count": 0,
+        } in empty["exec_argv_status"]["statuses"]
     finally:
         conn.close()
 
@@ -1081,7 +1087,14 @@ def test_zero_edge_result_carries_a_visible_scan_status(tmp_path: Path) -> None:
     assert not any("unsupported_note" in s for s in status["statuses"]), (
         "the shared note must not be duplicated per binary"
     )
-    assert set(status["statuses"][0]) == {"binary", "scanned", "cap_hit", "found_count"}
+    assert set(status["statuses"][0]) == {
+        "run_id",
+        "binary",
+        "binary_path",
+        "scanned",
+        "cap_hit",
+        "found_count",
+    }
 
 
 def test_scan_status_covers_a_binary_that_produced_no_edges(tmp_path: Path) -> None:

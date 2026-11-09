@@ -31,7 +31,6 @@ from treasure_map.lib.fmt_spec import conversions as fmt_conversions
 from treasure_map.lib.pattern.classes import CMD, FMT_STRING
 from treasure_map.lib.pattern.extractor_names import REGISTRY as _EXTRACTOR_NAMES
 from treasure_map.lib.query.nvram import _web_settable, run_scope
-from treasure_map.lib.query.paging import page_list
 from treasure_map.lib.query.sink_impact import (
     CONSTRAINED_MARKERS,
     NVRAM_GETTERS,
@@ -1164,6 +1163,8 @@ def get_sink_provenance(
         callsite_addr=callsite_addr,
     )
     if sink_idx is None:
+        from treasure_map.lib.facts import page_list  # here: facts imports this package
+
         page, total = page_list(records, offset, limit)
         out: dict[str, Any] = {
             "evidence_ref": evidence_ref,

@@ -159,6 +159,14 @@ X_VERDICTS = {A1: NRC, A2: CI, A3: CR, P4: CR, Y5: CI, REF_M: "excluded"}
 WORLDS = ("x", "y", "none")
 
 
+def _world_dir(which: str) -> str:
+    """World ``which``'s directory name, padded so all three are the same length. An answer
+    carries its world's path (the atlas, a run's analysis.db), and a page is cut on the raw bytes
+    before ``_text`` swaps the path out: worlds whose paths differ in length would be cut at
+    different rows for no reason a verdict gives."""
+    return which.ljust(max(map(len, WORLDS)), "_")
+
+
 def _verdict(which: str, x: str) -> str | None:
     """World ``which``'s verdict on a subject world x judged ``x`` (None: not judged)."""
     return {"x": x, "y": _OTHER[x], "none": None}[which]
@@ -455,7 +463,7 @@ def _answers(tmp: Path, which: str) -> dict[str, dict[str, Any]]:
     for part, calls in (("diff", SAFE_CALLS), ("sib", SIB_CALLS), ("pres", PRES_CALLS)):
         pv._clear_view_caches()
         ru.DIFF_CACHE.clear()
-        where = tmp / which / part
+        where = tmp / _world_dir(which) / part
         with pytest.MonkeyPatch.context() as mp:
             if part == "diff":
                 path = _world(where, mp, which).path
@@ -585,7 +593,7 @@ def test_the_worlds_really_differ_where_a_verdict_shows(
     for which in ("x", "y"):
         pv._clear_view_caches()
         ru.DIFF_CACHE.clear()
-        where = tmp_path / which
+        where = tmp_path / _world_dir(which)
         w = _world(where, monkeypatch, which)
         server = mcp_app.build_server(w.path)
         view = _server_call(server, "get_diff_patch_view", {"diff_id": DX})
@@ -611,7 +619,7 @@ def test_the_other_two_fixtures_really_hold_different_verdicts(tmp_path: Path) -
             pv._clear_view_caches()
             ru.DIFF_CACHE.clear()
             with pytest.MonkeyPatch.context() as mp:
-                path = build(tmp_path / which / part, mp, which)
+                path = build(tmp_path / _world_dir(which) / part, mp, which)
                 server = mcp_app.build_server(path)
                 rows = _server_call(
                     server, "list_overlays", {"anchor_kind": "diff_subject", "run_id": run_id}

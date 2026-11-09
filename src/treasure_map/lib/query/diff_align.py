@@ -521,8 +521,7 @@ def align_by_function(
     The ambiguous answer pages its ``candidates`` (by address, one per function): ``limit`` from
     ``offset`` (all when ``limit`` is None), ``total_candidates`` counting them all; each
     candidate's ``pairs`` is whole, never cut."""
-    from treasure_map.lib.facts import _addr_candidates
-    from treasure_map.lib.query.paging import page_list
+    from treasure_map.lib.facts import _addr_candidates, page_list
 
     addr_col, name_col = ("addr_a", "name_a") if side == "a" else ("addr_b", "name_b")
     cands = sorted(_addr_candidates(function))

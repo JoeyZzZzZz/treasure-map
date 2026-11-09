@@ -767,15 +767,25 @@ def _entry_words_note(block: dict[str, Any]) -> str:
 
 
 def xrefs_with_entry_words(
-    conn: sqlite3.Connection, *, func: str, direction: Any, binary: str | None
+    conn: sqlite3.Connection,
+    *,
+    func: str,
+    direction: Any,
+    binary: str | None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
-    """``facts.get_xrefs``, unchanged, plus ``entry_words`` — the aligned data words whose value is
-    the function's entry — when ``callers`` comes back empty, and always on ``address_taken``. The
-    original note is kept and the entry-words sentence is appended after it."""
-    result = get_xrefs(conn, func=func, direction=direction, binary=binary)
+    """``facts.get_xrefs``, unchanged (paged by ``limit`` / ``offset`` as it pages), plus
+    ``entry_words`` — the aligned data words whose value is the function's entry — when ``callers``
+    comes back empty, and always on ``address_taken``. Empty means the whole caller set, not one
+    page of it. The original note is kept and the entry-words sentence is appended after it."""
+    result = get_xrefs(
+        conn, func=func, direction=direction, binary=binary, limit=limit, offset=offset
+    )
     if not result.get("found"):
         return result
-    if not (direction == "address_taken" or (direction == "callers" and not result.get("edges"))):
+    no_callers = direction == "callers" and not result.get("total_edges", len(result["edges"]))
+    if not (direction == "address_taken" or no_callers):
         return result
     row, _miss = _resolve_one(conn, func, binary)
     if row is None:

@@ -1508,7 +1508,7 @@ def page_overlay_rows(result: dict[str, Any], offset: int, limit: int | None) ->
     ``total_overlays``; unchanged when ``limit`` is None."""
     if limit is None:
         return result
-    from treasure_map.lib.query.paging import page_list
+    from treasure_map.lib.facts import page_list
 
     rows = sorted(result["overlays"], key=lambda r: int(r["id"]))
     page, total = page_list(rows, offset, limit)
