@@ -147,12 +147,17 @@ def get_string_keyed_edges(
     key: str | None = None,
     callee: str | None = None,
     from_function: str | None = None,
-    limit: int = 500,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Enumerate string-keyed edges by any anchor (run / binary / key / callee / from_function).
 
     The agent's drill-down + the cross-version diff's enumeration surface. Any provided filter is
-    ANDed; with none, returns the whole table (bounded by ``limit``). Each edge carries the callee
+    ANDed; with none, returns the whole table (bounded by ``limit``). Paged: ``limit`` edges from
+    ``offset`` (every edge when ``limit`` is None), in one total order (the row id breaks a tie;
+    a static table's edges have no from_function). ``count`` is the edges returned and
+    ``truncated`` that the page reached ``limit``, as before; ``total_edges`` counts every edge
+    the filters match. Each edge carries the callee
     anchor (name + addr + kind — BinDiff-alignable, not a bare address) and its fine-grained
     completeness. ★ These are enumerated FACTS, never reachability verdicts.
     """
@@ -168,18 +173,27 @@ def get_string_keyed_edges(
         if val is not None:
             where.append(f"{col} = ?")
             params.append(val)
-    sql = f"SELECT {_COLS} FROM string_keyed_edge"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY from_function, key, callee_name LIMIT ?"
-    params.append(limit)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    sql = (
+        f"SELECT {_COLS} FROM string_keyed_edge{clause}"  # noqa: S608 -- literal columns + WHERE
+        " ORDER BY from_function, key, callee_name, id LIMIT ? OFFSET ?"
+    )
     try:
-        rows = conn.execute(sql, params).fetchall()
+        total = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM string_keyed_edge{clause}",  # noqa: S608 -- literal WHERE
+                params,
+            ).fetchone()[0]
+        )
+        rows = conn.execute(
+            sql, [*params, -1 if limit is None else max(0, limit), max(0, offset)]
+        ).fetchall()
     except sqlite3.OperationalError:
         return {
             "edges": [],
             "count": 0,
             "truncated": False,
+            "total_edges": 0,
             "note": "string_keyed_edge table absent (older atlas or not re-hunted yet)",
             "static_string_table_status": _static_table_status(conn, run_id, binary),
         }
@@ -187,7 +201,8 @@ def get_string_keyed_edges(
     return {
         "edges": edges,
         "count": len(edges),
-        "truncated": len(edges) >= limit,
+        "truncated": limit is not None and len(edges) >= limit,
+        "total_edges": total,
         # ★ static-table honesty travels WITH the result so an EMPTY one is not read as a confident
         # 'none' (scoped to the static_string_table mechanism; strcmp_gate/detector B is separate).
         "static_string_table_status": _static_table_status(conn, run_id, binary),

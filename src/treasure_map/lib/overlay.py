@@ -1402,6 +1402,8 @@ def list_overlays(
     run_id: str | None = None,
     anchor_kind: str = "evidence_ref",
     file_staleness: Any = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Every annotation of one ``anchor_kind``, optionally narrowed to one verdict and/or one
     firmware run (the resume view: 'what did I mark inconclusive / suspicious / excluded, on THIS
@@ -1416,13 +1418,25 @@ def list_overlays(
     came from, the carrying row's landing + subclass, and whether that diff is current now); when it
     is not, the row reads ``source_diff_stale`` (see ``effective_basis_state``). ``diff_subject``
     lists the diff-entry annotations instead, through lib/query/diff_annotations
-    (``file_staleness`` is passed to it for the judgements on non-binary files)."""
+    (``file_staleness`` is passed to it for the judgements on non-binary files).
+
+    ``limit`` None (the default) lists every row, by verdict and most recently written first.
+    With a ``limit`` the rows come as one page — ``limit`` rows from ``offset`` — in the order the
+    annotations were first written (their id), which a rewrite does not change: a page read while
+    judgements are being written stays where it was, and a new one joins at the end. ``count`` and
+    the counts by verdict are always over every row; ``returned`` is this page's rows and
+    ``total_overlays`` the rows in all."""
     _check_anchor_kind(anchor_kind)
     if anchor_kind == "diff_subject":
         from treasure_map.lib.query.diff_annotations import list_diff_overlays
 
         return list_diff_overlays(
-            atlas, verdict=verdict, run_id=run_id, file_staleness=file_staleness
+            atlas,
+            verdict=verdict,
+            run_id=run_id,
+            file_staleness=file_staleness,
+            limit=limit,
+            offset=offset,
         )
     params: list[str] = [anchor_kind]
     conds: list[str] = ["anchor_kind = ?"]
@@ -1478,10 +1492,27 @@ def list_overlays(
             }
         )
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
-    return {
+    out: dict[str, Any] = {
         "overlays": overlays,
         "count": len(overlays),
         "counts_by_verdict": counts,
         "filter": {"verdict": verdict, "run_id": run_id},
         "note": _LIST_NOTE,
     }
+    return page_overlay_rows(out, offset, limit)
+
+
+def page_overlay_rows(result: dict[str, Any], offset: int, limit: int | None) -> dict[str, Any]:
+    """``result`` (a list_overlays answer, its counts read over every row) as one page of its
+    ``overlays`` — by id, from ``offset``, ``limit`` rows — with ``returned`` and
+    ``total_overlays``; unchanged when ``limit`` is None."""
+    if limit is None:
+        return result
+    from treasure_map.lib.query.paging import page_list
+
+    rows = sorted(result["overlays"], key=lambda r: int(r["id"]))
+    page, total = page_list(rows, offset, limit)
+    result["overlays"] = page
+    result["returned"] = len(page)
+    result["total_overlays"] = total
+    return result

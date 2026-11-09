@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +122,35 @@ PRES_CALLS: list[tuple[str, dict[str, Any]]] = [
     ("get_diff_meta", {"diff_id": tbp.DIFF}),
 ]
 
+# The diff World's calls again in their paged forms (a later page, a small limit, an offset past
+# the end), answered under a response budget of PAGE_BUDGET bytes so the byte cut really runs:
+# where a page is cut, and what the paging fields say, must not depend on the verdicts either.
+PAGE_BUDGET = 2_000
+PAGE_CALLS: list[tuple[str, dict[str, Any]]] = [
+    ("get_xrefs", {"run_id": "run_m", "function": "do_fwd", "limit": 2, "offset": 1}),
+    ("get_xrefs", {"run_id": "run_m", "function": "do_fwd", "limit": 200}),
+    ("get_xrefs", {"run_id": "run_m", "function": "do_fwd", "offset": 50}),
+    ("get_sink_provenance", {"evidence_ref": REF_M, "limit": 2, "offset": 1}),
+    ("get_sink_provenance", {"evidence_ref": REF_M}),
+    ("get_imports_exports", {"run_id": "run_m", "binary": "webd", "limit": 2, "offset": 1}),
+    ("get_imports_exports", {"run_id": "run_m", "binary": "webd"}),
+    ("get_function_alignment", {"diff_id": DX, "function": "dup", "limit": 1, "offset": 1}),
+    ("get_function_alignment", {"diff_id": DX, "function": "dup"}),
+    ("get_functions_referencing_string", {"run_id": "run_m", "text": "x", "limit": 2, "offset": 1}),
+    ("get_functions_referencing_string", {"run_id": "run_m", "text": "x"}),
+    ("get_string_reference_anchors", {"run_id": "run_m", "text": "x", "limit": 2, "offset": 1}),
+    ("get_string_reference_anchors", {"run_id": "run_m", "text": "x"}),
+    ("get_string_keyed_edges", {"run_id": "run_m", "limit": 2, "offset": 1}),
+    ("get_string_keyed_edges", {"run_id": "run_m"}),
+    ("get_nvram_key_flow", {"key": "node_role", "limit": 2, "offset": 1}),
+    ("get_nvram_key_flow", {"key": "node_role", "run_id": "run_m"}),
+    ("get_nvram_key_flow", {"key": "node_role", "offset": 50}),
+    ("launched_by", {"target": "webd", "limit": 2, "offset": 1}),
+    ("launched_by", {"target": "webd"}),
+    ("get_diff_deltas", {"diff_id": DX, "limit": 2, "offset": 1}),
+    ("get_diff_deltas", {"diff_id": DX}),
+]
+
 NRC, CI, CR = "no_real_change", "change_inconclusive", "changed_real"
 # World y's verdict of a subject world x judged ``v``: another value on every subject, and another
 # distribution over the pair (x: nrc 1 / ci 2 / cr 2 here; y: ci 2 / cr 3).
@@ -147,17 +177,14 @@ NOT_FOUND_ONLY: dict[tuple[str, str], str] = {
     _key("get_data_table", {"run_id": "run_m", "binary": "webd", "address": "0x6bc0"}): (
         "the fixture's analysis.db holds no data segment"
     ),
-    _key("get_sink_provenance", {"evidence_ref": REF_M}): (
-        "the fixture's candidate carries no sink provenance record"
-    ),
-    _key("get_sink_provenance", {"evidence_ref": REF_M, "dominating_only": True}): (
-        "the fixture's candidate carries no sink provenance record"
-    ),
     _key("get_function_alignment", {"diff_id": DX, "function": "0x4000", "side": "b"}): (
         "a function in no pair: not found IS the answer for it (the unmatched branch)"
     ),
-    _key("get_string_reference_anchors", {"run_id": "run_m", "text": "x"}): (
-        "the fixture's analysis.db has no string-reference export"
+    _key("get_function_alignment", {"diff_id": DX, "function": "dup", "limit": 1, "offset": 1}): (
+        "a name on two functions: the ambiguous answer is found false, its candidates listed"
+    ),
+    _key("get_function_alignment", {"diff_id": DX, "function": "dup"}): (
+        "a name on two functions: the ambiguous answer is found false, its candidates listed"
     ),
 }
 
@@ -166,6 +193,87 @@ NOT_FOUND_ONLY: dict[tuple[str, str], str] = {
 JUDGED_OR_NOT: frozenset[tuple[str, str]] = frozenset(
     {('pres:get_diff_meta({"diff_id": "runA::runB::libx"})', "not_looked_at")}
 )
+
+
+# Three sink records on the candidate, so get_sink_provenance has records to page.
+_PROV = [
+    {
+        "sink_idx": i,
+        "sink": "system",
+        "sink_addr": hex(0x6BA0 + 0x10 * i),
+        "arg_idx": 0,
+        "provenance": {"kind": "stack_buf", "stack_key": f"frame[{i}]" + "s" * 600, "writers": []},
+    }
+    for i in range(3)
+]
+
+
+def _page_data(tmp: Path, conn: Any) -> None:
+    """A few rows more for each paged tool, so a page of two leaves rows after it and a budget of
+    PAGE_BUDGET cuts some pages: callers of do_fwd and functions mentioning "x" in run_m's
+    analysis.db, imports, exports and references of "x" there; nvram, launch and string-key edges
+    in the atlas; deltas on libx; and a name ("dup") on two of libx's aligned A functions."""
+    db = sqlite3.connect(tmp / "analysis.db")
+    for i in range(3, 7):
+        db.execute(
+            "INSERT INTO functions (id, binary_id, name, address, pseudocode, callees) "
+            "VALUES (?, 1, ?, ?, ?, ?)",
+            (
+                i,
+                f"fx{i}_" + "n" * 300,
+                hex(0x7000 + 0x40 * i),
+                f'void fx{i}(){{ do_fwd("x{i}{"m" * 300}"); }}',
+                json.dumps(["do_fwd"]),
+            ),
+        )
+    for i in range(3):
+        db.execute(
+            "INSERT INTO imports (binary_id, func_name, lib_soname, source) "
+            "VALUES (1, ?, 'libc.so.0', 'decompiler')",
+            (f"imp{i}" + "_" * 200,),
+        )
+        db.execute(
+            "INSERT INTO exports (binary_id, func_name, address) VALUES (1, ?, ?)",
+            (f"exp{i}" + "_" * 200, hex(0x8000 + i)),
+        )
+        db.execute(
+            "INSERT INTO string_refs (binary_id, string_addr, string_value, ref_at, ref_in_func, "
+            "ref_in_func_addr, segment) VALUES (1, '0x9000', 'x', ?, 'handle_req', '0x6b90', ?)",
+            (hex(0x6B94 + 4 * i), ".text" + "-" * 200),
+        )
+    db.commit()
+    db.close()
+    pad = "p" * 200
+    for i in range(4):
+        conn.execute(
+            "INSERT INTO nvram_key_flow (source_run_id, key, key_kind, binary, func, op, api) "
+            "VALUES ('run_m', 'node_role', 'constant', 'webd', ?, ?, 'nvram_get')",
+            (f"f{i}_{pad}", "write" if i % 2 else "read"),
+        )
+        conn.execute(
+            "INSERT INTO exec_edge (source_run_id, launcher_binary, launcher_function, "
+            "launcher_addr, exec_api, sink_addr, target_layer, target_token, target_resolution, "
+            "target_binary, argv_template) "
+            "VALUES ('run_m', 'rcd', ?, ?, 'system', ?, 'shell_command', 'webd', 'resolved', "
+            "'webd', ?)",
+            (f"start{i}", hex(0x400 + i), hex(0x410 + i), f"webd -{i} {pad}"),
+        )
+        conn.execute(
+            "INSERT INTO string_keyed_edge (source_run_id, binary, from_function, key, "
+            "callee_name, callee_addr, callee_kind) "
+            "VALUES ('run_m', 'webd', 'dispatch', ?, ?, ?, 'direct')",
+            (f"k{i}_{pad}", f"cb{i}", hex(0x500 + i)),
+        )
+        conn.execute(
+            "INSERT INTO dimension_delta (diff_id, dimension, subject_kind, subject_key, binary, "
+            "delta_kind) VALUES (?, 'string_edge', 'edge', ?, 'libx', 'layer_changed')",
+            (DX, f"libx|strcmp_gate|k{i}|{pad * 3}"),
+        )
+    conn.execute(
+        "UPDATE function_alignment SET name_a = 'dup' WHERE diff_id = ? AND addr_a IN (?, ?)",
+        (DX, "00002000", "00003000"),
+    )
+    conn.commit()
 
 
 def _world(tmp: Path, monkeypatch: pytest.MonkeyPatch, which: str) -> World:
@@ -197,7 +305,9 @@ def _world(tmp: Path, monkeypatch: pytest.MonkeyPatch, which: str) -> World:
             scope_origin="intra",
             origin="custom",
             binary_path="usr/sbin/webd",
-            flow_evidence=json.dumps({"entry_reach": {"status": "found", "sites": []}}),
+            flow_evidence=json.dumps(
+                {"entry_reach": {"status": "found", "sites": []}, "sink_arg_provenance": _PROV}
+            ),
         ),
     )
     begin_run(conn, "run_m", analysis_db_path=str((tmp / "analysis.db").resolve()))
@@ -217,6 +327,7 @@ def _world(tmp: Path, monkeypatch: pytest.MonkeyPatch, which: str) -> World:
         ],
     )
     conn.commit()
+    _page_data(tmp, conn)
     for anchor, x in X_VERDICTS.items():
         verdict = _verdict(which, x)
         if verdict is None:
@@ -360,6 +471,12 @@ def _answers(tmp: Path, which: str) -> dict[str, dict[str, Any]]:
                         got.get("runs") or [], key=lambda r: json.dumps(r, sort_keys=True)
                     )
                 out[_label(part, name, args)] = json.loads(_text(got, where))
+            if part == "diff":
+                # The paged forms, in the same world, under the small budget.
+                mp.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", PAGE_BUDGET)
+                for name, args in PAGE_CALLS:
+                    got = _server_call(server, name, args)
+                    out[_label("page", name, args)] = json.loads(_text(got, where))
         pv._clear_view_caches()
         ru.DIFF_CACHE.clear()
     return out
@@ -368,7 +485,12 @@ def _answers(tmp: Path, which: str) -> dict[str, dict[str, Any]]:
 def _all_calls() -> list[tuple[str, str, dict[str, Any]]]:
     return [
         (part, name, args)
-        for part, calls in (("diff", SAFE_CALLS), ("sib", SIB_CALLS), ("pres", PRES_CALLS))
+        for part, calls in (
+            ("diff", SAFE_CALLS),
+            ("sib", SIB_CALLS),
+            ("pres", PRES_CALLS),
+            ("page", PAGE_CALLS),
+        )
         for name, args in calls
     ]
 
@@ -428,7 +550,10 @@ def test_no_whitelisted_answer_changes_with_the_verdicts(
     whitelist and a call of it here -> RED. FC03 — MUTATION (verified RED, 1 failed): give
     same_shape_siblings' members their entry's verdict (its found path) -> RED; MUTATION (verified
     RED, 1 failed): give get_diff_meta the pair's verdict counts -> RED; MUTATION (verified RED, 1
-    failed): give get_diff_meta's binary_presence the A-only binaries' verdicts -> RED."""
+    failed): give get_diff_meta's binary_presence the A-only binaries' verdicts -> RED.
+    T-J5 — MUTATION (verified RED, 1 failed): widen get_nvram_key_flow's answer by the number of
+    changed_real verdicts (a field padded before the page is fitted) -> its pages, and the
+    unpaged calls, differ -> RED."""
     x, y = answers["x"], answers["y"]
     differ = [label for label in x if json.dumps(x[label]) != json.dumps(y[label])]
     assert differ == []
@@ -495,3 +620,49 @@ def test_the_other_two_fixtures_really_hold_different_verdicts(tmp_path: Path) -
         assert got["none"] == Counter(), (part, got)
         assert got["x"] and got["y"] and got["x"] != got["y"], (part, got)
         assert sum(got["x"].values()) == sum(got["y"].values()), (part, got)
+
+
+# The tools whose paged forms PAGE_CALLS reads: the whitelisted tools that page their rows.
+_PAGED_TOOLS = frozenset(
+    {
+        "get_xrefs",
+        "get_sink_provenance",
+        "get_imports_exports",
+        "get_function_alignment",
+        "get_functions_referencing_string",
+        "get_string_reference_anchors",
+        "get_string_keyed_edges",
+        "get_nvram_key_flow",
+        "launched_by",
+        "get_diff_deltas",
+    }
+)
+
+
+def _cut(got: dict[str, Any]) -> bool:
+    """Whether a page says the byte budget ended it (top level, or in get_diff_deltas' page)."""
+    return (
+        got.get("truncated_by_bytes") is True
+        or (got.get("page") or {}).get("truncated_by_bytes") is True
+    )
+
+
+def test_the_paged_forms_really_reach_the_byte_cut(
+    answers: dict[str, dict[str, dict[str, Any]]],
+) -> None:
+    """T-J5 precondition: the paged calls compare pages the byte cut actually shaped — every
+    paging tool has a call whose page the budget ended, and a call past the end is an empty last
+    page that still finds its subject (never a not-found the comparison cannot tell apart).
+    Without the budget patch no page here is cut (the rows are few), and the equal answers of
+    test_no_whitelisted_answer_changes_with_the_verdicts would compare only whole lists.
+
+    MUTATION (verified RED, 1 failed): drop the PAGE_BUDGET patch in _answers -> RED."""
+    x = answers["x"]
+    page_calls = [(name, args) for part, name, args in _all_calls() if part == "page"]
+    assert {name for name, _ in page_calls} == _PAGED_TOOLS
+    cut = {name for name, args in page_calls if _cut(x[_label("page", name, args)])}
+    assert cut == _PAGED_TOOLS, sorted(_PAGED_TOOLS - cut)
+    for name, args in page_calls:
+        if args.get("offset") == 50:
+            got = x[_label("page", name, args)]
+            assert got.get("found") is True and got["next_offset"] is None, (name, got)

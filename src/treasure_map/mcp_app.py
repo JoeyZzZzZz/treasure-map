@@ -72,7 +72,7 @@ from treasure_map.lib.query import coverage_report as _coverage_report
 from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import diff_review as _dr_mod
 from treasure_map.lib.query import effective_float_filters as _effective_float_filters
-from treasure_map.lib.query import entry_words
+from treasure_map.lib.query import entry_words, paging
 from treasure_map.lib.query import explain_candidate as _explain_candidate
 from treasure_map.lib.query import extraction_gaps as _gaps
 from treasure_map.lib.query import file_diff as _fd
@@ -331,6 +331,112 @@ def _mark_over_budget(result: Any) -> None:
     result.clear()
     result["over_budget"] = True
     result.update(rest)
+
+
+# The page size a paged fact tool uses when the call names none. A page is cut further when its
+# rows do not fit the response budget, so this is an upper bound, not a promise.
+_FACT_PAGE_LIMIT = 100
+
+
+def _page_args_error(limit: Any, offset: Any) -> dict[str, Any] | None:
+    """The refusal of a ``limit`` outside 1.._MAX_LIMIT or an ``offset`` below 0 (a bool is not a
+    number here, though Python counts True as 1); None when both are good."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _MAX_LIMIT:
+        return {"error": f"limit must be an integer in 1..{_MAX_LIMIT}, got {limit!r}"}
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return {"error": f"offset must be an integer >= 0, got {offset!r}"}
+    return None
+
+
+def _clamped_limit(limit: Any, low: int) -> tuple[int, int | None] | dict[str, Any]:
+    """A ``limit`` a tool has always taken unbounded, brought into ``low``.._MAX_LIMIT: the value
+    to use and the value asked for when it was changed (else None), or the refusal of a value
+    that is no integer. Cut, not refused, so a call that worked before still works; the answer
+    says so (``limit_clamped``)."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        return {"error": f"limit must be an integer, got {limit!r}"}
+    used = min(max(limit, low), _MAX_LIMIT)
+    return used, (limit if used != limit else None)
+
+
+def _offset_error(offset: Any) -> dict[str, Any] | None:
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return {"error": f"offset must be an integer >= 0, got {offset!r}"}
+    return None
+
+
+def _fit_lists(
+    result: dict[str, Any], offset: int, lists: tuple[str, ...], budget: int | None = None
+) -> dict[str, Any]:
+    """An answer whose ``lists`` share one ``offset`` (each with its ``total_<list>``) fitted to
+    the response budget (or ``budget`` bytes) at ONE index: rows are taken index by index — the
+    i-th row of every list that has one, together — while the answer fits, so the next page
+    resumes every list from the same index. Each list stays where it is in the answer; the paging
+    fields are top-level: ``next_offset`` (null only when every list is read to its end) and
+    ``truncated_by_bytes``. Both are set to placeholders at least as wide as their final values
+    before the envelope is measured, as in ``_fit_page``. At least one index is kept; a page still
+    over the budget says so with ``over_budget: true``. A list that is None (not determined) is
+    left alone; an answer without the lists (an error, a not-found) is returned as it is."""
+    present = [name for name in lists if isinstance(result.get(name), list)]
+    if "error" in result or not present:
+        return result
+    limit = _RESPONSE_BYTE_BUDGET if budget is None else budget
+    totals = [int(result[f"total_{name}"]) for name in present]
+    widest = max(totals)
+    result["next_offset"] = widest if len(json.dumps(widest)) > len(json.dumps(None)) else None
+    result["truncated_by_bytes"] = False
+    full = {name: list(result[name]) for name in present}
+    for name in present:
+        result[name] = []
+    running = len(json.dumps(result))
+    width = max(len(rows) for rows in full.values())
+    kept = 0
+    for i in range(width):
+        cost = sum(
+            len(json.dumps(rows[i])) + (2 if i else 0) for rows in full.values() if i < len(rows)
+        )
+        if kept and running + cost > limit:
+            break
+        running += cost
+        kept += 1
+    for name in present:
+        result[name] = full[name][:kept]
+    end = offset + kept
+    result["next_offset"] = end if any(end < n for n in totals) else None
+    result["truncated_by_bytes"] = kept < width
+    if len(json.dumps(result)) > limit:
+        result["over_budget"] = True
+    return result
+
+
+def _fit_deltas(result: dict[str, Any], budget: int | None = None) -> dict[str, Any]:
+    """A get_diff_deltas page fitted to the response budget (or ``budget`` bytes). The library's
+    own paging block, ``page``, stays the one place the paging is read from — no second
+    ``next_offset`` beside it — so it is recomputed for what fits: ``count`` (every delta) as it
+    was, ``returned`` the deltas kept, ``next_offset`` right after them (null when none follow),
+    ``truncated`` whether any follow, and ``truncated_by_bytes`` whether the byte ceiling, not
+    ``limit``, ended the page. The fields are set to placeholders at least as wide as their final
+    values first, as in ``_fit_page``; at least one delta is kept, and a page still over the
+    budget says so with ``over_budget: true``."""
+    page = result.get("page")
+    deltas = result.get("deltas")
+    if "error" in result or not isinstance(page, dict) or not isinstance(deltas, list):
+        return result
+    limit = _RESPONSE_BYTE_BUDGET if budget is None else budget
+    n = page["count"]
+    page["next_offset"] = n if len(json.dumps(n)) > len(json.dumps(None)) else None
+    page["truncated"] = False
+    page["truncated_by_bytes"] = False
+    kept, cut = _fit_candidates(result, deltas, limit, key="deltas")
+    end = page["offset"] + len(kept)
+    result["deltas"] = kept
+    page["returned"] = len(kept)
+    page["next_offset"] = end if end < n else None
+    page["truncated"] = page["next_offset"] is not None
+    page["truncated_by_bytes"] = cut
+    if len(json.dumps(result)) > limit:
+        result["over_budget"] = True
+    return result
 
 
 # What a withheld sink-summary entry is read with: the tool and parameter names of the full record.
@@ -726,7 +832,8 @@ _AGENT_GUIDE = (
     "have cleared (safe must say what blocks it, where, and why). list_candidates(overlay=true) "
     "then re-ranks by your own conclusions; it is off by default and the base map is unchanged "
     "with it off. list_overlays(run_id=...) reviews what you concluded last time and flags any "
-    "whose underlying facts have since moved. A row already marked in_exploit_ledger was confirmed "
+    "whose underlying facts have since moved. It comes in pages: follow its next_offset until "
+    "null to read every one. A row already marked in_exploit_ledger was confirmed "
     "by a person — you cannot write that (people do, from the command line), and it is usually not "
     "worth re-verifying. DIFF: " + DIFF_ONE_DIFF + " " + DIFF_WORKFLOW + " "
     "get_diff_patch_view(diff_id) — "
@@ -743,7 +850,9 @@ _AGENT_GUIDE = (
     "find a row_ref past them, page its rows with get_diff_patch_view(diff_id, entry_id=..., "
     "rows_offset=...)), "
     "and list_overlays(anchor_kind='diff_subject', run_id='<run_a>::<run_b>') reviews them with "
-    "the progress over the whole run pair. same_shape_siblings(diff_id, evidence_ref=...) names "
+    "the progress over the whole run pair. It too comes in pages: follow its next_offset until "
+    "null. "
+    "same_shape_siblings(diff_id, evidence_ref=...) names "
     "the other calls of one call's shape in the same binary and where each landed in the diff. "
     "Per entry, sink_candidate_counts counts hunt candidates and sink_callsite_counts counts "
     "calls (unit callsite: each call of a sink name in the decompiled call tokens, a repeated "
@@ -2256,7 +2365,11 @@ def make_tools(
         return _fit_sink_summary(data)
 
     def get_sink_provenance(
-        evidence_ref: str, sink_idx: int | None = None, dominating_only: bool = False
+        evidence_ref: str,
+        sink_idx: int | None = None,
+        dominating_only: bool = False,
+        limit: int = _FACT_PAGE_LIMIT,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Full sink-argument def-use provenance for a candidate — the on-demand detail behind the
         explain_candidate summary (which stays compact to fit the token budget).
@@ -2277,7 +2390,17 @@ def make_tools(
         already carry the per-sink detail. When the ref carries a callsite address, the one record
         that is this candidate's own callsite — the record its dimension readings come from — is
         flagged ``is_candidate_callsite: true``; the flag is absent entirely for a function-level
-        anchor (every other record stays exactly as before)."""
+        anchor (every other record stays exactly as before).
+
+        Without ``sink_idx`` the records come in pages: ``limit`` (1-200, default 100) records
+        from ``offset`` (default 0), in their stored order, with ``total_records`` and
+        ``next_offset`` (null on the last page); follow ``next_offset`` until null to read every
+        record. ``limit`` is not a size guarantee: a page whose records do not fit the response
+        budget ends sooner, with ``truncated_by_bytes: true``, and the rest is on the next page. A
+        single record (``sink_idx``) is never cut."""
+        refused = _page_args_error(limit, offset)
+        if refused is not None:
+            return refused
         conn = open_atlas(atlas_path)
         try:
             ref = _resolve_ref(conn, evidence_ref)
@@ -2290,7 +2413,12 @@ def make_tools(
                     refusal["evidence_ref"] = evidence_ref
                     return refusal
             result: dict[str, Any] = _get_sink_provenance(
-                conn, evidence_ref, sink_idx, dominating_only=dominating_only
+                conn,
+                evidence_ref,
+                sink_idx,
+                dominating_only=dominating_only,
+                limit=limit,
+                offset=offset,
             )
         finally:
             conn.close()
@@ -2301,9 +2429,21 @@ def make_tools(
         if run is not None:
             result["resolved_run"] = run.run_id
             result["run_lineage"] = _lineage_inline(run, _current)
-        return result
+        return _fit_page(
+            result,
+            offset,
+            rows="records",
+            total="total_records",
+            next_offset="next_offset",
+            truncated="truncated_by_bytes",
+        )
 
-    def get_nvram_key_flow(key: str, run_id: str | None = None) -> dict[str, Any]:
+    def get_nvram_key_flow(
+        key: str,
+        run_id: str | None = None,
+        limit: int = _FACT_PAGE_LIMIT,
+        offset: int = 0,
+    ) -> dict[str, Any]:
         """Cross-binary nvram key graph: who WRITES and who READS one nvram key.
 
         Turns "trace this config value across processes" from two manual reverse-lookups into one
@@ -2323,7 +2463,18 @@ def make_tools(
         firmware you have scanned — often what you want, since a key's behaviour across devices is
         the interesting part, and every row names its own run. Pass it when you are auditing ONE
         image and do not want another device's rows in the answer. Scoping also scopes the
-        completeness caveat: it then means "may be incomplete within THIS run"."""
+        completeness caveat: it then means "may be incomplete within THIS run".
+
+        The three lists are paged together at one index: ``limit`` (1-200, default 100) rows of
+        each from ``offset`` (default 0), each list where it always is, with ``total_writers`` /
+        ``total_readers`` / ``total_template_matches`` and one ``next_offset`` (null only when
+        every list is read to its end). Follow ``next_offset`` until null; a list that has run out
+        is just empty on the later pages. ``found``, ``match``, ``completeness`` and the notes are
+        read from the whole lists. ``limit`` is not a size guarantee: a page that does not fit the
+        response budget ends sooner, with ``truncated_by_bytes: true``."""
+        refused = _page_args_error(limit, offset)
+        if refused is not None:
+            return refused
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_run(conn, run_id) or _unknown_run(
@@ -2331,11 +2482,13 @@ def make_tools(
             )
             if refusal is not None:
                 return refusal
-            result = _get_nvram_key_flow(conn, key, run_id=run_id)
+            result = paging.page_nvram_key_flow(
+                _get_nvram_key_flow(conn, key, run_id=run_id), offset, limit
+            )
         finally:
             conn.close()
         result["note"] = _DERIVED_SIGNAL_NOTE
-        return result
+        return _fit_lists(result, offset, paging.NVRAM_LISTS)
 
     def get_string_keyed_edges(
         binary: str | None = None,
@@ -2343,6 +2496,8 @@ def make_tools(
         callee: str | None = None,
         from_function: str | None = None,
         run_id: str | None = None,
+        limit: int = _FACT_PAGE_LIMIT,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Enumerate STRING-KEYED EDGES — an attacker-influenceable string key gates/dispatches to a
         callee, recovered structurally (a same-variable strcmp ladder, or a {string, func_ptr}
@@ -2358,7 +2513,16 @@ def make_tools(
         ★ These are ENUMERATED FACTS, NOT a reachability verdict: a candidate that is an edge callee
         stays reachability=unknown — the key is a lead you confirm, tmap does not judge whether the
         input actually arrives. Empty is NOT proof of unreachability (most functions are simply not
-        string-key-dispatched)."""
+        string-key-dispatched).
+
+        Paged: ``limit`` (1-200, default 100) edges from ``offset`` (default 0), in one fixed
+        order, with ``total_edges`` (every edge the filters match) and ``next_offset`` (null on
+        the last page); follow ``next_offset`` until null. ``count`` is the edges on this page and
+        ``truncated`` that the page reached ``limit``; ``truncated_by_bytes`` says the response
+        budget ended it sooner — ``limit`` is not a size guarantee."""
+        refused = _page_args_error(limit, offset)
+        if refused is not None:
+            return refused
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_run(conn, run_id) or _unknown_run(
@@ -2373,15 +2537,28 @@ def make_tools(
                 key=key,
                 callee=callee,
                 from_function=from_function,
+                limit=limit,
+                offset=offset,
             )
         finally:
             conn.close()
+        result = _fit_page(
+            result,
+            offset,
+            rows="edges",
+            total="total_edges",
+            next_offset="next_offset",
+            truncated="truncated_by_bytes",
+        )
+        if isinstance(result.get("edges"), list):
+            result["count"] = len(result["edges"])
         return result
 
     def launched_by(
         target: str,
         run_id: str | None = None,
         limit: int = 200,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Which binaries' CODE launches ``target`` — the cross-binary "A execs B" edge. Answers
         "who starts this daemon?" and "is this binary only ever run by that one caller?" from a
@@ -2403,15 +2580,42 @@ def make_tools(
         callsite runs, nor that an attacker's input reaches it — you confirm the caller. An EMPTY
         result is NOT proof that nothing launches the binary: read ``exec_argv_status``, which
         names what this pass cannot see (most sharply, a caller whose command sink sits behind a
-        thin forwarding wrapper — that callsite is invisible here)."""
+        thin forwarding wrapper — that callsite is invisible here).
+
+        Paged: ``limit`` edges (default 200; a larger value is cut to 200 and the answer carries
+        ``limit_clamped`` with the value asked for) from ``offset`` (default 0), with
+        ``total_edges`` and ``next_offset`` (null on the last page); follow ``next_offset`` until
+        null. ``count`` is the edges on this page and ``truncated`` that the page reached
+        ``limit``; ``truncated_by_bytes`` says the response budget ended it sooner — ``limit`` is
+        not a size guarantee. ``launcher_binaries`` is read from every edge, not this page's."""
+        clamped = _clamped_limit(limit, 0)
+        if isinstance(clamped, dict):
+            return clamped
+        used, asked = clamped
+        refused = _offset_error(offset)
+        if refused is not None:
+            return refused
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_run(conn, run_id) or _unknown_run(conn, run_id, "exec_edge")
             if refusal is not None:
                 return refusal
-            return _launched_by(conn, target, run_id=run_id, limit=limit)
+            result = _launched_by(conn, target, run_id=run_id, limit=used, offset=offset)
         finally:
             conn.close()
+        if asked is not None:
+            result["limit_clamped"] = asked
+        result = _fit_page(
+            result,
+            offset,
+            rows="edges",
+            total="total_edges",
+            next_offset="next_offset",
+            truncated="truncated_by_bytes",
+        )
+        if isinstance(result.get("edges"), list):
+            result["count"] = len(result["edges"])
+        return result
 
     def get_diff_deltas(
         diff_id: str,
@@ -2437,24 +2641,40 @@ def make_tools(
         ★ ``source_stale`` (with ``source_stale_reason``): true = the diff no longer describes what
         it was computed from (binary content, extraction, the hunt output it read, or the diff code
         changed — re-run the diff); null = could not be checked; false = checked and current. The
-        reasons are listed in list_diffs."""
+        reasons are listed in list_diffs.
+
+        ``limit`` above 200 is cut to 200 (the answer carries ``limit_clamped`` with the value
+        asked for). ``limit`` is not a size guarantee: a page that does not fit the response budget
+        ends sooner, and ``page`` says so — ``returned`` the deltas on it, ``next_offset`` where
+        the next page starts (null when none follows), ``truncated`` whether one follows and
+        ``truncated_by_bytes`` whether the budget, not ``limit``, ended this one. Follow
+        ``page.next_offset`` until null."""
+        clamped = _clamped_limit(limit, 0)
+        if isinstance(clamped, dict):
+            return clamped
+        used, asked = clamped
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            return {"error": f"offset must be an integer, got {offset!r}"}
         conn = open_atlas(atlas_path)
         try:
             refusal = _refuse_stale_diff(conn, diff_id)
             if refusal is not None:
                 return refusal
-            return _get_diff_deltas(
+            result = _get_diff_deltas(
                 conn,
                 diff_id,
                 binary=binary,
                 dimension=dimension,
                 delta_kind=delta_kind,
-                limit=limit,
+                limit=used,
                 offset=offset,
                 verbose=verbose,
             )
         finally:
             conn.close()
+        if asked is not None:
+            result["limit_clamped"] = asked
+        return _fit_deltas(result)
 
     # ── the pair review (start_diff_review(run_pair=...)) ──
 
@@ -3784,7 +4004,9 @@ def make_tools(
             (default 0), plus ``total_rows`` and ``next_offset`` (null on the last page). Rows are
             in a fixed neutral order (diff, binary, granularity, sink class, refs — never by
             presence or importance), so walking ``offset = next_offset`` until null returns every
-            row exactly once.
+            row exactly once. ``limit`` is not a size guarantee: a page whose rows do not fit the
+            response budget ends sooner, with ``truncated_by_bytes: true``, and ``next_offset``
+            resumes right after the last row it holds.
         Row filters (both modes): ``binary`` / ``sink_class`` / ``presence`` /
         ``min_alignment_confidence``, ``reason`` (exact ``presence_reason`` match), and ``side`` —
         the row's direction: ``a_only`` (it names an A candidate and no B one), ``b_only`` (a B
@@ -3944,7 +4166,14 @@ def make_tools(
                     ),
                 }
             )
-            return out
+            return _fit_page(
+                out,
+                offset,
+                rows="rows",
+                total="total_rows",
+                next_offset="next_offset",
+                truncated="truncated_by_bytes",
+            )
         finally:
             conn.close()
 
@@ -4429,7 +4658,11 @@ def make_tools(
         return result
 
     def get_function_alignment(
-        diff_id: str, function: str | None = None, side: str = "a"
+        diff_id: str,
+        function: str | None = None,
+        side: str = "a",
+        limit: int = _FACT_PAGE_LIMIT,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """The BinDiff-aligned counterpart of one function (name or address) in a diff.
         ``side="a"`` resolves an A-side (before) address to its B-side match; ``side="b"`` the
@@ -4451,7 +4684,16 @@ def make_tools(
         neither 'not matched' nor 'changed'. No match here is NOT proof the function was added or
         removed (see function_presence). ``source_stale`` / ``source_stale_reason``: whether the
         diff still describes what it was computed from (true / null = unverified / false; reasons
-        in list_diffs)."""
+        in list_diffs).
+
+        An ambiguous answer pages its ``candidates``: ``limit`` (1-200, default 100) from
+        ``offset`` (default 0), by address, with ``total_candidates`` and ``next_offset`` (null on
+        the last page); each candidate's ``pairs`` comes whole. ``limit`` is not a size
+        guarantee: a page that does not fit the response budget ends sooner, with
+        ``truncated_by_bytes: true``."""
+        refused = _page_args_error(limit, offset)
+        if refused is not None:
+            return {"found": False, **refused}
         if side not in ("a", "b"):
             # Anything but "b" used to be read as "a", answering for the other version unasked.
             return {"found": False, "error": f"side {side!r} does not exist; use 'a' or 'b'"}
@@ -4463,10 +4705,17 @@ def make_tools(
             refusal = _refuse_stale_diff(conn, diff_id)
             if refusal is not None:
                 return refusal
-            result = _align_by_function(conn, diff_id, target, side)
+            result = _align_by_function(conn, diff_id, target, side, limit=limit, offset=offset)
         finally:
             conn.close()
-        return result
+        return _fit_page(
+            result,
+            offset,
+            rows="candidates",
+            total="total_candidates",
+            next_offset="next_offset",
+            truncated="truncated_by_bytes",
+        )
 
     def get_diff_capabilities(diff_id: str) -> dict[str, Any]:
         """Per-dimension capability state for a diff (``diff_id`` = ``{run_a}::{run_b}::{binary}``,
@@ -4489,7 +4738,12 @@ def make_tools(
         finally:
             conn.close()
 
-    def list_diffs(run_a_id: str | None = None, run_b_id: str | None = None) -> dict[str, Any]:
+    def list_diffs(
+        run_a_id: str | None = None,
+        run_b_id: str | None = None,
+        limit: int = _FACT_PAGE_LIMIT,
+        offset: int = 0,
+    ) -> dict[str, Any]:
         """Browse the version diffs in the atlas: one row per binary diffed between two runs, with
         matched_pairs, version_skew, its ``functions`` counts AND its diff status (diff_ok /
         diff_status / diff_status_reason / diff_attempts). Optionally filter to a run-pair.
@@ -4542,13 +4796,32 @@ def make_tools(
         swapped.
         ``upstream_library`` (on a row whose binary's file name names an upstream library, absent
         otherwise) is that library by name only; its versions are get_diff_meta's
-        ``upstream_version``."""
+        ``upstream_version``.
+
+        The rows come in pages: ``limit`` (1-200, default 100) rows from ``offset`` (default 0),
+        in a fixed order, with ``total_diffs`` and ``next_offset`` (null on the last page); follow
+        ``next_offset`` until null to read every row. ``review_pairs``, ``count`` and
+        ``coverage`` are read from every row, not this page's. ``limit`` is not a size guarantee:
+        a page whose rows do not fit the response budget ends sooner, with
+        ``truncated_by_bytes: true``."""
+        refused = _page_args_error(limit, offset)
+        if refused is not None:
+            return refused
         conn = open_atlas(atlas_path)
         try:
             out = _list_diffs(conn, run_a_id, run_b_id, file_staleness=_file_staleness(conn))
             out.update(_reverse_hint(conn, run_a_id, run_b_id, ("run_a_id", "run_b_id")))
+            every = out.get("diffs") or []
+            out["diffs"], out["total_diffs"] = paging.page_list(every, offset, limit)
             # First key: the answer can run long, and the whole-pair entry must not sit past it.
-            return {"review_pairs": _review_pairs(out.get("diffs") or []), **out}
+            return _fit_page(
+                {"review_pairs": _review_pairs(every), **out},
+                offset,
+                rows="diffs",
+                total="total_diffs",
+                next_offset="next_offset",
+                truncated="truncated_by_bytes",
+            )
         finally:
             conn.close()
 
@@ -4687,6 +4960,8 @@ def make_tools(
         binary: str | None = None,
         run_id: str | None = None,
         evidence_ref: str | None = None,
+        limit: int = _FACT_PAGE_LIMIT,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Cross-reference edges: direction='callers' / 'callees' (both include cross-binary edges),
         or 'address_taken'.
@@ -4716,7 +4991,17 @@ def make_tools(
         when it does, the result is ``reason='ambiguous'`` listing each candidate's
         ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
         the firmware, not an error.
-        When ``function`` resolves, ITS binary is used and ``binary`` does not re-select."""
+        When ``function`` resolves, ITS binary is used and ``binary`` does not re-select.
+
+        The edges come in pages: ``limit`` (1-200, default 100) from ``offset`` (default 0), in
+        one fixed order (callers / callees by binary path, address, function, xref type), with
+        ``total_edges`` and ``next_offset`` (null on the last page); follow ``next_offset`` until
+        null to read every edge. ``entry_words`` is read from the whole caller set. ``limit`` is
+        not a size guarantee: a page whose edges do not fit the response budget ends sooner, with
+        ``truncated_by_bytes: true``."""
+        refused = _page_args_error(limit, offset)
+        if refused is not None:
+            return {"found": False, **refused}
         if direction not in ("callers", "callees", "address_taken"):
             # An unknown direction used to fall back to callers — another question's answer.
             return {
@@ -4745,7 +5030,14 @@ def make_tools(
         step = (result.get("entry_words") or {}).get("next")
         if isinstance(step, dict) and result.get("resolved_run"):
             step["args"]["run_id"] = result["resolved_run"]
-        return result
+        return _fit_page(
+            paging.page_xrefs(result, offset, limit),
+            offset,
+            rows="edges",
+            total="total_edges",
+            next_offset="next_offset",
+            truncated="truncated_by_bytes",
+        )
 
     def get_strings(
         binary: str | None = None,
@@ -4797,6 +5089,8 @@ def make_tools(
         binary: str | None = None,
         run_id: str | None = None,
         evidence_ref: str | None = None,
+        limit: int = _FACT_PAGE_LIMIT,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Import and export symbol tables of one binary (cross-binary edge endpoints).
 
@@ -4812,15 +5106,29 @@ def make_tools(
         ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
         the firmware, not an error.
         Without binary (or an evidence_ref that supplies one) it is an error naming the run, not an
-        empty answer."""
-        return _fact(
-            lambda c, fn, bn: facts.get_imports_exports(c, binary=bn or ""),
+        empty answer.
+
+        ``imports``, ``exports`` and ``dt_needed_unresolved`` are paged together at one index:
+        ``limit`` (1-200, default 100) rows of each from ``offset`` (default 0), each list where it
+        always is, with ``total_imports`` / ``total_exports`` / ``total_dt_needed_unresolved``
+        (``total_imports`` null when ``imports`` is) and one ``next_offset`` (null only when every
+        list is read to its end). Follow ``next_offset`` until null; a list that has run out is
+        just empty on the later pages. ``limit`` is not a size guarantee: a page that does not fit
+        the response budget ends sooner, with ``truncated_by_bytes: true``."""
+        refused = _page_args_error(limit, offset)
+        if refused is not None:
+            return refused
+        result = _fact(
+            lambda c, fn, bn: paging.page_imports_exports(
+                facts.get_imports_exports(c, binary=bn or ""), offset, limit
+            ),
             run_id=run_id,
             evidence_ref=evidence_ref,
             binary=binary,
             needs_binary=True,
             binary_error=_needs_binary("get_imports_exports"),
         )
+        return _fit_lists(result, offset, paging.IMPORTS_EXPORTS_LISTS)
 
     def get_data_bytes(
         address: str,
@@ -4942,6 +5250,8 @@ def make_tools(
         binary: str | None = None,
         run_id: str | None = None,
         evidence_ref: str | None = None,
+        limit: int = _FACT_PAGE_LIMIT,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Functions whose pseudocode TEXT contains a string (substring reverse-lookup).
 
@@ -4956,13 +5266,37 @@ def make_tools(
         short name. A short name is a label and can name several binaries in one firmware;
         when it does, the result is ``reason='ambiguous'`` listing each candidate's
         ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
-        the firmware, not an error."""
-        return _fact(
-            lambda c, fn, bn: facts.get_functions_referencing_string(c, text=text, binary=bn),
+        the firmware, not an error.
+
+        The hits come in pages: ``limit`` (1-200, default 100) from ``offset`` (default 0), by
+        binary and address, with ``total_functions`` (every hit) and ``next_offset`` (null on the
+        last page); follow ``next_offset`` until null to read every hit. Each page re-runs the text
+        scan, which on a large firmware takes seconds. ``limit`` is not a size guarantee: a page
+        whose hits do not fit the response budget ends sooner, with ``truncated_by_bytes:
+        true``."""
+        refused = _page_args_error(limit, offset)
+        if refused is not None:
+            return refused
+        result = _fact(
+            lambda c, fn, bn: paging.functions_referencing_string(
+                c, text=text, binary=bn, offset=offset, limit=limit
+            ),
             run_id=run_id,
             evidence_ref=evidence_ref,
             binary=binary,
         )
+        result = _fit_page(
+            result,
+            offset,
+            rows="functions",
+            total="total_functions",
+            next_offset="next_offset",
+            truncated="truncated_by_bytes",
+        )
+        if isinstance(result.get("functions"), list) and "total_functions" in result:
+            result["returned"] = len(result["functions"])
+            result["truncated"] = result["next_offset"] is not None
+        return result
 
     def get_string_reference_anchors(
         text: str,
@@ -4970,6 +5304,7 @@ def make_tools(
         limit: int = 50,
         run_id: str | None = None,
         evidence_ref: str | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Where a string is REFERENCED, by RESOLVED Ghidra data references (parsed, not text).
 
@@ -4998,15 +5333,46 @@ def make_tools(
         short name. A short name is a label and can name several binaries in one firmware;
         when it does, the result is ``reason='ambiguous'`` listing each candidate's
         ``binary_path`` and ``sha256`` — re-issue with one of them. That is an answer about
-        the firmware, not an error."""
-        return _fact(
-            lambda c, fn, bn: facts.get_string_reference_anchors(
-                c, text=text, binary=bn, limit=limit
+        the firmware, not an error.
+
+        Paged: ``limit`` anchors (default 50; a larger value than 200 is cut to 200 and the answer
+        carries ``limit_clamped`` with the value asked for) from ``offset`` (default 0), in one
+        fixed order, with ``total_anchors`` and ``next_offset`` (null on the last page); follow
+        ``next_offset`` until null. ``response_truncated`` says this page is not the last one,
+        ``export_truncated`` that the export capped this string's references (over all of them),
+        ``truncated`` either. ``limit`` is not a size guarantee: a page that does not fit the
+        response budget ends sooner, with ``truncated_by_bytes: true``."""
+        clamped = _clamped_limit(limit, 1)
+        if isinstance(clamped, dict):
+            return clamped
+        used, asked = clamped
+        refused = _offset_error(offset)
+        if refused is not None:
+            return refused
+        result = _fact(
+            lambda c, fn, bn: paging.string_reference_anchors(
+                c, text=text, binary=bn, offset=offset, limit=used
             ),
             run_id=run_id,
             evidence_ref=evidence_ref,
             binary=binary,
         )
+        if asked is not None and "error" not in result:
+            result["limit_clamped"] = asked
+        result = _fit_page(
+            result,
+            offset,
+            rows="anchors",
+            total="total_anchors",
+            next_offset="next_offset",
+            truncated="truncated_by_bytes",
+        )
+        if isinstance(result.get("anchors"), list) and "total_anchors" in result:
+            more = result["next_offset"] is not None
+            result["returned"] = len(result["anchors"])
+            result["response_truncated"] = more
+            result["truncated"] = bool(result["export_truncated"] or more)
+        return result
 
     def get_script_callsites(
         binary: str | None = None,
@@ -6128,7 +6494,11 @@ def make_tools(
         return result
 
     def list_overlays(
-        verdict: str | None = None, run_id: str | None = None, anchor_kind: str = "evidence_ref"
+        verdict: str | None = None,
+        run_id: str | None = None,
+        anchor_kind: str = "evidence_ref",
+        limit: int = _FACT_PAGE_LIMIT,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Your overlay annotations, optionally filtered to one ``verdict`` — the resume view: "what
         did I mark ``inconclusive`` / ``suspicious`` / ``excluded``". Each row carries its live
@@ -6156,7 +6526,20 @@ def make_tools(
         rebuilds every diff's view of the pair: tens of seconds for a pair of a hundred diffs. A
         judgment on a non-binary file (annotate_diff with run_pair) is listed with ``diff_id``
         null and its ``run_pair``, read against the pair's files; a stale run on either side reads
-        it ``needs_recheck`` (and refuses the call when ``run_id`` names that pair)."""
+        it ``needs_recheck`` (and refuses the call when ``run_id`` names that pair).
+
+        The rows come in pages: ``limit`` (1-200, default 100) from ``offset`` (default 0), with
+        ``total_overlays``, ``returned`` (this page's rows) and ``next_offset`` (null on the last
+        page); follow ``next_offset`` until null to read every judgment. The rows are in the order
+        the judgments were first written, NOT grouped by verdict: rewriting a judgment does not
+        move it, so a page read while you are still judging stays where it was, and a new
+        judgment joins at the end. ``count``, ``counts_by_verdict``, ``counts_by_review_state`` and
+        ``review_progress`` are over every row, not this page's. ``limit`` is not a size
+        guarantee: a page whose rows do not fit the response budget ends sooner, with
+        ``truncated_by_bytes: true``."""
+        refused = _page_args_error(limit, offset)
+        if refused is not None:
+            return refused
         atlas = open_atlas(atlas_path)
         try:
             if anchor_kind == "diff_subject":
@@ -6177,15 +6560,28 @@ def make_tools(
                     )
             if refusal is not None:
                 return refusal
-            return _list_overlays(
+            result = _list_overlays(
                 atlas,
                 verdict=verdict,
                 run_id=run_id,
                 anchor_kind=anchor_kind,
                 file_staleness=_file_staleness(atlas) if anchor_kind == "diff_subject" else None,
+                limit=limit,
+                offset=offset,
             )
         finally:
             atlas.close()
+        result = _fit_page(
+            result,
+            offset,
+            rows="overlays",
+            total="total_overlays",
+            next_offset="next_offset",
+            truncated="truncated_by_bytes",
+        )
+        if isinstance(result.get("overlays"), list) and "returned" in result:
+            result["returned"] = len(result["overlays"])
+        return result
 
     def clear_overlay(
         run_id: str | None = None,

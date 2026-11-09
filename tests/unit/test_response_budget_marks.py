@@ -257,18 +257,30 @@ def test_an_explanation_over_the_budget_with_nothing_left_to_withhold_says_so() 
     assert out.get("over_budget") is True
 
 
-def test_the_server_marks_an_unpaged_tool_and_fits_the_explanation(tmp_path: Path) -> None:
+def test_the_server_pages_the_provenance_and_fits_the_explanation(tmp_path: Path) -> None:
     """End to end on the real server, two real tools on the same 200-sink function:
-    get_sink_provenance without sink_idx (it does not page) answers over the budget and is
-    marked by the fallback; explain_candidate answers within it, its summary cut and named.
+    get_sink_provenance without sink_idx answers one page within the budget (it used to answer
+    every record, over it, marked by the fallback), and walking next_offset reads every record
+    once, in order; explain_candidate answers within it, its summary cut and named.
 
-    MUTATION (verified RED): drop the _mark_over_budget call from the wrapper -> RED.
-    MUTATION (verified RED): return data without _fit_sink_summary -> explanation marked -> RED."""
+    MUTATION (verified RED, 1 failed): return get_sink_provenance's result without _fit_page ->
+    RED. MUTATION (verified RED): return data without _fit_sink_summary -> explanation marked ->
+    RED."""
     ref = _many_sinks(tmp_path)
     server = mcp_app.build_server(tmp_path / "atlas.db")
     prov = _call(server, "get_sink_provenance", {"evidence_ref": ref})
-    assert len(prov.get("records") or []) == 200
-    assert prov.get("over_budget") is True
+    first = prov.get("records") or []
+    assert prov.get("total_records") == 200
+    assert 0 < len(first) < 100 and prov.get("next_offset") == len(first)
+    assert prov.get("truncated_by_bytes") is True and "over_budget" not in prov
+    seen = [r["sink_idx"] for r in first]
+    offset = prov.get("next_offset")
+    while offset is not None:
+        page = _call(server, "get_sink_provenance", {"evidence_ref": ref, "offset": offset})
+        assert "over_budget" not in page
+        seen += [r["sink_idx"] for r in page["records"]]
+        offset = page["next_offset"]
+    assert seen == list(range(200))
     ex = _call(server, "explain_candidate", {"evidence_ref": ref})
     assert "over_budget" not in ex
     assert (ex.get("sink_arg_provenance_summary_withheld") or {}).get("count", 0) > 0

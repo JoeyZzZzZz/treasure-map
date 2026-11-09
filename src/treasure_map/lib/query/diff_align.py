@@ -499,7 +499,13 @@ _NOT_PROOF = (
 
 
 def align_by_function(
-    atlas: sqlite3.Connection, diff_id: str, function: str, side: str
+    atlas: sqlite3.Connection,
+    diff_id: str,
+    function: str,
+    side: str,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """One function's aligned counterpart(s), the function named by a name OR an address.
 
@@ -510,8 +516,13 @@ def align_by_function(
     match more than one function on a side (an import stub and the body beside it), and then the
     answer lists every candidate (``reason: ambiguous``) instead of picking one. So does a
     digits-only value read as two addresses that both exist. No match lists the side's unmatched
-    functions of that name or address under ``presence`` (function_presence)."""
+    functions of that name or address under ``presence`` (function_presence).
+
+    The ambiguous answer pages its ``candidates`` (by address, one per function): ``limit`` from
+    ``offset`` (all when ``limit`` is None), ``total_candidates`` counting them all; each
+    candidate's ``pairs`` is whole, never cut."""
     from treasure_map.lib.facts import _addr_candidates
+    from treasure_map.lib.query.paging import page_list
 
     addr_col, name_col = ("addr_a", "name_a") if side == "a" else ("addr_b", "name_b")
     cands = sorted(_addr_candidates(function))
@@ -548,6 +559,7 @@ def align_by_function(
             "note": _ALIGN_NOTE,
         }
     if len(groups) > 1:
+        candidates, total = page_list(sorted(groups.items()), offset, limit)
         return {
             "found": False,
             "reason": "ambiguous",
@@ -560,8 +572,9 @@ def align_by_function(
                     "basicblocks": group[0]["basicblocks"],
                     "pairs": [_row_to_pair(r) for r in group],
                 }
-                for addr, group in sorted(groups.items())
+                for addr, group in candidates
             ],
+            "total_candidates": total,
             **diff_source_staleness(atlas, diff_id),
             "note": (
                 f"{len(groups)} functions on side {side} match this input; none is picked. A name "
@@ -1060,7 +1073,7 @@ def list_diffs(
         "dm.version_skew, dm.diff_ok, dm.diff_status, dm.diff_status_reason, dm.diff_attempts, "
         "dm.baseline_dropped, dm.alignment_undetermined, "
         + ", ".join(f"dm.{c}" for c in _STAMP_COLS)
-        + f" FROM diff_meta dm {clause} ORDER BY dm.run_a_id, dm.run_b_id, dm.binary_a",
+        + f" FROM diff_meta dm {clause} ORDER BY dm.run_a_id, dm.run_b_id, dm.binary_a, dm.diff_id",
         params,
     ).fetchall()
     # Two grouped counts over the stored tables, scoped like the listing: never a view, never a

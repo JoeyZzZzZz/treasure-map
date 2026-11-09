@@ -1130,7 +1130,8 @@ def _read_more(kind: str, run_pair: str, diff_id: Any, anchor: str) -> str:
     if kind == "non_binary" and "#non_binary#" in anchor:
         path = anchor.split("#non_binary#", 1)[1]
         return _inline(f'get_file_diff(run_pair="{run_pair}", path="{path}")')
-    return _inline(f'list_overlays(anchor_kind="diff_subject", run_id="{run_pair}")')
+    call = _inline(f'list_overlays(anchor_kind="diff_subject", run_id="{run_pair}")')
+    return f"{call}, following its next_offset until null"
 
 
 def _cap_lines(lines: list[str], room: int, more: str) -> list[str]:

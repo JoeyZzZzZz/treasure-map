@@ -30,7 +30,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from treasure_map.lib.errors import ConfigError
-from treasure_map.lib.overlay import _DIFF_VERDICTS
+from treasure_map.lib.overlay import _DIFF_VERDICTS, page_overlay_rows
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query.coverage import NEEDS_RECHECK
 from treasure_map.lib.query.diff_align import (
@@ -706,6 +706,8 @@ def list_diff_overlays(
     run_id: str | None = None,
     file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
     progress: bool = True,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Every judgement on a diff entry, optionally one verdict and/or one run pair
     (``run_id`` = ``{run_a}::{run_b}``), each read against its diff's view as it is now.
@@ -722,7 +724,10 @@ def list_diff_overlays(
     overlay baselines all had to be recomputed, about 80 s the first time and 50 s after; less when
     the baselines are current. The binaries no diff covers are read straight from the atlas, not
     by recomputing the pair's sink overlay. ``progress=False`` leaves ``review_progress`` out and
-    builds only the views the listed judgements are read against (the findings hand-off)."""
+    builds only the views the listed judgements are read against (the findings hand-off).
+
+    ``limit`` pages the rows as overlay.list_overlays does (by id; every count, and
+    ``review_progress``, over every row); None lists them all, by verdict, latest first."""
     if verdict is not None and verdict not in _DIFF_VERDICTS:
         raise ConfigError(f"verdict must be one of {list(_DIFF_VERDICTS)}; got {verdict!r}")
     conds, params = ["anchor_kind = 'diff_subject'"], []
@@ -829,7 +834,7 @@ def list_diff_overlays(
         result["review_progress"] = pair_progress(
             atlas, run_id, pairs[run_id], reviews, presence_staleness=staleness
         )
-    return result
+    return page_overlay_rows(result, offset, limit)
 
 
 def file_runs(atlas: sqlite3.Connection, pair: str) -> tuple[str, str] | None:

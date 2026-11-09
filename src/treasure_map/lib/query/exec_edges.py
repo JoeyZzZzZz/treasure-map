@@ -20,6 +20,8 @@ import posixpath
 import sqlite3
 from typing import Any
 
+from treasure_map.lib.query.paging import page_list
+
 _COLS = (
     "source_run_id, launcher_binary, launcher_function, launcher_addr, exec_api, sink_addr, "
     "target_layer, shell_wrapped, piped, inner_command_visible, argv_visibility, argv_template, "
@@ -156,9 +158,15 @@ def launched_by(
     target: str,
     *,
     run_id: str | None = None,
-    limit: int = 200,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Which binaries' code launches ``target``, and how.
+
+    Paged: ``edges`` holds ``limit`` edges from ``offset`` (every edge when ``limit`` is None), in
+    one total order (the row id breaks a tie), and ``total_edges`` counts them all; ``count`` is
+    the edges returned and ``truncated`` that the page reached ``limit``, as before.
+    ``launcher_binaries`` and the scan status are read from EVERY edge, not this page's.
 
     ``target`` takes any spelling a reader plausibly has in hand:
 
@@ -219,9 +227,8 @@ def launched_by(
     sql = (
         f"SELECT {_COLS} FROM exec_edge WHERE "  # noqa: S608 -- column list + WHERE are literals
         + " AND ".join(where)
-        + " ORDER BY launcher_binary, launcher_function, sink_addr LIMIT ?"
+        + " ORDER BY launcher_binary, launcher_function, sink_addr, id"
     )
-    params.append(limit)
     try:
         rows = conn.execute(sql, params).fetchall()
     except sqlite3.OperationalError:
@@ -230,20 +237,23 @@ def launched_by(
             "edges": [],
             "count": 0,
             "truncated": False,
+            "total_edges": 0,
             "note": "exec_edge table absent (older atlas or not re-hunted yet)",
             # No table at all is the emptiest answer there is: give the rows.
             "exec_argv_status": _exec_scan_status(conn, run_id, None, per_binary=True),
         }
-    edges = [_row_to_edge(r) for r in rows]
+    every = [_row_to_edge(r) for r in rows]
+    edges, total = page_list(every, offset, limit)
     return {
         "target": target,
         "edges": edges,
         "count": len(edges),
-        "truncated": len(edges) >= limit,
-        "launcher_binaries": sorted({str(e["launcher"]["binary"]) for e in edges if e["launcher"]}),
+        "truncated": limit is not None and len(edges) >= limit,
+        "total_edges": total,
+        "launcher_binaries": sorted({str(e["launcher"]["binary"]) for e in every if e["launcher"]}),
         # ★ The pass's honesty travels WITH the result so an EMPTY one is never read as
         # 'nothing launches this' on its own — and the per-binary rows come with it precisely then.
-        "exec_argv_status": _exec_scan_status(conn, run_id, None, per_binary=not edges),
+        "exec_argv_status": _exec_scan_status(conn, run_id, None, per_binary=not every),
         "note": (
             "Enumerated cross-binary launch edges (A's code calls a command/exec sink whose "
             "argument names B). A FACT, NOT a reachability verdict: an edge does not say the "

@@ -31,6 +31,7 @@ from treasure_map.lib.fmt_spec import conversions as fmt_conversions
 from treasure_map.lib.pattern.classes import CMD, FMT_STRING
 from treasure_map.lib.pattern.extractor_names import REGISTRY as _EXTRACTOR_NAMES
 from treasure_map.lib.query.nvram import _web_settable, run_scope
+from treasure_map.lib.query.paging import page_list
 from treasure_map.lib.query.sink_impact import (
     CONSTRAINED_MARKERS,
     NVRAM_GETTERS,
@@ -1110,13 +1111,17 @@ def get_sink_provenance(
     sink_idx: int | None = None,
     *,
     dominating_only: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Full sink_arg_provenance detail for a candidate (the on-demand companion to the explain
     summary). Returns every sink's record when ``sink_idx`` is None, otherwise the one record with
-    that idx. Writers are presented dominating-first with fmt-arity vararg trimming; pass
-    ``dominating_only`` to return only the dominating writers. Read-only; a surfaced def-use
-    fact, never a verdict. Unknown ref / idx is reported honestly, never as an empty-but-successful
-    result.
+    that idx. Every-record mode pages: ``records`` holds ``limit`` records from ``offset`` (all of
+    them when ``limit`` is None) in their stored order, and ``total_records`` counts them all; the
+    one-record mode is never cut. Writers are presented dominating-first with fmt-arity vararg
+    trimming; pass ``dominating_only`` to return only the dominating writers. Read-only; a
+    surfaced def-use fact, never a verdict. Unknown ref / idx is reported honestly, never as an
+    empty-but-successful result.
 
     The response also carries a ``source_origin`` companion — the origin fragments behind the sink
     value. It is scoped to the candidate's OWN anchored sink and is therefore identical for every
@@ -1159,10 +1164,12 @@ def get_sink_provenance(
         callsite_addr=callsite_addr,
     )
     if sink_idx is None:
+        page, total = page_list(records, offset, limit)
         out: dict[str, Any] = {
             "evidence_ref": evidence_ref,
             "found": True,
-            "records": [_marked(r) for r in records],
+            "records": [_marked(r) for r in page],
+            "total_records": total,
         }
         if origin is not None:
             out["source_origin"] = origin

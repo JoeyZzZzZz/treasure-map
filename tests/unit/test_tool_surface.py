@@ -755,7 +755,7 @@ def test_a_name_the_call_passed_is_never_offered_and_never_listed_as_missing() -
     )
     lines = msg.split("\n")
     assert lines[0].endswith("did you mean 'text'?")
-    assert lines[1] == "Accepted parameters: text, binary, run_id, evidence_ref."
+    assert lines[1] == "Accepted parameters: text, binary, run_id, evidence_ref, limit, offset."
     assert lines[2] == "Required: text; and run_id, or evidence_ref."
     assert lines[3] == "Also missing: run_id or evidence_ref."
     assert lines[4].startswith("Minimal call: get_functions_referencing_string(")
