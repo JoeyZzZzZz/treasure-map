@@ -25,6 +25,7 @@ _HOST_VARS = (
     "XDG_CONFIG_HOME",
     "CODEX_HOME",
     "DSH_HOME",
+    "DSH_AGENTS_HOME",
     "CLAUDE_CONFIG_DIR",
 )
 

@@ -403,13 +403,26 @@ def _skill_checks(inp: DoctorInputs) -> list[Check]:
     want = sk.shipped_bytes()
     home, environ = inp.client_host.home, inp.client_host.environ
     requested = sk.target_roots(inp.requested_clients, home, environ)
-    known = sk.known_roots(home, environ)
+    managed = sk.managed_roots(home, environ, ledger)
+    known = [r for _n, r in managed]
+    named = {r for _n, r in sk.named_roots(home, environ)}
     out = []
-    for short, root in sk.named_roots(home, environ):
+    for short, root in managed:
         st = sk.classify(root, ledger, want, known=known)
         name = f"skill.{short}"
         if st.state == "aligned":
             out.append(check(name, "ok", str(st.path)))
+        elif st.state == "missing" and root not in named and root not in requested:
+            # a directory only the ledger names: its record is what lets uninstall take back the
+            # directories that install created, so it is kept, not reported as a gap
+            out.append(
+                check(
+                    name,
+                    "info",
+                    f"{st.path}: no longer there; still in tmap's install ledger — "
+                    "`tmap uninstall` clears the record and the directories its install created",
+                )
+            )
         elif st.state == "missing":
             state: State = "missing" if root in requested else "info"
             out.append(check(name, state, f"{st.path}: not installed"))

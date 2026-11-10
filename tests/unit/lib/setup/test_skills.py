@@ -27,8 +27,14 @@ from . import fakes
 
 _FIXTURES = Path(__file__).parents[3] / "fixtures" / "skills"
 _LEGACY = _FIXTURES / "legacy_diff_review_3144.md"
-# Every text an earlier tmap shipped before the ledger recorded skills, as git holds it.
-_LEGACY_ALL = (_FIXTURES / "legacy_diff_review_2962.md", _LEGACY)
+# Every text an earlier tmap shipped, as git holds it (the first two before the ledger recorded
+# skills, the other two since).
+_LEGACY_ALL = (
+    _FIXTURES / "legacy_diff_review_2962.md",
+    _LEGACY,
+    _FIXTURES / "legacy_diff_review_3126.md",
+    _FIXTURES / "legacy_diff_review_3387.md",
+)
 
 
 def _shipped() -> bytes:
@@ -106,21 +112,20 @@ def _doctor(
     [
         (("claude-code", "codex", "cursor"), (".claude", ".agents")),
         (("cursor",), (".agents",)),
-        (("claude-code", "cursor"), (".claude",)),
+        (("claude-code", "cursor"), (".claude", ".agents")),
         (("codex", "cursor"), (".agents",)),
-        (("claude-desktop", "dsh"), ()),
+        (("claude-desktop", "dsh"), (".agents", ".dsh")),
     ],
     ids=["cc_codex_cursor", "cursor_alone", "cc_cursor", "codex_cursor", "desktop_dsh"],
 )
 def test_each_shared_skills_directory_is_written_once(
     tmp_path: Path, clients: tuple[str, ...], roots: tuple[str, ...]
 ) -> None:
-    """★ The directories come from the agents chosen in this run, each once: Cursor reads the
-    default Claude Code directory and the Codex one, so it adds one only when no directory already
-    chosen is one it reads.
+    """★ The directories come from the agents chosen in this run, each once: ~/.agents/skills
+    whenever any agent is chosen, plus Claude Code's and dsh's own.
 
-    MUTATION: always add Cursor's directory -> cc_cursor writes two -> RED; Codex into
-    ~/.codex/skills -> RED."""
+    MUTATION: Codex into ~/.codex/skills -> RED; ~/.agents/skills only for Codex or Cursor ->
+    desktop_dsh has no ~/.agents copy -> RED."""
     home = tmp_path / "h"
     _init(home, clients)
     want = {home / r / "skills" / sk.SKILL_DIRNAME / sk.SKILL_FILE for r in roots}
@@ -133,15 +138,17 @@ def test_each_shared_skills_directory_is_written_once(
         assert entry.extra["sha256"] == hashlib.sha256(_shipped()).hexdigest()
 
 
-def test_claude_desktop_and_dsh_get_steps_to_follow_and_no_file(tmp_path: Path) -> None:
-    """MUTATION: give Claude Desktop the ~/.claude/skills directory -> a file is written -> RED;
-    drop the printed steps -> RED."""
+def test_claude_desktop_gets_steps_to_follow_and_no_file_of_its_own(tmp_path: Path) -> None:
+    """Claude Desktop reads no skills directory: the steps are printed, and nothing is written
+    for it beyond the shared ~/.agents/skills every run writes.
+
+    MUTATION: give Claude Desktop the ~/.claude/skills directory -> a file is written there ->
+    RED; drop the printed steps -> RED."""
     home = tmp_path / "h"
     echo: list[str] = []
-    _init(home, ("claude-desktop", "dsh"), echo)
-    assert _skill_files(home) == set()
+    _init(home, ("claude-desktop",), echo)
+    assert _skill_files(home) == {sk.skill_path(sk.agents_root(home))}
     assert any("Claude Desktop: tmap does not install agent skills" in ln for ln in echo)
-    assert any("dsh: tmap does not know whether dsh loads agent skills" in ln for ln in echo)
 
 
 def test_a_dry_run_and_a_second_init_write_nothing(tmp_path: Path) -> None:
@@ -199,17 +206,21 @@ def test_a_symbolic_link_is_foreign(tmp_path: Path, newer: bytes) -> None:
 
 
 @pytest.mark.parametrize(
-    ("fixture", "size"), [(_LEGACY_ALL[0], 2962), (_LEGACY_ALL[1], 3144)], ids=["2962", "3144"]
+    ("fixture", "size"),
+    list(zip(_LEGACY_ALL, (2962, 3144, 3126, 3387), strict=True)),
+    ids=["2962", "3144", "3126", "3387"],
 )
 def test_a_hand_installed_earlier_version_is_replaced_and_recorded(
     tmp_path: Path, newer: bytes, fixture: Path, size: int
 ) -> None:
-    """★ Byte for byte the skill an earlier tmap shipped (put there by `tmap review skill
-    --install` before the ledger knew skills): replaced, and recorded from then on. One case per
+    """★ Byte for byte the skill an earlier tmap shipped (put there by hand, or by `tmap review
+    skill --install` where it did not record): replaced, and recorded from then on. One case per
     shipped text (E-m3c: each fixture is skills/diff-review.md exactly as git holds that version).
 
     MUTATION: drop the earlier-version hashes -> foreign -> left -> RED; drop only the 2,962-byte
-    hash from LEGACY_SHA256 -> the 2962 case -> RED (1 failed: the file is left)."""
+    hash from LEGACY_SHA256 -> the 2962 case -> RED (1 failed: the file is left); the same for
+    each of the two texts shipped after the ledger recorded skills (3126, 3387) — a copy written
+    where an earlier tmap did not record it is found by its text alone."""
     old = fixture.read_bytes()
     assert len(old) == size
     home = tmp_path / "h"
@@ -270,6 +281,7 @@ def test_the_doctor_reports_one_line_per_skills_directory(tmp_path: Path) -> Non
     assert {k: v[0] for k, v in _doctor(home).items()} == {
         "skill.claude": "info",
         "skill.agents": "info",
+        "skill.dsh": "info",
     }
     assert _doctor(home, ("cursor",))["skill.agents"][0] == "missing"
     _init(home, ("cursor",))
@@ -423,11 +435,15 @@ def test_review_skill_install_follows_the_same_rules(tmp_path: Path) -> None:
     assert _ledger(home).committed(sk.entry_id(other)) is not None
 
 
-def test_review_skill_install_elsewhere_is_not_recorded(tmp_path: Path, newer: bytes) -> None:
-    """A directory tmap does not manage: written, never recorded (uninstall could not take it
-    back); an earlier shipped version there is still replaced without --force.
+def test_review_skill_install_elsewhere_is_recorded_with_its_root(
+    tmp_path: Path, newer: bytes
+) -> None:
+    """★ Any directory: written and recorded, committed, with the sha256 and the directory as
+    ``root``; an earlier shipped version there is replaced without --force, and the output no
+    longer says the file is outside the ledger.
 
-    MUTATION: record it -> RED."""
+    MUTATION: write a directory outside named_roots unrecorded again -> RED; drop ``root`` from
+    install's record -> RED."""
     root = tmp_path / "skills"
     path = sk.skill_path(root)
     path.parent.mkdir(parents=True)
@@ -435,7 +451,11 @@ def test_review_skill_install_elsewhere_is_not_recorded(tmp_path: Path, newer: b
     res = _install(root)
     assert res.exit_code == 0, res.output  # type: ignore[attr-defined]
     assert path.read_bytes() == newer
-    assert _ledger(Path.home()).find(sk.entry_id(path)) is None
+    assert "not in tmap's install ledger" not in res.output  # type: ignore[attr-defined]
+    entry = _ledger(Path.home()).committed(sk.entry_id(path))
+    assert entry is not None and entry.path == str(path)
+    assert entry.extra["sha256"] == hashlib.sha256(newer).hexdigest()
+    assert entry.extra["root"] == str(root) and Path(entry.extra["root"]).is_absolute()
 
 
 # ── a recorded file changed since, links, other directories ─────────────────────────────────
@@ -502,15 +522,15 @@ def test_init_looks_again_before_it_writes(tmp_path: Path, monkeypatch: pytest.M
 def test_init_updates_tmaps_copy_in_a_directory_no_chosen_agent_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ E-m2: installed for Cursor (~/.agents), then the shipped text changes and init runs for
-    Claude Code alone: tmap's unchanged copy in ~/.agents is brought up to date too, and the doctor
-    then reports both directories current. An edited copy there is still left alone.
+    """★ E-m2: installed for dsh (~/.dsh), then the shipped text changes and init runs for
+    Claude Code alone: tmap's unchanged copy in ~/.dsh is brought up to date too, and the doctor
+    then reports every directory current. An edited copy there is still left alone.
 
     MUTATION: drop init's pass over the known directories outside this run's targets -> the
-    ~/.agents copy keeps the old text -> RED."""
+    ~/.dsh copy keeps the old text -> RED."""
     home = tmp_path / "h"
-    _init(home, ("cursor",))
-    agents = sk.skill_path(sk.agents_root(home))
+    _init(home, ("dsh",))
+    agents = sk.skill_path(sk.dsh_root(home, {}))
     assert agents.read_bytes() == _shipped()
     changed = diff_skill.skill_text() + "\nchanged\n"
     monkeypatch.setattr(diff_skill, "skill_text", lambda: changed)
@@ -523,6 +543,7 @@ def test_init_updates_tmaps_copy_in_a_directory_no_chosen_agent_reads(
     assert {k: v[0] for k, v in _doctor(home).items()} == {
         "skill.claude": "ok",
         "skill.agents": "ok",
+        "skill.dsh": "ok",
     }
     edited = agents.read_bytes() + b"mine\n"
     agents.write_bytes(edited)
@@ -691,7 +712,7 @@ def test_claude_code_skills_follow_claude_config_dir(
         tmap=None,
     )
     want = cfg / "skills" / sk.SKILL_DIRNAME / sk.SKILL_FILE
-    assert _skill_files(home) == set()
+    assert _skill_files(home) == {sk.skill_path(sk.agents_root(home))}  # the shared one only
     assert want.read_bytes() == _shipped()
     assert _ledger(home).committed(sk.entry_id(want)) is not None
     chost = cl.ClientHost(home, env, fakes.linux(), lambda _n: None, fakes.fake_run())
@@ -792,7 +813,10 @@ def test_a_copy_in_the_default_claude_directory_stays_tmaps_under_claude_config_
     _init(home, ("claude-code",), environ=env)
     assert default.read_bytes() == changed.encode("utf-8")
     assert _doctor(home, environ=env)["skill.claude.default"] == ("ok", str(default))
-    assert set(_doctor(home)) == {"skill.claude", "skill.agents"}  # unset: two lines, as before
+    # unset: the named directories, and $CLAUDE_CONFIG_DIR/skills as one the ledger holds a skill
+    # for
+    custom = "skill." + sk.custom_name(tmp_path / "cfg" / "skills")
+    assert set(_doctor(home)) == {"skill.claude", "skill.agents", "skill.dsh", custom}
     report = _uninstall(home, env)
     assert not report.refused, report.refused
     assert not default.exists()
@@ -854,22 +878,26 @@ def test_the_doctor_settles_an_interrupted_replacement_as_uninstall_does(
 def test_an_earlier_version_outside_this_runs_directories_is_replaced_too(
     tmp_path: Path, newer: bytes
 ) -> None:
-    """★ An earlier tmap's text, installed by hand in ~/.agents/skills; init then runs for Claude
-    Code and Cursor, which writes ~/.claude/skills only (Cursor reads it). The copy in ~/.agents —
-    which Cursor reads too — is replaced and recorded, as the doctor said it would be.
+    """★ An earlier tmap's text, installed by hand in ~/.dsh/skills (never recorded); init then
+    runs for Claude Code alone, which does not write ~/.dsh. That copy — which dsh prefers to
+    ~/.agents/skills — is replaced and recorded, as the doctor said it would be. The text is one
+    shipped after the ledger recorded skills, so only the named directory finds it.
 
     MUTATION (verified RED, 1 failed): replace only stale copies outside this run's directories
-    (not earlier versions) -> the ~/.agents copy keeps the old text -> RED."""
+    (not earlier versions) -> the ~/.dsh copy keeps the old text -> RED. MUTATION: leave dsh out
+    of named_roots -> RED."""
     home = tmp_path / "h"
-    agents = sk.skill_path(sk.agents_root(home))
+    agents = sk.skill_path(sk.dsh_root(home, {}))
     agents.parent.mkdir(parents=True)
-    agents.write_bytes(_LEGACY.read_bytes())
-    state, detail = _doctor(home)["skill.agents"]
+    old = (_FIXTURES / "legacy_diff_review_3387.md").read_bytes()
+    agents.write_bytes(old)
+    assert _ledger(home).find(sk.entry_id(agents)) is None
+    state, detail = _doctor(home)["skill.dsh"]
     assert state == "warn" and detail.endswith("; `tmap init` replaces it")
-    _init(home, ("claude-code", "cursor"))
+    _init(home, ("claude-code",))
     assert agents.read_bytes() == newer
     assert _ledger(home).committed(sk.entry_id(agents)) is not None
-    missing = sk.skill_path(sk.agents_root(tmp_path / "h2"))
+    missing = sk.skill_path(sk.dsh_root(tmp_path / "h2", {}))
     _init(tmp_path / "h2", ("claude-code",))
     assert not missing.parent.exists()  # nothing is created where there was no copy
 

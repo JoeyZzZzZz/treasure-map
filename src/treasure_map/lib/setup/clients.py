@@ -204,15 +204,24 @@ def desktop_config(host: ClientHost) -> Path:
     return host.home / ".config" / "Claude" / "claude_desktop_config.json"
 
 
-def dsh_home(host: ClientHost) -> Path:
+def home_relative(value: str, home: Path) -> Path:
+    """A path setting as dsh reads one: a leading ``~`` (alone, or followed by a separator) is
+    ``home``."""
+    if value == "~" or value.startswith(("~/", "~\\")):
+        return home / value[2:] if len(value) > 1 else home
+    return Path(value)
+
+
+def dsh_home_dir(home: Path, environ: Mapping[str, str]) -> Path:
     """dsh's home as dsh resolves it: a non-blank ``$DSH_HOME`` (``~`` expanded), else
-    ``~/.dsh`` — the same for a global and an npx install, since the package decides it."""
-    base = (host.environ.get("DSH_HOME") or "").strip()
-    if not base:
-        return host.home / ".dsh"
-    if base == "~" or base.startswith(("~/", "~\\")):
-        return host.home / base[2:] if len(base) > 1 else host.home
-    return Path(base)
+    ``~/.dsh`` — the same for a global and an npx install, since the package decides it. The one
+    place tmap reads ``$DSH_HOME``: its MCP patch layer and its skills directory both follow it."""
+    base = (environ.get("DSH_HOME") or "").strip()
+    return home_relative(base, home) if base else home / ".dsh"
+
+
+def dsh_home(host: ClientHost) -> Path:
+    return dsh_home_dir(host.home, host.environ)
 
 
 def dsh_patch(host: ClientHost) -> Path:

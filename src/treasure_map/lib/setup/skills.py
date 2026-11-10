@@ -4,16 +4,18 @@
 writing it through the install ledger.
 
 A skills directory is shared between agents, so tmap writes each directory once, however many of
-the chosen agents read it. A file there is in one of these states:
+the chosen agents read it: ``~/.agents/skills`` whenever any agent is chosen (Codex, Cursor and dsh
+read it), plus Claude Code's own directory and dsh's. A file there is in one of these states:
 
   * ``missing``  — no ``SKILL.md``.
   * ``aligned``  — exactly the skill this tmap ships.
   * ``stale``    — tmap's (the ledger records it, and it still holds exactly the bytes tmap
     wrote), an earlier text; it is replaced — in every directory tmap manages, not only the ones
     the agents chosen in a run read.
-  * ``legacy``   — byte for byte a version an earlier tmap shipped before the ledger recorded
-    skills (installed by hand); it is replaced — in every directory tmap manages, like ``stale``
-    (nothing is created where it is missing) — and recorded from then on.
+  * ``legacy``   — byte for byte a text an earlier tmap shipped and this one no longer does, the
+    ledger holding no record of it (installed by hand, or written where an earlier tmap did not
+    record); it is replaced — in every directory tmap manages, like ``stale`` (nothing is created
+    where it is missing) — and recorded from then on.
   * ``foreign``  — anything else (a file the ledger never recorded, a recorded file changed since
     tmap wrote it, an edited copy of an old version, a symbolic link); it is NEVER modified. Even
     ``--force`` replaces only the file itself (a link at ``SKILL.md`` included), never what a
@@ -25,10 +27,16 @@ file moves into place, read back, and only then ``committed``. ``tmap uninstall`
 only while it still holds the recorded bytes, and then the directories that write created, each
 only when empty.
 
+Every write is recorded, ``tmap review skill --install <dir>`` into any directory included (the
+entry keeps that directory as ``root``): a directory the ledger holds a skill for is one tmap
+manages from then on — the doctor reports it, init replaces tmap's copy there, uninstall takes it
+back.
+
 Claude Code's directory follows ``CLAUDE_CONFIG_DIR``; ``~/.claude/skills`` stays one of tmap's
 directories while that is set (tmap wrote there whenever it was not, and Cursor reads it), and a
 write into ``$CLAUDE_CONFIG_DIR/skills`` records the variable, so an uninstall run without it
-names the command that would take the file back.
+names the command that would take the file back. dsh's directory follows ``$DSH_HOME`` the same
+way (``~/.dsh/skills`` stays one of tmap's while that is set).
 """
 
 from __future__ import annotations
@@ -44,7 +52,7 @@ from typing import Literal
 
 from treasure_map.lib.query import diff_skill
 from treasure_map.lib.query.diff_skill import SKILL_DIRNAME
-from treasure_map.lib.setup.clients import claude_config_override
+from treasure_map.lib.setup.clients import claude_config_override, dsh_home_dir, home_relative
 from treasure_map.lib.setup.ledger import Entry, Ledger
 
 SKILL_FILE = "SKILL.md"
@@ -52,12 +60,14 @@ ID_PREFIX = "skill:"
 
 SkillState = Literal["missing", "aligned", "stale", "legacy", "foreign", "invalid"]
 
-# sha256 of each text an earlier tmap shipped (skills/diff-review.md, installed verbatim by
-# `tmap review skill --install`), before the ledger recorded skills.
+# sha256 of every text a tmap has shipped that this one no longer does. Changing the shipped text
+# adds its sha256 here (a test holds the current one and fails until it is).
 LEGACY_SHA256 = frozenset(
     {
         "9c0d4c05f95cb3e313070431db58e8b57f736e94850608904eacc90c536484d8",  # 2,962 bytes
         "17e4d906c3e3d942a9d7e2480c8e3b42c8b41bf04ee1d7d0775aab980cf0d271",  # 3,144 bytes
+        "ac9653260d39760ada0505833306d4bc15ca7e6a92733e98a2e777dea2ab03ef",  # 3,126 bytes
+        "72a1c74391c1c878e694b31c5e6160107a7160cc37c342b2e41345fd41553b4e",  # 3,387 bytes
     }
 )
 
@@ -68,6 +78,8 @@ LEGACY_SHA256 = frozenset(
 #   Codex: $HOME/.agents/skills (not ~/.codex/skills) — https://learn.chatgpt.com/docs/build-skills
 #   Cursor: ~/.agents/skills and ~/.cursor/skills, and also ~/.claude/skills and ~/.codex/skills
 #     — https://cursor.com/docs/context/skills
+#   dsh: $DSH_HOME/skills (~/.dsh/skills), then $DSH_AGENTS_HOME/skills (~/.agents/skills), each
+#     one level deep — as dsh describes itself; not checked against a run of dsh
 def claude_root(home: Path, environ: Mapping[str, str]) -> Path:
     base = claude_config_override(environ)
     return (base if base is not None else home / ".claude") / "skills"
@@ -88,15 +100,45 @@ def cursor_roots(home: Path) -> tuple[Path, ...]:
     return tuple(home / d / "skills" for d in (".agents", ".cursor", ".claude", ".codex"))
 
 
+def dsh_root(home: Path, environ: Mapping[str, str]) -> Path:
+    """dsh's own skills directory, ``$DSH_HOME/skills`` (``~/.dsh/skills``): dsh prefers it to
+    ``~/.agents/skills``."""
+    return dsh_home_dir(home, environ) / "skills"
+
+
+def default_dsh_root(home: Path) -> Path:
+    """dsh's directory when ``DSH_HOME`` is not set."""
+    return home / ".dsh" / "skills"
+
+
+def dsh_agents_root(home: Path, environ: Mapping[str, str]) -> Path | None:
+    """``$DSH_AGENTS_HOME/skills`` when that is set (not blank): where dsh then reads the shared
+    agents' skills; None when dsh reads ``~/.agents/skills``."""
+    base = (environ.get("DSH_AGENTS_HOME") or "").strip()
+    return home_relative(base, home) / "skills" if base else None
+
+
 def named_roots(home: Path, environ: Mapping[str, str]) -> tuple[tuple[str, Path], ...]:
-    """Every directory tmap may write the skill into (and so ``tmap uninstall`` may remove it
-    from), each with the short name the doctor reports it under. ``~/.claude/skills`` stays one
-    while CLAUDE_CONFIG_DIR moves Claude Code's: tmap wrote there whenever it was unset."""
+    """Every directory tmap writes the skill into for some agent (and so ``tmap uninstall`` may
+    remove it from), each with the short name the doctor reports it under — whichever agents a
+    run chose: a copy in any of them is seen, and tmap's replaced. ``~/.claude/skills`` stays one
+    while CLAUDE_CONFIG_DIR moves Claude Code's (tmap wrote there whenever it was unset), and
+    ``~/.dsh/skills`` while DSH_HOME moves dsh's."""
+    out: list[tuple[str, Path]] = []
+
+    def add(name: str, root: Path) -> None:
+        if not is_known(root, [r for _n, r in out]):
+            out.append((name, root))
+
     claude = claude_root(home, environ)
-    out = [("claude", claude)]
-    if not is_known(default_claude_root(home), [claude]):
-        out.append(("claude.default", default_claude_root(home)))
-    out.append(("agents", agents_root(home)))
+    add("claude", claude)
+    add("claude.default", default_claude_root(home))
+    add("agents", agents_root(home))
+    add("dsh", dsh_root(home, environ))
+    add("dsh.default", default_dsh_root(home))
+    dsh_agents = dsh_agents_root(home, environ)
+    if dsh_agents is not None:
+        add("dsh.agents", dsh_agents)
     return tuple(out)
 
 
@@ -110,18 +152,62 @@ def is_known(root: Path, known: Iterable[Path]) -> bool:
 
 
 def target_roots(selected: Iterable[str], home: Path, environ: Mapping[str, str]) -> list[Path]:
-    """The skills directories to write for the agents chosen in THIS run, each once. Cursor reads
-    the Codex directory and the default Claude Code one too, so it adds one only when no directory
-    already chosen is one Cursor reads (Claude Code's, moved by CLAUDE_CONFIG_DIR, is not)."""
+    """The skills directories to write for the agents chosen in THIS run, each once:
+    ``~/.agents/skills`` whenever any agent is chosen (Codex reads it, Cursor and dsh too), and
+    Claude Code's and dsh's own directories when those are chosen."""
     chosen = set(selected)
+    if not chosen:
+        return []
     out: list[Path] = []
     if "claude-code" in chosen:
         out.append(claude_root(home, environ))
-    if "codex" in chosen:
-        out.append(agents_root(home))
-    if "cursor" in chosen and not any(is_known(r, cursor_roots(home)) for r in out):
-        out.append(agents_root(home))
+    out.append(agents_root(home))
+    if "dsh" in chosen:
+        out.append(dsh_root(home, environ))
+        dsh_agents = dsh_agents_root(home, environ)
+        if dsh_agents is not None:
+            out.append(dsh_agents)
     return list(dict.fromkeys(out))
+
+
+def shared_note(root: Path, home: Path) -> str:
+    """What a plan line says of a directory more than one agent reads ("" for any other)."""
+    if is_known(root, [agents_root(home)]):
+        return " — a directory shared between agents: others read the skill there too"
+    return ""
+
+
+def recorded_roots(ledger: Ledger) -> tuple[Path, ...]:
+    """The directories the ledger holds a skill for (committed or pending), each once: only an
+    absolute ``<root>/tmap-diff-review/SKILL.md`` gives its ``<root>`` — a relative path would
+    name a different file from every other working directory."""
+    out: list[Path] = []
+    for e in ledger.entries:
+        if not e.id.startswith(ID_PREFIX):
+            continue
+        path = Path(e.path)
+        if path.name != SKILL_FILE or path.parent.name != SKILL_DIRNAME or not path.is_absolute():
+            continue
+        out.append(path.parent.parent)
+    return tuple(dict.fromkeys(out))
+
+
+def custom_name(root: Path) -> str:
+    """The doctor's short name for a recorded directory outside ``named_roots``: from its path
+    alone, so it never changes when another directory is recorded."""
+    return "custom." + hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:8]
+
+
+def managed_roots(
+    home: Path, environ: Mapping[str, str], ledger: Ledger
+) -> tuple[tuple[str, Path], ...]:
+    """``named_roots`` and each other directory the ledger holds a skill for: every directory tmap
+    reports, and replaces its own copy in. Being here never makes a file tmap's to replace — that
+    is ``classify``'s ledger record or an earlier shipped text."""
+    named = named_roots(home, environ)
+    known = [r for _n, r in named]
+    extra = [(custom_name(r), r) for r in recorded_roots(ledger) if not is_known(r, known)]
+    return (*named, *extra)
 
 
 # Agents tmap writes no skill for: what to do by hand instead.
@@ -132,11 +218,6 @@ MANUAL: dict[str, str] = {
         "Claude Desktop: tmap does not install agent skills there. To add the diff-review skill, "
         f"save `tmap review skill` as {SKILL_DIRNAME}/{SKILL_FILE}, zip that folder and upload it "
         "under Customize > Skills (code execution must be on)"
-    ),
-    # Whether and where dsh loads agent skills is not documented to tmap.
-    "dsh": (
-        "dsh: tmap does not know whether dsh loads agent skills, or from where; "
-        "`tmap review skill` prints the diff-review skill"
     ),
 }
 
@@ -175,8 +256,8 @@ class SkillStatus:
 
 def classify(root: Path, ledger: Ledger, want: bytes, *, known: Iterable[Path]) -> SkillStatus:
     """What is at ``root``'s skill path, against ``want`` and the ledger's committed record.
-    ``known`` is the directories tmap manages (``known_roots``): a file elsewhere is never in the
-    ledger, and is said so rather than called someone else's."""
+    ``known`` is the directories tmap manages (``managed_roots``' paths): an unrecorded file
+    elsewhere is said to be outside the ledger rather than called someone else's."""
     path = skill_path(root)
 
     def status(state: SkillState, detail: str = "") -> SkillStatus:
@@ -270,14 +351,6 @@ def _read_back(path: Path) -> bytes:
     return path.read_bytes()
 
 
-def write_plain(path: Path, data: bytes) -> None:
-    """Write without recording (a directory tmap does not manage), then read it back."""
-    _refuse_linked_dir(path)
-    _write(path, data)
-    if _read_back(path) != data:
-        raise SkillWriteError(f"{path}: the file read back differs from what was written")
-
-
 def claude_config_dir_of(root: Path, home: Path, environ: Mapping[str, str]) -> Path | None:
     """``CLAUDE_CONFIG_DIR`` when it is set and ``root`` is the Claude Code directory it moved
     (what a write there records, for an uninstall run without the variable)."""
@@ -292,16 +365,16 @@ def claude_config_dir_of(root: Path, home: Path, environ: Mapping[str, str]) -> 
 def install(
     path: Path, data: bytes, ledger: Ledger, *, claude_config_dir: Path | None = None
 ) -> None:
-    """Write ``data`` at ``path`` through the ledger: pending (path, sha256, the directories this
-    write creates — kept from the earlier record on a replacement — and the ``claude_config_dir``
-    it is written under, if any) -> write -> read back equal -> committed. A failed read-back
-    leaves the entry pending for the next run to settle."""
+    """Write ``data`` at ``path`` through the ledger: pending (path, sha256, its skills directory
+    as ``root``, the directories this write creates — kept from the earlier record on a
+    replacement — and the ``claude_config_dir`` it is written under, if any) -> write -> read back
+    equal -> committed. A failed read-back leaves the entry pending for the next run to settle."""
     _refuse_linked_dir(path)
     eid = entry_id(path)
     prior = ledger.committed(eid)
     prior_sha = prior.extra.get("sha256") if prior is not None else None
     prior_dirs = prior.extra.get("created_dirs") if prior is not None else None
-    extra: dict[str, object] = {"sha256": sha256_of(data)}
+    extra: dict[str, object] = {"sha256": sha256_of(data), "root": str(path.parent.parent)}
     if isinstance(prior_sha, str):
         extra["prior_sha256"] = prior_sha
     created = [d for d in prior_dirs if isinstance(d, str)] if isinstance(prior_dirs, list) else []
@@ -370,23 +443,29 @@ def removable(
     environ: Mapping[str, str],
     *,
     claude_config_dir: object = None,
+    recorded_root: object = None,
 ) -> str | None:
     """None when the recorded skill at ``path`` may be removed; else why not: only a
-    ``tmap-diff-review/SKILL.md`` directly in one of tmap's skills directories, still holding what
-    tmap wrote. One written under a ``claude_config_dir`` this run does not have is refused with
-    the command that runs under it."""
-    in_known = is_known(path.parent.parent, known_roots(home, environ))
+    ``tmap-diff-review/SKILL.md`` directly in one of tmap's skills directories — or in the
+    absolute directory its entry recorded as ``root`` — still holding what tmap wrote. One written
+    under a ``claude_config_dir`` this run does not have is refused first, with the command that
+    runs under it."""
+    now = claude_config_override(environ)
+    if (
+        isinstance(claude_config_dir, str)
+        and claude_config_dir
+        and (now is None or os.path.realpath(now) != os.path.realpath(claude_config_dir))
+    ):
+        return (
+            f"{path} was installed while CLAUDE_CONFIG_DIR={claude_config_dir}; not removed — "
+            f"run `CLAUDE_CONFIG_DIR={shlex.quote(claude_config_dir)} tmap uninstall`"
+        )
+    in_known = is_known(path.parent.parent, known_roots(home, environ)) or (
+        isinstance(recorded_root, str)
+        and recorded_root == str(path.parent.parent)
+        and path.is_absolute()
+    )
     if path.name != SKILL_FILE or path.parent.name != SKILL_DIRNAME or not in_known:
-        now = claude_config_override(environ)
-        if (
-            isinstance(claude_config_dir, str)
-            and claude_config_dir
-            and (now is None or os.path.realpath(now) != os.path.realpath(claude_config_dir))
-        ):
-            return (
-                f"{path} was installed while CLAUDE_CONFIG_DIR={claude_config_dir}; not removed — "
-                f"run `CLAUDE_CONFIG_DIR={shlex.quote(claude_config_dir)} tmap uninstall`"
-            )
         return f"{path} is not where tmap installs its skill; not removed"
     if path.is_symlink() or path.parent.is_symlink():
         return f"{path} is a symbolic link; not removed"

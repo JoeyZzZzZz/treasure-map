@@ -162,8 +162,9 @@ def report(
     default=None,
     type=click.Path(file_okay=False),
     help=(
-        "A skills directory to write it into, as <dir>/" + SKILL_DIRNAME + "/SKILL.md "
-        "(an earlier tmap's file there is replaced; any other file only with --force)."
+        "A skills directory to write it into, as <dir>/" + SKILL_DIRNAME + "/SKILL.md, "
+        "recorded so tmap init keeps it current and tmap uninstall removes it (an earlier "
+        "tmap's file there is replaced; any other file only with --force)."
     ),
 )
 @click.option(
@@ -187,9 +188,11 @@ def skill(install_dir: str | None, force: bool) -> None:
         raise click.ClickException(str(exc)) from exc
     for line in sk.recover(ledger):
         click.echo(line)
-    root = Path(install_dir)
+    # absolute, not resolved: the ledger names the file from any working directory, and a
+    # directory reached through a link stays the one the earlier install recorded
+    root = Path(install_dir).expanduser().absolute()
     data = text.encode("utf-8")
-    known = sk.known_roots(home, os.environ)
+    known = [r for _n, r in sk.managed_roots(home, os.environ, ledger)]
     st = sk.classify(root, ledger, data, known=known)
     if st.state == "aligned":
         click.echo(f"{st.path} is already current")
@@ -198,21 +201,18 @@ def skill(install_dir: str | None, force: bool) -> None:
         raise click.ClickException(f"{st.path}: {st.detail}; not replaced — {sk.next_step(st)}")
     if st.state == "invalid" and not force:
         raise click.ClickException(f"{st.path}: {st.detail}; not replaced (--force replaces it)")
-    # Recorded only where tmap uninstall may take it away again.
-    recorded = sk.is_known(root, known)
+    # Recorded wherever it goes: tmap init keeps tmap's copy there current, tmap uninstall takes
+    # it back.
     try:
-        if recorded:
-            sk.install(
-                st.path,
-                data,
-                ledger,
-                claude_config_dir=sk.claude_config_dir_of(root, home, os.environ),
-            )
-        else:
-            sk.write_plain(st.path, data)
+        sk.install(
+            st.path,
+            data,
+            ledger,
+            claude_config_dir=sk.claude_config_dir_of(root, home, os.environ),
+        )
     except OSError as exc:
         raise click.ClickException(f"could not write {st.path}: {exc}") from exc
-    click.echo(f"wrote {st.path}" + ("" if recorded else " (not in tmap's install ledger)"))
+    click.echo(f"wrote {st.path}")
 
 
 # ── a person's judgements: judge (one) and the audit worksheet (many) ────────────────────────

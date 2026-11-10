@@ -94,6 +94,7 @@ def safe_to_remove(
             home,
             environ,
             claude_config_dir=entry.extra.get("claude_config_dir"),
+            recorded_root=entry.extra.get("root"),
         )
     if entry.kind == "edit":
         return None  # restored, never deleted; checked in _restore_edit

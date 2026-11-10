@@ -1021,7 +1021,9 @@ def run_init(
                 plan.needs_you.append(f"{label}: {r}")
     # the diff-review skill: each skills directory the chosen agents read, once
     skill_bytes = sk.shipped_bytes()
-    skill_known = sk.known_roots(chost.home, chost.environ)
+    # the directories tmap manages: its named ones and every one the ledger holds a skill for
+    # (`tmap review skill --install <dir>` records any directory, a project's included)
+    skill_known = [r for _n, r in sk.managed_roots(chost.home, chost.environ, ledger)]
     skill_targets = sk.target_roots(selected, chost.home, chost.environ)
     for root in skill_targets:
         sst = sk.classify(root, ledger, skill_bytes, known=skill_known)
@@ -1029,7 +1031,7 @@ def run_init(
             plan.add(
                 Action(
                     "install_skill",
-                    f"install the diff-review skill in {root}",
+                    f"install the diff-review skill in {root}{sk.shared_note(root, chost.home)}",
                     target=sst.path,
                     lines=[] if sst.state == "missing" else [f"replaces: {sst.detail}"],
                 )
@@ -1051,7 +1053,8 @@ def run_init(
             plan.add(
                 Action(
                     "install_skill",
-                    f"update the diff-review skill tmap installed in {root}",
+                    f"update the diff-review skill tmap installed in {root}"
+                    f"{sk.shared_note(root, chost.home)}",
                     target=sst.path,
                     lines=[f"replaces: {sst.detail}"],
                 )
