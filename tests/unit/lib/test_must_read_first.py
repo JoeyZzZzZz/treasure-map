@@ -444,17 +444,50 @@ def test_a_shards_offer_says_which_counts_are_the_pairs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """MINOR 13: a shard's offer is scoped "shard" (its second tier, its reduce) while
-    ``disposed`` / ``unseen`` / ``basis_incomplete`` are the whole pair's — every shard gives the
-    same numbers there, and ``pair_wide`` names them.
+    ``disposed`` / ``unseen`` / ``not_reachable`` / ``basis_incomplete`` / ``must_read_complete``
+    / ``complete`` are the whole pair's — every shard gives the same values there, and
+    ``pair_wide`` names them.
 
-    MUTATION (verified RED, 1 failed): drop ``pair_wide`` -> RED."""
+    MUTATION (verified RED, 1 failed): drop ``pair_wide`` -> RED. MUTATION (verified RED, 1
+    failed): name only the three counts (the old list) -> RED."""
     w = _mixed(tmp_path, monkeypatch)
     r = _review(w, k=0)
     offers = [ru.coverage_offer(r, worker=i, workers=3, sweep=False) for i in range(3)]
-    for key in ("disposed", "unseen", "basis_incomplete"):
+    wide = list(ru.PAIR_WIDE_OFFER_KEYS)
+    assert set(wide) == {
+        "disposed",
+        "unseen",
+        "not_reachable",
+        "basis_incomplete",
+        "must_read_complete",
+        "complete",
+    }
+    for key in wide:
         assert len({json.dumps(o[key]) for o in offers}) == 1, key
-    assert all(o.get("pair_wide") == ["disposed", "unseen", "basis_incomplete"] for o in offers)
+    assert all(o.get("pair_wide") == wide for o in offers)
     assert {o["scope"] for o in offers} == {"shard"}
+
+
+def test_a_shard_read_through_says_the_pair_is_not_yet_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR (G-5/1): one shard of two judged through — its next unit None — while the other
+    shard's must-read units are open: its offer says ``must_read_complete`` false, and
+    ``pair_wide`` says that is the pair's, not the shard's.
+
+    MUTATION (verified RED, 1 failed): leave must_read_complete out of pair_wide -> RED."""
+    w = _mixed(tmp_path, monkeypatch)
+    for _ in range(100):
+        u = _review(w, k=0).next_unit(0, 2, sweep=False)
+        if u is None:
+            break
+        _judge_unit(w, u)
+    r = _review(w, k=0)
+    assert r.next_unit(0, 2, sweep=False) is None  # the precondition: shard 0 read through
+    assert r.next_unit(1, 2, sweep=False) is not None  # and shard 1 not
+    offer = ru.coverage_offer(r, worker=0, workers=2, sweep=False)
+    assert offer["scope"] == "shard" and offer["must_read_complete"] is False
+    assert "must_read_complete" in offer["pair_wide"] and "complete" in offer["pair_wide"]
 
 
 def test_by_default_an_open_audit_is_still_handed_out(

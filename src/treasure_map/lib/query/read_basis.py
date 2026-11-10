@@ -40,7 +40,8 @@ whole), and a read of it that logged no window at all counts as partial (FAIL-CL
 where any of those was read, a callee list read whole does not make it whole (every pseudocode
 page carries the callees already). An entry read by its entry_id reads the code whole only when
 it showed the code difference whole (``code_shown`` true in the log: its inline hunk not held
-back, a layout-only delta, two texts that match); otherwise the code's own reads decide. With no
+back, a layout-only delta, two texts that match — an undetermined pair's read from its
+``proposed_pair_reading``); otherwise the code's own reads decide. With no
 read of the code at all, an entry that held its hunk back (``code_shown`` false) is ``"pages"``,
 and one that carried no hunk either way is read as the entry it is (no flag).
 ``"extraction_cap"`` — only a callee list was read, whole as the scan stored it but cut short

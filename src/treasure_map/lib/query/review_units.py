@@ -955,6 +955,17 @@ def next_unit(
     return None
 
 
+# The coverage offer's fields that are the whole pair's, also in a shard.
+PAIR_WIDE_OFFER_KEYS = (
+    "disposed",
+    "unseen",
+    "not_reachable",
+    "basis_incomplete",
+    "must_read_complete",
+    "complete",
+)
+
+
 def coverage_offer(
     review: PairReview,
     *,
@@ -969,8 +980,9 @@ def coverage_offer(
     what no unit can reach, the judgements written on a basis read in part, and the reduce still
     owed. The reduce is one unit of the pair, held by one shard: with shards, only the shard that
     holds it says how much it owes (``reduce_owed_in_this_shard``), every other one says null.
-    ``disposed``, ``unseen`` and ``basis_incomplete`` are the whole pair's counts, also in a shard
-    (``pair_wide`` names them)."""
+    ``disposed``, ``unseen``, ``not_reachable``, ``basis_incomplete``, ``must_read_complete`` and
+    ``complete`` are the whole pair's, also in a shard (``pair_wide`` names them): a shard whose
+    own units are all disposed can still read ``must_read_complete`` false."""
     rep = review.report
     states = review.progress.states
     second = [
@@ -984,7 +996,8 @@ def coverage_offer(
     by_bucket: dict[str, int] = {}
     for m in members:
         by_bucket[m.bucket or "-"] = by_bucket.get(m.bucket or "-", 0) + 1
-    reduce_id = unit_id(REDUCE, [dr.run_pair(review.facts.run_a, review.facts.run_b)])
+    pair = dr.run_pair(review.facts.run_a, review.facts.run_b)
+    reduce_id = unit_id(REDUCE, [pair])
     owed = rep["reduce"]["owed"]
     holds_reduce = in_shard(reduce_id, worker, workers)
     nr = rep["not_reachable"]
@@ -1008,10 +1021,13 @@ def coverage_offer(
             "withheld_diffs": len(nr["withheld_diffs"]),
             "not_diffed_binaries": bool(nr["not_diffed_binaries"]),
             "non_binary_files_unavailable": nr["non_binary_files_unavailable"],
-            "see": "list_diff_blindspots(run_a, run_b); tmap review report for the lists",
+            "see": (
+                f"list_diff_blindspots(run_a_id, run_b_id); tmap review report {pair} --md -o "
+                "<file> for the lists"
+            ),
         },
         "basis_incomplete": rep["basis_incomplete"]["count"],
-        "pair_wide": ["disposed", "unseen", "basis_incomplete"],
+        "pair_wide": list(PAIR_WIDE_OFFER_KEYS),
         "reduce_owed_in_this_shard": owed if holds_reduce else None,
         "reduce_note": (
             "the reduce is one unit of the pair; with shards only the shard holding it counts it"

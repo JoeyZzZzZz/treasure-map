@@ -3277,7 +3277,10 @@ def make_tools(
                 "withheld_diffs": len(nr["withheld_diffs"]),
                 "not_diffed_binaries": bool(nr["not_diffed_binaries"]),
                 "non_binary_files_unavailable": nr["non_binary_files_unavailable"],
-                "see": "list_diff_blindspots(run_a, run_b); tmap review report for the lists",
+                "see": (
+                    f"list_diff_blindspots(run_a_id, run_b_id); tmap review report {run_pair} "
+                    "--md -o <file> for the lists"
+                ),
             }
             out["shard"] = (
                 {"worker": worker, "workers": workers, "slices": _shard_slices(review, workers)}
@@ -6139,9 +6142,9 @@ def make_tools(
         same-shape group_ref, ``same_shape`` — each same-shape group of its A-side calls in this
         diff (``group_ref``, ``member_count``, ``by_landing``), its members outside this diff
         across the run pair, and the calls that read it. Each group's one-diff facts are computed
-        within ~10 s per write call (groups past it ``same_shape_deferred`` with their calls); the
-        run pair's members outside this diff in the time left, smallest group first (one not
-        reached: ``members_outside_deferred``, read with its run_pair call) — a large group's
+        within ~10 s per write call (groups past it ``same_shape_deferred`` with their member count
+        and calls); the run pair's members outside this diff in the time left, smallest group first
+        (one not reached: ``members_outside_deferred``, read with its run_pair call) — one slow
         run-pair read, once begun, can take the call past 10 s by itself.
         ``same_shape_unavailable`` when no row is a group's member."""
         supplied = {
@@ -6299,9 +6302,13 @@ def make_tools(
         a group carries its ``group_ref``, and each distinct group is echoed once under top-level
         ``groups``. A batch whose echo would near the page keeps ``{index, action}`` per entry and
         says the rest once: ``needs_recheck_indexes``, ``overwrote_by``; its items' same-shape
-        groups are listed once for the batch (``same_shape_groups`` / ``same_shape_deferred_groups``
-        by group_ref), each item naming its group refs — or, still near the page, their counts
-        (``same_shape_withheld`` says so). An item may carry
+        groups are listed once for the batch (``same_shape_groups`` /
+        ``same_shape_deferred_groups``, each group with its ``group_ref`` and the ``evidence_ref``
+        its ``same_shape_read_with`` calls take), each item naming its groups by their indexes
+        there — or, still near the page, their counts (``same_shape_withheld`` says so). The whole
+        echo is measured, the ``groups`` echo included: near the page it keeps each group's
+        relation and member count, then their count (``groups_withheld`` says so). An item may
+        carry
         ``change_kind`` (changed_real). ``unit_id`` / ``worker`` /
         ``workers`` / ``attributed_to`` as in annotate_diff: every item must be a member of the
         unit, and the answer carries the next unit.
@@ -6566,7 +6573,16 @@ def make_tools(
             pair = run_pair if meta is None else f"{meta['run_a_id']}::{meta['run_b_id']}"
             unread_at = [r["index"] for r in results if "needs_recheck" in r]
             extra: dict[str, Any] = {}
-            if len(json.dumps(results)) > _RESPONSE_BYTE_BUDGET - _ECHO_RESERVE:
+            # The echo of the groups the items leaned on, cut with the rest when near the page.
+            groups_out: Any = groups_echo
+            groups_withheld: str | None = None
+            room = _RESPONSE_BYTE_BUDGET - _ECHO_RESERVE
+
+            def echo_size() -> int:
+                # The whole echo: each item's part, what is said once, the groups echoed.
+                return len(json.dumps([results, extra, groups_out]))
+
+            if echo_size() > room:
                 # A full batch's per-item echo alone nears the page: each result keeps its index
                 # (the item's place in the call) and action; what repeats is said once.
                 overwrote_by: dict[str, int] = {}
@@ -6575,7 +6591,7 @@ def make_tools(
                         who = str(r["overwrote"].get("attributed_to"))
                         overwrote_by[who] = overwrote_by.get(who, 0) + 1
                 extra.update(_compact_hints(results, diff_id))
-                shapes, shape_extra = _wh.batch_same_shape(results)
+                shapes, shape_extra = _wh.batch_same_shape(results, hints_pass, diff_id)
                 results = [
                     {
                         **{k: r[k] for k in ("index", "action", "group_ref") if k in r},
@@ -6585,25 +6601,40 @@ def make_tools(
                     for r, shape in zip(results, shapes, strict=True)
                 ]
                 extra.update(shape_extra)
-                room = _RESPONSE_BYTE_BUDGET - _ECHO_RESERVE
-                if shape_extra and len(json.dumps([results, extra])) > room:
+                if groups_echo and echo_size() > room:
+                    # Still near the page: the groups the items leaned on (each item names its
+                    # group_ref), first by their relation and member count, then by count.
+                    groups_out = {
+                        ref: {k: g[k] for k in ("group_ref", "relation", "member_count") if k in g}
+                        for ref, g in groups_echo.items()
+                    }
+                    groups_withheld = (
+                        "page_budget: each group echoed by its relation and member count"
+                    )
+                    if echo_size() > room:
+                        groups_out = len(groups_echo)
+                        groups_withheld = (
+                            "page_budget: the groups the items leaned on are given by count, each "
+                            "item naming its group_ref"
+                        )
+                if shape_extra and echo_size() > room:
                     # Still near the page: each item's groups by count, the groups listed once.
                     _wh.count_same_shape(
                         results,
                         extra,
                         "page_budget: each item's same-shape groups are given by count, the "
-                        "groups listed once in same_shape_groups / same_shape_deferred_groups; an "
-                        "item's own groups read with same_shape_siblings(diff_id, evidence_ref=<a "
-                        "call of the item's entry>)",
+                        "groups listed once in same_shape_groups / same_shape_deferred_groups, "
+                        "each with the evidence_ref its same_shape_read_with call takes",
                         listings=False,
                     )
-                    if len(json.dumps([results, extra])) > room:
+                    if echo_size() > room:
                         _wh.count_same_shape(
                             results,
                             extra,
-                            "page_budget: the batch's same-shape groups are given by count; an "
-                            "item's groups read with same_shape_siblings(diff_id, evidence_ref=<a "
-                            "call of the item's entry>)",
+                            "page_budget: the batch's same-shape groups are given by count; a "
+                            "group is same_shape_siblings(diff_id, evidence_ref=<the a_ref of one "
+                            "of the item's candidate rows>), one call per row, and a smaller batch "
+                            "lists them",
                             listings=True,
                         )
                 if unread_at:
@@ -6633,7 +6664,9 @@ def make_tools(
                     f" {len(unread_at)} of them written before their subject was read: see {where}."
                 )
             if groups_echo:
-                out["groups"] = groups_echo
+                out["groups"] = groups_out
+                if groups_withheld is not None:
+                    out["groups_withheld"] = groups_withheld
             if shadow:
                 out["note"] = (
                     "recorded as SHADOW judgments (an audit): in the overlay's history only; the "

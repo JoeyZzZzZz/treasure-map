@@ -687,3 +687,178 @@ def test_a_callee_read_or_an_entry_read_does_not_complete_one_page_of_the_code(
         )
         offset = nxt["paging"]["next_offset"]
     assert _judge(server, anchor)["read_basis"] == {"basis": "fetched"}
+
+
+# ── an undetermined pair's reading, and same-shape member pages ─────────────────────────────
+
+_WITHHELD = {"withheld": "over_gate", "structural_lines": 1110}
+
+
+def _proposed(**reading: Any) -> dict[str, Any]:
+    return {"proposed_pair_reading": {"pairing": "undetermined", **reading}}
+
+
+@pytest.mark.parametrize(
+    ("entry", "shown"),
+    [
+        (
+            _proposed(
+                state="differs", pseudocode_delta={"kind": "structural", "inline_hunk": _WITHHELD}
+            ),
+            False,
+        ),
+        (
+            _proposed(
+                state="differs",
+                pseudocode_delta={"kind": "structural", "inline_hunk": {"lines": ["x"]}},
+            ),
+            True,
+        ),
+        (_proposed(state="differs", pseudocode_delta={"kind": "layout_only"}), True),
+        (_proposed(state="identical_unique"), True),
+        (_proposed(state="identical_text_unverified"), True),
+        (_proposed(state="no_body"), None),
+        (_proposed(state="differs"), None),
+    ],
+    ids=[
+        "withheld",
+        "shown",
+        "layout_only",
+        "identical_unique",
+        "text_unverified",
+        "no_body",
+        "differs_no_delta",
+    ],
+)
+def test_an_undetermined_pairs_entry_logs_whether_its_reading_showed_the_code(
+    entry: dict[str, Any], shown: bool | None
+) -> None:
+    """★ G-1: an undetermined pair carries its pseudocode delta and text state in
+    ``proposed_pair_reading``, not on the entry: ``code_shown`` reads that block too — a hunk held
+    back there is false, one shown whole or two matching texts (``identical_unique`` is a state
+    only that block carries) true, no hunk either way nothing.
+
+    MUTATION (verified RED, 5 failed): read the entry's own fields only -> withheld, shown,
+    layout_only, identical_unique and text_unverified RED."""
+    line = tcl.build_line(
+        tcl.Session(),
+        "get_diff_patch_view",
+        {"entry_id": ENTRY},
+        {"entries": [{"entry_id": ENTRY, **entry}]},
+    )
+    assert line.get("code_shown") is shown
+
+
+def test_an_undetermined_pairs_held_back_hunk_read_by_entry_alone_is_pages() -> None:
+    """★ G-1: the entry of an undetermined pair whose hunk is held back, read by its entry_id and
+    nothing else, reads ``read_partial: "pages"`` — as an entry of a determined pair does; read on
+    a unit whose material was cut, the same.
+
+    MUTATION (verified RED, 1 failed): read the entry's own fields only (code_shown absent) -> no
+    flag -> RED."""
+    entry = _proposed(
+        state="differs", pseudocode_delta={"kind": "structural", "inline_hunk": _WITHHELD}
+    )
+    rows = {"rows": [{}], "rows_total": 1}  # its one row on the page
+    line = tcl.build_line(
+        tcl.Session(),
+        "get_diff_patch_view",
+        {"entry_id": ENTRY},
+        {"entries": [{"entry_id": ENTRY, **rows, **entry}]},
+    )
+    assert line.get("code_shown") is False  # the precondition: logged as held back
+    assert _infer([line]) == {"basis": "fetched", "read_partial": "pages"}
+    delivery = {"tool": "start_diff_review", "params": {}, "unit": "u1", "unit_material_cut": True}
+    got = _infer([delivery, line], unit_id="u1")
+    assert got == {"basis": "unit_delivered", "material_cut": True, "read_partial": "pages"}
+
+
+def test_a_cut_unit_read_on_by_an_entry_whose_hunk_is_held_back_is_pages() -> None:
+    """MINOR (unit branch): a unit whose material was cut, read on by the entry's entry_id whose
+    hunk is held back (code_shown false), is still ``read_partial: "pages"``; read on by an entry
+    that showed the code whole, no flag.
+
+    MUTATION (verified RED, 1 failed): exempt every entry read on the delivered branch -> RED."""
+    delivery = {"tool": "start_diff_review", "params": {}, "unit": "u1", "unit_material_cut": True}
+    held = _infer([delivery, _entry_read(False, [0, 3, 3])], unit_id="u1")
+    assert held == {"basis": "unit_delivered", "material_cut": True, "read_partial": "pages"}
+    shown = _infer([delivery, _entry_read(True, [0, 3, 3])], unit_id="u1")
+    assert shown == {"basis": "unit_delivered", "material_cut": True}
+
+
+def _members_page(total: int, offset: int = 0) -> dict[str, Any]:
+    """A same_shape_siblings members page as the server fits it: ``total`` members of ~500 bytes,
+    from ``offset``."""
+    members = [{"evidence_ref": f"m{i:05d}", "pad": "x" * 500} for i in range(offset, total)]
+    result = {"group_ref": "d#f2:k:a@1/1", "member_count": total, "members": members}
+    return mcp_app._fit_members(result, offset)
+
+
+def test_a_cut_same_shape_members_page_is_logged_cut() -> None:
+    """★ G-2: same_shape_siblings' members page continues by ``members_next_offset`` and says
+    ``members_truncated``: the log reads it cut, and a reading left there counts in
+    ``evidence_reads_cut``; its last page read, it does not.
+
+    MUTATION (verified RED, 1 failed): drop members_next_offset / members_truncated from the keys
+    the log reads (the dead next_members_offset only) -> logged uncut -> RED."""
+    page = _members_page(679)
+    assert page["members_truncated"] is True and page["members_next_offset"] is not None
+    args = {"diff_id": "a::b::x", "evidence_ref": "r", "members_offset": 0}
+    line = _evidence("same_shape_siblings", page, **args)
+    assert line["truncated"] is True
+    got = rb.evidence_reads_cut([line])
+    assert got is not None and (got["count"], got["readings"]) == (1, 1), got
+    last = _members_page(679, page["members_next_offset"])
+    while last["members_next_offset"] is not None:
+        last = _members_page(679, last["members_next_offset"])
+    tail = _evidence("same_shape_siblings", last, **{**args, "members_offset": 600})
+    got = rb.evidence_reads_cut([line, tail])
+    assert got is not None and (got["count"], got["readings"]) == (0, 1), got
+
+
+def test_a_group_object_read_does_not_clear_a_cut_members_page() -> None:
+    """★ G-2: the group object (no ``members_offset``) and a page of its members are two readings:
+    an uncut group object read first does not clear a members page left cut.
+
+    MUTATION (verified RED, 1 failed): leave members_offset's presence out of the digest -> one
+    reading, cleared -> count 0 -> RED."""
+    args = {"diff_id": "a::b::x", "evidence_ref": "r", "candidate_anchor": None}
+    group = _evidence(
+        "same_shape_siblings", {"group_ref": "g", "member_count": 679}, **args, members_offset=None
+    )
+    page = _evidence("same_shape_siblings", _members_page(679), **args, members_offset=0)
+    got = rb.evidence_reads_cut([group, page])
+    assert got is not None and (got["count"], got["readings"]) == (1, 2), got
+
+
+def test_the_log_reads_every_page_fitters_continuation_and_cut_keys() -> None:
+    """★ G-2: every ``_fit_page`` call of the server names its continuation key and its cut key;
+    each must be one the log reads (``_CONTINUATION_KEYS`` / ``_CUT_KEYS``), so no tool's page
+    that continues is logged read whole. get_diff_string_delta's per-side keys likewise.
+
+    MUTATION (verified RED, 1 failed): drop members_next_offset from _CONTINUATION_KEYS -> RED."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(mcp_app))
+    pairs: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_fit_page"
+        ):
+            kw = {k.arg: k.value for k in node.keywords}
+            nxt, cut = kw.get("next_offset"), kw.get("truncated")
+            assert isinstance(nxt, ast.Constant) and isinstance(cut, ast.Constant), ast.dump(node)
+            pairs.append((nxt.value, cut.value))
+    assert len(pairs) >= 10  # the scan found the server's page fitters
+    assert ("members_next_offset", "members_truncated") in pairs
+    for nxt, cut in pairs:
+        assert nxt in tcl._CONTINUATION_KEYS, nxt
+        assert cut in tcl._CUT_KEYS, cut
+    side = mcp_app._fit_string_delta(
+        {"sides": {"a_only": {"count": 3, "values": ["x", "y", "z"]}}}, 0
+    )["sides"]["a_only"]
+    assert {"next_offset", "values_truncated"} <= set(side)
+    assert "next_offset" in tcl._CONTINUATION_KEYS and "values_truncated" in tcl._CUT_KEYS

@@ -93,15 +93,20 @@ PAGE_PARAMS: frozenset[str] = frozenset(
     {"offset", "limit", "members_offset", "hunk_offset", "ko_offset", "rows_offset", "rows_limit"}
 )
 
-# Keys that say a response is one page of more (a continuation offset) or was cut to fit.
-_CONTINUATION_KEYS = ("next_offset", "next_hunk_offset", "next_rows_offset", "next_members_offset")
+# Keys that say a response is one page of more (a continuation offset) or was cut to fit — the
+# names the page fitters write (held to them by a test).
+_CONTINUATION_KEYS = ("next_offset", "next_hunk_offset", "members_next_offset")
 _CUT_KEYS = (
     "truncated",
     "over_budget",
     "truncated_by_bytes",
     "entries_truncated",
     "values_truncated",
+    "members_truncated",
 )
+# Page parameters whose absence asks for another answer, not the first page of the same list:
+# same_shape_siblings without ``members_offset`` returns the group object, with it a members page.
+_ANSWER_SELECTING_PAGE_PARAMS = ("members_offset",)
 # A block holding several paging blocks side by side (get_diff_string_delta's ``sides``, one per
 # side): each of them is read as a paging block of the answer itself.
 _PAGED_SIDES = "sides"
@@ -162,8 +167,13 @@ def _is_cut(result: Any, depth: int = 0) -> bool:
 def reading_digest(arguments: dict[str, Any]) -> str:
     """A digest of a call's arguments but the page's own place (``PAGE_PARAMS``): equal for the
     pages of one reading, different for two readings that differ in any other argument — free
-    text included, which is never stored itself."""
-    rest = {k: v for k, v in arguments.items() if k not in PAGE_PARAMS}
+    text included, which is never stored itself. A page parameter that selects another answer
+    when left out (``members_offset``: the group object, or a page of its members) keeps the two
+    readings apart by whether it was given."""
+    rest: dict[str, Any] = {k: v for k, v in arguments.items() if k not in PAGE_PARAMS}
+    for k in _ANSWER_SELECTING_PAGE_PARAMS:
+        if arguments.get(k) is not None:
+            rest[f"{k}:paged"] = True
     text = json.dumps(rest, sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -261,15 +271,25 @@ def code_shown(entry: dict[str, Any]) -> bool | None:
     carries an inline hunk with nothing held back or cut (``part_cut``), or there is nothing to
     show (a ``layout_only`` delta, two texts that match); False when a hunk was held back (over
     its gate, too large, the page budget); None when the entry carried no hunk either way (no
-    delta computed, a function with no counterpart, a text not available, a summary)."""
-    delta = entry.get("pseudocode_delta")
-    if isinstance(delta, dict):
-        hunk = delta.get("inline_hunk")
-        if isinstance(hunk, dict):
-            return not part_cut(hunk)
-        if delta.get("kind") == "layout_only":
-            return True
-    if entry.get("pseudocode_sameness") in IDENTICAL_TEXT_STATES:
+    delta computed, a function with no counterpart, a text not available, a summary).
+
+    An undetermined pair carries its reading in ``proposed_pair_reading`` (its ``state`` and
+    ``pseudocode_delta``) instead of on the entry: the entry's own fields are read first, then
+    that block's."""
+    proposed = entry.get("proposed_pair_reading")
+    blocks = [entry] + ([proposed] if isinstance(proposed, dict) else [])
+    for block in blocks:
+        delta = block.get("pseudocode_delta")
+        if isinstance(delta, dict):
+            hunk = delta.get("inline_hunk")
+            if isinstance(hunk, dict):
+                return not part_cut(hunk)
+            if delta.get("kind") == "layout_only":
+                return True
+    state = entry.get("pseudocode_sameness")
+    if state is None and isinstance(proposed, dict):
+        state = proposed.get("state")
+    if state in IDENTICAL_TEXT_STATES:
         return True
     return None
 

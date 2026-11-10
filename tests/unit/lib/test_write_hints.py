@@ -408,10 +408,12 @@ def test_past_its_time_a_group_is_deferred_and_the_write_stands(
 def test_near_the_page_a_group_keeps_its_ref_count_and_calls_only(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ T-K9e: an answer past the hints' room keeps each group's ref, member count and calls, and
-    says ``by_landing_withheld``.
+    """★ T-K9e: an answer past the hints' room keeps each group's ref, member counts (this diff's,
+    and outside it across the run pair, once read) and calls, and says ``by_landing_withheld``.
 
-    MUTATION (verified RED, 1 failed): never withhold -> by_landing still there -> RED."""
+    MUTATION (verified RED, 1 failed): never withhold -> by_landing still there -> RED.
+    MUTATION (verified RED, 1 failed): leave members_outside_input_diff out of the kept keys (the
+    run pair's count read, then dropped) -> RED."""
     monkeypatch.setattr(mcp_app, "_ECHO_RESERVE", 10**9)
     tools = mcp_app.make_tools(world.path)
     got = tools["annotate_diff"](
@@ -420,7 +422,8 @@ def test_near_the_page_a_group_keeps_its_ref_count_and_calls_only(
     block = got.get("same_shape")
     assert block is not None and block.get("by_landing_withheld") is True, got
     (g,) = block["groups"]
-    assert set(g) == {"group_ref", "member_count", "read_with"}
+    assert set(g) == {"group_ref", "member_count", "members_outside_input_diff", "read_with"}
+    assert isinstance(g["members_outside_input_diff"], int), g
 
 
 def _unit_of(tools: dict[str, Any], entry_id: str) -> tuple[str, str]:
@@ -634,7 +637,7 @@ def test_a_cut_batch_says_each_deferred_group_once(
 ) -> None:
     """★ MAJOR-5: every item of a batch with the same ten groups deferred, each with its calls: the
     cut echo lists each group once for the batch (``same_shape_deferred_groups``, by group_ref)
-    and each item only its group refs — the answer within the page, every group_ref named.
+    and each item only their indexes there — the answer within the page, every group_ref named.
 
     MUTATION (verified RED, 1 failed): keep each item's same_shape_deferred as it is (the old cut
     echo) -> the answer over the page -> RED."""
@@ -652,10 +655,13 @@ def test_a_cut_batch_says_each_deferred_group_once(
     assert out.get("written") is True, out
     text = json.dumps(out)
     assert len(text) <= mcp_app._RESPONSE_BYTE_BUDGET, len(text)
-    assert set(out["same_shape_deferred_groups"]) == {g["group_ref"] for g in shared}
+    listed = out["same_shape_deferred_groups"]
+    assert [g["group_ref"] for g in listed] == [g["group_ref"] for g in shared]
     assert out["same_shape_deferred_why"] == "ran out"
     for r in out["results"]:
-        assert r["same_shape_deferred"] == [g["group_ref"] for g in shared], r
+        assert [listed[i]["group_ref"] for i in r["same_shape_deferred"]] == [
+            g["group_ref"] for g in shared
+        ], r
 
 
 def test_a_cut_batch_still_near_the_page_gives_its_groups_by_count(
@@ -683,34 +689,163 @@ def test_a_cut_batch_still_near_the_page_gives_its_groups_by_count(
     assert all(r["same_shape"] == 30 for r in out["results"]), out["results"][:2]
 
 
-def test_a_cut_batch_with_long_group_lists_keeps_the_groups_listed_once(
+def _evidence_ref(i: int) -> str:
+    return f"runA::usr/sbin/httpd::{0x40000 + 16 * i:08x}::callsite::strcpy::{'k' * 120}"
+
+
+def test_a_cut_batch_lists_every_group_once_with_one_call_template(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ MAJOR-5: thirty groups shared by every item, their refs long: the items' ref lists alone
-    near the page, the groups said once do not — so each item gives its groups by count and the
-    batch still lists every group once (``same_shape_groups`` by group_ref).
+    """★ G-4: sixty-one groups, each with its two calls (one diff, the run pair) and long refs,
+    spread over the batch's items: said per group, the calls alone near the page. The cut echo
+    says the two calls once (``same_shape_read_with``, the ref a slot), lists each group once
+    (``same_shape_groups``: its group_ref, counts and the ``evidence_ref`` that fills the slot) and
+    each item the indexes of its groups — the answer within the page, every group listed, each
+    item's groups read back by index, nothing given by count.
 
-    MUTATION (verified RED, 1 failed): give the batch's listings by count at the first cut too
-    -> no group listed -> RED."""
-    groups = [
-        {"group_ref": f"G{'r' * 150}#f2:{i:04d}", "member_count": 2, "read_with": {"one_diff": "c"}}
-        for i in range(30)
-    ]
+    MUTATION (verified RED, 1 failed): keep each group's read_with in the listing (no template)
+    -> the listings near the page, the items by count -> RED."""
+    n = 61
+    items = _all_items(world)
+    held = {
+        i: [g for g in range(n) if g % len(items) == i % len(items) or g < 8]
+        for i in range(len(items))
+    }
+    calls = {"n": 0}
+    refs = {g: f"{DIFF}#f2:{'s' * 60}:{g:04d}:a@3/2" for g in range(n)}
 
-    def shared(atlas: Any, diff_id: str, subject: Any, ss_pass: Any) -> dict[str, Any]:
+    def spread(atlas: Any, diff_id: str, subject: Any, ss_pass: Any) -> dict[str, Any]:
+        i = calls["n"]
+        calls["n"] += 1
+        groups = []
+        for g in held[i]:
+            ss_pass.refs.setdefault(refs[g], _evidence_ref(g))
+            groups.append(
+                {
+                    "group_ref": refs[g],
+                    "member_count": 3,
+                    "by_landing": {"A": {"-": 3}},
+                    "members_outside_input_diff": 5,
+                    "read_with": wh._read_with(diff_id, PAIR, _evidence_ref(g)),
+                }
+            )
         return {"same_shape": {"groups": groups}}
 
-    monkeypatch.setattr(wh, "same_shape", shared)
+    monkeypatch.setattr(wh, "same_shape", spread)
+    per_group = sum(len(json.dumps(wh._read_with(DIFF, PAIR, _evidence_ref(g)))) for g in range(n))
+    assert per_group > 30_000  # the precondition: said per group, the calls alone near the page
     tools = mcp_app.make_tools(world.path)
-    items = _all_items(world)
-    assert len(items) * 30 * 155 > mcp_app._RESPONSE_BYTE_BUDGET  # the refs per item: over
     out = tools["annotate_diff_batch"](items, diff_id=DIFF)
     assert out.get("written") is True, out
-    assert len(json.dumps(out)) <= mcp_app._RESPONSE_BYTE_BUDGET
-    assert isinstance(out.get("same_shape_groups"), dict), out.get("same_shape_groups")
-    assert set(out["same_shape_groups"]) == {g["group_ref"] for g in groups}
-    assert all(r["same_shape"] == 30 for r in out["results"]), out["results"][:2]
-    assert "listed once" in out["same_shape_withheld"]
+    assert len(json.dumps(out)) <= mcp_app._RESPONSE_BYTE_BUDGET, len(json.dumps(out))
+    assert "same_shape_withheld" not in out, out.get("same_shape_withheld")
+    listed = out["same_shape_groups"]
+    assert sorted(g["group_ref"] for g in listed) == sorted(refs.values())
+    assert all(g["members_outside_input_diff"] == 5 and "read_with" not in g for g in listed)
+    template = out["same_shape_read_with"]
+    assert set(template) == {"one_diff", "run_pair"} and wh._REF_SLOT in template["one_diff"]
+    for r in out["results"]:
+        i = r["index"]
+        assert [listed[k]["group_ref"] for k in r["same_shape"]] == [refs[g] for g in held[i]], r
+        for k in r["same_shape"]:
+            filled = template["one_diff"].replace(
+                wh._REF_SLOT, json.dumps(listed[k]["evidence_ref"])
+            )
+            assert filled == wh._read_with(DIFF, PAIR, listed[k]["evidence_ref"])["one_diff"]
+
+
+def test_a_batch_listing_keeps_the_run_pairs_count(world: World) -> None:
+    """★ MINOR (G-5/8): a cut batch's group listing keeps the members outside the input diff that
+    the second part read (and why a run pair could not be read), beside the group's ref, count
+    and the evidence_ref its calls take.
+
+    MUTATION (verified RED, 1 failed): leave members_outside_input_diff out of the kept keys ->
+    RED."""
+    ss_pass = wh.SameShapePass(build_hash=None, current=None, commit="c")
+    ss_pass.refs["G#f2:1"] = "ref-1"
+    ss_pass.refs["G#f2:2"] = "ref-2"
+    group = {
+        "group_ref": "G#f2:1",
+        "member_count": 4,
+        "by_landing": {"A": {"-": 4}},
+        "members_outside_input_diff": 7,
+        "read_with": {"one_diff": "x", "run_pair": "y"},
+    }
+    other = {"group_ref": "G#f2:2", "member_count": 2, "run_pair_unavailable": "e", "read_with": {}}
+    results = [{"same_shape": {"groups": [group, other]}}, {"same_shape": {"groups": [group]}}]
+    items, batch = wh.batch_same_shape(results, ss_pass, DIFF)
+    assert items == [{"same_shape": [0, 1]}, {"same_shape": [0]}]
+    first, second = batch["same_shape_groups"]
+    assert first == {
+        "group_ref": "G#f2:1",
+        "member_count": 4,
+        "members_outside_input_diff": 7,
+        "evidence_ref": "ref-1",
+    }
+    assert second["run_pair_unavailable"] == "e" and second["evidence_ref"] == "ref-2"
+
+
+def test_a_deferred_group_still_says_its_member_count(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ MINOR (G-5/6): with the write call's time gone before any group is begun, each deferred
+    group still says its member count — the one same_shape_siblings gives for it — read from the
+    side's calls already in hand.
+
+    MUTATION (verified RED, 1 failed): leave member_count out of a deferred group -> RED."""
+    monkeypatch.setattr(wh.SameShapePass, "over", lambda self: True)
+    tools = mcp_app.make_tools(world.path)
+    got = tools["annotate_diff"](
+        **_args(_anchor(world, BOTH), "changed_real", change_kind=["sink_removed"])
+    )
+    late = got.get("same_shape_deferred")
+    assert late is not None and "same_shape" not in got, sorted(got)
+    want = _one_diff_group(world, LISTED)
+    (g,) = late["groups"]
+    assert g["group_ref"] == want["group_ref"]
+    assert g.get("member_count") == want["member_count"], (g, want["member_count"])
+
+
+@pytest.mark.parametrize("level", ["relation_and_count", "count"])
+def test_a_batch_whose_groups_echo_nears_the_page_cuts_it(
+    world: World, monkeypatch: pytest.MonkeyPatch, level: str
+) -> None:
+    """★ G-3: the echo of the groups the items leaned on is measured with the rest: an echo near
+    the page by itself keeps each group's relation and member count — still near it, their count —
+    and ``groups_withheld`` says so; the answer within the page, each item naming its group_ref.
+
+    MUTATION (verified RED, 2 failed): measure the items' echo only (the old check) -> the groups
+    echo kept whole -> over the page -> RED."""
+    gref = _one_diff_group(world, LISTED)["group_ref"]
+    pad = "s" * 45_000
+    real = mcp_app._diff_group_echo
+
+    def big(atlas: Any, row_id: int) -> dict[str, Any] | None:
+        echo = real(atlas, row_id)
+        assert echo is not None
+        if level == "count":
+            return {**echo, "relation": pad}
+        return {**echo, "summary": pad}
+
+    monkeypatch.setattr(mcp_app, "_diff_group_echo", big)
+    tools = mcp_app.make_tools(world.path)
+    item = {
+        "anchor_ref": _anchor(world, BOTH),
+        "verdict": "changed_real",
+        "rationale": "r",
+        "change_kind": ["sink_removed"],
+        "group_ref": gref,
+    }
+    out = tools["annotate_diff_batch"]([item], diff_id=DIFF)
+    assert out.get("written") is True, out
+    assert len(json.dumps(out)) <= mcp_app._RESPONSE_BYTE_BUDGET, len(json.dumps(out))
+    assert "page_budget" in out.get("groups_withheld", ""), sorted(out)
+    assert [r.get("group_ref") for r in out["results"]] == [gref]
+    if level == "count":
+        assert out["groups"] == 1
+    else:
+        assert set(out["groups"][gref]) <= {"group_ref", "relation", "member_count"}
+        assert out["groups"][gref]["member_count"] == _one_diff_group(world, LISTED)["member_count"]
 
 
 def test_a_batch_builds_its_subjects_once(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -773,7 +908,7 @@ def test_a_presence_and_a_file_anchor_say_their_own_why() -> None:
     MUTATION (verified RED, 1 failed): one reason for all three (the old text) -> RED."""
     presence = f"{PAIR}#binary_presence#a_only:usr/sbin/x::00001000"
     assert dr.is_binary_presence_anchor(presence)  # the precondition: read as a presence anchor
-    assert "every candidate is on that side" in wh.no_entry_why(presence)
+    assert "any candidate of it is on that side" in wh.no_entry_why(presence)
     assert "has no candidate rows" in wh.no_entry_why(f"{PAIR}#non_binary#etc/rc")
     assert "every candidate" not in wh.no_entry_why(f"{PAIR}#non_binary#etc/rc")
     assert "no entry of a binary diff" in wh.no_entry_why(f"{PAIR}#function_pair#x::1::2")
@@ -811,4 +946,43 @@ def test_a_large_hint_leaves_less_room_for_the_next_units_material(
     nu = got.get("next_unit")
     assert nu is not None and "pad" in json.dumps(nu.get("material")), sorted(got)
     assert len(json.dumps(got["same_shape"])) > 20_000  # the precondition: the block was kept
+    assert len(json.dumps(got)) <= mcp_app._RESPONSE_BYTE_BUDGET, len(json.dumps(got))
+
+
+def test_a_large_hint_in_a_batch_leaves_less_room_for_the_next_units_material(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ MINOR (G-5/5): as for one judgement, a batch's ~20 KB same-shape block is counted in the
+    size the next unit's material is fit beside — the answer within the page.
+
+    MUTATION (verified RED, 1 failed): measure the batch's answer without its results for the
+    next unit's room -> over the page -> RED."""
+    block = {"groups": [{"group_ref": "G#f2:1", "member_count": 2, "read_with": "y" * 20_000}]}
+
+    def big(atlas: Any, diff_id: str, subject: Any, ss_pass: Any) -> dict[str, Any]:
+        return {"same_shape": block}
+
+    real_fit = mcp_app._entry_within_budget
+
+    def fill(entry: dict[str, Any], base: int, budget: int | None = None) -> dict[str, Any]:
+        out = real_fit(entry, base, budget)
+        if budget is None:
+            return out
+        return {**out, "pad": "z" * max(0, budget - len(json.dumps(out)) - 16)}
+
+    tools = mcp_app.make_tools(world.path)
+    uid, anchor = _unit_of(tools, BOTH)
+    monkeypatch.setattr(wh, "same_shape", big)
+    monkeypatch.setattr(mcp_app, "_entry_within_budget", fill)
+    item = {
+        "anchor_ref": anchor,
+        "verdict": "changed_real",
+        "rationale": "r",
+        "change_kind": ["sink_removed"],
+    }
+    got = tools["annotate_diff_batch"]([item], diff_id=DIFF, unit_id=uid)
+    assert got.get("written") is True, got
+    nu = got.get("next_unit")
+    assert nu is not None and "pad" in json.dumps(nu.get("material")), sorted(got)
+    assert len(json.dumps(got["results"])) > 20_000  # the precondition: the block was kept
     assert len(json.dumps(got)) <= mcp_app._RESPONSE_BYTE_BUDGET, len(json.dumps(got))
