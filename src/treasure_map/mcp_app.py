@@ -897,8 +897,10 @@ _AGENT_GUIDE = (
     "supported_pair_swap / supported_pair_counts); a counterpart_hint or pairing_name_conflict "
     "keeps it in "
     "attention 1 with its lift_basis, and nothing is re-paired. Unread is not 'nothing found': "
-    "read every P entry, every entry with a lift_basis (a floated R entry has one too), every "
-    "bucket S entry and each binary_presence binary. "
+    "read every P entry, every bucket S entry that carries a candidate row or is in a callee "
+    "group, every entry with a lift_basis (a floated R entry has one too) and each "
+    "binary_presence binary; the rest of the listed entries are the second tier (handed out on "
+    "request — ask the person first — with sweep). "
     "The non-binary files (scripts, configs, credentials, web assets) are compared by "
     "get_file_diff(run_pair='<run_a>::<run_b>') — any two runs from list_runs, with or without a "
     "binary diff — and one file is judged with annotate_diff(anchor_ref, verdict, rationale, "
@@ -964,8 +966,8 @@ _AGENT_INSTRUCTIONS = (
     "verdict=changed_real|no_real_change|change_inconclusive, rationale, diff_id=...) records a "
     "judgment on one entry, promote(diff_id, entry_id, row_ref, verdict, rationale) carries it "
     "onto one of the entry's candidates, and list_overlays(anchor_kind='diff_subject', "
-    "run_id='<run_a>::<run_b>') reviews them. Unread is not 'nothing found': read every P entry, "
-    "entry with a lift_basis, bucket S entry, binary_presence binary and every "
+    "run_id='<run_a>::<run_b>') reviews them. Unread is not 'nothing found': read every "
+    "must-read unit start_diff_review hands out, each entry with a lift_basis and every "
     "candidate row of a function; sink_candidate_counts counts hunt candidates and "
     "get_diff_string_delta one-sided strings (unknown is not 'no change'). Every tool's first "
     "line lists its required "
@@ -3349,9 +3351,11 @@ def make_tools(
         one run of the pair holds alone, per side, with how many carry no judgment yet.
 
         An entry nobody judged is UNREAD, which is not "nothing found": the view's first page is
-        where reading starts, not where it ends. Read the P entries, every entry with a
-        ``lift_basis``, every bucket S entry and each ``binary_presence`` binary (judged with
-        annotate_diff(..., run_pair=...)), and in an entry every candidate row of the function.
+        where reading starts, not where it ends. Read every P entry, every bucket S entry that
+        carries a candidate row or is in a callee group, every entry with a ``lift_basis``, each
+        ``binary_presence`` binary (judged with annotate_diff(..., run_pair=...)), and in an entry
+        every candidate row of the function; the rest of the listed entries are the second tier
+        (handed out on request — ask the person first — with ``sweep``).
 
         The response keeps to the byte budget (~48KB) at every ``limit``: the view page gets the
         bytes the other blocks leave and is cut there as get_diff_patch_view cuts a page
@@ -3378,9 +3382,9 @@ def make_tools(
         facts, how much of the second tier is unread (``second_tier``: its units, members and
         members by bucket), what no unit can reach, ``basis_incomplete``,
         ``evidence_reads_cut`` (this session's fact-tool readings left on a cut page, per
-        session) and the reduce still owed in this shard. ``sweep=true`` hands out the second
-        tier too, after the must-read units; a write naming its unit hands on the next unit as
-        the session's last start_diff_review(run_pair) asked.
+        session) and the reduce still owed in this shard. ``sweep=true`` (ask the person first)
+        hands out the second tier too, after the must-read units; a write naming its unit hands
+        on the next unit as the session's last start_diff_review(run_pair) asked.
         ``worker`` / ``workers`` (both or neither) keep one shard: the units whose id's first 8 hex
         digits, as an integer, are worker modulo workers. ``unit=<unit_id>`` returns that one unit:
         its members with their review state and verdict, and its material. Judge each member with
@@ -3684,12 +3688,14 @@ def make_tools(
         not complete now; the judgments already written are unchanged.
 
         Reading a diff through: an entry nobody has opened is UNREAD, which is not "nothing found"
-        — only a judgment (annotate_diff) moves it. Read every P entry, every entry with a
-        ``lift_basis``, every bucket S entry, and each ``binary_presence`` binary of the run
-        pair (get_diff_meta / start_diff_review ``meta.binary_presence``; judged with
-        ``run_pair``); in an entry, walk every candidate row of the function (``rows_total``, page
-        with ``entry_id`` + ``rows_offset``), not only the first. ``sink_candidate_counts`` counts
-        hunt candidates, and an ``unknown`` there is not "no change".
+        — only a judgment (annotate_diff) moves it. Read every P entry, every bucket S entry
+        that carries a candidate row or is in a callee group, every entry with a ``lift_basis``,
+        and each ``binary_presence`` binary of the run pair (get_diff_meta / start_diff_review
+        ``meta.binary_presence``; judged with ``run_pair``); the rest of the listed entries are
+        the second tier (handed out on request — ask the person first — with ``sweep``). In an
+        entry, walk every candidate row of the function (``rows_total``, page with ``entry_id`` +
+        ``rows_offset``), not only the first. ``sink_candidate_counts`` counts hunt candidates,
+        and an ``unknown`` there is not "no change".
 
         Every page carries the counts, ``blind_spots``, ``legend`` and ``caveats``. The long texts
         that are the same on every page of a scope — ``lens.order`` and the filter texts,

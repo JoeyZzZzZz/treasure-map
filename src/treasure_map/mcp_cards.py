@@ -418,8 +418,9 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "and judge them, composed from get_diff_patch_view and get_diff_meta, nothing computed "
             "of its own; returns workflow, meta (with binary_presence), headline, view, read_next "
             'and non_binary. An entry nobody judged is UNREAD, which is not "nothing found": '
-            "read the P entries, the entries with a lift_basis, bucket S and each binary_presence "
-            "binary too. A pair or diff with a proven-stale side is refused."
+            "read the P entries, the S entries with a candidate row or in a callee group, the "
+            "entries with a lift_basis and each binary_presence binary too. A pair or diff with a "
+            "proven-stale side is refused."
         ),
     ),
     "get_diff_patch_view": ToolCard(

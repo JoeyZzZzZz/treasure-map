@@ -9,7 +9,10 @@ states, made checkable, plus what it left out. An entry of a diff is must-read w
 * a P entry (a function in no matched pair) — ``p_entry``;
 * an entry carrying a ``lift_basis`` (whatever its page) — ``lift_basis``;
 * an attention-0 entry — ``attention_0``;
-* a bucket S entry — ``bucket_s`` (handed out per binary, as a batch);
+* a bucket S entry with at least one candidate row — ``bucket_s_candidate`` (handed out per diff,
+  as a batch);
+* a bucket S entry in one of its diff's callee groups — ``bucket_s_callee_group`` (handed out
+  with its group); a bucket S entry with neither is second tier unless another reason holds;
 * an R entry whose one side is not in that scan's function inventory (its candidate count there is
   unknown) while the other side names a sink candidate — ``side_not_in_inventory``;
 * an aligned pair whose ``sink_callsite_counts`` shows fewer calls on the B side of a command sink
@@ -68,7 +71,7 @@ from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, OPEN, UNSEEN
 
-PREDICATE_VERSION = "v2"
+PREDICATE_VERSION = "v3"
 DEFAULT_K = 4
 MAX_K = 200
 # At most this many items in one annotate_diff_batch call.
@@ -92,7 +95,8 @@ REASONS = (
     "p_entry",
     "lift_basis",
     "attention_0",
-    "bucket_s",
+    "bucket_s_candidate",
+    "bucket_s_callee_group",
     "side_not_in_inventory",
     "command_calls_fewer",
     "aligned_b_sink",
@@ -247,8 +251,8 @@ def entry_reasons(
         out.append("lift_basis")
     if attention == 0:
         out.append("attention_0")
-    if bucket == "S":
-        out.append("bucket_s")
+    if bucket == "S" and len(e.row_views) >= 1:
+        out.append("bucket_s_candidate")
     if _side_not_in_inventory(e):
         out.append("side_not_in_inventory")
     if _command_calls_fewer(e):
@@ -344,6 +348,16 @@ def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) ->
                     "members_a_side_unread": g.members_a_side_unread,
                 }
             )
+    # A bucket S entry in a callee group is must-read with its group, rows or none: several entries
+    # newly calling one function is the shape the reduce checks call site by call site, and
+    # _assign_groups counts must-read members only.
+    in_group = {e for g in groups for e in g["members"]}
+    entries = [
+        _with_reason(m, "bucket_s_callee_group")
+        if m.bucket == "S" and m.entry_id in in_group and "bucket_s_candidate" not in m.reasons
+        else m
+        for m in entries
+    ]
     return DiffFacts(
         diff_id=diff_id,
         binary=d.binary,
@@ -462,6 +476,10 @@ def pair_facts(
     )
 
 
+def _with_reason(m: Member, reason: str) -> Member:
+    return replace(m, reasons=tuple(sorted({*m.reasons, reason}, key=REASONS.index)))
+
+
 def _with_top_k(m: Member, k: int) -> Member:
     if m.kind != "entry" or m.position >= k or "top_k" in m.reasons:
         return m
@@ -534,7 +552,7 @@ def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
             m = _with_top_k(raw, k)
             if m.entry_id in taken:
                 continue
-            if m.bucket == "S":
+            if m.bucket == "S" and m.must_read:
                 s_members.append(m)
             elif m.must_read:
                 add(ENTRY, [m], True)
@@ -1036,7 +1054,10 @@ def coverage_offer(
         "complete": rep["complete"],
         "continue_with": None
         if sweep or not second
-        else "sweep=true (start_diff_review) / --until complete (tmap review run)",
+        else (
+            "ask the person first; on their yes: sweep=true (start_diff_review) / --until "
+            "complete (tmap review run)"
+        ),
     }
 
 

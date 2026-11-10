@@ -374,7 +374,7 @@ def test_s_entries_and_the_second_tier_are_batched_and_capped() -> None:
 
     MUTATION (verified RED): drop the cap -> one S batch of 250 -> RED. MUTATION (verified RED,
     1 failed): cut batches at BATCH_MAX (200) again -> RED."""
-    s = [_m(f"s{i}", "p::d", i, "S", ("bucket_s",)) for i in range(250)]
+    s = [_m(f"s{i}", "p::d", i, "S", ("bucket_s_candidate",)) for i in range(250)]
     c = [_m(f"c{i}", "p::d", 250 + i, "C") for i in range(3)]
     units = ru.cut_units(_facts(diffs=[_diff("p::d", s + c)]), k=0)
     sizes = sorted((u.kind, len(u.members)) for u in units)
@@ -2257,13 +2257,17 @@ def test_a_file_material_over_its_room_withholds_inside_its_entry_and_is_built_o
 
 
 def _s_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int) -> World:
-    """``n`` aligned similarity-1 pairs in DX that all read as differing: bucket S, must-read,
-    batched (at most 200 a batch)."""
+    """``n`` aligned similarity-1 pairs in DX that all read as differing, each with one persisted
+    candidate row: bucket S, must-read (``bucket_s_candidate``), batched (at most 16 a batch)."""
     w = World(tmp_path, monkeypatch)
     pairs = []
     for i in range(1, n + 1):
         a = f"{i:08x}"
         w.pair(DX, a, a, sim=1.0)
+        # a persisted row keeps the entry in bucket S (a row placed A / R / P / B would move it)
+        w.rows.setdefault(DX, []).append(
+            _row(_ref("runA", a), _ref("runB", a), presence="persisted", call="present_same_callee")
+        )
         pairs.append((a, a))
     monkeypatch.setattr(pv, "_differs_of", lambda readings, built: frozenset(pairs))
     return w

@@ -35,8 +35,9 @@ produces no payload: every judgment is yours.
 - `must_read_complete` is the bar for "the must-read part is done"; `complete` also needs every
   second-tier entry. Report both as the server gives them.
 - By default only the must-read units are handed out: `next_unit` null then comes with
-  `coverage_offer`, which counts the second tier still unread. Quote it as it is; to read the
-  second tier too, call `start_diff_review(run_pair=..., sweep=true)` and go on as before.
+  `coverage_offer`, which counts the second tier still unread (`second_tier.by_bucket`). Quote it
+  as it is and ask the person whether to read the second tier; only on their yes, call
+  `start_diff_review(run_pair=..., sweep=true)` and go on as before.
 - `report.not_seen` lists what this view cannot see. Do not claim coverage of those classes.
 - With several workers, give each its own `worker` / `workers` pair so no two judge the same unit.
 - The full unit list is not sent over MCP: `tmap review report <run_pair> --md -o review.md`
