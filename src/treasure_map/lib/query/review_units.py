@@ -1040,6 +1040,60 @@ def coverage_offer(
     }
 
 
+# The progress block's fields that are the whole pair's, also in a shard: its own names (not
+# PAIR_WIDE_OFFER_KEYS, which names coverage_offer's).
+PROGRESS_PAIR_WIDE_KEYS = (
+    "must_read_left",
+    "reduce_owed",
+    "must_read_complete",
+    "coverage_statement",
+    "still_open",
+)
+NO_SESSION_LOG = "no tool-call log for this session"
+
+
+def progress_block(
+    rep: dict[str, Any],
+    *,
+    sharded: bool,
+    this_session: dict[str, int] | None,
+    resume_with: str,
+) -> dict[str, Any]:
+    """Where a pair's review stands, beside every unit handed out and every stop (facts only: no
+    threshold, no prediction of when to stop): what this session was handed before this answer,
+    the must-read units and members not yet disposed, the reduce still owed, ``must_read_complete``
+    and — the rest of what keeps it false — ``still_open``, the coverage statement, and the call a
+    fresh session continues with. Every count is read off the report ``rep`` as it is; the ones
+    ``pair_wide`` names are the whole pair's, also in a shard (``scope``)."""
+    mr = rep["must_read"]
+    nr = rep["not_reachable"]
+    out: dict[str, Any] = {"this_session": this_session}
+    if this_session is None:
+        out["this_session_unavailable"] = NO_SESSION_LOG
+    out.update(
+        {
+            "must_read_left": {
+                "units": mr["units"] - mr["units_disposed"],
+                "members": mr["members"] - mr["members_disposed"],
+            },
+            "reduce_owed": rep["reduce"]["owed"],
+            "must_read_complete": rep["must_read_complete"],
+            "still_open": {
+                "failed_diffs": len(nr["failed_diffs"]),
+                "withheld_diffs": len(nr["withheld_diffs"]),
+                "audits_open": rep["audits"]["open"],
+                "disagreements": rep["disagreements"]["count"],
+                "judged_unread": rep["judged_unread"]["count"],
+            },
+            "coverage_statement": rep["coverage_statement"],
+            "scope": "shard" if sharded else "pair",
+            "pair_wide": list(PROGRESS_PAIR_WIDE_KEYS),
+            "resume_with": resume_with,
+        }
+    )
+    return out
+
+
 # ── the report ──────────────────────────────────────────────────────────────────────────────
 
 

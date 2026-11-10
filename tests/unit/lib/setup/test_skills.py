@@ -28,12 +28,13 @@ from . import fakes
 _FIXTURES = Path(__file__).parents[3] / "fixtures" / "skills"
 _LEGACY = _FIXTURES / "legacy_diff_review_3144.md"
 # Every text an earlier tmap shipped, as git holds it (the first two before the ledger recorded
-# skills, the other two since).
+# skills, the others since).
 _LEGACY_ALL = (
     _FIXTURES / "legacy_diff_review_2962.md",
     _LEGACY,
     _FIXTURES / "legacy_diff_review_3126.md",
     _FIXTURES / "legacy_diff_review_3387.md",
+    _FIXTURES / "legacy_diff_review_3741.md",
 )
 
 
@@ -207,8 +208,8 @@ def test_a_symbolic_link_is_foreign(tmp_path: Path, newer: bytes) -> None:
 
 @pytest.mark.parametrize(
     ("fixture", "size"),
-    list(zip(_LEGACY_ALL, (2962, 3144, 3126, 3387), strict=True)),
-    ids=["2962", "3144", "3126", "3387"],
+    list(zip(_LEGACY_ALL, (2962, 3144, 3126, 3387, 3741), strict=True)),
+    ids=["2962", "3144", "3126", "3387", "3741"],
 )
 def test_a_hand_installed_earlier_version_is_replaced_and_recorded(
     tmp_path: Path, newer: bytes, fixture: Path, size: int
@@ -219,7 +220,7 @@ def test_a_hand_installed_earlier_version_is_replaced_and_recorded(
 
     MUTATION: drop the earlier-version hashes -> foreign -> left -> RED; drop only the 2,962-byte
     hash from LEGACY_SHA256 -> the 2962 case -> RED (1 failed: the file is left); the same for
-    each of the two texts shipped after the ledger recorded skills (3126, 3387) — a copy written
+    each of the texts shipped after the ledger recorded skills (3126, 3387, 3741) — a copy written
     where an earlier tmap did not record it is found by its text alone."""
     old = fixture.read_bytes()
     assert len(old) == size

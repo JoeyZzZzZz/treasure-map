@@ -12,10 +12,12 @@ read it), plus Claude Code's own directory and dsh's. A file there is in one of 
   * ``stale``    — tmap's (the ledger records it, and it still holds exactly the bytes tmap
     wrote), an earlier text; it is replaced — in every directory tmap manages, not only the ones
     the agents chosen in a run read.
-  * ``legacy``   — byte for byte a text an earlier tmap shipped and this one no longer does, the
-    ledger holding no record of it (installed by hand, or written where an earlier tmap did not
-    record); it is replaced — in every directory tmap manages, like ``stale`` (nothing is created
-    where it is missing) — and recorded from then on.
+  * ``legacy``   — byte for byte a text an earlier tmap shipped and this one no longer does, but
+    not the bytes the ledger records there (no record: installed by hand, or written where an
+    earlier tmap did not record; or a recorded copy overwritten since with another such text — a
+    copy still holding its recorded bytes is ``stale``, whatever its text); it is replaced — in
+    every directory tmap manages, like ``stale`` (nothing is created where it is missing) — and
+    recorded from then on.
   * ``foreign``  — anything else (a file the ledger never recorded, a recorded file changed since
     tmap wrote it, an edited copy of an old version, a symbolic link); it is NEVER modified. Even
     ``--force`` replaces only the file itself (a link at ``SKILL.md`` included), never what a
@@ -68,6 +70,7 @@ LEGACY_SHA256 = frozenset(
         "17e4d906c3e3d942a9d7e2480c8e3b42c8b41bf04ee1d7d0775aab980cf0d271",  # 3,144 bytes
         "ac9653260d39760ada0505833306d4bc15ca7e6a92733e98a2e777dea2ab03ef",  # 3,126 bytes
         "72a1c74391c1c878e694b31c5e6160107a7160cc37c342b2e41345fd41553b4e",  # 3,387 bytes
+        "81cb1c8a3f38f56e1db267cd05eefd0e4dc01fa90ff0b51d624555ff3b2c7055",  # 3,741 bytes
     }
 )
 
@@ -277,14 +280,18 @@ def classify(root: Path, ledger: Ledger, want: bytes, *, known: Iterable[Path]) 
         return status("invalid", f"unreadable: {exc}")
     if data == want:
         return status("aligned")
-    if sha256_of(data) in LEGACY_SHA256:
-        return status("legacy", "an earlier tmap's version, installed by hand")
     rec = ledger.committed(entry_id(path))
-    if rec is not None and rec.path == str(path):
-        # Only the very bytes tmap wrote are tmap's to replace: the same test uninstall applies
-        # before it deletes the file (``removable``).
-        if sha256_of(data) == rec.extra.get("sha256"):
-            return status("stale", "tmap's, from an earlier version")
+    recorded = rec is not None and rec.path == str(path)
+    # Only the very bytes tmap wrote are tmap's to replace: the same test uninstall applies before
+    # it deletes the file (``removable``). Read before the earlier texts, so a copy tmap recorded
+    # is said to be tmap's even when its text is one of them.
+    if recorded and rec is not None and sha256_of(data) == rec.extra.get("sha256"):
+        return status("stale", "tmap's, from an earlier version")
+    # An earlier tmap's text byte for byte is tmap's to replace, recorded or not (a recorded copy
+    # overwritten since with another earlier text too).
+    if sha256_of(data) in LEGACY_SHA256:
+        return status("legacy", "an earlier tmap's version")
+    if recorded:
         return status("foreign", "changed since tmap installed it")
     if not is_known(root, known):
         return status("foreign", "not in tmap's install ledger (a directory tmap does not manage)")

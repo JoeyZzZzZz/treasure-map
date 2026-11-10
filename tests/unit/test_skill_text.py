@@ -66,7 +66,7 @@ def _rules_commands() -> list[str]:
 
 def test_every_command_the_skill_rules_name_exists() -> None:
     """★ Each ``tmap ...`` command the skill's Rules give (``tmap review report <run_pair> --md
-    -o review.md``, ``tmap review <run_pair> --agent claude-code``) is parsed by the real click
+    -o review.md``, ``tmap review run <run_pair> --agent claude-code``) is parsed by the real click
     command tree: placeholders filled, ``--help`` appended so nothing runs. A renamed command or
     option makes click fail the parse (exit 2) before help is shown.
 
@@ -80,3 +80,62 @@ def test_every_command_the_skill_rules_name_exists() -> None:
         res = CliRunner().invoke(main, [*argv, "--help"])
         assert res.exit_code == 0, (cmd, res.output)
         assert "Usage:" in res.output, (cmd, res.output)
+
+
+def test_the_rules_name_exactly_the_driver_and_the_report() -> None:
+    """★ T-F2b: the Rules name two commands, the batch driver and the report (both checked by the
+    test above against the real command tree).
+
+    MUTATION (verified RED, 1 failed): write the driver's ``--agent`` as ``--agents`` -> the
+    command test above RED (exit 2)."""
+    assert _rules_commands() == [
+        "tmap review run <run_pair> --agent claude-code",
+        "tmap review report <run_pair> --md -o review.md",
+    ]
+
+
+def test_the_skill_says_a_pair_spans_sessions_and_how_one_hands_off() -> None:
+    """★ T-F2a: the description no longer promises the whole pair in one go; the Rules name the
+    batch driver (which probes the agent's tool set) before the loop's own rules, say where a
+    session stops and what its hand-off quotes, and what a shard's counts are; the unit_id and the
+    full-list rules are as they were.
+
+    MUTATION (verified RED, 1 failed): put back the old description -> RED. MUTATION (verified
+    RED, 1 failed): drop the shard sentence -> RED."""
+    text = skill_text()
+    head, rules = text[: text.index("## Rules")], text[text.index("## Rules") :]
+    assert "until the server reports the must-read set complete" not in head
+    assert "a whole run pair usually spans several sessions, or tmap's batch driver" in head
+    assert rules.index("`tmap review run <run_pair>") < rules.index("An unjudged member is UNREAD")
+    assert "it probes the agent's tool set first" in rules
+    flat = " ".join(rules.split())
+    assert "Stop only at a unit boundary" in flat
+    assert "An early stop is a hand-off" in flat
+    assert "name `progress.resume_with` as the call a fresh session continues with" in flat
+    assert "Never call the review complete unless `must_read_complete` is true" in flat
+    assert (
+        "Working a shard (`progress.scope` is `shard`), the counts `progress.pair_wide` names are "
+        "the whole pair's, not this shard's." in flat
+    )
+    assert (
+        "- Name the unit you judge (`unit_id`). A judgment written before its subject's material "
+        "was read\n  reads `needs_recheck` — not disposed — until you judge it again after "
+        "reading it.\n" in rules
+    )
+    assert (
+        "- The full unit list is not sent over MCP: `tmap review report <run_pair> --md -o "
+        "review.md`\n  writes it for a person to read.\n" in rules
+    )
+
+
+def test_the_pair_workflow_still_closes_with_both_sides() -> None:
+    """★ T-F2d: PAIR_WORKFLOW still ends with PAIR_SIDES (the module docstring says it closes it),
+    the several-sessions sentence before it.
+
+    MUTATION (verified RED, 1 failed): append the new sentence after PAIR_SIDES -> RED."""
+    from treasure_map.lib.query import diff_workflow as dw
+
+    assert dw.PAIR_WORKFLOW.endswith(dw.PAIR_SIDES)
+    new = "A pair larger than one session is reviewed in several"
+    assert new in dw.PAIR_WORKFLOW
+    assert dw.PAIR_WORKFLOW.index(new) < dw.PAIR_WORKFLOW.index(dw.PAIR_SIDES)

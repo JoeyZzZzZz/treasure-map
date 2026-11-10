@@ -138,6 +138,18 @@ def session_lines(log: tcl.ToolCallLog | None) -> list[dict[str, Any]] | None:
     return [ln for ln in lines if ln.get("session") == log.session.id]
 
 
+def session_tally(lines: list[dict[str, Any]] | None) -> dict[str, int] | None:
+    """What this session has been handed so far, from its log lines (``session_lines``; a call's
+    line is written once it has answered, so the answer being put together is not in them): the
+    distinct work units handed out with their material, and the bytes of every answer. None when
+    there is no log."""
+    if lines is None:
+        return None
+    units = {ln["unit"] for ln in lines if isinstance(ln.get("unit"), str)}
+    sent = sum(n for ln in lines if isinstance(n := ln.get("response_bytes"), int))
+    return {"units_handed": len(units), "response_bytes": sent}
+
+
 def _addrs(anchor_ref: str) -> set[str]:
     key = anchor_ref.split("#", 2)[-1]
     return {m.group(1).lower().lstrip("0") or "0" for m in _HEX.finditer(key.split("::", 1)[-1])}

@@ -3290,6 +3290,9 @@ def make_tools(
             nxt = review.next_unit(worker, workers, session=_session_id(), sweep=sweeping)
             out["workflow"] = _PAIR_WORKFLOW
             out["full_list"] = f"tmap review report {run_pair} --md -o <file>.md"
+            # Before the stop and before the room is measured: the stop says it too, and the
+            # material is fitted beside it.
+            out["progress"] = _progress(review, run_pair, worker, workers, kk, sweeping)
             if nxt is None:
                 out["next_unit"] = None
                 out["coverage_offer"] = _coverage_offer(review, worker, workers, sweeping)
@@ -5883,6 +5886,8 @@ def make_tools(
             extra["sweep"] = {"on": True, "inferred": True}
         elif why is not None:
             extra["sweep"] = {"on": False, "why": why}
+        # Before ``used`` is counted: the material is fitted beside it, and the stop says it too.
+        extra["progress"] = _progress(review, pair, worker, workers, k, sweeping)
         used += len(json.dumps(extra))
         nxt = review.next_unit(worker, workers, session=_session_id(), sweep=sweeping)
         if nxt is None:
@@ -5931,6 +5936,28 @@ def make_tools(
                 continue
             return params.get("sweep") is True, None
         return False, None
+
+    def _progress(
+        review: Any, pair: str, worker: Any, workers: Any, k: int, sweeping: bool
+    ) -> dict[str, Any]:
+        """The ``progress`` block of a hand-out answer (review_units.progress_block): this
+        session's tally from its log, and the call a fresh session continues with — the same
+        reading (k, shard, sweep) this one is on."""
+        from treasure_map.lib.query import read_basis as _rb
+
+        call = f"start_diff_review(run_pair={json.dumps(pair)}"
+        if k != _ru.DEFAULT_K:
+            call += f", k={k}"
+        if workers is not None:
+            call += f", worker={worker}, workers={workers}"
+        if sweeping:
+            call += ", sweep=true"
+        return _ru.progress_block(
+            review.report,
+            sharded=workers is not None,
+            this_session=_rb.session_tally(_rb.session_lines(call_log)),
+            resume_with=call + ")",
+        )
 
     def _coverage_offer(review: Any, worker: Any, workers: Any, sweeping: bool) -> dict[str, Any]:
         """The review's coverage at its stop (review_units.coverage_offer), with this session's

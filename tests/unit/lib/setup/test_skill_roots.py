@@ -29,11 +29,12 @@ from .test_skills import _doctor, _init, _ledger, _uninstall
 _FIXTURES = Path(__file__).parents[3] / "fixtures" / "skills"
 _V3126 = _FIXTURES / "legacy_diff_review_3126.md"
 _V3387 = _FIXTURES / "legacy_diff_review_3387.md"
+_V3741 = _FIXTURES / "legacy_diff_review_3741.md"
 _SRC = Path(__file__).parents[4] / "src"
 
 # The text this tmap ships. Changing it means adding this value to LEGACY_SHA256 and the new one
 # here.
-SHIPPED_SHA256 = "81cb1c8a3f38f56e1db267cd05eefd0e4dc01fa90ff0b51d624555ff3b2c7055"
+SHIPPED_SHA256 = "d0e126bdab7520511c1db4827c5f51b03d22c0b8749caacf1b193bc9d76de496"
 
 
 @pytest.fixture()
@@ -593,7 +594,7 @@ def test_a_directory_reached_through_a_link_stays_the_recorded_one(
 # ── every earlier shipped text ───────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("fixture", [_V3387, _V3126], ids=["3387", "3126"])
+@pytest.mark.parametrize("fixture", [_V3741, _V3387, _V3126], ids=["3741", "3387", "3126"])
 def test_a_text_shipped_since_the_ledger_is_replaced_without_a_record(
     tmp_path: Path, newer: bytes, fixture: Path
 ) -> None:
@@ -616,7 +617,7 @@ def test_the_shipped_text_is_pinned_and_not_an_earlier_one() -> None:
     now = hashlib.sha256(sk.shipped_bytes()).hexdigest()
     assert now == SHIPPED_SHA256
     assert now not in sk.LEGACY_SHA256
-    assert len(sk.LEGACY_SHA256) == 4
+    assert len(sk.LEGACY_SHA256) == 5
 
 
 def test_one_byte_changed_in_an_earlier_text_is_foreign(tmp_path: Path, newer: bytes) -> None:
@@ -630,3 +631,118 @@ def test_one_byte_changed_in_an_earlier_text_is_foreign(tmp_path: Path, newer: b
     result = _init(home, ("codex",))
     assert path.read_bytes() == bytes(edited)
     assert any(str(path) in n and "--force" in n for n in result.needs_you)
+
+
+# ── a recorded copy is read before the earlier texts ──────────────────────────────────────────
+
+
+def _recorded_copy(home: Path, data: bytes, recorded: bytes) -> Path:
+    """``data`` at the Claude Code skill path, the ledger recording ``recorded`` there."""
+    path = sk.skill_path(sk.claude_root(home, {}))
+    path.parent.mkdir(parents=True)
+    path.write_bytes(data)
+    _record(_ledger(home), path, recorded, root=str(path.parents[1]))
+    return path
+
+
+def _classify(home: Path, want: bytes) -> sk.SkillStatus:
+    return sk.classify(sk.claude_root(home, {}), _ledger(home), want, known=[])
+
+
+def test_a_recorded_copy_of_an_earlier_text_is_tmaps(tmp_path: Path, newer: bytes) -> None:
+    """★ T-F4a: the text tmap shipped until now, written by tmap (the ledger records those very
+    bytes), is ``stale`` — tmap's, from an earlier version — though that text is now also one of
+    LEGACY_SHA256's; replaced all the same.
+
+    MUTATION (verified RED, 1 failed): read LEGACY_SHA256 before the ledger -> legacy -> RED."""
+    home = tmp_path / "h"
+    old = _V3741.read_bytes()
+    assert sk.sha256_of(old) in sk.LEGACY_SHA256  # the precondition
+    path = _recorded_copy(home, old, old)
+    st = _classify(home, newer)
+    assert (st.state, st.detail) == ("stale", "tmap's, from an earlier version")
+    _init(home, ("claude-code",))
+    assert path.read_bytes() == newer
+
+
+def test_a_recorded_copy_overwritten_with_an_earlier_text_is_still_replaced(
+    tmp_path: Path, newer: bytes
+) -> None:
+    """★ T-F4b: the ledger records other bytes there, but the file is byte for byte an earlier
+    tmap's text: ``legacy`` (tmap's text, so tmap's to replace), not ``foreign``.
+
+    MUTATION (verified RED, 1 failed): read the whole ledger block (both of its answers) before
+    LEGACY_SHA256 -> foreign -> left -> RED."""
+    home = tmp_path / "h"
+    path = _recorded_copy(home, _V3387.read_bytes(), b"another text tmap wrote\n")
+    st = _classify(home, newer)
+    assert (st.state, st.detail) == ("legacy", "an earlier tmap's version")
+    _init(home, ("claude-code",))
+    assert path.read_bytes() == newer
+
+
+def test_a_recorded_copy_changed_into_no_tmap_text_is_left(tmp_path: Path, newer: bytes) -> None:
+    """★ T-F4c: the ledger records other bytes there and the file is no text tmap shipped:
+    ``foreign`` (changed since tmap installed it), never modified.
+
+    MUTATION (verified RED, 1 failed): drop the recorded-but-changed answer after LEGACY_SHA256 ->
+    "not in tmap's install ledger" -> RED."""
+    home = tmp_path / "h"
+    edited = b"a person's own edit\n"
+    path = _recorded_copy(home, edited, b"another text tmap wrote\n")
+    st = _classify(home, newer)
+    assert (st.state, st.detail) == ("foreign", "changed since tmap installed it")
+    _init(home, ("claude-code",))
+    assert path.read_bytes() == edited
+
+
+# What tmap init and the doctor do with each kind of file at the skill path: the same before and
+# after T-F4 moved the recorded copy ahead of the earlier texts (checked against d3eb840).
+_CASES: dict[str, tuple[bool, str]] = {
+    "missing": (True, "info"),
+    "aligned": (False, "ok"),
+    "recorded": (True, "warn"),
+    "recorded_earlier_text": (True, "warn"),
+    "earlier_text": (True, "warn"),
+    "recorded_overwritten_earlier": (True, "warn"),
+    "recorded_changed": (False, "warn"),
+    "unrecorded": (False, "warn"),
+    "invalid": (False, "wrong"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_CASES))
+def test_what_is_replaced_is_the_same_in_every_state(
+    tmp_path: Path, newer: bytes, case: str
+) -> None:
+    """★ T-F4d: over every state classify gives (and both ways a file can be ``legacy`` or
+    ``stale``), whether init replaces the file and what the doctor reports are unchanged — only
+    the wording of one state moved. The table was read from d3eb840 by the same test body."""
+    home = tmp_path / "h"
+    path = sk.skill_path(sk.claude_root(home, {}))
+    earlier = _V3387.read_bytes()
+    other = b"another text tmap wrote\n"
+    if case == "aligned":
+        _recorded_copy(home, newer, newer)
+    elif case == "recorded":
+        _recorded_copy(home, other, other)
+    elif case == "recorded_earlier_text":
+        _recorded_copy(home, earlier, earlier)
+    elif case == "earlier_text":
+        path.parent.mkdir(parents=True)
+        path.write_bytes(earlier)
+    elif case == "recorded_overwritten_earlier":
+        _recorded_copy(home, earlier, other)
+    elif case == "recorded_changed":
+        _recorded_copy(home, b"a person's own edit\n", other)
+    elif case == "unrecorded":
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"a person's own skill\n")
+    elif case == "invalid":
+        path.mkdir(parents=True)
+    before = path.read_bytes() if path.is_file() else None
+    level = _doctor(home)["skill.claude"][0]
+    _init(home, ("claude-code",))
+    after = path.read_bytes() if path.is_file() else None
+    replaced = after == newer and before != newer
+    assert (replaced, level) == _CASES[case], (replaced, level)

@@ -1,6 +1,6 @@
 ---
 name: tmap-diff-review
-description: Review every change between two firmware versions with the tmap MCP server, unit by unit, until the server reports the must-read set complete. Use when asked to review, triage or audit a version diff (a run pair) with tmap.
+description: Review every change between two firmware versions with the tmap MCP server, unit by unit; a whole run pair usually spans several sessions, or tmap's batch driver. Use when asked to review, triage or audit a version diff (a run pair) with tmap.
 ---
 
 # Reviewing a version diff with tmap
@@ -14,8 +14,20 @@ produces no payload: every judgment is yours.
 
 ## Rules
 
-- An unjudged member is UNREAD, which is not "nothing found". Do not stop after a few units and
-  summarise: the report shows what was skipped.
+- A whole run pair is usually larger than one agent context. For full coverage a person runs
+  `tmap review run <run_pair> --agent claude-code` (it probes the agent's tool set first, then
+  one fresh agent run per unit; `--until complete` for the second tier too). Working here, you
+  review one slice of the pair.
+- An unjudged member is UNREAD, which is not "nothing found".
+- Stop only at a unit boundary (every member of the unit in hand judged): when `next_unit` is
+  null, or when your context nears its limit (`progress.this_session` counts what this session
+  has read). An early stop is a hand-off: from your last answer, quote
+  `progress.coverage_statement`, `progress.must_read_left`, `progress.reduce_owed`,
+  `progress.must_read_complete` and, when it is false with nothing left, `progress.still_open`;
+  say the review is not complete, and name `progress.resume_with` as the call a fresh session
+  continues with. Never call the review complete unless `must_read_complete` is true. Working a
+  shard (`progress.scope` is `shard`), the counts `progress.pair_wide` names are the whole
+  pair's, not this shard's.
 - Name the unit you judge (`unit_id`). A judgment written before its subject's material was read
   reads `needs_recheck` — not disposed — until you judge it again after reading it.
 - Do not judge from the summary alone. Read both sides of the code the material gives (or fetch
@@ -29,8 +41,5 @@ produces no payload: every judgment is yours.
 - With several workers, give each its own `worker` / `workers` pair so no two judge the same unit.
 - The full unit list is not sent over MCP: `tmap review report <run_pair> --md -o review.md`
   writes it for a person to read.
-- To have tmap drive the review instead (one fresh agent run per unit, coverage guaranteed):
-  `tmap review <run_pair> --agent claude-code` — it probes the agent's tool set first, and hands
-  out the must-read units (`--until complete` for the second tier too).
 
 Full rules: `get_tool_reference(name="guide")`.

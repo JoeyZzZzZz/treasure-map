@@ -50,5 +50,7 @@ PAIR_WORKFLOW = (
     "UNREAD, which is not 'nothing found'; a judgment written before its subject's material was "
     "read reads needs_recheck (not disposed) until judged again after reading. Once the review "
     "is done, get_diff_handoff(run_pair) pages a standardized hand-off of the changed_real "
-    "findings. " + PAIR_SIDES
+    "findings. A pair larger than one session is reviewed in several: a fresh session's "
+    "start_diff_review(run_pair) continues with the next unit not yet disposed (progress counts "
+    "what is left). " + PAIR_SIDES
 )

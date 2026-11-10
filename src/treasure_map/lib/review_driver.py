@@ -239,6 +239,57 @@ class Launch:
     seconds: float
     timed_out: bool
     output: str = ""
+    # The JSON value the whole output ends with (final_json), read before a per-unit launch's
+    # output is cut to its tail; None when it ends in none.
+    final: Any = None
+
+
+def final_json(output: str) -> Any:
+    """The JSON value ``output`` ends with: the shortest suffix starting at a line's start that
+    parses whole, read back line by line from the end — so lines printed before it (a warning on
+    stderr, merged into the output) are skipped and a JSON object printed over several lines is
+    read whole. None when no such suffix parses."""
+    lines = output.splitlines(keepends=True)
+    for i in range(len(lines) - 1, -1, -1):
+        if not lines[i].strip():
+            continue
+        try:
+            return json.loads("".join(lines[i:]))
+        except ValueError:
+            continue
+    return None
+
+
+# The presets whose launch output is read for the agent's usage (claude-code's
+# ``--output-format json`` result).
+USAGE_PRESETS = frozenset({"claude-code"})
+
+
+def agent_usage(preset: Preset, launch: Launch) -> tuple[dict[str, Any] | None, str | None]:
+    """What one launch used, as its agent reported it — ``(usage, None)``, or ``(None, why)`` when
+    it cannot be read. A record only: whether the unit was done is read from the overlay, never
+    from this."""
+    if preset.name not in USAGE_PRESETS:
+        return None, "not read for this preset"
+    if launch.timed_out:
+        return None, "the launch hit its deadline; its output is not kept"
+    data = launch.final
+    if not isinstance(data, dict):
+        return None, "the launch's output does not end in a JSON object"
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
+    if usage is None and "total_cost_usd" not in data:
+        return None, "the launch's JSON carries no usage"
+    usage = usage or {}
+    models = data.get("modelUsage")
+    return {
+        "cost_usd": data.get("total_cost_usd"),
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+        "turns": data.get("num_turns"),
+        # One launch may use more than one model.
+        "model": sorted(models) if isinstance(models, dict) else None,
+    }, None
 
 
 def run_agent(argv: Sequence[str], *, cwd: Path, timeout: float, keep_full: bool = False) -> Launch:
@@ -253,6 +304,9 @@ def run_agent(argv: Sequence[str], *, cwd: Path, timeout: float, keep_full: bool
         list(argv),
         cwd=cwd,
         env=env,
+        # Nothing to read: an agent waiting on an inherited stdin that is not a terminal (claude
+        # -p waits 3 s, then warns on stderr) reads end of input at once.
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -261,7 +315,11 @@ def run_agent(argv: Sequence[str], *, cwd: Path, timeout: float, keep_full: bool
     try:
         out, _ = proc.communicate(timeout=timeout)
         return Launch(
-            proc.returncode, time.monotonic() - t0, False, out if keep_full else out[-4000:]
+            proc.returncode,
+            time.monotonic() - t0,
+            False,
+            out if keep_full else out[-4000:],
+            final=final_json(out),
         )
     except subprocess.TimeoutExpired:
         try:
@@ -513,6 +571,7 @@ def drive(
                 atlas.close()
             now = _disposed_count(review, nxt)
             done = now == len(nxt.members)
+            usage, no_usage = agent_usage(preset, launch)
             _log(
                 log_path,
                 {
@@ -527,6 +586,8 @@ def drive(
                     "members_disposed": now,
                     "members": len(nxt.members),
                     "success": done,
+                    "agent_usage": usage,
+                    **({"agent_usage_unavailable": no_usage} if usage is None else {}),
                 },
             )
             echo(
@@ -690,10 +751,9 @@ def extract_handoff(
         )
     if launch.exit != 0:
         return None, f"the hand-off launch exited {launch.exit}"
-    try:
-        data = json.loads(launch.output)
-    except (TypeError, ValueError) as exc:
-        return None, f"the launch did not print the expected JSON result ({exc})"
+    data = final_json(launch.output)
+    if data is None:
+        return None, "the launch did not print the expected JSON result (its output ends in none)"
     if not isinstance(data, dict):
         return None, "the launch's JSON is not an object"
     if data.get("is_error") is not False:
@@ -720,10 +780,7 @@ def agent_result_path(out_file: Path) -> Path:
 
 def _launch_result(launch: Launch) -> str | None:
     """The agent's final message (claude-code's ``result``) in a launch's output, or None."""
-    try:
-        data = json.loads(launch.output)
-    except (TypeError, ValueError):
-        return None
+    data = final_json(launch.output)
     result = data.get("result") if isinstance(data, dict) else None
     return result if isinstance(result, str) and result.strip() else None
 
