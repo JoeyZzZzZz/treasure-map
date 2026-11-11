@@ -28,8 +28,10 @@ produces no payload: every judgment is yours.
   continues with. Never call the review complete unless `must_read_complete` is true. Working a
   shard (`progress.scope` is `shard`), the counts `progress.pair_wide` names are the whole
   pair's, not this shard's.
-- Name the unit you judge (`unit_id`). A judgment written before its subject's material was read
-  reads `needs_recheck` — not disposed — until you judge it again after reading it.
+- Name the unit you judge (`unit_id`). A judgment written before its subject was read reads
+  `needs_recheck` — not disposed — until you judge it again after reading it. A `no_real_change`
+  or `change_inconclusive` on a must-read subject needs it read whole (every candidate row; code
+  held back, read in full); a `changed_real` read in part still counts.
 - Do not judge from the summary alone. Read both sides of the code the material gives (or fetch
   it) before a verdict.
 - `must_read_complete` is the bar for "the must-read part is done"; `complete` also needs every

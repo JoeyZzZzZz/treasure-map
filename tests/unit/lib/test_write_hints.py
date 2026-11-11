@@ -530,9 +530,13 @@ def test_the_two_direction_wording_is_tmaps_own_and_judges_nothing(world: World)
             if key in got:
                 texts += [key, json.dumps(got[key])]
     texts.append(wh.other_direction(DIFF, None, "x")["other_direction_unavailable"])
-    header = rr.handoff_header(PAIR, 1)
-    assert dw.PAIR_SIDES in header and dw.PAIR_SIDES in dw.PAIR_WORKFLOW
-    texts += [header.replace(rr.HANDOFF_BOUNDARY, "")]
+    rep = rr.handoff_report(world.atlas, PAIR)
+    # Both forms of the header: the official one and the partial one (the must-read set not done).
+    for done in (True, False):
+        header = rr.handoff_header(PAIR, 1, {**rep, "must_read_complete": done})
+        assert dw.PAIR_SIDES in header and dw.PAIR_SIDES in dw.PAIR_WORKFLOW
+        assert ("PARTIAL" in header) is (not done)
+        texts += [header.replace(rr.HANDOFF_BOUNDARY, "")]
     hits = [m.group(0) for t in texts for m in _JUDGEMENT_WORDS.finditer(t.replace("_", " "))]
     assert hits == [], hits
     assert any("other_direction" in t for t in texts)  # the scan read the fields

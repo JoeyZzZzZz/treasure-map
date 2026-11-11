@@ -30,17 +30,18 @@ anchor), handed out per binary in batches. Such a member is disposed only when i
 whatever verdict, cites every candidate of its subject (``presence_citations_short``). Every
 candidate row of a must-read entry is read with it: its unit's material carries up to a page of
 its rows (an entry alone, or each entry of a batch or group), the rest read on by entry_id and
-rows_offset; a member whose rows were not all delivered is not read whole by the material, and a
-judgement written having read only part of them is counted under ``basis_incomplete`` — as is one
-written having read the subject itself only in part by a tool that pages it (a function's
-pseudocode, disassembly or callees, a file's line difference: ``read_partial``). The listed
-entries
-outside the set are the second tier, cut into batches per diff and bucket. By default only the
-must-read units are handed out (with the reduce, and the audits as they are): the review stops when
-no must-read unit is left, and the report says how much of the second tier is unread
-(``coverage_offer``) — it is not read as "nothing found". The second tier is handed out on request
-(``sweep``, the command line's ``--until complete``), only after every must-read unit, in the same
-order (``dispatch_order``); asking for it moves no entry into or out of either part.
+rows_offset; a member whose rows were not all delivered is not read whole by the material. A
+no_real_change / change_inconclusive on a must-read subject written having read only part of them,
+or the subject itself only in part by a tool that pages it (a function's pseudocode, disassembly
+or callees, a file's line difference: ``read_partial``), reads needs_recheck (judged unread, not
+disposed) until judged again after reading it whole; a changed_real read in part still counts,
+under ``basis_incomplete`` (as does a judgement read in part on a subject not must-read). The
+listed entries outside the set are the second tier, cut into batches per diff and bucket. By
+default only the must-read units are handed out (with the reduce, and the audits as they are):
+the review stops when no must-read unit is left, and the report says how much of the second tier
+is unread (``coverage_offer``) — it is not read as "nothing found". The second tier is handed out
+on request (``sweep``, the command line's ``--until complete``), only after every must-read unit,
+in the same order (``dispatch_order``); asking for it moves no entry into or out of either part.
 
 Order (dispatch): the must-read units first, then (on request) the second tier; within each, round
 robin by position. Each diff is a stream of its entries in the significance order its facts give:
@@ -148,6 +149,33 @@ BLIND_AUDIT_ENABLED = False
 # The writes a person makes: never audited, and what settles a disagreement.
 HUMAN = "human"
 DISPOSED_STATES = frozenset({OPEN, CONCLUDED})
+# The verdicts that lean towards "nothing here": on a must-read subject one counts as disposed only
+# when written after the subject was read WHOLE (all its candidate rows, all of its code). A
+# changed_real read in part still counts (the reversible direction). Read by the write
+# (mcp_app._write_plan) and by read_audits alike.
+GATED_VERDICTS = ("no_real_change", "change_inconclusive")
+# The verdicts a report counts, in the order it states them.
+VERDICTS = ("changed_real", "no_real_change", "change_inconclusive")
+
+
+def read_short(read_basis: dict[str, Any]) -> bool:
+    """Whether a write's read basis read its subject only in part: part of its candidate rows
+    (``rows_partial``) or part of its code (``read_partial``)."""
+    return bool(read_basis.get("rows_partial")) or read_basis.get("read_partial") is not None
+
+
+def gated_short(verdict: Any, read_basis: dict[str, Any]) -> bool:
+    """Whether a write is a no_real_change / change_inconclusive written having read its subject
+    only in part (``read_short``)."""
+    return verdict in GATED_VERDICTS and read_short(read_basis)
+
+
+def held_unread(verdict: Any, read_basis: dict[str, Any]) -> bool:
+    """Whether a write, were its subject must-read, is judged unread: written before anything of
+    the subject was read (basis ``none``, any verdict), or a ``gated_short`` write."""
+    return read_basis.get("basis") == "none" or gated_short(verdict, read_basis)
+
+
 PRESENCE_STREAM, FILE_STREAM, REDUCE_STREAM = "binary_presence", "non_binary_file", "reduce"
 # The reduce unit is handed out after every other unit.
 _REDUCE_POSITION = 1 << 30
@@ -760,15 +788,22 @@ class Audits:
     open: list[Audit] = field(default_factory=list)
     disagreements: list[dict[str, Any]] = field(default_factory=list)
     # Subjects judged unread: a write flagged ``unread_before_verdict`` not followed by a write
-    # whose basis is other than ``none``, or a latest write with basis ``none`` on a subject the
+    # that read the subject (basis other than ``none``; whole, for a no_real_change /
+    # change_inconclusive: ``gated_short``), or a latest write ``held_unread`` on a subject the
     # report's own k makes must-read. Always computed, independent of ``BLIND_AUDIT_ENABLED``; the
     # caller sets each to NEEDS_RECHECK (not disposed).
     needs_recheck: list[str] = field(default_factory=list)
+    # Of ``needs_recheck``: those whose latest write read something of the subject (basis not
+    # ``none``) — a no_real_change / change_inconclusive written having read it only in part.
+    read_in_part: set[str] = field(default_factory=set)
     # Subjects whose current judgement reads disposed although its latest write read nothing of the
     # subject whole (basis ``none``: a member its unit's material did not show whole, or a material
-    # cut and not read on) — not must-read at the report's k, so not judged unread — or read it with
-    # only part of its candidate rows (``rows_partial``, at any k). Counted apart.
+    # cut and not read on), or read it in part (``rows_partial`` / ``read_partial``) — a
+    # changed_real (never held back), or a subject not must-read at the report's k, so not judged
+    # unread. Counted apart.
     basis_incomplete: list[str] = field(default_factory=list)
+    # Every current diff_subject judgement of the pair: anchor_ref -> its verdict.
+    verdicts: dict[str, str] = field(default_factory=dict)
 
 
 def _json(raw: Any) -> dict[str, Any]:
@@ -788,12 +823,16 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
       auditing is sealed. An audit closes when a blind shadow judgement follows the write (one whose
       session neither wrote it nor made any call off the blind-read whitelist first:
       ``non_blind`` is not counted).
-    * ``needs_recheck`` (ALWAYS on) — a subject judged before anything of it was read. Walking its
-      writes in order, one flagged ``unread_before_verdict`` sets it and only a newer write whose
-      read basis is not ``none`` clears it (a basis-``none`` write that carries no flag — not
-      must-read at its writer's k — changes nothing); and a subject whose latest write has basis
-      ``none`` is set too when it is must-read at ``units``' own k, whatever k its writer worked
-      at. The caller marks it NEEDS_RECHECK; it does not open a blind audit.
+    * ``needs_recheck`` (ALWAYS on) — a subject judged before it was read: anything of it (any
+      verdict), or all of it (a no_real_change / change_inconclusive on a must-read subject).
+      Walking its writes in order, one flagged ``unread_before_verdict`` sets it and only a newer
+      write that read the subject clears it — one whose read basis is not ``none`` and, for a
+      no_real_change / change_inconclusive, not ``gated_short`` (a changed_real read in part
+      clears it); a write that is neither flagged nor clears — not must-read at its writer's k —
+      changes nothing. A subject whose latest write is ``held_unread`` is set too when it is
+      must-read at ``units``' own k, whatever k its writer worked at. Those whose latest write
+      read something are also in ``read_in_part``. The caller marks it NEEDS_RECHECK; it does not
+      open a blind audit. A write recorded with no read basis (an older one) never sets it.
     * ``disagreements`` (ALWAYS on) — a blind shadow that reads otherwise than the current judgement
       (from history, even once the gate is off), or a judgement overwritten by another session with
       another verdict; a person's write settles it."""
@@ -823,7 +862,7 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
                 "session": row[7],
             }
         )
-    out = Audits()
+    out = Audits(verdicts={a: str(r["verdict"]) for a, r in current.items()})
     index = {u.stream: u.stream_index for u in units}
     # The must-read set at the k these units were cut for (the report's k).
     must_now = {
@@ -881,21 +920,25 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
                     )
             # Always on, independent of the gate: a subject judged unread is re-read
             # (NEEDS_RECHECK), not audited blind. A flagged write sets it; only a newer write that
-            # read something (basis not ``none``) clears it. A latest basis-``none`` write on a
-            # subject must-read at this k sets it too (its writer may have worked at a smaller k).
+            # read the subject clears it — basis not ``none`` and, for a no_real_change /
+            # change_inconclusive, read whole (a ``gated_short`` write neither sets nor clears). A
+            # latest ``held_unread`` write on a subject must-read at this k sets it too (its writer
+            # may have worked at a smaller k).
             flagged = False
             for h in writes:
                 hb = h["read_basis"]
                 if hb.get("unread_before_verdict"):
                     flagged = True
-                elif hb.get("basis") != "none":
+                elif hb.get("basis") != "none" and not gated_short(h["after"].get("verdict"), hb):
                     flagged = False
             if flagged or (
                 last is not None
-                and last["read_basis"].get("basis") == "none"
+                and held_unread(last["after"].get("verdict"), last["read_basis"])
                 and m.anchor_ref in must_now
             ):
                 out.needs_recheck.append(m.anchor_ref)
+                if last is not None and last["read_basis"].get("basis") != "none":
+                    out.read_in_part.add(m.anchor_ref)
             elif last is not None and (
                 last["read_basis"].get("basis") == "none"
                 or last["read_basis"].get("rows_partial")
@@ -1076,8 +1119,16 @@ PROGRESS_PAIR_WIDE_KEYS = (
     "must_read_complete",
     "coverage_statement",
     "still_open",
+    "dispositions",
 )
 NO_SESSION_LOG = "no tool-call log for this session"
+# Said beside a hand-out while the must-read set is not done (``drive_with`` names the command):
+# a statement of what exists, never a refusal.
+IF_THIS_CONTEXT_FILLS = (
+    "A must-read set too large for one context is judged unit by unit, each in a process of its "
+    "own: {drive_with} (preset: claude-code; experimental, probe first: codex, cursor; any other "
+    "agent: a command template holding {{prompt}}). It writes through the same tools and checks."
+)
 
 
 def progress_block(
@@ -1086,12 +1137,15 @@ def progress_block(
     sharded: bool,
     this_session: dict[str, int] | None,
     resume_with: str,
+    drive_with: str | None = None,
 ) -> dict[str, Any]:
     """Where a pair's review stands, beside every unit handed out and every stop (facts only: no
     threshold, no prediction of when to stop): what this session was handed before this answer,
     the must-read units and members not yet disposed, the reduce still owed, ``must_read_complete``
-    and — the rest of what keeps it false — ``still_open``, the coverage statement, and the call a
-    fresh session continues with. Every count is read off the report ``rep`` as it is; the ones
+    and — the rest of what keeps it false — ``still_open``, what the disposed subjects were judged
+    (``dispositions``), the coverage statement, and the call a fresh session continues with; while
+    the must-read set is not done, ``drive_with`` (the batch driver's command) is said in
+    ``if_this_context_fills``. Every count is read off the report ``rep`` as it is; the ones
     ``pair_wide`` names are the whole pair's, also in a shard (``scope``)."""
     mr = rep["must_read"]
     nr = rep["not_reachable"]
@@ -1113,12 +1167,15 @@ def progress_block(
                 "disagreements": rep["disagreements"]["count"],
                 "judged_unread": rep["judged_unread"]["count"],
             },
+            "dispositions": rep["verdicts"]["disposed"],
             "coverage_statement": rep["coverage_statement"],
             "scope": "shard" if sharded else "pair",
             "pair_wide": list(PROGRESS_PAIR_WIDE_KEYS),
             "resume_with": resume_with,
         }
     )
+    if drive_with and not rep["must_read_complete"]:
+        out["if_this_context_fills"] = IF_THIS_CONTEXT_FILLS.format(drive_with=drive_with)
     return out
 
 
@@ -1188,18 +1245,26 @@ def report(
     # disagreement counts are always real.
     audits_off = not BLIND_AUDIT_ENABLED
     open_text = "off" if audits_off else str(len(audits.open))
+    in_part = len(audits.read_in_part & set(audits.needs_recheck))
     judged_unread = {
         "count": len(audits.needs_recheck),
         "subjects": sorted(audits.needs_recheck)[:DISAGREEMENTS_SHOWN],
-        "why": "judged before anything of the subject was read",
-        "cleared_by": "a later judgement written after reading the subject",
+        "by_cause": {"unread": len(audits.needs_recheck) - in_part, "read_in_part": in_part},
+        "why": (
+            "judged before the subject was read — anything of it (any verdict), or all of it "
+            "(no_real_change / change_inconclusive on a must-read subject)"
+        ),
+        "cleared_by": (
+            "a later judgement written after reading the subject (whole, for no_real_change / "
+            "change_inconclusive)"
+        ),
     }
     basis_incomplete = {
         "count": len(audits.basis_incomplete),
         "subjects": sorted(audits.basis_incomplete)[:DISAGREEMENTS_SHOWN],
         "why": (
-            "disposed, but written before the subject was read whole: its unit's material did not "
-            "show it whole (not listed, or a part withheld or cut) and it was not read on"
+            "disposed though its latest write read the subject in part or not at all: a "
+            "changed_real read in part (not held back), or a subject not must-read at this k"
         ),
         "cleared_by": "a later judgement written after reading the subject in full",
     }
@@ -1209,16 +1274,31 @@ def report(
         "the pairing or the subject moved); they stay needs_recheck and no unit hands them out"
     )
     not_listed = dr.judged_not_listed(progress.unlisted)
+    # What the disposed subjects were judged, and every judgement the pair records: counts only.
+    disposed_by: dict[str, int] = {**dict.fromkeys(VERDICTS, 0), "without_verdict": 0}
+    counted: set[str] = set()
+    for m in all_members:
+        if m.anchor_ref in counted or not disposed(states.get(m.anchor_ref)):
+            continue
+        counted.add(m.anchor_ref)
+        v = audits.verdicts.get(m.anchor_ref)
+        disposed_by[v if v in VERDICTS else "without_verdict"] += 1
+    recorded = {v: sum(1 for x in audits.verdicts.values() if x == v) for v in VERDICTS}
     statement = (
         f"must-read {len(must_members)} / disposed {must_done}; "
         f"all subjects {len(all_members)} / disposed {all_done}; "
-        f"open audits {open_text}; judged unread {judged_unread['count']}; "
+        f"open audits {open_text}; judged unread {judged_unread['count']} "
+        f"(read in part {in_part}); "
         f"disagreements {len(audits.disagreements)}; "
         f"{'reduce done' if not reduce_owed else f'reduce owed {len(reduce_owed)}'}; "
         f"presence citations short {len(presence_short)}; "
         f"basis incomplete {basis_incomplete['count']}; "
         f"dangling {dangling['count']} (changed_real {dangling['changed_real']['count']}); "
         f"not listed {not_listed['count']}; "
+        f"verdicts disposed {disposed_by['changed_real']}/{disposed_by['no_real_change']}/"
+        f"{disposed_by['change_inconclusive']}, recorded {recorded['changed_real']}/"
+        f"{recorded['no_real_change']}/{recorded['change_inconclusive']} "
+        "(changed_real/no_real_change/inconclusive); "
         f"predicate {PREDICATE_VERSION} (k={k}); server {server}"
     )
     group_units = [u for u in units if u.kind == GROUP]
@@ -1287,6 +1367,9 @@ def report(
         # Apart from the dangling ones: the subject resolves but is no longer listed.
         "judged_not_listed": not_listed,
         "basis_incomplete": basis_incomplete,
+        # Counts only, never a ranking: the disposed subjects by their current verdict (each
+        # subject once), and every current judgement of the pair.
+        "verdicts": {"disposed": disposed_by, "recorded": recorded},
     }
 
 

@@ -1562,7 +1562,7 @@ def test_the_coverage_statement_counts_the_subjects_judged_unread(world: World) 
     MUTATION (verified RED, 1 failed): print len(audits.open) there instead -> RED."""
     world.judge(DX, A1, "changed_real", ctx=UNREAD)
     st = _review(world, k=0).report["coverage_statement"]
-    assert "judged unread 1;" in st, st
+    assert "judged unread 1 (read in part 0);" in st, st
 
 
 def _walk_pair(server: Any, k: int | None, batch: bool = False) -> dict[str, Any]:
@@ -2135,7 +2135,7 @@ def test_the_reports_judged_unread_is_the_coverage_statements_number(world: Worl
 
     world.judge(DX, A1, "changed_real", ctx=UNREAD)
     rep = _review(world, k=0).report
-    said = re.search(r"judged unread (\d+);", rep["coverage_statement"])
+    said = re.search(r"judged unread (\d+) \(read in part \d+\);", rep["coverage_statement"])
     assert said is not None, rep["coverage_statement"]
     assert rep["judged_unread"]["count"] == int(said.group(1)) == 1
     assert A1 in rep["judged_unread"]["subjects"]
@@ -2334,10 +2334,59 @@ def test_a_full_batch_write_answer_keeps_to_the_budget_and_names_the_unread(
         assert b.get("written") is True, b
         assert len(json.dumps(b)) <= mcp_app._RESPONSE_BYTE_BUDGET, (label, len(json.dumps(b)))
         assert b["needs_recheck_indexes"] == unread, label
-        assert b["needs_recheck_means"] == mcp_app._JUDGED_UNREAD
+        # A changed_real is read unread only when nothing of it was read: the one cause there is.
+        assert list(b["needs_recheck_means"]) == ["unread"], label
+        assert b["needs_recheck_means"]["unread"] == mcp_app._JUDGED_UNREAD
+        assert "needs_recheck_in_part_indexes" not in b
         assert "needs_recheck_indexes" in b["note"]
         if label == "overwrite":
             assert b["overwrote_by"] == {"agent-via-mcp": 200}
+
+
+def test_a_full_batch_names_the_items_read_in_part_apart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A9 (read gate): a 200-item batch whose echo is cut to index and action, mixing items no
+    delivery had listed (changed_real: nothing read) and no_real_change items whose candidate rows
+    were read in part: ``needs_recheck_means`` says both causes, ``needs_recheck_in_part_indexes``
+    is exactly the items read in part, and the answer keeps to the budget.
+
+    MUTATION (verified RED, 1 failed): give needs_recheck_means as _JUDGED_UNREAD alone -> RED."""
+    w = _s_world(tmp_path, monkeypatch, 200)
+    server = mcp_app.build_server(w.path)
+    nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"]
+    listed = {e["entry_id"] for e in nu["material"].get("entries") or []}
+    members = [m for u in _review(w, k=0).units if u.kind == ru.S_BATCH for m in u.members]
+    unlisted = [i for i, m in enumerate(members) if m.entry_id not in listed]
+    part = unlisted[::3]  # read in part: one of its rows of five, by entry_id
+    assert part and len(part) < len(unlisted)  # the precondition: both causes
+    for i in part:
+        entry = members[i].entry_id
+        server._call_log.record(
+            "get_diff_patch_view",
+            {"diff_id": DX, "entry_id": entry},
+            {"entries": [{"entry_id": entry, "rows": [{}], "rows_total": 5, "rows_offset": 0}]},
+        )
+    items: list[dict[str, Any]] = []
+    for i, m in enumerate(members):
+        if i in part:
+            items.append(
+                {"anchor_ref": m.anchor_ref, "verdict": "no_real_change", **_nrc(m.anchor_ref)}
+            )
+        else:
+            items.append({"anchor_ref": m.anchor_ref, "verdict": "changed_real", "rationale": "r"})
+    b = _server_call(server, "annotate_diff_batch", {"annotations": items, "diff_id": DX})
+    assert b.get("written") is True, b
+    assert len(json.dumps(b)) <= mcp_app._RESPONSE_BYTE_BUDGET, len(json.dumps(b))
+    # the precondition: the echo was cut to index and action, so only the shared fields say why
+    assert all("needs_recheck" not in r for r in b["results"])
+    assert b["needs_recheck_indexes"] == unlisted
+    assert b["needs_recheck_in_part_indexes"] == part
+    assert b["needs_recheck_means"] == {
+        "unread": mcp_app._JUDGED_UNREAD,
+        "read_in_part": mcp_app._JUDGED_PART_READ,
+    }
+    assert f"{len(unlisted)} of them written before their subject was read (read whole" in b["note"]
 
 
 def test_a_batch_echo_within_the_reserve_below_the_budget_is_compacted(

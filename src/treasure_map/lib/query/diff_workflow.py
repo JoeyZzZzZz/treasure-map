@@ -47,10 +47,12 @@ PAIR_WORKFLOW = (
     "unit_id=<next_unit.unit_id>) — or annotate_diff_batch with the same unit_id for a batch, "
     "run_pair=... for a binary_presence binary or a file — then call start_diff_review(run_pair) "
     "again: the next unit follows. The report counts what is disposed; an unjudged member is "
-    "UNREAD, which is not 'nothing found'; a judgment written before its subject's material was "
-    "read reads needs_recheck (not disposed) until judged again after reading. Once the review "
-    "is done, get_diff_handoff(run_pair) pages a standardized hand-off of the changed_real "
-    "findings. A pair larger than one session is reviewed in several: a fresh session's "
-    "start_diff_review(run_pair) continues with the next unit not yet disposed (progress counts "
-    "what is left). " + PAIR_SIDES
+    "UNREAD, which is not 'nothing found'; a judgment written before its subject was read reads "
+    "needs_recheck (not disposed) until judged again after reading it — for no_real_change / "
+    "change_inconclusive on a must-read subject, read whole; a changed_real read in part still "
+    "counts. Once must_read_complete is true, get_diff_handoff(run_pair) pages a standardized "
+    "hand-off of the changed_real findings (refused before; tmap review report --handoff writes "
+    "a partial one for a person). A pair larger than one session is reviewed in several: a fresh "
+    "session's start_diff_review(run_pair) continues with the next unit not yet disposed (progress "
+    "counts what is left). " + PAIR_SIDES
 )

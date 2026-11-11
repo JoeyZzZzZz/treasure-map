@@ -57,7 +57,13 @@ PROGRESS_KEYS = {
     "scope",
     "pair_wide",
     "resume_with",
+    "dispositions",
 }
+# Said only while the must-read set is not done (the batch driver's command).
+WHILE_OPEN_KEY = "if_this_context_fills"
+# The block's fields the skill does not name: the coverage statement it quotes already carries
+# what the disposed subjects were judged.
+NOT_IN_SKILL = {"dispositions"}
 STILL_OPEN_KEYS = {
     "failed_diffs",
     "withheld_diffs",
@@ -71,6 +77,7 @@ PAIR_WIDE = [
     "must_read_complete",
     "coverage_statement",
     "still_open",
+    "dispositions",
 ]
 
 
@@ -183,7 +190,8 @@ def test_without_a_log_this_session_is_unknown_and_the_rest_is_given(
     for p in (head["progress"], out["progress"]):
         assert p["this_session"] is None
         assert p["this_session_unavailable"] == "no tool-call log for this session"
-        assert set(p) == PROGRESS_KEYS | {"this_session_unavailable"}
+        open_now = {WHILE_OPEN_KEY} if not p["must_read_complete"] else set()
+        assert set(p) == PROGRESS_KEYS | {"this_session_unavailable"} | open_now
 
 
 # ── what is left ──────────────────────────────────────────────────────────────────────────────
@@ -512,7 +520,7 @@ def test_every_progress_field_the_skill_names_is_in_the_answer(
 
     MUTATION (verified RED, 1 failed): rename any one field of the block (resume_with) -> RED."""
     named = set(re.findall(r"progress\.([a-z_]+)", diff_skill.skill_text()))
-    assert named == PROGRESS_KEYS  # every field of it is named
+    assert named == PROGRESS_KEYS - NOT_IN_SKILL  # every field of it is named but those
     w = _mixed(tmp_path, monkeypatch)
     server = mcp_app.build_server(w.path)
     head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})

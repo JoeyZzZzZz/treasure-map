@@ -215,7 +215,9 @@ def unit_prompt(run_pair: str, u: ru.Unit, k: int) -> str:
         "2. Judge EVERY member listed in members with annotate_diff (or annotate_diff_batch), "
         f'passing unit_id="{u.unit_id}": changed_real (with evidence and change_kind when you '
         "can), no_real_change (checked + why_unchanged), or change_inconclusive (what is "
-        "missing). "
+        "missing). A no_real_change or change_inconclusive written before its member was read "
+        "whole (all candidate rows; code held back read in full) reads needs_recheck and the unit "
+        "comes back. "
         "3. Then stop. Do not judge anything outside this unit; the unit comes back until all "
         "its members are judged."
     )
@@ -879,7 +881,8 @@ def run_handoff(
                 f"the agent wrote for {len(extra)} anchor(s) the hand-off does not hold "
                 f"(first: {extra[0][:200]!r}); nothing was written",
             )
-        document = _rr.handoff_header(run_pair, len(findings)) + "".join(
+        rep = _rr.handoff_report(atlas, run_pair, file_staleness=file_staleness)
+        document = _rr.handoff_header(run_pair, len(findings), rep) + "".join(
             _rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=named)
         )
     finally:

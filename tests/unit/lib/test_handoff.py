@@ -1269,18 +1269,24 @@ def _same_second(w: World) -> None:
 def test_a_moved_basis_is_not_served_from_the_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ The judgement is unchanged but its basis moved (the diff reads stale): the next page is
-    the document as it reads now, not the cached one.
+    """★ The judgement is unchanged but its basis moved (the diff reads stale): the cached blocks
+    are not served. The moved judgement reads needs_recheck, so the must-read set is no longer
+    done and the hand-off is refused (the gate reads the review afresh); the command line's
+    partial document shows the basis as it reads now.
 
-    MUTATION (verified RED): digest the count and newest updated_at again -> "current" served ->
-    RED."""
+    MUTATION (verified RED, 1 failed): drop the gate (never refuse) -> the page is served, not
+    refused -> RED."""
     w = _wide_findings_world(tmp_path, monkeypatch, 1)
     tools = mcp_app.make_tools(w.path)
     assert "- basis: current" in _pages_of(tools)
     w.stale[DX] = {"source_stale": True, "source_stale_reason": "diff_logic_changed"}
-    assert _pages_of(tools) == rr.handoff_document(
+    page = tools["get_diff_handoff"](PAIR, 0)
+    assert page.get("refused") == "must_read_incomplete", page
+    assert "text" not in page
+    document = rr.handoff_document(
         w.atlas, PAIR, stamp=_stamp(), file_staleness=_local_staleness(w)
     )
+    assert "PARTIAL" in document and "- basis: current" not in document
 
 
 def _local_staleness(w: World) -> Any:
@@ -1619,6 +1625,16 @@ def test_every_handoff_template_string_carries_no_verdict_word() -> None:
 # ── the driver's command line: when the hand-off runs, and with which preset ────────────────────
 
 
+# A drive's coverage offer at its stop with the must-read set done (the fields the command line
+# prints).
+_DONE_OFFER: dict[str, Any] = {
+    "second_tier": {"members": 0, "units": 0, "by_bucket": {}, "due_recheck": 0},
+    "continue_with": None,
+    "must_read_complete": True,
+    "complete": True,
+}
+
+
 def _patch_run(
     monkeypatch: pytest.MonkeyPatch, stopped: str, failed: list[dict[str, Any]] | None = None
 ) -> dict[str, list[Any]]:
@@ -1643,12 +1659,16 @@ def _patch_run(
 
     def drive(*a: Any, **k: Any) -> rd.DriveResult:
         calls["drive"].append(a)
+        finished = stopped in ("no unit left", "no must-read unit left")
         return rd.DriveResult(
             units_tried=1,
             units_done=1,
             stopped=stopped,
             failed=list(failed or []),
-            finished=stopped in ("no unit left", "no must-read unit left"),
+            finished=finished,
+            # A finished drive's stop, the must-read set done at the default k (what the hand-off
+            # is gated on): read from here, so no atlas is opened.
+            offer=_DONE_OFFER if finished else None,
         )
 
     def run_handoff(*a: Any, **k: Any) -> dict[str, Any]:

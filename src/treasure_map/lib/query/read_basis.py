@@ -20,15 +20,18 @@ of the writing server's session — recorded with the write in overlay_history a
   A one-sided binary's function is read by explain_candidate on every one of its candidates
   (``candidates``, the evidence_refs it must cite).
 * ``none`` — the log holds nothing of the kind. On a must-read subject the caller marks it
-  ``unread_before_verdict``: the subject reads needs_recheck (not disposed) until a judgement
-  written after reading it.
+  ``unread_before_verdict`` (whatever the verdict): the subject reads needs_recheck (not disposed)
+  until a judgement written after reading it.
 * ``unknown`` — there is no log, or no session to read it by: nothing can be said either way.
 
 ``rows_partial`` (with ``unit_delivered`` or ``fetched``): the subject is an entry whose candidate
 rows this session read only part of — the windows its unit's material and its own reads held
 (``unit_rows`` / ``rows_read`` in the log) leave some of its ``rows_total`` out, or it was read by
-entry id with no window logged at all (fail-closed). The judgement still counts as disposed; the
-report counts it under ``basis_incomplete``.
+entry id with no window logged at all (fail-closed). On a must-read subject a no_real_change /
+change_inconclusive so written is marked ``unread_before_verdict`` too (lib/query/review_units
+``GATED_VERDICTS``): it reads needs_recheck (not disposed) until judged again after reading the
+subject whole. A changed_real still counts as disposed (the reversible direction), and so does a
+judgement on a subject not must-read; the report counts those under ``basis_incomplete``.
 
 ``read_partial`` (with ``unit_delivered`` or ``fetched``, when the read that made it count was of
 the subject itself — a function's pseudocode, disassembly or callees, a file's line difference,
@@ -46,7 +49,8 @@ read of the code at all, an entry that held its hunk back (``code_shown`` false)
 and one that carried no hunk either way is read as the entry it is (no flag).
 ``"extraction_cap"`` — only a callee list was read, whole as the scan stored it but cut short
 there (``callees_truncated``): reading on cannot complete it; a whole read of the code does.
-Like ``rows_partial``, the judgement still counts as disposed and the report counts it under
+Like ``rows_partial``: a no_real_change / change_inconclusive on a must-read subject reads
+needs_recheck, a changed_real (or a judgement on a subject not must-read) counts as disposed under
 ``basis_incomplete``; a later judgement written after a whole read clears it. ``rows_partial``
 stays about an entry's candidate rows only; the two can stand together (an entry whose rows and
 whose code were both read in part).

@@ -118,11 +118,21 @@ def report(
             # builds, so the file and the tool's pages are the same text (B-4(d)).
             stamp, file_staleness = rr.local_handoff_context(conn)
             findings = rr.handoff_findings(conn, run_pair, file_staleness=file_staleness)
-            text = rr.handoff_header(run_pair, len(findings)) + "".join(
+            # Not gated: before the must-read set is done the file is written all the same, its
+            # header saying it is a PARTIAL hand-off (the MCP tool serves none then).
+            hrep = rr.handoff_report(conn, run_pair, file_staleness=file_staleness)
+            text = rr.handoff_header(run_pair, len(findings), hrep) + "".join(
                 rr.handoff_blocks(conn, run_pair, findings, stamp=stamp)
             )
             Path(output).write_text(text, encoding="utf-8")
-            click.echo(f"wrote {output} ({len(findings)} findings)")
+            click.echo(
+                f"wrote {output} ({len(findings)} findings)"
+                + (
+                    ""
+                    if hrep["must_read_complete"]
+                    else " — PARTIAL: must_read_complete is false, not the official hand-off"
+                )
+            )
             return
         staleness = ru.pair_staleness(conn, run_a, run_b)
         commit = installed_commit()
@@ -547,6 +557,44 @@ def worksheet(conn: sqlite3.Connection, reading: Any, run_pair: str) -> dict[str
     }
 
 
+def _handoff_held(
+    result: Any, atlas: str, run_a: str, run_b: str, k: int | None, staleness: dict[str, Any]
+) -> str | None:
+    """Why the driver writes no hand-off, or None: the drive stopped at a limit, a unit failed, or
+    the must-read set is not done at the default k (the official hand-off's bar, the same the MCP
+    get_diff_handoff holds) — read again at the default k when this drive worked at another."""
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.query import review_units as ru
+
+    if not result.finished:
+        return (
+            f"the review is not done ({result.stopped}); re-run without a limit, then write the "
+            "hand-off"
+        )
+    if result.failed:
+        return f"{len(result.failed)} unit(s) failed; the review is not done"
+    kk = ru.DEFAULT_K if k is None else k
+    if result.offer is not None and result.offer["must_read_complete"] and kk == ru.DEFAULT_K:
+        return None
+    conn = open_atlas(Path(atlas))
+    try:
+        rep = ru.review_pair(
+            conn, run_a, run_b, k=ru.DEFAULT_K, pair_staleness=staleness, server_commit=None
+        ).report
+    finally:
+        conn.close()
+    if rep["must_read_complete"]:
+        return None
+    mr, nr = rep["must_read"], rep["not_reachable"]
+    return (
+        f"must_read_complete false at the default k={ru.DEFAULT_K} (must-read left "
+        f"{mr['members'] - mr['members_disposed']}, withheld diffs {len(nr['withheld_diffs'])}, "
+        f"failed diffs {len(nr['failed_diffs'])}, judged unread {rep['judged_unread']['count']}, "
+        f"reduce owed {rep['reduce']['owed']}); tmap review report --handoff writes a partial one "
+        "for a person"
+    )
+
+
 @review.command(name="run")
 @click.argument("run_pair")
 @click.option(
@@ -701,11 +749,9 @@ def run(
             f"{result.offer['complete']}"
         )
     if handoff_out is not None:
-        if not result.finished or result.failed:
-            click.echo(
-                f"hand-off skipped: the review is not done ({result.stopped}); re-run without a "
-                "limit, then write the hand-off"
-            )
+        held = _handoff_held(result, atlas, run_a, run_b, k, staleness)
+        if held is not None:
+            click.echo(f"hand-off skipped: {held}")
         else:
             click.echo(f"writing the findings hand-off with {preset.name} …")
             ho = rd.run_handoff(

@@ -185,7 +185,8 @@ _ECHO_RESERVE = 8_000
 # value is (digest, blocks), the digest a sha256 of the pair's findings as each page reads them
 # (verdict, rationale, basis, review state, source staleness, updated_at): any change to one —
 # a rewrite within the same second, a swapped judgement, a basis that moved — rebuilds the blocks.
-# ``blocks[0]`` is the header, then one block per finding.
+# The blocks are one per finding; the header is never cached (it is read from the pair's report
+# on every call, as the gate is).
 _HANDOFF_CACHE: dict[tuple[str, str], tuple[str, list[str]]] = {}
 
 # How much of a caller-supplied string an error echoes back.
@@ -675,6 +676,22 @@ _JUDGED_UNREAD = (
     "lists it — a file by get_file_diff(path), a one-sided binary's function by "
     "explain_candidate on every one of its candidates"
 )
+# A no_real_change / change_inconclusive on a must-read subject written having read it only in part:
+# what that reads as, on its answer.
+_JUDGED_PART_READ = (
+    "written before its subject was read whole (a no_real_change or change_inconclusive with its "
+    "candidate rows / its code read only in part): it reads needs_recheck (not disposed) until "
+    "judged again after reading it whole — the rest of the rows by entry_id and rows_offset, the "
+    "code by every page of a side's get_pseudocode / get_disassembly; a changed_real is not held "
+    "back"
+)
+
+
+def _judged_unread_means(read_basis: dict[str, Any]) -> str:
+    """What a write flagged ``unread_before_verdict`` reads as: nothing read, or read in part."""
+    return _JUDGED_UNREAD if read_basis.get("basis") == "none" else _JUDGED_PART_READ
+
+
 _HEADLINE_WITHHELD = "diff_undetermined (meta.banners)"
 _HEADLINE_NONE = "no listed entry"
 
@@ -918,18 +935,21 @@ _AGENT_GUIDE = (
     "review report <run_pair> prints the same summary and --md / --html write every unit. "
     "Name the unit you judge (annotate_diff(..., unit_id=...)): the answer carries the next one, "
     "and every write is kept in the overlay's history with what this session read before it. A "
-    "judgment written before anything of its subject was read reads needs_recheck (re-read, not "
-    "disposed) until a later judgment written after reading it; a judgment a second session "
+    "judgment written before its subject was read reads needs_recheck (re-read, not disposed) "
+    "until a later judgment written after reading it — for no_real_change / change_inconclusive "
+    "on a must-read subject, read whole; a changed_real read in part still counts; a judgment a "
+    "second session "
     "overwrites with a different verdict is a disagreement, settled by a person (tmap review judge "
     "/ tmap review audit). needs_recheck subjects and disagreements hold must_read_complete false. "
     + _blind_audit_sentence(_ru.BLIND_AUDIT_ENABLED)
     + "A callee_group unit holds the entries that newly call one "
     "function (its code on both sides given once): judge each with group_ref=<its group_ref>, "
     "and the callee's own entry too; the reduce unit, handed out last, names what still lacks "
-    "it. A reduce owed holds must_read_complete false. Once the review is done, "
+    "it. A reduce owed holds must_read_complete false. Once must_read_complete is true, "
     "get_diff_handoff(run_pair) pages a standardized hand-off of the changed_real findings — one "
-    "block each, tmap's facts and two placeholders for a person; tmap review report --handoff "
-    "writes the same text to a file."
+    "block each, tmap's facts and two placeholders for a person (refused before; tmap review "
+    "report --handoff writes a partial one for a person); once complete, tmap review report "
+    "--handoff writes the same text to a file."
 )
 
 # What the server sends as its standing instructions: the loop and both entry points, within the
@@ -3267,6 +3287,7 @@ def make_tools(
                     "judged_not_listed",
                     "dangling",
                     "basis_incomplete",
+                    "verdicts",
                     "presence_citations_short",
                     "dispatch_groups",
                     "upstream_groups",
@@ -4479,10 +4500,14 @@ def make_tools(
         finally:
             conn.close()
 
-    def _handoff_blocks(conn: sqlite3.Connection, run_pair: str) -> tuple[str, list[str]]:
-        """The pair's hand-off blocks (header + one per changed_real finding), from the process
-        cache when the pair's findings read the same as when they were built, else rebuilt from
-        that same reading. Returns (digest, blocks); the digest is a sha256 of the findings."""
+    def _handoff_blocks(
+        conn: sqlite3.Connection, run_pair: str, rep: dict[str, Any]
+    ) -> tuple[str, list[str]]:
+        """The pair's hand-off blocks (header + one per changed_real finding): the finding blocks
+        from the process cache when the pair's findings read the same as when they were built, else
+        rebuilt from that same reading; the header always from ``rep`` (the pair's report at the
+        default k, read by this call), never cached — what it counts moves with judgements the
+        findings do not hold. Returns (digest, blocks); the digest is a sha256 of the findings."""
         import hashlib
 
         findings = _rr.handoff_findings(conn, run_pair, file_staleness=_file_staleness(conn))
@@ -4490,16 +4515,16 @@ def make_tools(
             json.dumps(findings, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
         key = (str(atlas_path.resolve()), run_pair)
+        header = _rr.handoff_header(run_pair, len(findings), rep)
         cached = _HANDOFF_CACHE.get(key)
         if cached is not None and cached[0] == digest:
-            return cached
+            return digest, [header, *cached[1]]
         stamp = _rr.HandoffStamp(
             build_hash=_current_pass_version(), current=_current, commit=_installed_commit()
         )
-        blocks = [_rr.handoff_header(run_pair, len(findings))]
-        blocks += _rr.handoff_blocks(conn, run_pair, findings, stamp=stamp)
-        _HANDOFF_CACHE[key] = (digest, blocks)
-        return digest, blocks
+        body = _rr.handoff_blocks(conn, run_pair, findings, stamp=stamp)
+        _HANDOFF_CACHE[key] = (digest, body)
+        return digest, [header, *body]
 
     def _handoff_cut(block: str, room: int) -> str:
         """A block alone larger than a page (a budget below the render cap): its longest prefix
@@ -4536,7 +4561,13 @@ def make_tools(
         reads differently mid-paging (a judgement written or rewritten, a basis moved) — re-fetch
         from offset 0 when it does. Throughout, the status stays awaiting human verification. The
         pair's files are read through the same stale-run gate as the other pair tools; a stale run
-        is refused, with the ``server`` block."""
+        is refused, with the ``server`` block.
+
+        Every page is refused (``refused: must_read_incomplete``, with the review's ``progress``)
+        until the pair's ``must_read_complete`` is true at the default k — read afresh on each
+        call, never cached; a review that cannot be read is refused as ``must_read_unknown``.
+        Before then, ``tmap review report --handoff`` writes a PARTIAL hand-off for a person (not
+        the official one)."""
         if not isinstance(offset, int) or offset < 0:
             return {
                 "run_pair": _echo(run_pair),
@@ -4545,11 +4576,49 @@ def make_tools(
         server, _moved = _server_block()
         conn = open_atlas(atlas_path)
         try:
-            refusal, _runs = _file_pair_gate(conn, run_pair)
+            refusal, runs = _file_pair_gate(conn, run_pair)
             if refusal is not None:
                 refusal["server"] = server
                 return refusal
-            digest, blocks = _handoff_blocks(conn, run_pair)
+            assert runs is not None
+            run_a, run_b = runs
+            # The gate: the official hand-off is served once the must-read set is done at the
+            # default k — read on every page, never cached (the findings digest covers the
+            # changed_real findings only: a no_real_change written, or a write read in part and
+            # held back, moves the must-read set without moving it).
+            try:
+                review = _ru.review_pair(
+                    conn,
+                    run_a,
+                    run_b,
+                    k=_ru.DEFAULT_K,
+                    pair_staleness={"source_stale": False, "source_stale_reason": None},
+                    server_commit=server.get("commit"),
+                )
+            except Exception as exc:  # noqa: BLE001 -- unknown is refused, never served
+                return {
+                    "run_pair": run_pair,
+                    "refused": "must_read_unknown",
+                    "error": f"the pair's review could not be read: {exc}",
+                    "server": server,
+                }
+            if not review.report["must_read_complete"]:
+                progress = _progress(review, run_pair, None, None, _ru.DEFAULT_K, False)
+                return {
+                    "run_pair": run_pair,
+                    "refused": "must_read_incomplete",
+                    "must_read_complete": False,
+                    "progress": progress,
+                    "note": (
+                        "The hand-off is served once the must-read set is done (must_read_complete "
+                        f"true at the default k). Continue: {progress['resume_with']}; each unit "
+                        f"in a process of its own: tmap review run {run_pair} --agent <preset>; a "
+                        "PARTIAL hand-off for a person (not the official one): tmap review report "
+                        f"{run_pair} --handoff -o <file>."
+                    ),
+                    "server": server,
+                }
+            digest, blocks = _handoff_blocks(conn, run_pair, review.report)
             total = len(blocks)
             if offset >= total:
                 return {
@@ -5671,6 +5740,7 @@ def make_tools(
         worker: Any,
         workers: Any,
         attributed_to: Any,
+        verdicts: dict[str, Any],
     ) -> tuple[dict[str, Any], bool, str | None, int]:
         """``(context per anchor, shadow, error, k)`` of a diff write. A ``unit_id`` (from
         start_diff_review(run_pair)) must hold every anchor written; an audit unit's write is a
@@ -5678,7 +5748,11 @@ def make_tools(
         a person's judgement this agent writes down; a person's own is written on the command line.
         ``k`` is this session's k — the hit unit's k when a unit is named, else the largest k the
         session asked start_diff_review for; the caller hands it to ``_after_unit_write`` so the
-        next unit and coverage come back at that k (on error it is the default, unused)."""
+        next unit and coverage come back at that k (on error it is the default, unused).
+        ``verdicts`` maps each anchor to the verdict written on it: a write that read nothing of its
+        subject (basis ``none``), or a no_real_change / change_inconclusive that read it only in
+        part (review_units ``held_unread``), is marked ``unread_before_verdict`` when the subject is
+        must-read at ``k``."""
         from treasure_map.lib.overlay import WriteContext
         from treasure_map.lib.query import read_basis as _rb
 
@@ -5794,7 +5868,7 @@ def make_tools(
                         _inferred_unit_basis(lines, anchor, handed, ks, review, cands.get(anchor))
                         or rb
                     )
-                if rb["basis"] == "none":
+                if _ru.held_unread(verdicts.get(anchor), rb):
                     must = {
                         m.anchor_ref
                         for u in review(k).units
@@ -5953,17 +6027,23 @@ def make_tools(
         from treasure_map.lib.query import read_basis as _rb
 
         call = f"start_diff_review(run_pair={json.dumps(pair)}"
+        # The batch driver's command for the same reading (k, shard, sweep).
+        drive = f"tmap review run {pair} --agent <preset>"
         if k != _ru.DEFAULT_K:
             call += f", k={k}"
+            drive += f" --k {k}"
         if workers is not None:
             call += f", worker={worker}, workers={workers}"
+            drive += f" --worker {worker} --workers {workers}"
         if sweeping:
             call += ", sweep=true"
+            drive += " --until complete"
         return _ru.progress_block(
             review.report,
             sharded=workers is not None,
             this_session=_rb.session_tally(_rb.session_lines(call_log)),
             resume_with=call + ")",
+            drive_with=drive,
         )
 
     def _coverage_offer(review: Any, worker: Any, workers: Any, sweeping: bool) -> dict[str, Any]:
@@ -6164,8 +6244,10 @@ def make_tools(
         its member; the answer then carries the next unit of the shard (``worker`` / ``workers``),
         or the coverage_statement when none is left, read at the session's k. Every write is
         recorded in the overlay's history with what this session read before it (``read_basis``); a
-        judgment written before anything of its subject was read reads ``needs_recheck`` (re-read,
-        not disposed) until a later one written after reading it.
+        judgment written before its subject was read reads ``needs_recheck`` (re-read, not
+        disposed) until a later one written after reading it — for no_real_change /
+        change_inconclusive on a must-read subject, read whole; a changed_real read in part still
+        counts.
         ``attributed_to='human-via-agent'`` marks a person's judgment you write down for them.
 
         The answer also points to what the view holds about the subject, read when written and
@@ -6214,6 +6296,7 @@ def make_tools(
                 worker=worker,
                 workers=workers,
                 attributed_to=attributed_to,
+                verdicts={anchor_ref: verdict},
             )
             if bad is not None:
                 return {"written": False, "error": bad}
@@ -6268,7 +6351,7 @@ def make_tools(
                 )
             result["read_basis"] = ctxs[anchor_ref].read_basis
             if result["read_basis"].get("unread_before_verdict"):
-                result["needs_recheck"] = _JUDGED_UNREAD
+                result["needs_recheck"] = _judged_unread_means(result["read_basis"])
             if (
                 run_pair is not None
                 and not shadow
@@ -6403,6 +6486,13 @@ def make_tools(
                 for item in annotations
                 if isinstance(item, dict) and isinstance(item.get("anchor_ref"), str)
             ]
+            # Each anchor's verdict (an anchor named twice refuses the whole batch below, so none
+            # of it is written).
+            item_verdicts = {
+                str(item["anchor_ref"]): item.get("verdict")
+                for item in annotations
+                if isinstance(item, dict) and isinstance(item.get("anchor_ref"), str)
+            }
             ctxs, shadow, bad, unit_k = _write_plan(
                 atlas,
                 runs,
@@ -6411,6 +6501,7 @@ def make_tools(
                 worker=worker,
                 workers=workers,
                 attributed_to=attributed_to,
+                verdicts=item_verdicts,
             )
             if bad is not None:
                 return {"written": False, "count": 0, "errors": [{"error": bad, "indexes": []}]}
@@ -6561,7 +6652,7 @@ def make_tools(
                         }
                     ctx = ctxs.get(p.anchor_ref)
                     if ctx is not None and (ctx.read_basis or {}).get("unread_before_verdict"):
-                        echo["needs_recheck"] = _JUDGED_UNREAD
+                        echo["needs_recheck"] = _judged_unread_means(ctx.read_basis)
                     gref = item.get("group_ref")
                     if gref:
                         echo["group_ref"] = gref
@@ -6606,6 +6697,11 @@ def make_tools(
             _wh.finish(atlas, hints_pass)
             pair = run_pair if meta is None else f"{meta['run_a_id']}::{meta['run_b_id']}"
             unread_at = [r["index"] for r in results if "needs_recheck" in r]
+            # Of them, those read in part (a no_real_change / change_inconclusive): what each reads
+            # as is said once below when the per-item echo is cut to its index and action.
+            in_part_at = [
+                r["index"] for r in results if r.get("needs_recheck") == _JUDGED_PART_READ
+            ]
             extra: dict[str, Any] = {}
             # The echo of the groups the items leaned on, cut with the rest when near the page.
             groups_out: Any = groups_echo
@@ -6673,7 +6769,16 @@ def make_tools(
                         )
                 if unread_at:
                     extra["needs_recheck_indexes"] = unread_at
-                    extra["needs_recheck_means"] = _JUDGED_UNREAD
+                    if in_part_at:
+                        extra["needs_recheck_in_part_indexes"] = in_part_at
+                    extra["needs_recheck_means"] = {
+                        cause: means
+                        for cause, means, n in (
+                            ("unread", _JUDGED_UNREAD, len(unread_at) - len(in_part_at)),
+                            ("read_in_part", _JUDGED_PART_READ, len(in_part_at)),
+                        )
+                        if n
+                    }
                 if overwrote_by:
                     extra["overwrote_by"] = overwrote_by
             out: dict[str, Any] = {
@@ -6695,7 +6800,9 @@ def make_tools(
                     else "needs_recheck on those results"
                 )
                 out["note"] += (
-                    f" {len(unread_at)} of them written before their subject was read: see {where}."
+                    f" {len(unread_at)} of them written before their subject was read (read "
+                    "whole, for a no_real_change / change_inconclusive): see "
+                    f"{where}."
                 )
             if groups_echo:
                 out["groups"] = groups_out

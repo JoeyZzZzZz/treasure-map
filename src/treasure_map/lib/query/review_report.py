@@ -1311,13 +1311,59 @@ def handoff_findings(
     return rows
 
 
-def handoff_header(run_pair: str, n_findings: int) -> str:
+def handoff_report(
+    atlas: Any,
+    run_pair: str,
+    *,
+    file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The pair's review report at the default k — what the hand-off's header states (how the
+    disposed subjects were judged, and whether the must-read set is done). ``file_staleness`` is
+    the same reading of the two runs the findings are read with; without it they read current.
+    Each hand-off (the MCP pages, the command line's file, the driver's document) reads it once,
+    on the atlas as it is then, so the same state gives the same header."""
+    from treasure_map.lib.query import file_diff as fd
+
+    runs = fd.split_run_pair(atlas, run_pair)
+    if runs is None:
+        raise ValueError(f"run pair {run_pair!r} does not name two runs of this atlas")
+    staleness = (
+        file_staleness(*runs)
+        if file_staleness is not None
+        else {"source_stale": False, "source_stale_reason": None}
+    )
+    review = ru.review_pair(
+        atlas, runs[0], runs[1], k=ru.DEFAULT_K, pair_staleness=staleness, server_commit=None
+    )
+    return review.report
+
+
+def handoff_header(run_pair: str, n_findings: int, rep: dict[str, Any]) -> str:
     """The document's header line, served as its own first page by get_diff_handoff so the CLI file
-    and the MCP pages are the same text."""
+    and the MCP pages are the same text. ``rep`` is the pair's report at the default k
+    (``handoff_report``): the header counts its disposed subjects by verdict and, when the
+    must-read set is not done, says the hand-off is a partial one (the MCP tool serves none then;
+    the command line writes it for a person)."""
+    v = rep["verdicts"]["disposed"]
+    n = sum(v.values())
+    without = f" / {v['without_verdict']} without a verdict" if v["without_verdict"] else ""
+    mr = rep["must_read"]
+    partial = (
+        ""
+        if rep["must_read_complete"]
+        else (
+            "_must_read_complete false: a PARTIAL hand-off, not the official one — "
+            f"{mr['members'] - mr['members_disposed']} must-read member(s) not disposed._\n\n"
+        )
+    )
     return (
         f"# Findings hand-off for {run_pair}\n\n"
         f"_{n_findings} changed_real finding(s). Each block carries tmap's facts and the "
         f"recorded judgment; the analysis is for a person to fill. {HANDOFF_BOUNDARY}_\n\n"
+        f"_Of {n} disposed subjects: {v['changed_real']} changed_real / "
+        f"{v['no_real_change']} no_real_change / {v['change_inconclusive']} "
+        f"change_inconclusive{without}._\n\n"
+        f"{partial}"
         f"_{PAIR_SIDES}_\n\n"
     )
 
@@ -1358,10 +1404,12 @@ def handoff_document(
     file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
     analysis: dict[str, dict[str, str]] | None = None,
 ) -> str:
-    """The whole findings hand-off as one markdown document — the header then every block in anchor
-    order. The concatenation of get_diff_handoff's pages is this same text (B-4); with
-    ``analysis`` it is the driver's document, the agent's texts under each block's placeholders."""
+    """The whole findings hand-off as one markdown document — the header (read with the pair's
+    report at the default k, ``handoff_report``) then every block in anchor order. The
+    concatenation of get_diff_handoff's pages is this same text (B-4); with ``analysis`` it is the
+    driver's document, the agent's texts under each block's placeholders."""
     findings = handoff_findings(atlas, run_pair, file_staleness=file_staleness)
-    return handoff_header(run_pair, len(findings)) + "".join(
+    rep = handoff_report(atlas, run_pair, file_staleness=file_staleness)
+    return handoff_header(run_pair, len(findings), rep) + "".join(
         handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=analysis)
     )

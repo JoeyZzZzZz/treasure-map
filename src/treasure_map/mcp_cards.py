@@ -563,7 +563,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "(anchor_ref); "
             "follow next_offset. The pages concatenated are the file tmap review report --handoff "
             "writes; re-fetch from offset 0 if findings_digest changes. Throughout, the status "
-            "stays awaiting human verification."
+            "stays awaiting human verification. Refused until the pair's must_read_complete is "
+            "true (refused: must_read_incomplete, with progress)."
         ),
     ),
     "get_function_alignment": ToolCard(

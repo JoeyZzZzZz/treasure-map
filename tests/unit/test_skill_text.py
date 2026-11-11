@@ -118,9 +118,11 @@ def test_the_skill_says_a_pair_spans_sessions_and_how_one_hands_off() -> None:
         "the whole pair's, not this shard's." in flat
     )
     assert (
-        "- Name the unit you judge (`unit_id`). A judgment written before its subject's material "
-        "was read\n  reads `needs_recheck` — not disposed — until you judge it again after "
-        "reading it.\n" in rules
+        "- Name the unit you judge (`unit_id`). A judgment written before its subject was read "
+        "reads\n  `needs_recheck` — not disposed — until you judge it again after reading it. A "
+        "`no_real_change`\n  or `change_inconclusive` on a must-read subject needs it read whole "
+        "(every candidate row; code\n  held back, read in full); a `changed_real` read in part "
+        "still counts.\n" in rules
     )
     assert (
         "- The full unit list is not sent over MCP: `tmap review report <run_pair> --md -o "
