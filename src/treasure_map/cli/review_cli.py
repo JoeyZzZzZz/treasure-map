@@ -695,7 +695,7 @@ def run(
         second = result.offer["second_tier"]
         click.echo(
             f"second tier: {second['members']} member(s) in {second['units']} unit(s) not judged "
-            f"(by bucket {second['by_bucket']})"
+            f"(by bucket {second['by_bucket']}, {second['due_recheck']} due a re-check)"
             + (" — read them with --until complete" if result.offer["continue_with"] else "")
             + f"; must_read_complete {result.offer['must_read_complete']}, complete "
             f"{result.offer['complete']}"

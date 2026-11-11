@@ -369,6 +369,32 @@ def test_the_command_line_stops_at_the_must_read_part_by_default(
         assert seen[-1] == want
 
 
+def test_the_run_names_the_judgements_due_a_recheck(monkeypatch: pytest.MonkeyPatch) -> None:
+    """★ T-J6c: tmap review run's closing line names the second tier's judgements due a re-check.
+
+    MUTATION (verified RED): leave due_recheck off the second-tier line -> RED."""
+
+    class _Conn:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(review_cli, "_open", lambda atlas, pair: (_Conn(), "runA", "runB", "a.db"))
+    monkeypatch.setattr(ru, "pair_staleness", lambda *a, **k: {"source_stale": False})
+    monkeypatch.setattr(rd, "probe", lambda *a, **k: rd.ProbeResult(True, True, True, "faked"))
+    offer = {
+        "second_tier": {"units": 2, "members": 5, "by_bucket": {"C": 2, "S": 3}, "due_recheck": 4},
+        "continue_with": "ask the person first",
+        "must_read_complete": True,
+        "complete": False,
+    }
+    monkeypatch.setattr(
+        rd, "drive", lambda *a, **k: rd.DriveResult(stopped="s", finished=True, offer=offer)
+    )
+    res = CliRunner().invoke(review_cli.review, ["run", PAIR, "--agent", "claude-code"])
+    assert res.exit_code == 0, res.output
+    assert "4 due a re-check" in res.output
+
+
 def test_in_shards_each_stops_on_its_own_and_one_holds_the_reduce(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

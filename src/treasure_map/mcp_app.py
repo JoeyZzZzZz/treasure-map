@@ -3376,11 +3376,12 @@ def make_tools(
         the first unit, in the hand-out order, with a member not yet disposed (judged
         change_inconclusive or concluded), with its ``unit_id`` and its ``material``. Units are
         handed out round robin by position: round r takes the r-th entry of every diff (each in
-        its own default order), of the binary_presence binaries and of the changed files.
+        the order its facts give), of the binary_presence binaries and of the changed files.
         By default ``next_unit`` is drawn from the must-read units only (the reduce among them):
         once none is left in the shard, ``next_unit`` is null and ``coverage_offer`` says, as
-        facts, how much of the second tier is unread (``second_tier``: its units, members and
-        members by bucket), what no unit can reach, ``basis_incomplete``,
+        facts, how much of the second tier is unread (``second_tier``: its units, members,
+        members by bucket and ``due_recheck``, the members whose judgement is due a re-check),
+        what no unit can reach, ``basis_incomplete``,
         ``evidence_reads_cut`` (this session's fact-tool readings left on a cut page, per
         session) and the reduce still owed in this shard. ``sweep=true`` (ask the person first)
         hands out the second tier too, after the must-read units; a write naming its unit hands

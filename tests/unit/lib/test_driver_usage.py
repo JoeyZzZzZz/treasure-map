@@ -221,11 +221,74 @@ def test_the_usage_never_decides_a_units_success(tmp_path: Path) -> None:
     )
 
 
-def test_final_json_reads_the_value_the_output_ends_with() -> None:
-    """``final_json``: the JSON value the output ends with, lines before it skipped; None when it
+def test_final_json_reads_the_object_the_output_ends_with() -> None:
+    """``final_json``: the JSON object the output ends with, lines before it skipped; None when it
     ends in none (trailing text after it, or no JSON at all)."""
     assert rd.final_json('a warning\n{"x": 1}\n') == {"x": 1}
     assert rd.final_json('{"x": 1}') == {"x": 1}
     assert rd.final_json('{\n  "x": [\n    1,\n    2\n  ]\n}\n\n') == {"x": [1, 2]}
     assert rd.final_json('{"x": 1}\ntrailing text\n') is None
     assert rd.final_json("") is None
+
+
+# ── spec Y M-1: the parser reads plain text and pseudocode in linear time ───────────────────
+
+
+def _pseudocode(functions: int) -> str:
+    """Decompiler-style C: every function body's ``{`` and ``}`` on lines of their own."""
+    return "".join(
+        f"void FUN_{i:08x}(int param_1)\n{{\n  int local_8;\n\n  local_8 = param_1 + {i};\n"
+        "  return;\n}\n\n"
+        for i in range(functions)
+    )
+
+
+_NO_OBJECT_OUTPUTS = {
+    "plain_text": "".join(f"line {i} of a long transcript\n" for i in range(40_000)),
+    "pseudocode_then_text": _pseudocode(10_000) + "the function above was read.\n",
+    "pseudocode_ending_in_brace": _pseudocode(10_000).rstrip(),
+    "jsonl_then_text": "".join(f'{{"i": {i}}}\n' for i in range(40_000)) + "done\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_NO_OBJECT_OUTPUTS))
+def test_an_output_ending_in_no_object_is_read_without_a_parse(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ T-M1a: four outputs ending in no JSON object (40,000 lines of plain text; 10,000
+    decompiled functions with each ``{`` on a line of its own, then a line of text; the same
+    ending in ``}``; 40,000 JSONL lines, then a line of text) read None with no parse tried. The
+    count is the tooth, the time a second check. "0 tries" holds for these four only: an output
+    with many lines opening a whole object, none of them last, is tried once per such line.
+
+    MUTATION (verified RED): the earlier reader (every non-blank line tried) -> all four RED;
+    the earlier reader trying only lines that start with ``{`` -> both pseudocode cases and
+    jsonl_then_text RED; the opening pattern replaced by ``lstrip().startswith("{")`` (the end
+    check kept) -> pseudocode_ending_in_brace RED; the ``}`` end check dropped ->
+    jsonl_then_text RED; the opening pattern dropped (every non-blank line tried after the end
+    check) -> pseudocode_ending_in_brace RED."""
+    import time
+
+    output = _NO_OBJECT_OUTPUTS[name]
+    tries = {"n": 0}
+    real = rd.json.loads
+
+    def counted(text: Any, *a: Any, **kw: Any) -> Any:
+        tries["n"] += 1
+        return real(text, *a, **kw)
+
+    monkeypatch.setattr(rd.json, "loads", counted)
+    t0 = time.monotonic()
+    assert rd.final_json(output) is None
+    assert tries["n"] == 0, tries
+    assert time.monotonic() - t0 < 2.0
+
+
+def test_an_object_after_text_is_read_whatever_its_first_line_holds() -> None:
+    """T-M1b: an indented object after a warning line, and an object whose ``{`` is followed by
+    a blank line, are read whole.
+
+    MUTATION (verified RED): the opening pattern not spanning a line end (``\\{[ \\t]*``) -> the
+    second RED."""
+    assert rd.final_json('a warning\n  {"x": 1}') == {"x": 1}
+    assert rd.final_json('{\n\n  "k": 1}') == {"k": 1}

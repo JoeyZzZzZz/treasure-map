@@ -12,7 +12,8 @@ states, made checkable, plus what it left out. An entry of a diff is must-read w
 * a bucket S entry with at least one candidate row — ``bucket_s_candidate`` (handed out per diff,
   as a batch);
 * a bucket S entry in one of its diff's callee groups — ``bucket_s_callee_group`` (handed out
-  with its group); a bucket S entry with neither is second tier unless another reason holds;
+  with its group when the group forms, else in an S batch); a bucket S entry with neither is
+  second tier unless another reason holds;
 * an R entry whose one side is not in that scan's function inventory (its candidate count there is
   unknown) while the other side names a sink candidate — ``side_not_in_inventory``;
 * an aligned pair whose ``sink_callsite_counts`` shows fewer calls on the B side of a command sink
@@ -20,7 +21,7 @@ states, made checkable, plus what it left out. An entry of a diff is must-read w
   counted is unknown, never fewer);
 * a bucket B entry of attention 0 or 1 whose subclass is ``sink_present_no_visible_delta`` or
   ``instruction_unmatched`` — ``aligned_b_sink``;
-* among the first ``k`` entries of its diff in the default order — ``top_k``.
+* among the first ``k`` entries of its diff in the order its facts give (below) — ``top_k``.
 
 Besides the entries, every changed non-binary file of the pair is a must-read unit of its own, and
 so are the binaries one run of the pair holds alone (``binary_presence``): each function of such a
@@ -42,11 +43,12 @@ no must-read unit is left, and the report says how much of the second tier is un
 order (``dispatch_order``); asking for it moves no entry into or out of either part.
 
 Order (dispatch): the must-read units first, then (on request) the second tier; within each, round
-robin by position. Each diff is a stream of its entries in its own default
-(significance) order; the binary_presence binaries and the changed files are two more streams.
-Round r hands out the r-th item of every stream before any (r+1)-th — no significance is compared
-across diffs, so the order is computable and deterministic. A unit takes the position of its first
-member.
+robin by position. Each diff is a stream of its entries in the significance order its facts give:
+the view's hold of a judged entry off the bottom (``patch_view.significance``) is left out, so no
+judgement moves an entry into or out of the must-read set; the binary_presence binaries and the
+changed files are two more streams. Round r hands out the r-th item of every stream before any
+(r+1)-th — no significance is compared across diffs, so the order is computable and deterministic.
+A unit takes the position of its first member.
 
 A unit's id is a hash of its kind, its sorted member anchors and the predicate version; a shard
 ``worker`` of ``workers`` takes the units whose id's first eight hex digits, read as an integer,
@@ -69,9 +71,9 @@ from typing import Any
 
 from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review as dr
-from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, OPEN, UNSEEN
+from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN, UNSEEN
 
-PREDICATE_VERSION = "v3"
+PREDICATE_VERSION = "v4"
 DEFAULT_K = 4
 MAX_K = 200
 # At most this many items in one annotate_diff_batch call.
@@ -269,9 +271,9 @@ def entry_reasons(
 
 @dataclass
 class DiffFacts:
-    """One diff of the pair as its units read it: its listed entries in the default order (as
-    members, with every predicate reason computed for ``k`` = MAX_K so any k reads from it), and
-    the facts each judgement on it is read against (anchor -> subject)."""
+    """One diff of the pair as its units read it: its listed entries in the order its facts give
+    (as members, with every predicate reason computed for ``k`` = MAX_K so any k reads from it),
+    and the facts each judgement on it is read against (anchor -> subject)."""
 
     diff_id: str
     binary: str | None
@@ -994,7 +996,9 @@ def coverage_offer(
     """What a review stopped at its last unit hands over (facts only, no prediction): the stop's
     ``scope`` (this shard, or the whole pair), how many listed subjects are disposed and unjudged
     (the pair's ``all_listed``), the second tier of the scope still to read (its undisposed units
-    and members, by bucket — what ``sweep`` would hand out; none left once it was handed out),
+    and members, by bucket, and how many of those members carry a judgement due a re-check — all
+    four of this scope, a shard's being the shard's) — what ``sweep`` would hand out; none left
+    once it was handed out),
     what no unit can reach, the judgements written on a basis read in part, and the reduce still
     owed. The reduce is one unit of the pair, held by one shard: with shards, only the shard that
     holds it says how much it owes (``reduce_owed_in_this_shard``), every other one says null.
@@ -1033,6 +1037,9 @@ def coverage_offer(
                 "and bucket"
             ),
             "handed_out": sweep,
+            "due_recheck": sum(
+                1 for m in members if states.get(m.anchor_ref) in (NEEDS_RECHECK, NEEDS_RELABEL)
+            ),
         },
         "not_reachable": {
             "failed_diffs": len(nr["failed_diffs"]),

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import sqlite3
@@ -239,22 +240,31 @@ class Launch:
     seconds: float
     timed_out: bool
     output: str = ""
-    # The JSON value the whole output ends with (final_json), read before a per-unit launch's
+    # The JSON object the whole output ends with (final_json), read before a per-unit launch's
     # output is cut to its tail; None when it ends in none.
     final: Any = None
 
 
+_JSON_OBJECT_OPEN = re.compile(r"\{\s*[\"}]")
+
+
 def final_json(output: str) -> Any:
-    """The JSON value ``output`` ends with: the shortest suffix starting at a line's start that
+    """The JSON object ``output`` ends with: the shortest suffix starting at a line's start that
     parses whole, read back line by line from the end — so lines printed before it (a warning on
     stderr, merged into the output) are skipped and a JSON object printed over several lines is
-    read whole. None when no such suffix parses."""
-    lines = output.splitlines(keepends=True)
-    for i in range(len(lines) - 1, -1, -1):
-        if not lines[i].strip():
+    read whole. Only a line whose first non-blank text opens an object (``{`` then ``"`` or ``}``)
+    is tried, and only when the output ends in ``}``: plain text, pseudocode and a result printed
+    on one line are read in time linear in the output; each line tried reads the output from it to
+    the end once. None when no such suffix parses."""
+    if not output.rstrip().endswith("}"):
+        return None
+    pos = len(output)
+    for line in reversed(output.splitlines(keepends=True)):
+        pos -= len(line)
+        if not _JSON_OBJECT_OPEN.match(output, pos + len(line) - len(line.lstrip())):
             continue
         try:
-            return json.loads("".join(lines[i:]))
+            return json.loads(output[pos:])
         except ValueError:
             continue
     return None

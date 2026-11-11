@@ -82,10 +82,12 @@ def _members(r: ru.PairReview) -> dict[str, ru.Member]:
 def test_the_listing_is_the_default_page_order_with_its_attention_and_lift(
     world: World, diff_id: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ significance_listing gives the entries in the order, attention and lift_basis of the
-    default get_diff_patch_view page — one computation, so the two never part. (libx's C entry is
-    read at attention 0 here, through the one significance both read, so the significance order
-    and the candidate_tier order differ.)
+    """★ With no listed entry held up by a judgement, significance_listing gives the entries in
+    the order, attention and lift_basis of the default get_diff_patch_view page: the two read the
+    same code and part only where the view holds a judged entry off the bottom, which the listing
+    leaves out (T-J4, ``test_the_listing_and_the_view_part_only_at_the_judgement_hold``, holds
+    that boundary). (libx's C entry is read at attention 0 here, through the one significance
+    both read, so the significance order and the candidate_tier order differ.)
 
     MUTATION (verified RED): order the listing by candidate_tier -> the C entry is not first ->
     RED."""
@@ -2767,3 +2769,176 @@ def test_a_batch_whose_first_owed_entry_is_larger_than_the_page_hands_out_that_o
     assert one["material"]["entries"][0]["entry_id"] == big
     assert one["material_cut"] is True
     assert one["members_after_this_page"] == len(unit.members) - 1
+
+
+# ── the order the units read is the facts' (spec Y) ──────────────────────────────────────────
+
+
+_C5 = [f"0000{i}000" for i in range(1, 6)]
+
+
+def _c_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
+    """Five changed pairs of libx with no sink candidate: bucket C, attention 2, positions 0-4 by
+    their facts; at k=4 the fourth (position 3) is must-read by ``top_k`` alone."""
+    w = World(tmp_path, monkeypatch)
+    for a in _C5:
+        w.pair(DX, a, a, conf=0.97, sim=0.7)
+    return w
+
+
+def _fresh_review(w: World, k: int = 4) -> ru.PairReview:
+    pv._clear_view_caches()
+    return _review(w, k=k, cache=None)
+
+
+def _structure(r: ru.PairReview) -> tuple[frozenset[str], frozenset[str]]:
+    must = frozenset(m.anchor_ref for u in r.units if u.must_read for m in u.members)
+    return must, frozenset(u.unit_id for u in r.units)
+
+
+def _by_entry(r: ru.PairReview) -> dict[str, ru.Member]:
+    return {m.entry_id or m.anchor_ref: m for u in r.units for m in u.members}
+
+
+def test_no_judgement_moves_an_entry_into_or_out_of_the_must_read_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ T-J1: a changed_real written on the fifth C entry (attention 2, past k) leaves the
+    must-read anchors and the unit ids as they were. The fixture's premise: C + changed_real +
+    concluded is held up in the view (attention 2 -> 1), and the fourth entry is attention 2 with
+    no reason but ``top_k`` — so a hold read by the units would push it to fifth, out of top_k.
+
+    MUTATION (verified RED): significance_listing without ``hold_judged=False`` -> the judged
+    entry sorts first, the fourth falls to the second tier -> RED."""
+    w = _c_world(tmp_path, monkeypatch)
+    before = _fresh_review(w)
+    fourth, fifth = (
+        _by_entry(before)[f"pair:{_C5[3]}:{_C5[3]}"],
+        _by_entry(before)[f"pair:{_C5[4]}:{_C5[4]}"],
+    )
+    assert (fourth.position, fourth.attention, fourth.reasons) == (3, 2, ("top_k",))  # premise
+    assert (fifth.position, fifth.attention, fifth.reasons) == (4, 2, ())
+    w.judge(DX, fifth.anchor_ref, "changed_real")
+    after = _fresh_review(w)
+    assert after.progress.states[fifth.anchor_ref] == ru.CONCLUDED
+    assert _structure(after) == _structure(before)
+    assert _by_entry(after)[fourth.entry_id].reasons == ("top_k",)
+
+
+def test_the_cached_and_the_recomputed_structure_agree_after_a_judgement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-J2: a review read through a cache before the judgement and one recomputed after it hand
+    out the same units.
+
+    MUTATION (verified RED): the hold read by the listing -> the recomputed units differ -> RED."""
+    w = _c_world(tmp_path, monkeypatch)
+    cache = ru._DiffCache()
+    pv._clear_view_caches()
+    first = _review(w, k=4, cache=cache)
+    w.judge(DX, _by_entry(first)[f"pair:{_C5[4]}:{_C5[4]}"].anchor_ref, "changed_real")
+    pv._clear_view_caches()
+    cached = _review(w, k=4, cache=cache)
+    recomputed = _fresh_review(w)
+    assert [u.unit_id for u in cached.units] == [u.unit_id for u in recomputed.units]
+    assert _structure(cached) == _structure(recomputed)
+
+
+def test_the_view_still_holds_a_judged_entry_off_the_bottom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-J3: the default page reads the judged C entry at (1, judged_never_sunk) — the view keeps
+    what an agent marked in view.
+
+    MUTATION (verified RED): ``hold_judged=False`` in the view's _order_inputs too -> RED."""
+    w = _c_world(tmp_path, monkeypatch)
+    fifth = f"pair:{_C5[4]}:{_C5[4]}"
+    w.judge(DX, _by_entry(_fresh_review(w))[fifth].anchor_ref, "changed_real")
+    pv._clear_view_caches()
+    page = pv.get_diff_patch_view(w.atlas, DX, limit=50)
+    sig = {e["entry_id"]: e["significance"] for e in page["entries"]}
+    assert sig[fifth] == {"attention": 1, "basis": "judged_never_sunk"}
+
+
+def test_the_listing_and_the_view_part_only_at_the_judgement_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ T-J4: with one held-up C entry, the listing reads it at attention 2 on a basis its facts
+    give and the page at 1, judged_never_sunk; every other entry reads the same attention, basis
+    and lift_basis in both.
+
+    MUTATION (verified RED): the listing holding it too -> the same in both -> RED; the view not
+    holding it -> the page reads 2 -> RED."""
+    w = _c_world(tmp_path, monkeypatch)
+    fifth = f"pair:{_C5[4]}:{_C5[4]}"
+    w.judge(DX, _by_entry(_fresh_review(w))[fifth].anchor_ref, "changed_real")
+    pv._clear_view_caches()
+    listing = pv.significance_listing(w.atlas, DX)
+    assert listing is not None
+    listed = {o.entry.entry_id: (o.attention, o.basis, o.lift_basis) for o in listing.entries}
+    page = pv.get_diff_patch_view(w.atlas, DX, limit=50)
+    shown = {
+        e["entry_id"]: (
+            e["significance"]["attention"],
+            e["significance"]["basis"],
+            e.get("lift_basis"),
+        )
+        for e in page["entries"]
+    }
+    assert set(listed) == set(shown)
+    assert listed[fifth][0] == 2 and listed[fifth][1] != "judged_never_sunk"
+    assert shown[fifth][:2] == (1, "judged_never_sunk")
+    assert {k: v for k, v in listed.items() if k != fifth} == {
+        k: v for k, v in shown.items() if k != fifth
+    }
+
+
+def test_aligned_b_sink_reads_the_facts_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-J5: a bucket B ``instruction_unmatched`` entry whose pseudocode reads identical
+    (attention 2), judged changed_real: the view holds it at 1, the units give it no
+    ``aligned_b_sink``.
+
+    MUTATION (verified RED): the listing holding it -> attention 1 -> aligned_b_sink -> RED."""
+    from treasure_map.lib.query import sameness
+
+    w = World(tmp_path, monkeypatch)
+    w.pair(DX, "00001000", "00001000", conf=0.97, sim=0.9)
+    w.rows[DX] = [
+        _row(_ref("runA", "00001000"), _ref("runB", "00001000"), reason="instruction_unmatched")
+    ]
+    monkeypatch.setattr(pv, "_sameness_of", lambda e, readings: sameness.IDENTICAL)
+    (m,) = _by_entry(_fresh_review(w, k=0)).values()
+    assert (m.bucket, m.subclass, m.attention) == ("B", "instruction_unmatched", 2)  # premise
+    w.judge(DX, m.anchor_ref, "changed_real")
+    pv._clear_view_caches()
+    page = pv.get_diff_patch_view(w.atlas, DX, limit=50)
+    assert page["entries"][0]["significance"]["attention"] == 1  # the view holds it
+    (after,) = _by_entry(_fresh_review(w, k=0)).values()
+    assert "aligned_b_sink" not in after.reasons
+    assert after.attention == 2
+
+
+@pytest.mark.parametrize("name", ["lib.query.review_units", "lib.review_driver"])
+def test_the_review_layer_is_outside_the_code_a_diff_or_baseline_is_versioned_by(
+    name: str,
+) -> None:
+    """Its module is not hashed, and no hashed module imports it: changing how a pair is reviewed
+    never makes a stored diff or baseline read as stale.
+
+    MUTATION (verified RED): import it from a hashed module -> RED; list it in an entry table ->
+    RED."""
+    import ast
+
+    from treasure_map.lib.diff import code_version as cv
+
+    entries = cv.DIFF_CODE_ENTRIES + cv.OVERLAY_CODE_ENTRIES
+    assert all(e.partition(":")[0] != name for e in entries)
+    package = Path(cv.__file__).resolve().parents[2]
+    for module in sorted({e.partition(":")[0] for e in entries}):
+        tree = ast.parse(cv._module_path(package, module).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported = {node.module, *(f"{node.module}.{a.name}" for a in node.names)}
+                assert f"treasure_map.{name}" not in imported, module

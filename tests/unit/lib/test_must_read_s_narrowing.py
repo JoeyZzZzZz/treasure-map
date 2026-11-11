@@ -29,6 +29,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
 from tests.unit.lib.test_review_units import _diff, _facts, _m, _review
 from tests.unit.test_tool_surface import _call
 from treasure_map import mcp_app, mcp_cards
+from treasure_map.lib import overlay
 from treasure_map.lib.query import diff_skill
 from treasure_map.lib.query import patch_view as pv
 from treasure_map.lib.query import review_units as ru
@@ -334,16 +335,19 @@ def test_an_added_reason_keeps_the_reasons_order() -> None:
 
 
 def test_the_predicate_version_moved_and_with_it_every_unit_id() -> None:
-    """T-X3a. MUTATION (verified RED): PREDICATE_VERSION left at v2 -> RED."""
-    assert ru.PREDICATE_VERSION == "v3"
+    """T-X3a / T-J7 (v4: the units read the facts' order, spec Y). MUTATION (verified RED):
+    PREDICATE_VERSION left at v3 -> RED."""
+    assert ru.PREDICATE_VERSION == "v4"
     anchors = ["a", "b"]
-    assert ru.unit_id(ru.S_BATCH, anchors, "v2") != ru.unit_id(ru.S_BATCH, anchors)
+    for earlier in ("v2", "v3"):
+        assert ru.unit_id(ru.S_BATCH, anchors, earlier) != ru.unit_id(ru.S_BATCH, anchors)
 
 
 def test_a_judgement_written_under_v2_is_kept_under_v3(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T-X3b: a judgement written naming a v2 unit is read under v3 by its anchor: the member's
+    """T-X3b: a judgement written naming a v2 unit is read under the current version by its
+    anchor: the member's
     review state is the same, under a new unit id.
 
     MUTATION (verified RED): the review state read by unit id (the judgement's unit) -> RED."""
@@ -454,3 +458,86 @@ def test_the_text_shipped_before_is_an_earlier_version() -> None:
     assert hashlib.sha256(old).hexdigest() in sk.LEGACY_SHA256
     src = (_SRC / "lib" / "setup" / "skills.py").read_text(encoding="utf-8")
     assert src.count("81cb1c8a3f38f56e1db267cd05eefd0e4dc01fa90ff0b51d624555ff3b2c7055") == 1
+
+
+# ── spec Y J-2: the second tier's judgements due a re-check ─────────────────────────────────
+
+
+_UNREAD = overlay.WriteContext(
+    channel="mcp", session="w", read_basis={"basis": "none", "unread_before_verdict": True}
+)
+_READ = overlay.WriteContext(channel="mcp", session="w", read_basis={"basis": "fetched"})
+
+
+def _due_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[World, list[str]]:
+    """Six S entries at k=0: the first two (a candidate row each) in the must-read S batch, the
+    last four (none) in one second-tier unit. Judged: the first must-read one written unread
+    (needs_recheck); in the second tier two written unread (needs_recheck), one read and judged
+    changed_real (concluded), one judged and then given a verdict no longer in use
+    (needs_relabel). Returns the world and the six anchors."""
+    w, ids = _s_pairs(tmp_path, monkeypatch, [1, 1, 0, 0, 0, 0])
+    r = _review(w, k=0)
+    anchors = [_member(r, e).anchor_ref for e in ids]
+    for a in (anchors[0], anchors[2], anchors[3]):
+        w.judge(DX, a, "changed_real", ctx=_UNREAD)
+    w.judge(DX, anchors[4], "changed_real", ctx=_READ)
+    w.judge(DX, anchors[5], "changed_real", ctx=_READ)
+    w.atlas.execute(
+        "UPDATE overlay SET verdict = 'a_retired_word' WHERE anchor_ref = ?", (anchors[5],)
+    )
+    w.atlas.commit()
+    ru.DIFF_CACHE.clear()
+    return w, anchors
+
+
+def test_the_stop_counts_the_second_tier_judgements_due_a_recheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ T-J6: ``second_tier.due_recheck`` counts the second-tier members due a re-check or a
+    relabel (3), not the concluded one, nor the must-read member due a re-check (it is handed out
+    again). The relabel one is what neither completion flag sees: it is in no audit's
+    needs_recheck, and due_recheck counts it.
+
+    MUTATION (verified RED): no due_recheck -> RED; NEEDS_RELABEL left out -> 2 -> RED; the
+    must-read members counted too -> 4 -> RED; only the audits' needs_recheck counted -> the
+    relabel one missed -> RED."""
+    w, anchors = _due_world(tmp_path, monkeypatch)
+    r = _review(w, k=0)
+    states = r.progress.states
+    assert [states[a] for a in anchors[2:]] == [
+        ru.NEEDS_RECHECK,
+        ru.NEEDS_RECHECK,
+        ru.CONCLUDED,
+        ru.NEEDS_RELABEL,
+    ]  # the premise
+    assert states[anchors[0]] == ru.NEEDS_RECHECK
+    assert _unit_of(r, _member_id(r, anchors[0])).must_read
+    assert not _unit_of(r, _member_id(r, anchors[5])).must_read
+    offer = ru.coverage_offer(r, worker=None, workers=None, sweep=False)
+    assert offer["second_tier"].get("due_recheck") == 3
+    assert anchors[5] not in r.audits.needs_recheck
+
+
+def test_due_recheck_is_the_scope_s_in_a_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-J6b: with three shards, the shards' due_recheck add up to the pair's and at least one is
+    below it; due_recheck is not among the pair-wide keys.
+
+    MUTATION (verified RED): due_recheck read off the whole pair (as basis_incomplete is) -> every
+    shard reads the total -> RED."""
+    w, _anchors = _due_world(tmp_path, monkeypatch)
+    r = _review(w, k=0)
+    whole = ru.coverage_offer(r, worker=None, workers=None, sweep=False)["second_tier"]
+    shards = [
+        ru.coverage_offer(r, worker=i, workers=3, sweep=False)["second_tier"]["due_recheck"]
+        for i in range(3)
+    ]
+    assert sum(shards) == whole["due_recheck"] == 3
+    assert min(shards) < whole["due_recheck"]
+    assert "due_recheck" not in ru.PAIR_WIDE_OFFER_KEYS
+    assert "second_tier" not in ru.PAIR_WIDE_OFFER_KEYS
+
+
+def _member_id(r: ru.PairReview, anchor: str) -> str:
+    return next(m.entry_id for u in r.units for m in u.members if m.anchor_ref == anchor) or ""

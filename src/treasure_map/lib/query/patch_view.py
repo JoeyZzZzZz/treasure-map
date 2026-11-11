@@ -3149,7 +3149,8 @@ def significance(
         reading is ``identical_unique`` and its B side a proven none_found — read first, so the
         caller-set edge is not hidden by the R close) or its
         judgement is held up (changed_real, needs_recheck / needs_relabel, inconclusive), which
-        stops it at 1; or, last, the caller-set edge: an E entry -> 1 (basis
+        stops it at 1 (in the view; the pair review's listing passes no judgement); or, last,
+        the caller-set edge: an E entry -> 1 (basis
         ``lost_every_direct_caller_never_sunk`` for a proven-none B side, else
         ``caller_signal_undetermined_never_sunk``), and any other entry whose B side is a proven
         none_found -> 1, ``lost_every_direct_caller_never_sunk`` (an undetermined edge on an
@@ -5723,7 +5724,12 @@ class _OrderInputs:
 
 
 def _order_inputs(
-    chosen: list[_Entry], readings: _Readings, review: ViewReview, *, significant: bool
+    chosen: list[_Entry],
+    readings: _Readings,
+    review: ViewReview,
+    *,
+    significant: bool,
+    hold_judged: bool = True,
 ) -> _OrderInputs:
     proposed = {e.entry_id: r for e in chosen if (r := _proposed_of(e, readings)) is not None}
     lens: dict[str, tuple[int, str]] = {}
@@ -5737,7 +5743,7 @@ def _order_inputs(
             e.entry_id: significance(
                 e,
                 _sameness_of(e, readings),
-                review.items.get(e.entry_id),
+                review.items.get(e.entry_id) if hold_judged else None,
                 proposed[e.entry_id][0] if e.entry_id in proposed else None,
             )
             for e in chosen
@@ -5819,8 +5825,8 @@ def _sort_with(
 
 @dataclass(frozen=True)
 class OrderedEntry:
-    """One listed entry of a diff in the default (significance) order: its place, attention,
-    basis and lift_basis as a summary page gives them, and its review item."""
+    """One listed entry of a diff in the order its facts give (the default page's, with the
+    judgement hold off): its place, attention, basis and lift_basis, and its review item."""
 
     entry: _Entry
     position: int
@@ -5832,8 +5838,8 @@ class OrderedEntry:
 
 @dataclass(frozen=True)
 class SignificanceListing:
-    """Every listed entry of one diff in the default order, or the build withheld (``withheld``
-    True: the whole diff is undetermined and lists nothing)."""
+    """Every listed entry of one diff in the order its facts give, or the build withheld
+    (``withheld`` True: the whole diff is undetermined and lists nothing)."""
 
     built: BuiltDiff
     withheld: bool
@@ -5867,9 +5873,11 @@ def diff_fact_key(atlas: sqlite3.Connection, diff_id: str) -> tuple[str, ...] | 
 
 
 def significance_listing(atlas: sqlite3.Connection, diff_id: str) -> SignificanceListing | None:
-    """Every listed entry of ``diff_id`` in the order get_diff_patch_view lists them by default
-    (sort_by unset, no filter, no band), with the same attention, basis and lift_basis — computed
-    by the same code (:func:`_order_inputs`). None when there is no such diff."""
+    """Every listed entry of ``diff_id`` in the default page's order (sort_by unset, no filter, no
+    band) with the judgement hold off (``hold_judged=False``), computed by the same code
+    (:func:`_order_inputs`): the same as the page whenever no listed entry is held up; a held-up
+    entry reads the attention and basis its facts give (test_review_units.py T-J4 holds the
+    boundary). None when there is no such diff."""
     built = build_diff_view(atlas, diff_id)
     if built is None:
         return None
@@ -5881,7 +5889,7 @@ def significance_listing(atlas: sqlite3.Connection, diff_id: str) -> Significanc
     shown = listed_view(atlas, built, readings)
     review = ViewReview(atlas, built, shown)
     chosen = list(shown.entries)
-    inputs = _order_inputs(chosen, readings, review, significant=True)
+    inputs = _order_inputs(chosen, readings, review, significant=True, hold_judged=False)
     ordered = _sort_with(chosen, "significance", None, inputs)
     return SignificanceListing(
         built,
