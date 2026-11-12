@@ -11,7 +11,7 @@
 [![MCP server](https://img.shields.io/badge/MCP-server-5c4ee5?style=flat-square)](https://github.com/JoeyZzZzZz/treasure-map/blob/main/README.zh.md#连接你的-agent)
 [![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square)](https://github.com/JoeyZzZzZz/treasure-map/blob/main/LICENSE)
 
-[**官网**](https://tmap.tools/zh/) · [**案例**](https://tmap.tools/zh/showcase/) · [**博客**](https://tmap.tools/zh/blog/) · [**快速开始**](https://github.com/JoeyZzZzZz/treasure-map/blob/main/README.zh.md#快速开始)
+[**官网**](https://tmap.tools/zh/) · [**案例**](https://tmap.tools/zh/showcase/) · [**博客**](https://tmap.tools/zh/blog/) · [**快速开始**](#快速开始)
 
 </div>
 
@@ -106,15 +106,6 @@ tmap diff --before fw-v1 --after fw-v2
 提示词只需要说清你要什么。怎么读地图、怎么审对比（该读哪些、每个判断怎么记录、什么时候才能停），由 Treasure Map 自己告诉 agent：MCP 服务器的说明和 diff 审查 skill。一对固件的审查常常超出一次 agent 会话的容量：新会话会从上次停下的地方接着做。
 
 `scan` 是最慢的一步：每个二进制跑一遍 Ghidra，会显示进度；用同一个 `-w` 重新运行会从中断处继续。你扫过、比过的所有结果都积累在同一个 **atlas**（`~/.treasure-map/atlas.db`）里，由 agent 自己选择看哪个固件、哪次对比。
-
-## 为什么只给事实，不给结论
-
-扫描器给你的是发现和严重程度评分，也就是一个结论，你要么信，要么自己再查一遍。Treasure Map 交给 agent 的是它能核对的事实，结论留给 agent 自己下。
-
-- **"未知"绝不等于"安全"。** 没能确认的事实就保持"未知"。对比失败的二进制会作为盲区列出，绝不计为"没变"；找不到对应函数的标为"未定"（可能被内联或挪走了），绝不报成"删除"或"新增"。
-- **给线索，不给结论。** 候选是待验证的线索，不是确认的漏洞；改动过的函数是待审的改动，不是确认的修复。可达性按单个函数分级：这**不是**污点传播引擎，也从不声称某条路径不可达。
-- **在本地运行，不带自己的模型。** 除了安装、升级自身和工具链，Treasure Map 不发出任何网络请求，也不调用任何模型。agent 通过它读到的内容，会随上下文一起发给 agent 所用的模型服务。
-- **不产出利用代码。** 它产出的是分析线索，绝不生成漏洞利用 PoC、payload 或 shellcode。
 
 ## 日常命令
 

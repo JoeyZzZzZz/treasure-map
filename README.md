@@ -11,7 +11,7 @@
 [![MCP server](https://img.shields.io/badge/MCP-server-5c4ee5?style=flat-square)](https://github.com/JoeyZzZzZz/treasure-map#connect-your-agent)
 [![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square)](https://github.com/JoeyZzZzZz/treasure-map/blob/main/LICENSE)
 
-[**Website**](https://tmap.tools/) · [**Showcase**](https://tmap.tools/showcase/) · [**Blog**](https://tmap.tools/blog/) · [**Quick start**](https://github.com/JoeyZzZzZz/treasure-map#quick-start)
+[**Website**](https://tmap.tools/) · [**Showcase**](https://tmap.tools/showcase/) · [**Blog**](https://tmap.tools/blog/) · [**Quick start**](#quick-start)
 
 </div>
 
@@ -148,25 +148,6 @@ fresh session continues where the last one stopped.
 `scan` is the slow part: one Ghidra pass per binary, with progress shown. Re-running with the same
 `-w` resumes where it stopped. Everything you scan and diff accumulates in one **atlas**
 (`~/.treasure-map/atlas.db`), and your agent picks which firmware or diff to work on.
-
-## Why facts, not verdicts
-
-A scanner hands you findings and a severity score: a verdict you then have to trust or re-check.
-Treasure Map hands your agent facts it can check, and leaves the verdict to it.
-
-- **UNKNOWN is never "safe".** A fact it could not establish stays UNKNOWN. A binary the diff could
-  not analyze is listed as a blind spot, never counted as unchanged; a function with no
-  counterpart is *undetermined* (it may have been inlined or moved), never reported as removed or
-  added.
-- **Leads, not verdicts.** A candidate is a lead to verify, not a confirmed vulnerability; a
-  changed function is a change to review, not a confirmed fix. Reachability is graded one function
-  at a time: this is **not** a taint-propagation engine, and it never claims a path is
-  unreachable.
-- **Local, with no model of its own.** Apart from installing and updating itself and its
-  toolchain, Treasure Map makes no network requests and calls no model. What your agent reads
-  through it goes wherever your agent sends its context.
-- **No exploit code.** It produces analysis leads, never proof-of-concept exploits, payloads or
-  shellcode.
 
 ## Day to day
 
