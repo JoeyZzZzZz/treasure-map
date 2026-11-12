@@ -1,6 +1,6 @@
 ---
 name: tmap-diff-review
-description: Review every change between two firmware versions with the tmap MCP server, unit by unit; a whole run pair usually spans several sessions, or tmap's batch driver. Use when asked to review, triage or audit a version diff (a run pair) with tmap.
+description: Review every change between two firmware versions with the Treasure Map (tmap) MCP server, unit by unit; a whole run pair usually spans several sessions, or tmap's batch driver. Use when asked to review, triage or audit a version diff (a run pair) with Treasure Map or tmap.
 ---
 
 # Reviewing a version diff with tmap

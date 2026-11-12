@@ -1,51 +1,117 @@
+<div align="center">
+
 # Treasure Map: A firmware map for your AI agent
 
-**English** | [中文](README.zh.md)
+**English** | [中文](https://github.com/JoeyZzZzZz/treasure-map/blob/main/README.zh.md)
 
 ### Treasure Map draws the map; your agent finds the treasure.
 
 [![PyPI](https://img.shields.io/pypi/v/tmap-agents?style=flat-square&color=3775a9)](https://pypi.org/project/tmap-agents/)
 [![Python](https://img.shields.io/pypi/pyversions/tmap-agents?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/tmap-agents/)
-[![MCP server](https://img.shields.io/badge/MCP-server-5c4ee5?style=flat-square)](#connect-your-agent)
-[![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square)](LICENSE)
+[![MCP server](https://img.shields.io/badge/MCP-server-5c4ee5?style=flat-square)](https://github.com/JoeyZzZzZz/treasure-map#connect-your-agent)
+[![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square)](https://github.com/JoeyZzZzZz/treasure-map/blob/main/LICENSE)
 
-Treasure Map turns an unpacked firmware filesystem into facts your coding agent (Claude Code, Codex,
-Cursor and others) reads through a bundled MCP server: every dangerous call it recognizes, where the
-data reaching it comes from, and — just as important — what it could not determine. Every fact points
-at an exact binary, function and address. It has no agent of its own and runs no model; deciding which
-lead is a real bug is your agent's job.
+[**Website**](https://tmap.tools/) · [**Showcase**](https://tmap.tools/showcase/) · [**Blog**](https://tmap.tools/blog/) · [**Quick start**](https://github.com/JoeyZzZzZz/treasure-map#quick-start)
+
+</div>
+
+Treasure Map turns an unpacked firmware filesystem into a map your coding agent (Claude Code,
+Codex, Cursor and others) reads through a bundled MCP server: every place the compiled code runs a
+shell command, copies into a buffer, formats a string or opens a file by path, where the data
+reaching each one comes from, and what could not be determined. Give it two versions and it shows
+what the update changed around those calls.
+
+It runs no model and needs no API key. Every fact points at an exact binary, function and address;
+deciding which lead is a real bug is your agent's job.
 
 **Facts are the tool's job; judgment is the model's.**
 
-![tmap scan and tmap diff turn your firmware into facts; your agent reads them over MCP and writes its judgments to a separate layer](https://raw.githubusercontent.com/JoeyZzZzZz/treasure-map/main/docs/images/architecture.svg)
+![Treasure Map turns your firmware into facts; your agent reads them over MCP and writes its judgments to a separate layer](https://raw.githubusercontent.com/JoeyZzZzZz/treasure-map/main/docs/images/architecture.svg)
 
-It does two things:
+## Why your agent needs a map
 
-- **Map one firmware.** Every place the compiled code runs a shell command, copies into a memory
-  buffer, formats a string or opens a file by path — each marked with what is known, what is not, and
-  why. Your agent picks the views it needs, reads the code, and records its judgments.
-- **Diff two versions.** Every function that changed between two releases, grouped by what happened
-  around its dangerous calls. Instead of thousands of functions, your agent reviews the few that
-  changed: is this a security fix, and which 1-day does it close in the old version? Is the fix
-  complete, or does the same call survive somewhere else? Can the new check be bypassed?
+A modern agent reads one function well. What it cannot do on its own is cover a whole root
+filesystem (a hundred binaries, tens of thousands of functions) the same way twice, or tell you
+what it never looked at. So it stops after the first few leads, or reports "nothing found" for
+code it never read.
 
-> **Developer preview.** Commands, config, the atlas database and MCP tool fields may change
-> incompatibly between versions. After upgrading, see [Upgrading](#upgrading).
+Treasure Map does that half. It lays out every lead with the facts behind it, keeps count of what
+has been read and judged, and says plainly where it is blind. Your agent does the reading and the
+judging, and its conclusions are kept for the next session.
+
+## What it does
+
+### Map one firmware
+
+`tmap scan` decompiles every binary with Ghidra and marks each call that runs a shell command,
+copies into a buffer, formats a string or opens a file by path. Every candidate carries the same
+layers: where its data comes from, how much of it an attacker controls, who wrote the value, how
+the spot is reached, whether anything filters it, and whether the function was fully analyzed.
+Each layer reads **YES**, **NO** or an explicit **UNKNOWN** that says what is missing and why.
+
+There is no score. The default view puts the highest-impact calls that nothing has proven safe
+first; your agent can re-sort or filter by any layer, and the set of candidates stays the same.
+Only a proven-safe fact can push a candidate down; an UNKNOWN never can. Command-execution,
+buffer-copy and format-string calls come with in-function argument provenance; path and file calls
+are detected and ranked, and their controllability comes from a text-level reading, marked as
+such.
+
+### Diff two versions
+
+`tmap diff` compares every binary whose content changed, running Ghidra, BinExport and BinDiff end
+to end in parallel; you never handle an intermediate file. Each changed function pair is grouped
+by what happened around its dangerous calls, so your agent reads the few changes that matter
+instead of thousands of functions, and answers: is this a security fix, which weakness in the old
+version does it close, is it complete, and does the same call survive elsewhere?
+
+- **What a similarity score misses.** BinDiff can read `similarity=1.0` while a buffer length went
+  from `0x40` to `0x3f`. Treasure Map compares address-normalized pseudocode and flags a changed
+  length constant at a copy or format call.
+- **A review that knows what it skipped.** The server picks the must-read changes, hands them out
+  in work units and counts what has been judged. An unread change stays *unread*, never "nothing
+  found", and the review is not called complete before the must-read list is done.
+- **Scripts and configs too.** Non-binary files are compared by path, and each one can be judged.
+
+### Keep what your agent concluded
+
+Judgments go into an annotation layer over the read-only facts, so a multi-session audit picks up
+where it left off, with any model or agent. A judgment is flagged for review again the moment the
+facts under it change.
+
+## Case studies
+
+### CVE-2021-26614 was “fixed”. The backdoor never left.
+
+In 2021 ipTIME patched CVE-2021-26614, a debug backdoor in its C200 IP camera (firmware 1.058 →
+1.060). We gave that patch to DeepSeek-V4.1-Flash, a budget general-purpose model, with Treasure
+Map and the diff prompt from Quick start. It judged every must-read item and found three changes
+that look like security fixes; not one of them finishes the job:
+
+- **The backdoor was unlinked, not removed.** Its handler, hardcoded token and command execution
+  are still in the latest firmware, 1.094 (June 2026).
+- **The buffer got bigger, not safer.** The copy into it still takes a length the client decides.
+- **Validation was added only in the browser.** The server CGI is byte-identical in both versions.
+
+**4 of 110 binaries changed · 144 of 144 must-read items judged · US$0.5–1 per run**
+
+[Read the full case study →](https://tmap.tools/showcase/iptime-c200-patch-diff/)
 
 ## Quick start
 
-**1. Install.** One command installs `tmap` and then runs `tmap init`, which sets up the toolchain
-(JDK 21, Ghidra 11.4.3, BinExport, BinDiff 8 — reusing what you already have) and registers the MCP
-server with the agents you pick. No API key is needed. Restart your agent when it finishes and check
-that treasure-map is connected.
+> **Developer preview.** Commands, config, the atlas database and MCP tool fields may change
+> incompatibly between versions; see Upgrading below.
+
+**1. Install.** One command installs `tmap`, then runs `tmap init`: it sets up the toolchain (JDK
+21, Ghidra 11.4.3, BinExport, BinDiff 8, reusing what you already have), registers the MCP server
+with the agents you pick and installs the diff-review skill for those that read skills. Restart
+your agent when it finishes.
 
 ```bash
 curl -LsSf https://github.com/JoeyZzZzZz/treasure-map/releases/latest/download/install.sh | sh
 ```
 
-**2. Map a firmware.** The input is an *already-extracted* filesystem — unpack the image first with
-any extraction tool you like (or ask your agent to unpack it into its filesystem). `-w` is the name
-you give this firmware; use it whenever you mention the firmware to your agent.
+**2. Map a firmware.** The input is an *already-extracted* filesystem (unpack the image with any
+tool you like, or ask your agent to). `-w` is the name you give it.
 
 ```bash
 tmap scan ./firmware.extracted -w my-fw
@@ -54,16 +120,11 @@ tmap scan ./firmware.extracted -w my-fw
 Then ask your agent:
 
 ```text
-Audit firmware my-fw using treasure-map.
-Choose for yourself which views of its candidate map to review
-(by sink, by data source, or by any other layer) and find the issues in them:
-open a lead's pseudocode, trace where its input comes from, and judge it yourself.
-The candidates are leads to verify, not confirmed bugs.
-Record each conclusion with annotate so the next session starts from it.
+Audit firmware my-fw with Treasure Map.
 End with the leads worth following up, each with its evidence_ref and why.
 ```
 
-**3. Or diff two versions.**
+**3. Diff two versions.**
 
 ```bash
 tmap scan ./fw_v1.extracted -w fw-v1
@@ -71,103 +132,60 @@ tmap scan ./fw_v2.extracted -w fw-v2
 tmap diff --before fw-v1 --after fw-v2
 ```
 
-A firmware pair splits into one diff per changed binary; the non-binary files are compared on their
-own.
+Then ask your agent:
 
 ```text
-Review the firmware diff fw-v1 → fw-v2 using treasure-map, starting from start_diff_review,
-across every changed binary and the non-binary files.
-Judge whether each change does something real; say inconclusive when you cannot tell.
-For a real one: what weakness in fw-v1 does it address, and does the same pattern survive elsewhere?
-Record each judgment with annotate_diff, and end with what you reviewed,
-what you did not reach or could not diff, and the changes that look security-relevant.
+Review the firmware diff fw-v1 → fw-v2 with Treasure Map:
+find the security fixes, judge whether each one is complete,
+and check whether the new code adds attack surface.
 ```
 
-That is all you need to get started. `scan` is the slow part — one Ghidra pass per binary, with
-progress shown. Re-running with the same `-w` resumes where it stopped; a different `-w` keeps
-another firmware alongside. Everything you scan and diff accumulates in one **atlas**
-(`~/.treasure-map/atlas.db`), and the agent picks which firmware or diff to work on — no
-reconfiguration per scan.
+The prompts only say what you want. How to work through a map or a diff (what to read, how to
+record each judgment, when a review may stop) comes from Treasure Map itself: its MCP instructions
+and the diff-review skill. A whole firmware pair is often more than one agent session holds: a
+fresh session continues where the last one stopped.
 
-### Your runs
-
-`tmap runs` lists every firmware you have scanned, by the name you gave it, grouped by whether the
-installed tmap would redo it:
-
-```text
-3 run(s) in /home/you/.treasure-map/atlas.db:
-
-needs re-hunt (2):
-  fw-v1   complete   scanned 2026-10-20    58 bins / 10437 fns
-  fw-v2   complete   scanned 2026-10-20    58 bins / 10419 fns
-  → the hunt code changed since this run was hunted; re-hunt needs no decompile
-
-up to date (1):
-  my-fw   complete   scanned 2026-10-27   145 bins / 43643 fns
-
-`tmap rescan` refreshes them.
-```
-
-## What your agent gets
-
-### The firmware map
-
-Each candidate is one point on the map, annotated on several equal layers: where the data comes
-from, how much of it an attacker controls, who wrote the value, how the spot is reached, whether
-anything filters it on the way, and whether the function was fully analyzed. Each layer reads
-**YES**, **NO** or an explicit **UNKNOWN** that says what is missing and why.
-
-There is no score. The default view puts the highest-impact calls that nothing has proven safe first;
-your agent can re-sort or filter by any layer. Re-sorting changes the order, never the set of
-candidates. In every view, only a *proven-safe* fact can push a candidate down; an UNKNOWN never can.
-
-Command-execution, buffer-copy and format-string calls come with in-function argument provenance.
-Path and file calls are covered for detection and ranking; their controllability comes from a
-text-level reading, and is marked as such.
-
-### The patch diff
-
-`tmap diff` compares every binary whose content changed, in parallel, running Ghidra, BinExport and
-BinDiff end to end — you never handle an intermediate file. (`--binary NAME` limits it to one.)
-
-- **A function-level patch view.** One entry per changed function pair, grouped by what happened
-  around its dangerous calls: a call that now goes somewhere else, a dangerous call that is still
-  there, a reading that could not be decided. By default the entries most likely to matter come
-  first; other orderings are a switch away.
-- **What a similarity score misses.** BinDiff's similarity ignores constants: a function can read
-  `similarity=1.0` while a buffer length went from `0x40` to `0x3f`. tmap adds an
-  address-normalized pseudocode comparison (truly identical, or only similar) and flags a changed
-  length constant at a copy or format call.
-- **Blind spots stated, not hidden.** A binary that could not be diffed is listed as such, never
-  counted as unchanged. A function with no counterpart is *undetermined* — it may have been inlined
-  or moved — never reported as removed or added.
-- **Non-binary files too.** Scripts, configs and web files are compared by path between the two
-  versions, and your agent can record a judgment on each file.
-- **Judgments that stay.** Your agent records on each entry whether the change does something real,
-  and can carry that judgment over to the affected candidate in the firmware map.
-
-If the stored scans or diffs were made by an older tmap, `tmap diff` brings them up to date first and
-says what that involves before it starts.
+`scan` is the slow part: one Ghidra pass per binary, with progress shown. Re-running with the same
+`-w` resumes where it stopped. Everything you scan and diff accumulates in one **atlas**
+(`~/.treasure-map/atlas.db`), and your agent picks which firmware or diff to work on.
 
 ## Why facts, not verdicts
 
-A scanner hands you findings and a severity score — a verdict you then have to trust or re-check. A
-modern agent already reads and reasons about one function well. What it cannot do is cover a whole
-root filesystem, or every changed binary between two releases, the same way twice — or say where it
-did not look. That is the half Treasure Map does.
+A scanner hands you findings and a severity score: a verdict you then have to trust or re-check.
+Treasure Map hands your agent facts it can check, and leaves the verdict to it.
 
-- **UNKNOWN is never "safe".** A fact it could not establish stays UNKNOWN; a binary the diff could
-  not analyze never reads as unchanged.
-- **Leads, not verdicts.** A candidate is a lead to verify, not a confirmed vulnerability; a changed
-  function is a change to review, not a confirmed fix. Reachability is graded one function at a time
-  — this is **not** a taint-propagation engine, and it never claims a path is unreachable.
-- **Judgments that accumulate.** Your agent's conclusions live in an annotation layer over the
-  read-only facts, so a multi-session audit picks up where it left off — with any model or agent. A
-  judgment is flagged for review again the moment the facts under it change.
+- **UNKNOWN is never "safe".** A fact it could not establish stays UNKNOWN. A binary the diff could
+  not analyze is listed as a blind spot, never counted as unchanged; a function with no
+  counterpart is *undetermined* (it may have been inlined or moved), never reported as removed or
+  added.
+- **Leads, not verdicts.** A candidate is a lead to verify, not a confirmed vulnerability; a
+  changed function is a change to review, not a confirmed fix. Reachability is graded one function
+  at a time: this is **not** a taint-propagation engine, and it never claims a path is
+  unreachable.
+- **Local, with no model of its own.** Apart from installing and updating itself and its
+  toolchain, Treasure Map makes no network requests and calls no model. What your agent reads
+  through it goes wherever your agent sends its context.
+- **No exploit code.** It produces analysis leads, never proof-of-concept exploits, payloads or
+  shellcode.
+
+## Day to day
+
+| Command | What it does |
+|---|---|
+| `tmap scan DIR -w NAME` | Map one extracted firmware (run it again to resume) |
+| `tmap diff --before A --after B` | Diff two scanned versions (`--binary NAME` for one binary) |
+| `tmap runs` | List the firmware you scanned, and which ones the installed version would redo |
+| `tmap rescan [NAME ...]` | Re-scan the runs the installed version would produce differently (`--dry-run` lists them) |
+| `tmap doctor` | Check the toolchain, config and agent registrations (changes nothing) |
+| `tmap update` | Install the newest version, then run its `tmap init` |
+| `tmap uninstall` | Remove what `tmap init` installed; your data stays |
 
 ## Install details
 
-`tmap init` installs the toolchain for you, or reuses what you already have if it passes the checks:
+`tmap init` installs the toolchain into `~/.treasure-map/toolchain/`, or reuses what you already
+have if it passes the checks. Downloads come from pinned URLs and are checked against a pinned
+size and sha256 before anything is unpacked. It shows what it found and what it will download,
+and changes nothing until you confirm; `--dry-run` prints the full plan.
 
 | Tool | Version | Used for |
 |---|---|---|
@@ -176,24 +194,23 @@ did not look. That is the half Treasure Map does.
 | **BinExport** | for Ghidra 11.4.3 | exporting binaries for `tmap diff` |
 | **BinDiff** | 8 | matching functions between two versions |
 
-Downloads come from pinned URLs and are checked against a pinned size and sha256 before anything is
-unpacked; they go to `~/.treasure-map/toolchain/`.
-
 | Platform | Status |
 |---|---|
 | Linux x86_64 (including WSL2) | supported |
 | macOS on Apple Silicon | supported |
 | macOS on Intel | runs the same toolchain; not acceptance-tested |
-| Linux arm64, native Windows | not supported (no Ghidra decompiler / BinDiff build) — on Windows use WSL2 |
-
-`tmap init` shows what it found and what it will download, and changes nothing until you confirm;
-`--dry-run` prints the full plan.
+| Linux arm64, native Windows | not supported (no Ghidra decompiler / BinDiff build); on Windows use WSL2 |
 
 ## Connect your agent
 
-`tmap init` registers the MCP server for you; restart the agent afterwards.
+`tmap init` registers the MCP server with the agents you pick (Claude Code, Codex, Cursor, Claude
+Desktop, dsh; the ones it finds are pre-selected) and installs the diff-review skill where the
+agent reads skills from disk. Restart the agent afterwards. Claude Desktop takes skills only as an
+upload: save the output of `tmap review skill` as `tmap-diff-review/SKILL.md`, zip that folder and
+upload it under Customize > Skills (code execution must be on).
 
-### Registering by hand
+<details>
+<summary>Registering the MCP server by hand</summary>
 
 The command is always `<absolute path of tmap> mcp` (`command -v tmap` prints the path).
 
@@ -218,53 +235,49 @@ The command is always `<absolute path of tmap> mcp` (`command -v tmap` prints th
 Config files: Cursor `~/.cursor/mcp.json`; Claude Desktop
 `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS); Windsurf
 `~/.codeium/windsurf/mcp_config.json`; Gemini CLI `~/.gemini/settings.json`. With Claude Code use
-`-s user`: a project-local entry of the same name hides it inside that project (`tmap doctor` points
-such entries out).
+`-s user`: a project-local entry of the same name hides it inside that project (`tmap doctor`
+points such entries out).
 
 Parameter names, what each means and where it differs between tools:
 `get_tool_reference(name="parameters")`.
 
+</details>
+
 ## Upgrading
 
 ```bash
-tmap update                                 # install the newest tmap
-tmap rescan                                 # re-scan every run this tmap's code would redo
-tmap diff --before fw-v1 --after fw-v2      # re-runs the diffs that are out of date
+tmap update                                 # install the newest version, then run its init
+tmap rescan                                 # re-scan every run the new code would redo
+tmap diff --before fw-v1 --after fw-v2      # re-run a diff; out-of-date runs are rescanned first
 ```
 
-`tmap update` checks PyPI for the newest version, shows its plan and asks once (`--check` only
-reports, `--yes` skips the question). It replaces the installed version, names any other `tmap` on
-PATH that would shadow the new one, and then starts the new version's `tmap init` by itself — you
-do not type it. That init also tells you how many of your runs predate the new version; `tmap runs`
-shows which ones and what redoing each costs (see [Your runs](#your-runs)). A diff made by an older
-tmap, or with another toolchain, is recomputed once.
+`tmap update` checks PyPI, shows its plan and asks once (`--check` only reports, `--yes` skips the
+question). It names any other `tmap` on PATH that would shadow the new one, then starts the new
+version's `tmap init` by itself, which says how many of your runs predate it; `tmap runs` shows
+which. A diff made by an older version, or with another toolchain, is recomputed once. To rescan a
+single firmware, name its run (the `-w` name, unless you set `--run-id`): `tmap rescan fw-v1`.
 
-With no arguments, `tmap rescan` re-scans every run the installed tmap's code would produce
-differently. To rescan a single firmware, name its run — the `-w` name you scanned it with, unless
-you set `--run-id` — for example `tmap rescan fw-v1`. `--dry-run` lists what would be rescanned and
-why, without running anything.
-
-`tmap update` works on the install the one-line installer makes (`uv tool`). Installed another way,
-update it the same way you installed it.
+`tmap update` works on the install the one-line installer makes (`uv tool`). Installed another
+way, update it the same way you installed it.
 
 ## Troubleshooting
 
-Run `tmap doctor` first. Each check shows ✅, ⚠ (works, worth knowing), `·` (information), ❌, or `?`
-(could not be determined — never shown as ✅); it exits non-zero on any ❌ or `?`.
+Run `tmap doctor` first. Each check shows ✅, ⚠ (works, worth knowing), `·` (information), ❌, or
+`?` (could not be determined, never shown as ✅); it exits non-zero on any ❌ or `?`.
 
-- **`tmap: command not found`** — the tool's bin directory is not on PATH. Run
+- **`tmap: command not found`**: the tool's bin directory is not on PATH. Run
   `uv tool update-shell`, then open a new shell.
-- **`ghidra` / `java` / `bindiff` ❌** — run `tmap init` again for the pinned download, or pass
+- **`ghidra` / `java` / `bindiff` ❌**: run `tmap init` again for the pinned download, or pass
   `--ghidra / --java-home / --bindiff PATH`. On WSL keep everything on the Linux side, not under
   `/mnt/c/...`.
-- **`binexport` ❌ "two copies"** — Ghidra loads extensions from both its own `Ghidra/Extensions` and
-  its user settings directory; remove one of the two.
-- **A binary is missing from a diff** — ask your agent for `list_diff_blindspots`, which names every
-  binary the diff could not analyze and why. After fixing a toolchain problem,
+- **`binexport` ❌ "two copies"**: Ghidra loads extensions from both its own `Ghidra/Extensions`
+  and its user settings directory; remove one of the two.
+- **A binary is missing from a diff**: ask your agent for `list_diff_blindspots`, which names
+  every binary the diff could not analyze and why. After fixing a toolchain problem,
   `tmap diff … --force-retry` tries them again.
-- **Your own Ghidra 11.4.3 starts with an unexpected JDK** — Ghidra remembers the JDK it last ran with
-  (`java_home.save` in its settings directory), and tmap's runs record the JDK tmap uses there. Set
-  `JAVA_HOME` when you start Ghidra yourself.
+- **Your own Ghidra 11.4.3 starts with an unexpected JDK**: Ghidra remembers the JDK it last ran
+  with (`java_home.save` in its settings directory), and Treasure Map's runs record the JDK they
+  use there. Set `JAVA_HOME` when you start Ghidra yourself.
 
 ## Uninstalling
 
@@ -272,26 +285,26 @@ Run `tmap doctor` first. Each check shows ✅, ⚠ (works, worth knowing), `·` 
 tmap uninstall
 ```
 
-It shows its plan, asks once, then removes the treasure-map entry from each agent, removes the
-toolchain `tmap init` downloaded (never a JDK, Ghidra or BinDiff you installed yourself), and offers
-to remove the program itself.
-
-**Your data stays:** `~/.treasure-map/config.yaml`, `.env`, the **atlas** and the workspaces —
-reinstalling reuses all of it. `tmap uninstall --purge-data` deletes them too, after you type a
-confirmation phrase (not recoverable), but only what is provably tmap's: the atlas, what a scan
-wrote in each workspace directory holding a tmap `analysis.db`, and the `config.yaml` / `.env` that
-`tmap init` wrote. The workspace base itself stays (unless it is the default inside
-`~/.treasure-map` and left empty), and nothing in it is deleted when it is your home directory or
-above it. Anything else — a file you wrote yourself, in a workspace or beside one — is kept and
-listed.
+It shows its plan, asks once, then removes the treasure-map entry and the diff-review skill from
+each agent, removes the toolchain `tmap init` downloaded (never a JDK, Ghidra or BinDiff you
+installed yourself), and offers to remove the program itself. **Your data stays:**
+`~/.treasure-map/config.yaml`, `.env`, the atlas and the workspaces; reinstalling reuses all of
+it.
 
 <details>
-<summary>Details</summary>
+<summary>Deleting your data too, and other details</summary>
 
-- An agent entry named treasure-map that does not run tmap is left alone, and so is one inside a dsh
-  profile's own file.
-- The program is removed with `uv tool uninstall tmap-agents` when it was installed with `uv tool`;
-  installed another way, `tmap uninstall` tells you to remove it the same way.
+- `tmap uninstall --purge-data` deletes the data too, after you type a confirmation phrase (not
+  recoverable), but only what is provably Treasure Map's: the atlas, what a scan wrote in each
+  workspace directory holding a Treasure Map `analysis.db`, and the `config.yaml` / `.env` that
+  `tmap init` wrote. The workspace base itself stays (unless it is the default inside
+  `~/.treasure-map` and left empty), and nothing in it is deleted when it is your home directory
+  or above it. Anything else, such as a file you wrote yourself in a workspace or beside one, is
+  kept and listed.
+- An agent entry named treasure-map that does not run `tmap` is left alone, and so is one inside
+  a dsh profile's own file.
+- The program is removed with `uv tool uninstall tmap-agents` when it was installed with
+  `uv tool`; installed another way, `tmap uninstall` tells you to remove it the same way.
 - `--dry-run` prints the plan and changes nothing; `--yes` skips the questions, but never the
   confirmation phrase.
 
@@ -314,10 +327,17 @@ a confirmed vulnerability.
 **No warranty.** The tool is provided "as is". You are solely responsible for how you use it and for
 ensuring your activity is lawful in your jurisdiction. If unsure, consult qualified legal counsel.
 
+## Security
+
+To report a vulnerability in Treasure Map itself, please do it privately: see
+[SECURITY.md](https://github.com/JoeyZzZzZz/treasure-map/blob/main/SECURITY.md). A vulnerability
+you find in firmware *with* Treasure Map belongs to that device's vendor.
+
 ## Contributing
 
-Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and pull requests are welcome; see
+[CONTRIBUTING.md](https://github.com/JoeyZzZzZz/treasure-map/blob/main/CONTRIBUTING.md).
 
 ## License
 
-[Apache-2.0](LICENSE).
+[Apache-2.0](https://github.com/JoeyZzZzZz/treasure-map/blob/main/LICENSE).

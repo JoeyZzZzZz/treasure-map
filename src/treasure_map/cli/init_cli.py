@@ -94,23 +94,16 @@ def render_checks(result: InitResult) -> bool:
 
 
 # What to say to the agent, written out in full (one sentence per line) so it can be copied as is.
+# The README's English prompts are these lines. They say only what the person wants: how to work
+# the map or the diff is the server's standing instructions and the diff-review skill.
 _AUDIT_PROMPT = (
-    "Audit firmware my-fw using treasure-map.",
-    "Choose for yourself which views of its candidate map to review",
-    "(by sink, by data source, or by any other layer) and find the issues in them:",
-    "open a lead's pseudocode, trace where its input comes from, and judge it yourself.",
-    "The candidates are leads to verify, not confirmed bugs.",
-    "Record each conclusion with annotate so the next session starts from it.",
+    "Audit firmware my-fw with Treasure Map.",
     "End with the leads worth following up, each with its evidence_ref and why.",
 )
 _DIFF_PROMPT = (
-    "Review the firmware diff fw-v1 → fw-v2 using treasure-map, starting from start_diff_review,",
-    "across every changed binary and the non-binary files.",
-    "Judge whether each change does something real; say inconclusive when you cannot tell.",
-    "For a real one: what weakness in fw-v1 does it address, and does the same pattern survive"
-    " elsewhere?",
-    "Record each judgment with annotate_diff, and end with what you reviewed,",
-    "what you did not reach or could not diff, and the changes that look security-relevant.",
+    "Review the firmware diff fw-v1 → fw-v2 with Treasure Map:",
+    "find the security fixes, judge whether each one is complete,",
+    "and check whether the new code adds attack surface.",
 )
 
 

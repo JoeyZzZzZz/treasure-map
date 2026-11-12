@@ -34,7 +34,8 @@ fail=0
 
 # ── 1) diff content over the range ───────────────────────────────────────────
 # Two diff views sharing one source of truth (.githooks/lib.sh):
-#   ADDED_ALL     — everything but the pattern-holding machinery. The vendor-name
+#   ADDED_ALL     — everything but the pattern-holding machinery and the two
+#                   top-level READMEs (TM_DIFF_VENDOR_SCAN_EXCLUDES). The vendor-name
 #                   scan runs here; a neutrality test must never name a brand, and
 #                   every such test was verified brand-clean.
 #   ADDED_FRAMING — ADDED_ALL minus the self-referential tests, which embed the
@@ -43,7 +44,7 @@ fail=0
 if [ -n "$BASE_REF" ]; then
     # --no-renames: a renamed file is scanned whole, never skipped as "unchanged".
     ADDED_ALL=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --no-renames --diff-filter=ACM -- . \
-            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" \
+            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" "${TM_DIFF_VENDOR_SCAN_EXCLUDES[@]}" \
             | grep '^+' | grep -v '^+++' || true)
     ADDED_FRAMING=$(git diff "$BASE_REF" "$HEAD_REF" -U0 --no-renames --diff-filter=ACM -- . \
             "${TM_DIFF_MACHINERY_EXCLUDES[@]}" ${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]+"${TM_DIFF_SELF_REFERENTIAL_EXCLUDES[@]}"} \

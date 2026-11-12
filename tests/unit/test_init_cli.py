@@ -242,7 +242,6 @@ def test_the_agent_prompts_are_written_out_in_full(capsys: pytest.CaptureFixture
     assert "…" not in out
     for line in (*_AUDIT_PROMPT, *_DIFF_PROMPT):
         assert f"     {line}\n" in out
-    assert "annotate_diff" in out and "start_diff_review" in out
 
 
 def test_init_prints_each_run_that_kept_an_earlier_extraction(

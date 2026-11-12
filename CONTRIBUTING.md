@@ -25,6 +25,9 @@ Open an issue with:
 
 Please do not attach firmware images or anything you are not allowed to share.
 
+A security vulnerability in Treasure Map itself does not go in a public issue: report it
+privately, as [SECURITY.md](SECURITY.md) describes.
+
 ## Suggesting features
 
 Open an issue describing your use case and what you would like to see.
@@ -58,9 +61,13 @@ network or your real `~/.treasure-map`; the fixtures in `tests/conftest.py` take
 
 ## Keeping the repository vendor-neutral
 
-The repository does not name specific device vendors or model numbers. A `pre-commit` and a
-`commit-msg` hook (installed by `./scripts/install-hooks.sh`) check the staged diff and the commit
-message against `.githooks/vendor-watchlist.example.txt`, a list of generic model-number patterns;
-CI runs the same check on every push and pull request. If a check flags something, rephrase it in
-generic terms. Maintainers can point the hooks at a fuller local list with
-`TM_VENDOR_WATCHLIST=/path/to/list`.
+The repository does not name specific device vendors or model numbers. The one exception is the
+two top-level READMEs, which describe the case study published on the project site by its real
+device, firmware and CVE; the hooks and CI leave those two files out of the vendor-name check, and
+only that check.
+
+A `pre-commit` and a `commit-msg` hook (installed by `./scripts/install-hooks.sh`) check the
+staged diff and the commit message against `.githooks/vendor-watchlist.example.txt`, a list of
+generic model-number patterns; CI runs the same check on every push and pull request. If a check
+flags something, rephrase it in generic terms. Maintainers can point the hooks at a fuller local
+list with `TM_VENDOR_WATCHLIST=/path/to/list`.

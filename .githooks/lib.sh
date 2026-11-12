@@ -45,6 +45,19 @@ TM_DIFF_MACHINERY_EXCLUDES=(
 # so an empty list is safe under `set -u` on old bash.
 TM_DIFF_SELF_REFERENTIAL_EXCLUDES=()
 
+# PUBLIC READMES: the two top-level READMEs describe the case study published on the project
+# site by its real device, firmware and CVE. Their content is exempt from the vendor-name scan
+# ONLY; the file-name, private-note and section-reference scans still cover them, and the
+# commit-message scan is unchanged.
+#
+# ADMISSION RULE — the ONLY files that may enter this list are the repository's top-level
+# READMEs. A README in a subdirectory, and every other file, is still scanned: anything else that
+# names a vendor is fixed in the source, never parked here.
+TM_DIFF_VENDOR_SCAN_EXCLUDES=(
+    ":(exclude)README.md"
+    ":(exclude)README.zh.md"
+)
+
 # Echo the watchlist path to use (env override -> local full list -> committed
 # brand-free example). When falling back to the example, print a notice to stderr.
 # Returns non-zero only if no watchlist file exists at all.

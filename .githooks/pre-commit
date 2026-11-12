@@ -17,13 +17,14 @@ fi
 
 # ── vendor-neutrality enforcement (diff content) ─────────────────────────────
 # Resolve the watchlist and scan the staged ADDED lines via the shared scanner.
-# ADDED_ALL drops only the pattern-holding machinery (TM_DIFF_MACHINERY_EXCLUDES
-# in lib.sh); the neutrality tests stay IN — they must never name a brand.
+# ADDED_ALL drops the pattern-holding machinery (TM_DIFF_MACHINERY_EXCLUDES in lib.sh)
+# and the two top-level READMEs (TM_DIFF_VENDOR_SCAN_EXCLUDES); the neutrality tests
+# stay IN — they must never name a brand.
 WATCHLIST="$(tm_resolve_watchlist || true)"
 if [ -n "$WATCHLIST" ]; then
     # --no-renames: a renamed file's content is scanned whole, not skipped as "unchanged".
     ADDED_ALL=$(git diff --cached -U0 --no-renames --diff-filter=ACM -- . \
-            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" \
+            "${TM_DIFF_MACHINERY_EXCLUDES[@]}" "${TM_DIFF_VENDOR_SCAN_EXCLUDES[@]}" \
             | grep '^+' | grep -v '^+++' || true)
     # The staged paths themselves are scanned too: a file name can carry a model number.
     PATHS=$(git diff --cached --name-only --no-renames --diff-filter=ACM -- . \

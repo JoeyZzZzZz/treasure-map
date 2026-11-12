@@ -43,8 +43,10 @@ dev = [
 tmap = "treasure_map.cli.main:main"
 
 [project.urls]
-Homepage = "https://github.com/JoeyZzZzZz/treasure-map"
+Homepage = "https://tmap.tools/"
 Repository = "https://github.com/JoeyZzZzZz/treasure-map"
+Showcase = "https://tmap.tools/showcase/"
+Blog = "https://tmap.tools/blog/"
 Changelog = "https://github.com/JoeyZzZzZz/treasure-map/blob/main/CHANGELOG.md"
 
 [build-system]

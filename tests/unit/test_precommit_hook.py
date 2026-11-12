@@ -551,3 +551,49 @@ def test_ci_backstop_scans_a_file_name(tmp_path: Path) -> None:
     head = _commit(repo, name, "generic notes\n", "docs: add a note")
     result = _run_ci(repo, example, base, head)
     assert result.returncode != 0 and name in result.stdout, result.stdout
+
+
+def test_the_top_level_readmes_may_name_a_vendor_and_nothing_else_may(tmp_path: Path) -> None:
+    """The two top-level READMEs name the device, firmware and CVE of the published case study, so
+    the vendor-name scan leaves them out. A README in a subdirectory is still scanned, and the
+    private-doc scan still covers the top-level ones.
+
+    MUTATION: drop TM_DIFF_VENDOR_SCAN_EXCLUDES from the pre-commit ADDED_ALL diff -> the README
+    cases are blocked -> RED. MUTATION: add it to the ADDED_FRAMING diff too -> the private-doc
+    case passes -> RED."""
+    cases = [
+        ("README.md", f"Case study: an {_FAKE_VENDOR} {_FAKE_LC_MODEL} camera\n", True),
+        ("README.zh.md", f"案例：{_FAKE_VENDOR} {_FAKE_LC_MODEL} 摄像头\n", True),
+        ("docs/README.md", f"an {_FAKE_VENDOR} camera\n", False),
+        ("README.md", "as the map" + "_design.md notes say\n", False),
+    ]
+    for i, (name, text, passes) in enumerate(cases):
+        (tmp_path / f"case{i}").mkdir()
+        repo, watchlist = _init_repo(tmp_path / f"case{i}")
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(text, encoding="utf-8")
+        _git(repo, "add", name)
+        result = _run_hook(repo, watchlist)
+        if passes:
+            assert result.returncode == 0, (name, result.stdout)
+        else:
+            assert result.returncode != 0 and "COMMIT BLOCKED" in result.stdout, (name, text)
+
+
+def test_ci_leaves_only_the_top_level_readmes_out_of_the_vendor_scan(tmp_path: Path) -> None:
+    """CI reads the same exclude set as the hook: a vendor in README.md passes; the same vendor in
+    another file, or in a commit message, still fails.
+
+    MUTATION: drop TM_DIFF_VENDOR_SCAN_EXCLUDES from check-vendor-neutrality.sh's ADDED_ALL ->
+    the README range fails -> RED."""
+    repo, watchlist = _init_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    readme = _commit(repo, "README.md", f"Case study: an {_FAKE_VENDOR} camera\n", "docs: case")
+    result = _run_ci(repo, watchlist, base, readme)
+    assert result.returncode == 0, result.stdout
+    other = _commit(repo, "notes.md", f"an {_FAKE_VENDOR} camera\n", "docs: notes")
+    result = _run_ci(repo, watchlist, readme, other)
+    assert result.returncode != 0 and "diff content" in result.stdout, result.stdout
+    message = _commit(repo, "README.md", "the case study\n", f"docs: the {_FAKE_VENDOR} case")
+    result = _run_ci(repo, watchlist, other, message)
+    assert result.returncode != 0 and "commit message" in result.stdout, result.stdout
