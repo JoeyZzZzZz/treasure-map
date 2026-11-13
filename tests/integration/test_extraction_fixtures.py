@@ -493,3 +493,52 @@ def test_the_thunks_the_export_skips_are_recorded(promote_json: dict[str, Any]) 
     assert thunks
     exported = {int(f["address"], 16) for f in promote_json["functions"]}
     assert not {int(entry, 16) for entry, _body in thunks} & exported
+
+
+# ── the hunt-time dispatch-table reader, end to end through real Ghidra ──────────────────────
+
+
+def test_the_hunt_reader_finds_the_dispatch_table_in_the_stored_image(
+    tables_json: dict[str, Any], tmp_path: Path
+) -> None:
+    """The one end-to-end test of the hunt-time table reader (lib/hunt/dispatch_tables): the
+    functions, strings and pointer words Ghidra exported for libtables are ingested into an
+    analysis.db, and ``detect_run`` reads the {name -> handler} ``commands`` table back out of the
+    stored bytes — no re-run of Ghidra. The unit tests lay the bytes out directly; this proves the
+    real extraction feeds the reader. The ELF is on disk at its scanned sha256, so the slot check
+    runs (every handler verified)."""
+    import hashlib
+
+    from treasure_map.lib.analyze.elf_slots import read_elf_slots
+    from treasure_map.lib.analyze.ghidra_ingest import IngestStats, _ingest_one_binary
+    from treasure_map.lib.hunt.dispatch_tables import detect_run
+    from treasure_map.lib.storage.connection import open_db
+
+    elf = _FIXTURES / "libtables_x86_64.so"
+    sha = hashlib.sha256(elf.read_bytes()).hexdigest()
+    db = tmp_path / "analysis.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, arch, bits, ghidra_ok, last_seen_at) "
+        "VALUES (1, 'libtables', ?, ?, 'x86:LE:64:default', 64, 1, '2026-01-01')",
+        (str(elf), sha),
+    )
+    _ingest_one_binary(conn, 1, tables_json, IngestStats(), slots=read_elf_slots(elf))
+    conn.commit()
+    conn.close()
+
+    res = detect_run(db, "run_fx")
+    handler = {r.key: r.callee_name for r in res.edges if r.pairing_basis != "undetermined"}
+    # the {name -> internal function} commands table is read, key-first (+1), each name -> its fn
+    for name, fn in (
+        ("alpha", "fx_alpha"),
+        ("beta", "fx_beta"),
+        ("gamma", "fx_gamma"),
+        ("delta", "fx_delta"),
+        ("epsilon", "fx_epsilon"),
+    ):
+        assert handler.get(name) == fn, (name, handler.get(name))
+    assert all(r.completeness_status == "incomplete" for r in res.edges)
+    # the detector's honesty row rode across, and the ELF was verified (no unverified handlers)
+    (status,) = [s for s in res.statuses if s.binary == "libtables"]
+    assert status.scanned == 1 and status.handler_unverified == 0

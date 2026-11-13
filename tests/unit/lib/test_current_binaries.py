@@ -20,6 +20,8 @@ from treasure_map.lib.diff.loader import load_functions
 from treasure_map.lib.pattern.scanner import scan
 from treasure_map.lib.storage.connection import open_db
 
+from .dispatch_image import Image
+
 _BODY = "void handle(char *p){ char b[64]; recv(0, b, 64, 0); system(b); }"
 
 
@@ -49,6 +51,10 @@ def test_the_hunt_reads_only_the_current_scans_binaries(tmp_path: Path) -> None:
     assert {m.func_ref.binary_name for m in scan(db).matches} == {"new_daemon"}
 
 
+def _table_keys(name: str, bid: int) -> list[str]:
+    return [f"{name}_{bid}_{op}" for op in ("cmd", "set", "get", "del")]
+
+
 def _replaced_firmware_db(tmp_path: Path) -> Path:
     """The firmware under a workspace was replaced: the first scan held webd (1) and cfgd (2), the
     current scan holds a new webd (3) only. Each binary carries a defaults table, a static dispatch
@@ -62,9 +68,20 @@ def _replaced_firmware_db(tmp_path: Path) -> Path:
         (3, "webd", "2026-02-01 00:00:00"),
     ):
         conn.execute(
-            "INSERT INTO binaries (id, name, path, sha256, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO binaries (id, name, path, sha256, last_seen_at, ghidra_ok) "
+            "VALUES (?, ?, ?, ?, ?, 1)",
             (bid, name, f"usr/sbin/{name}", str(bid) * 64, seen),
         )
+        # A stored image holding one key-first dispatch table (four records, then a zero record):
+        # what the hunt-time table reader reads.
+        img = Image()
+        handlers = [img.func(f"fx_{bid}_{i}") for i in range(4)]
+        keys = [img.string(k) for k in _table_keys(name, bid)]
+        img.words(0x7FFF0001, 0x7FFF0002)
+        for k, h in zip(keys, handlers, strict=True):
+            img.words(k, h)
+        img.words(0, 0, 0x7FFF0003, 0x7FFF0004)
+        img.write_contents(conn, bid)
         conn.execute(
             "INSERT INTO nvram_defaults (binary_id, key, default_value, flags, member_index) "
             "VALUES (?, ?, '1', 0, 0)",
@@ -98,7 +115,7 @@ def _replaced_firmware_db(tmp_path: Path) -> Path:
         (
             "string_tables",
             "SELECT binary, key FROM string_keyed_edge WHERE mechanism = 'static_string_table'",
-            {("webd", "webd_3_cmd")},
+            {("webd", k) for k in ("webd_3_cmd", "webd_3_set", "webd_3_get", "webd_3_del")},
         ),
         (
             "detector_scan_status",
@@ -117,9 +134,9 @@ def test_the_hunt_carries_only_the_current_scans_tables_into_the_atlas(
 
     MUTATION (each measured RED on the assertion of its own case): join every binary again in
     the hunt's nvram_defaults loader -> the old webd's and cfgd's keys come back; in the
-    string_tables loader -> their dispatch keys come back; in the detector-status loader -> three
-    status rows instead of one (a list, not a set, so the old webd's row is not folded into the
-    new one's).
+    static-table reader's binary query (dispatch_tables.detect_run) -> their dispatch keys come
+    back AND three status rows instead of one (a list, not a set, so the old webd's row is not
+    folded into the new one's).
     """
     from treasure_map.lib.hunt.analyzer2 import run_analyzer2
 

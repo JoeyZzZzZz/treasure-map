@@ -106,14 +106,15 @@ class _Fixture:
         table_addr: str,
         entries: list[tuple[str, str]],
         reason: str | None = None,
+        basis: str = "data_terminator",
     ) -> None:
         for key, callee in entries:
             self.atlas.execute(
                 "INSERT INTO string_keyed_edge (source_run_id, binary, binary_path, key, "
                 "mechanism, callee_addr, callee_kind, table_addr, completeness_status, "
-                "completeness_reason) "
-                "VALUES (?, ?, ?, ?, 'static_string_table', ?, 'direct', ?, 'incomplete', ?)",
-                (run, binary, path, key, callee, table_addr, reason),
+                "completeness_reason, pairing_basis) "
+                "VALUES (?, ?, ?, ?, 'static_string_table', ?, 'direct', ?, 'incomplete', ?, ?)",
+                (run, binary, path, key, callee, table_addr, reason, basis),
             )
 
     def gate(
@@ -285,6 +286,31 @@ def test_an_undetermined_pairing_joins_no_two_sides(tmp_path: Path) -> None:
     anchors = sorted(((g.a_anchor or "-"), (g.b_anchor or "-")) for g in _by_mech(pd, dg.GATE))
     assert anchors == [("-", D1B), (D1A, "-")], anchors
     assert all(not g.counterpart_enumerates for g in pd.groups)
+
+
+def test_a_candidate_handler_joins_the_group_but_is_marked(tmp_path: Path) -> None:
+    """A static-table row whose pairing is undetermined (a candidate: the table holds the key and
+    this function, but which handler the key is paired with is unsettled) still places its function
+    in the table's group — the table holds it — but the member is marked ``pairing_undetermined``
+    on the side it is only a candidate.
+
+    MUTATION (verified RED): mark no member -> the candidate reads as a settled handler -> RED."""
+    fx = _Fixture(tmp_path, with_sibling=False)
+    f1 = dg.MemberRef(D1, f"pair:{F1A}:{F1B}", f"anc:{F1A}", "entry", F1A, F1B)
+    # F1's A-side function is an undetermined (candidate) handler of its table
+    fx.sql(
+        "UPDATE string_keyed_edge SET pairing_basis = 'undetermined' "
+        "WHERE source_run_id = 'runA' AND callee_addr = ? AND mechanism = 'static_string_table'",
+        F1A,
+    )
+    pd = dg.compute_pair(fx.atlas, "runA", "runB", [f1])
+    static_label = next(
+        lab for lab in dg.member_labels(pd)[(D1, f1.entry_id)] if lab["mechanism"] == dg.STATIC
+    )
+    assert static_label.get("pairing_undetermined") == ["a"]
+    # the member is still in the group (the table holds it)
+    g = next(x for x in pd.groups if x.mechanism == dg.STATIC)
+    assert f1.entry_id in g.members
 
 
 def test_the_keys_of_a_member_are_given_per_side(tmp_path: Path) -> None:

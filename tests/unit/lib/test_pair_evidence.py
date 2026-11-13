@@ -68,12 +68,16 @@ def _image(w: World, side: str, words: tuple[int, ...] = (0x11111111,)) -> None:
     )
 
 
-def _key(w: World, side: str, key: str, func: str) -> None:
-    """One dispatch-table entry: ``key`` selects the handler at ``func``."""
-    w.adb[side].execute(
-        "INSERT INTO string_tables (binary_id, table_addr, stride, entry_index, key, func_name, "
-        "func_addr, func_kind) VALUES (1, '0x00080000', 8, 0, ?, NULL, ?, 'direct')",
-        (key, f"0x{func}"),
+def _key(w: World, side: str, key: str, func: str, *, basis: str = "data_terminator") -> None:
+    """One static-table row of that side's run: ``key`` is paired with the handler at ``func`` by
+    ``basis`` (``undetermined``: a candidate row, which is no anchor)."""
+    w.adb[side].execute("UPDATE binaries SET path = '/fx/libx' WHERE id = 1")
+    w.atlas.execute(
+        "INSERT INTO string_keyed_edge (source_run_id, binary, binary_path, key, mechanism, "
+        "callee_addr, callee_kind, table_addr, completeness_status, stride_words, key_phase, "
+        "handler_offset, pairing_basis) VALUES (?, 'libx', '/fx/libx', ?, "
+        "'static_string_table', ?, 'direct', '0x80000', 'incomplete', 2, 0, 1, ?)",
+        ("runA" if side == "a" else "runB", key, f"0x{func}", basis),
     )
 
 
@@ -286,6 +290,23 @@ def test_the_dispatch_key_anchor_reads_one_handler_on_each_side(tmp_path: Path) 
     e = _e(v, SUP_KEY)
     assert e["pair_evidence"]["state"] == "none"
     assert "counterpart_hint" not in e
+
+
+def test_an_undetermined_dispatch_row_is_no_anchor(tmp_path: Path) -> None:
+    """A static-table row whose pairing is undetermined (a candidate: the bytes hold the key and
+    the handler, but which handler the key is paired with is unsettled) is NOT a key anchor — the
+    anchor reads only determined rows, so SUP_KEY falls back to its caller/string evidence.
+
+    MUTATION (verified RED): read candidate rows as anchors too -> SUP_KEY's key ties a handler
+    again -> the counterpart_hint comes back -> RED."""
+    w = _evidence_world(tmp_path)
+    # a second, UNDETERMINED row for the same key on B: it must not make the key an anchor
+    _key(w, "b", "do_reboot", OTHER_B, basis="undetermined")
+    w.commit()
+    e = _e(_view(w, sort_by="significance"), SUP_KEY)
+    # the determined 1:1 handler still anchors; the extra candidate row did not spoil it
+    assert e["counterpart_hint"]["state"] == "consistent"
+    assert e["pair_evidence"]["state"] == "supported"
 
 
 # ── the float, and its limits ────────────────────────────────────────────────────────────────

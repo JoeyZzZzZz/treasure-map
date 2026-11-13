@@ -139,8 +139,10 @@ def add_string_keyed_edges(
         """INSERT INTO string_keyed_edge
            (source_run_id, binary, from_function, from_func_addr, key, mechanism,
             callee_name, callee_addr, callee_kind, ladder_size, table_addr,
-            completeness_status, completeness_reason, completeness_scope, binary_path)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            completeness_status, completeness_reason, completeness_scope, binary_path,
+            stride_words, key_phase, handler_offset, pairing_basis, pairing_conflict,
+            column_evidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.source_run_id,
@@ -158,6 +160,12 @@ def add_string_keyed_edges(
                 r.completeness_reason,
                 r.completeness_scope,
                 r.binary_path,
+                r.stride_words,
+                r.key_phase,
+                r.handler_offset,
+                r.pairing_basis,
+                r.pairing_conflict,
+                r.column_evidence,
             )
             for r in rows
         ],
@@ -258,8 +266,8 @@ def add_detector_status(
     conn.executemany(
         """INSERT INTO detector_scan_status
            (source_run_id, binary, detector, scanned, supported_scope, unsupported_note,
-            cap_hit, found_count, binary_path)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            cap_hit, found_count, binary_path, handler_unverified, pairing_undetermined)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 r.source_run_id,
@@ -271,6 +279,8 @@ def add_detector_status(
                 r.cap_hit,
                 r.found_count,
                 r.binary_path,
+                r.handler_unverified,
+                r.pairing_undetermined,
             )
             for r in rows
         ],

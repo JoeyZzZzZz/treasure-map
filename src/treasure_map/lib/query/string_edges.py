@@ -20,11 +20,42 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-_COLS = (
+_BASE_COLS = (
     "source_run_id, binary, binary_path, from_function, from_func_addr, key, mechanism, "
     "callee_name, callee_addr, callee_kind, ladder_size, table_addr, "
     "completeness_status, completeness_reason, completeness_scope"
 )
+# The static-table reading's columns. An atlas written before them has none: each is then read as
+# NULL ("no pairing recorded"), never as a pairing.
+_PAIRING_COLS = (
+    "stride_words",
+    "key_phase",
+    "handler_offset",
+    "pairing_basis",
+    "pairing_conflict",
+    "column_evidence",
+)
+# The pairing a candidate row carries: the bytes hold the key and this function in one record, but
+# which handler the key is paired with is not settled (one row per reading, none chosen).
+UNDETERMINED = "undetermined"
+
+
+def _cols(conn: sqlite3.Connection) -> str:
+    """The select list over this atlas's string_keyed_edge columns (missing pairing columns as
+    NULL)."""
+    try:
+        have = {r[1] for r in conn.execute("PRAGMA table_info(string_keyed_edge)")}
+    except sqlite3.Error:
+        have = set()
+    extra = ", ".join(c if c in have else f"NULL AS {c}" for c in _PAIRING_COLS)
+    return f"{_BASE_COLS}, {extra}"
+
+
+def is_candidate_edge(edge: dict[str, Any]) -> bool:
+    """A static-table candidate row: the record holds the key and this function, but its pairing
+    is undetermined — never read as "key K dispatches to F"."""
+    pairing = edge.get("pairing")
+    return isinstance(pairing, dict) and pairing.get("basis") == UNDETERMINED
 
 
 def _row_to_edge(r: sqlite3.Row) -> dict[str, Any]:
@@ -49,6 +80,26 @@ def _row_to_edge(r: sqlite3.Row) -> dict[str, Any]:
             "scope": r["completeness_scope"],
         },
         "source_run_id": r["source_run_id"],
+        **_pairing(r),
+    }
+
+
+def _pairing(r: sqlite3.Row) -> dict[str, Any]:
+    """A static-table row's reading: ``pairing.basis`` is what pairs the key with this handler
+    (``code_two_index`` / ``code_helper`` / ``data_terminator``), or ``undetermined`` — a
+    CANDIDATE row, one per reading the bytes allow, never a pairing chosen. Absent on a strcmp-gate
+    row; ``basis`` null on a row written before the reading was recorded."""
+    if r["mechanism"] != "static_string_table":
+        return {}
+    return {
+        "pairing": {
+            "basis": r["pairing_basis"],
+            "handler_offset": r["handler_offset"],
+            "stride_words": r["stride_words"],
+            "key_phase": r["key_phase"],
+            "conflict": r["pairing_conflict"],
+            "column_evidence": r["column_evidence"],
+        }
     }
 
 
@@ -75,15 +126,15 @@ def edges_reaching_callee(
         return []
     if binary_path and binary:
         sql = (
-            f"SELECT {_COLS} FROM string_keyed_edge WHERE callee_name = ? "
+            f"SELECT {_cols(conn)} FROM string_keyed_edge WHERE callee_name = ? "
             "AND (binary_path = ? OR (binary_path IS NULL AND binary = ?))"
         )
         params: tuple[str, ...] = (func_name, binary_path, binary)
     elif binary:
-        sql = f"SELECT {_COLS} FROM string_keyed_edge WHERE callee_name = ? AND binary = ?"
+        sql = f"SELECT {_cols(conn)} FROM string_keyed_edge WHERE callee_name = ? AND binary = ?"
         params = (func_name, binary)
     else:
-        sql = f"SELECT {_COLS} FROM string_keyed_edge WHERE callee_name = ?"
+        sql = f"SELECT {_cols(conn)} FROM string_keyed_edge WHERE callee_name = ?"
         params = (func_name,)
     try:
         rows = conn.execute(sql, params).fetchall()
@@ -119,9 +170,14 @@ def _static_table_status(
         if val is not None:
             where.append(f"{col} = ?")
             params.append(val)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(detector_scan_status)")}
+    unver = "handler_unverified" if "handler_unverified" in have else "NULL AS handler_unverified"
+    undet = (
+        "pairing_undetermined" if "pairing_undetermined" in have else "NULL AS pairing_undetermined"
+    )
     sql = (
         "SELECT source_run_id, binary, binary_path, scanned, supported_scope, unsupported_note, "
-        "cap_hit, found_count FROM detector_scan_status WHERE "
+        f"cap_hit, found_count, {unver}, {undet} FROM detector_scan_status WHERE "  # noqa: S608
         + " AND ".join(where)  # noqa: S608 -- literal
         + " ORDER BY source_run_id, binary, id"
     )
@@ -139,6 +195,10 @@ def _static_table_status(
             "scanned": r["scanned"],
             "cap_hit": bool(r["cap_hit"]),
             "found_count": r["found_count"],
+            # the static-table reader's per-binary counts (NULL on a pre-column status row): the
+            # handler slots the ELF could not vouch for; candidate rows (pairing undetermined)
+            "handler_unverified": r["handler_unverified"],
+            "pairing_undetermined": r["pairing_undetermined"],
         }
         for r in rows
     ]
@@ -154,6 +214,10 @@ def _static_table_status(
             "not_scanned": sum(1 for r in rows if not r["scanned"]),
         },
         "found_total": sum(r["found_count"] or 0 for r in rows),
+        # ★ the recovery's own honesty: candidate rows (pairing undetermined) and ELF-unverified
+        # handlers over the scope, so "how much did it NOT settle" rides with the result.
+        "pairing_undetermined_total": sum(r["pairing_undetermined"] or 0 for r in rows),
+        "handler_unverified_total": sum(r["handler_unverified"] or 0 for r in rows),
         "binaries_without_status": _binaries_without_status(conn, run_id, binary, rows),
         "statuses": statuses[lo:] if limit is None else statuses[lo : lo + max(0, limit)],
         "total_statuses": len(statuses),
@@ -230,7 +294,7 @@ def get_string_keyed_edges(
             params.append(val)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     sql = (
-        f"SELECT {_COLS} FROM string_keyed_edge{clause}"  # noqa: S608 -- literal columns + WHERE
+        f"SELECT {_cols(conn)} FROM string_keyed_edge{clause}"  # noqa: S608 -- literal cols + WHERE
         " ORDER BY from_function, key, callee_name, id LIMIT ? OFFSET ?"
     )
     try:
@@ -269,6 +333,8 @@ def get_string_keyed_edges(
             "Enumerated string-keyed edges (a string key gates/dispatches to a callee). A FACT, "
             "NOT a reachability verdict: a candidate that is an edge callee stays reachability="
             "unknown — the key is a lead you confirm. Check each edge's completeness (an "
-            "incomplete region means undetected edges may exist)."
+            "incomplete region means undetected edges may exist). A static-table edge whose "
+            "pairing.basis is 'undetermined' is a CANDIDATE: the record holds the key and this "
+            "function, but which handler the key is paired with is not settled."
         ),
     }

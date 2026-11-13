@@ -68,6 +68,7 @@ from treasure_map.lib.atlas.writer import (
 )
 from treasure_map.lib.diff.loader import FuncRow, load_functions
 from treasure_map.lib.hunt.bridge import callsite_addr_out_of_body, callsite_address_offset
+from treasure_map.lib.hunt.dispatch_tables import detect_run, elf_file_state
 from treasure_map.lib.hunt.downweight import (
     CONST_SINK_ARG,
     detect_form_signal,
@@ -398,7 +399,12 @@ def hunt_input_fingerprint(db_path: Path | str) -> str | None:
     the current binaries' content (path, sha256, extraction pass, Ghidra outcome and version), the
     non-binary files, the filesystem links, and every table's row count (a changed setting such as
     the xref fold threshold shows up there). Equal digests over a deterministic hunt mean the same
-    result; anything unreadable is None, which re-hunts."""
+    result; anything unreadable is None, which re-hunts.
+
+    It also reads one thing outside the database: whether each current binary's ELF is still on
+    disk with the recorded sha256 (``dispatch_tables.elf_file_state``). The static-table reader
+    re-checks every handler slot against that file's relocations, so an unpacked image deleted or
+    replaced since changes the hunt's result — and must change this digest with it."""
     try:
         conn = facts.open_analysis_ro(db_path)
     except sqlite3.Error:
@@ -414,6 +420,10 @@ def hunt_input_fingerprint(db_path: Path | str) -> str | None:
         ):
             for row in conn.execute(sql):
                 h.update(json.dumps(list(row), default=str).encode() + b"\n")
+        for path, sha in conn.execute(
+            "SELECT path, sha256 FROM current_binaries WHERE ghidra_ok = 1 ORDER BY path, sha256"
+        ):
+            h.update(f"elf {path} {elf_file_state(path, sha)}\n".encode())
         tables = [
             r[0]
             for r in conn.execute(
@@ -843,59 +853,6 @@ def _flatten_string_keyed_edges(
     return rows
 
 
-def _flatten_string_tables(db_path: Path | str, source_run_id: str) -> list[StringKeyedEdgeRow]:
-    """Flatten detector A's static {string -> funcptr} dispatch-table entries into the SAME atlas
-    string_keyed_edge table (mechanism='static_string_table'), one row per entry.
-
-    ★ IRON LAW: a table entry is an ENUMERATED edge (key -> handler), never a reachability verdict.
-    The reachability layer reads it as a key lead, the candidate stays unknown. A static table has
-    no source function (it lives in .rodata), so from_function/from_func_addr are None and the
-    table_addr is set; the callee anchor is the handler's {name, addr, kind}. The detector-level
-    completeness rides on every row (incomplete by construction — MVP absolute-2-field only), so a
-    cross-version delta in an unhandled table form reads as undetermined, not a real add/remove. A
-    missing table (older analysis.db) yields no rows — the capability is still registered anyway.
-    """
-    uri = ro_uri(Path(db_path))
-    conn = sqlite3.connect(uri, uri=True)
-    try:
-        rows = conn.execute(
-            "SELECT s.table_addr, s.key, s.func_name, s.func_addr, s.func_kind, "
-            "s.completeness_status, s.completeness_reason, s.completeness_scope, "
-            "b.name AS binary, b.path AS binary_path "
-            "FROM string_tables s JOIN binaries b ON b.id = s.binary_id "
-            # The current scan's binaries only — the rule the shape scan applies to functions. A
-            # re-scan in place keeps the previous scan's binaries, and their tables, in the db.
-            "WHERE b.last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries)"
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return []  # pre-detector-A analysis.db -> no data (capability still registered)
-    finally:
-        conn.close()
-    out: list[StringKeyedEdgeRow] = []
-    for r in rows:
-        c_status = r[5] if r[5] in ("complete", "incomplete", "partial") else "incomplete"
-        out.append(
-            StringKeyedEdgeRow(
-                source_run_id=source_run_id,
-                binary=r[8],
-                binary_path=r[9],
-                from_function=None,  # a static table has no source function (it lives in .rodata)
-                from_func_addr=None,
-                key=r[1] if isinstance(r[1], str) else None,
-                mechanism="static_string_table",
-                callee_name=r[2] if isinstance(r[2], str) else None,
-                callee_addr=r[3] if isinstance(r[3], str) else None,
-                callee_kind=r[4] if isinstance(r[4], str) else None,
-                ladder_size=None,  # ladder_size is a strcmp-ladder concept; N/A for a static table
-                table_addr=r[0] if isinstance(r[0], str) else None,
-                completeness_status=c_status,
-                completeness_reason=r[6] if isinstance(r[6], str) else None,
-                completeness_scope=r[7] if isinstance(r[7], str) else None,
-            )
-        )
-    return out
-
-
 def _load_exec_inventory(db_path: Path | str) -> ExecEdgeInventory:
     """Everything a launch token is matched against: the link inventory, the binary names, and the
     script names.
@@ -1029,7 +986,10 @@ def _flatten_detector_status(
             "FROM detector_scan_status d JOIN binaries b ON b.id = d.binary_id "
             # Current binaries only: a replaced binary's status row would sit beside its
             # successor's under the same path and make the completeness claim ambiguous.
-            "WHERE b.last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries)"
+            "WHERE b.last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries) "
+            # The static-table status comes from the hunt-time reader (dispatch_tables), which
+            # replaces the extractor's table pass on the read side: its row is not carried over.
+            "AND COALESCE(d.detector, 'string_tables') != 'string_tables'"
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # pre-feature analysis.db -> no status (query reports 'no status recorded')
@@ -1111,6 +1071,10 @@ def _one_hop_edge_leads(
     seen: set[tuple[_BinaryScope, str, str, str, str, bool]] = set()
     for e in edge_rows:
         if not e.callee_name or not e.key:
+            continue
+        if e.pairing_basis == "undetermined":
+            # A static-table CANDIDATE row: the record holds the key and this function, but that
+            # the key dispatches to it is not settled — no lead walks down from it.
             continue
         callee_addr = _addr_to_int(e.callee_addr)
         callee_row: FuncRow | None
@@ -1483,12 +1447,15 @@ def run_analyzer2(
     string_keyed_edge_rows = _flatten_string_keyed_edges(
         all_funcs, _load_string_keyed_edges(db_path), source_run_id
     )
-    # detector A: static {string -> funcptr} dispatch tables land in the SAME atlas edge table
-    # (mechanism='static_string_table'), so both detectors share one query + MCP surface + cap key.
-    string_keyed_edge_rows += _flatten_string_tables(db_path, source_run_id)
-    # detector A honesty status (per binary): flattened into atlas alongside the edges so an EMPTY
+    # Static {string -> handler} dispatch tables, read here from the stored bytes (lib/hunt/
+    # dispatch_tables), land in the SAME atlas edge table (mechanism='static_string_table'), so both
+    # detectors share one query + MCP surface + cap key. Its per-binary status row replaces the one
+    # the extractor's own table pass recorded (same detector name, which the readers select on).
+    static_tables = detect_run(db_path, source_run_id)
+    string_keyed_edge_rows += static_tables.edges
+    # Detector honesty status (per binary): flattened into atlas alongside the edges so an EMPTY
     # result carries "scanned / scope / cap_hit" instead of reading as a confident "none".
-    detector_status_rows = _flatten_detector_status(db_path, source_run_id)
+    detector_status_rows = static_tables.statuses + _flatten_detector_status(db_path, source_run_id)
     # Launch-edge honesty status (per binary), written even at zero edges — an empty result must
     # not read as "this binary launches nothing" when the pass has known structural gaps.
     detector_status_rows += _exec_scan_status(

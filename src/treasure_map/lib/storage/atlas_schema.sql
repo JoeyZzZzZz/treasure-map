@@ -279,6 +279,17 @@ CREATE TABLE IF NOT EXISTS string_keyed_edge (
         CHECK (completeness_status IN ('complete','incomplete','partial')),
     completeness_reason TEXT,   -- switch_form_unrecognized / gate_branch_unresolved / got_relative_table_skipped / …
     completeness_scope  TEXT,   -- function@addr or region id, so a diff can match by region
+    -- static_string_table only (NULL on a strcmp_gate row and on a row from before the columns):
+    stride_words        INTEGER,  -- the record's width in words
+    key_phase           INTEGER,  -- the key slot's word position mod stride_words
+    handler_offset      INTEGER,  -- the handler slot's word offset from the key (+1 key first,
+                                  --   -1 key last, ...); NULL on a candidate row that two
+                                  --   readings give the same function
+    pairing_basis       TEXT,     -- what pairs this key with this handler: code_two_index /
+                                  --   code_helper / data_terminator, or 'undetermined' — a
+                                  --   CANDIDATE row, one per reading, never a pairing chosen
+    pairing_conflict    TEXT,     -- the weaker basis that disagreed (the stronger one is kept)
+    column_evidence     TEXT,     -- what shows the column is dispatched to: code / struct
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -376,7 +387,9 @@ CREATE TABLE IF NOT EXISTS detector_scan_status (
     supported_scope  TEXT,
     unsupported_note TEXT,
     cap_hit          INTEGER NOT NULL DEFAULT 0,
-    found_count      INTEGER NOT NULL DEFAULT 0
+    found_count      INTEGER NOT NULL DEFAULT 0,
+    handler_unverified   INTEGER,      -- static tables: handler slots the ELF could not vouch for
+    pairing_undetermined INTEGER       -- static tables: candidate rows (pairing undetermined)
 );
 CREATE INDEX IF NOT EXISTS idx_detstat_run    ON detector_scan_status(source_run_id);
 CREATE INDEX IF NOT EXISTS idx_detstat_binary ON detector_scan_status(binary);

@@ -365,6 +365,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if cols and column not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")  # noqa: S608
 
+    # The static-table reading's columns (added with the hunt-time table reader): the record's
+    # stride, the key's phase, the handler offset and what pairs the two, on string_keyed_edge; the
+    # unverified-handler and undetermined-pairing counts on detector_scan_status. NULL on a row
+    # written before they existed — a reader takes NULL as "no pairing recorded", never as paired.
+    # Idempotent; each runs only while its column is missing.
+    for table, column, decl in (
+        ("string_keyed_edge", "stride_words", "INTEGER"),
+        ("string_keyed_edge", "key_phase", "INTEGER"),
+        ("string_keyed_edge", "handler_offset", "INTEGER"),
+        ("string_keyed_edge", "pairing_basis", "TEXT"),
+        ("string_keyed_edge", "pairing_conflict", "TEXT"),
+        ("string_keyed_edge", "column_evidence", "TEXT"),
+        ("detector_scan_status", "handler_unverified", "INTEGER"),
+        ("detector_scan_status", "pairing_undetermined", "INTEGER"),
+    ):
+        cols = _column_names(conn, table)
+        if cols and column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")  # noqa: S608
+
 
 def open_atlas(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the atlas SQLite database and apply the schema.

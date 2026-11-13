@@ -209,6 +209,18 @@ class StringKeyedEdgeRow:
     # firmware, so it is the path that says which file this row is about. None on a row read
     # back from before the column existed.
     binary_path: str | None = None
+    # static_string_table only (None on a strcmp_gate row and on a row from before the columns):
+    # the record's stride in words, the key slot's word position mod the stride, the handler's
+    # word offset from the key (None on a candidate row two readings give the same function),
+    # what pairs the key with this handler (code_two_index / code_helper / data_terminator, or
+    # 'undetermined' for a candidate row), the weaker basis that disagreed (if any), and what
+    # shows the column is one the table dispatches to (code / struct).
+    stride_words: int | None = None
+    key_phase: int | None = None
+    handler_offset: int | None = None
+    pairing_basis: str | None = None
+    pairing_conflict: str | None = None
+    column_evidence: str | None = None
     id: int | None = None
     created_at: str | None = None
 
@@ -272,6 +284,10 @@ class DetectorScanStatusRow:
     # firmware, so it is the path that says which file this row is about. None on a row read
     # back from before the column existed.
     binary_path: str | None = None
+    # static-table detector only: handler slots the ELF could not vouch for (its file missing,
+    # replaced, or the slot untyped), and candidate rows whose pairing is undetermined.
+    handler_unverified: int | None = None
+    pairing_undetermined: int | None = None
     id: int | None = None
 
 

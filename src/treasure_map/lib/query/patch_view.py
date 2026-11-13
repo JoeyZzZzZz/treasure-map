@@ -2624,10 +2624,12 @@ def _format_only(value: str) -> bool:
 
 @dataclass(frozen=True)
 class _AnchorSide:
-    """One side's anchor facts for the diffed binary, from that run's analysis.db: each string
-    referenced from exactly one function (no reference outside a function, the list not cut), each
-    dispatch key with exactly one handler, and the thunk entries. Empty where a table or column is
-    not recorded — an anchor that cannot be read points nowhere, it is never read as absent."""
+    """One side's anchor facts for the diffed binary: from that run's analysis.db, each string
+    referenced from exactly one function (no reference outside a function, the list not cut) and
+    the thunk entries; from the atlas, each static-table key with exactly one handler among the
+    rows whose pairing is DETERMINED (a candidate row — pairing undetermined — is never an
+    anchor). Empty where a table or column is not recorded — an anchor that cannot be read points
+    nowhere, it is never read as absent."""
 
     owner_of_string: dict[str, str] = field(default_factory=dict)
     strings_of: dict[str, frozenset[str]] = field(default_factory=dict)
@@ -2636,16 +2638,43 @@ class _AnchorSide:
     thunks: frozenset[str] = frozenset()
 
 
-def _read_anchor_side(path: str, sha: str) -> _AnchorSide:
+# The pairing bases of a static-table row that pairs its key with its handler (a candidate row,
+# 'undetermined', is not among them).
+_DETERMINED_PAIRINGS = ("code_two_index", "code_helper", "data_terminator")
+
+
+def _static_handlers(
+    atlas: sqlite3.Connection, run_id: str, binary_path: str
+) -> dict[str, set[str]]:
+    """key -> its handler entries over the binary's static-table rows whose pairing is determined.
+    An atlas without the pairing column records no pairing: no row is an anchor."""
+    out: dict[str, set[str]] = {}
+    try:
+        rows = atlas.execute(
+            "SELECT key, callee_addr FROM string_keyed_edge WHERE source_run_id = ? "
+            "AND binary_path = ? AND mechanism = 'static_string_table' "
+            "AND pairing_basis IN (?, ?, ?)",
+            (run_id, binary_path, *_DETERMINED_PAIRINGS),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return out
+    for key, callee in rows:
+        entry = norm_hex(str(callee)) if callee else None
+        if key is not None and entry is not None:
+            out.setdefault(key, set()).add(entry)
+    return out
+
+
+def _read_anchor_side(path: str, sha: str, atlas: sqlite3.Connection, run_id: str) -> _AnchorSide:
     try:
         conn = ro_connect(path)
     except sqlite3.Error:
         return _AnchorSide()
     try:
-        found = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", (sha,)).fetchone()
+        found = conn.execute("SELECT id, path FROM binaries WHERE sha256 = ?", (sha,)).fetchone()
         if found is None:
             return _AnchorSide()
-        bid = found[0]
+        bid, binary_path = found
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         refs: dict[str, set[str]] = {}
         spoiled: set[str] = set()
@@ -2662,14 +2691,6 @@ def _read_anchor_side(path: str, sha: str) -> _AnchorSide:
                     spoiled.add(value)
                 else:
                     refs.setdefault(value, set()).add(entry)
-        handlers: dict[str, set[str]] = {}
-        if "string_tables" in tables:
-            for key, func in conn.execute(
-                "SELECT key, func_addr FROM string_tables WHERE binary_id = ?", (bid,)
-            ):
-                entry = norm_hex(str(func)) if func else None
-                if key is not None and entry is not None:
-                    handlers.setdefault(key, set()).add(entry)
         thunks: frozenset[str] = frozenset()
         if "thunk_spans" in {r[1] for r in conn.execute("PRAGMA table_info(binaries)")}:
             row = conn.execute("SELECT thunk_spans FROM binaries WHERE id = ?", (bid,)).fetchone()
@@ -2682,6 +2703,7 @@ def _read_anchor_side(path: str, sha: str) -> _AnchorSide:
     strings_of: dict[str, set[str]] = {}
     for value, entry in owner.items():
         strings_of.setdefault(entry, set()).add(value)
+    handlers = _static_handlers(atlas, run_id, binary_path) if binary_path else {}
     handler = {k: next(iter(hs)) for k, hs in handlers.items() if len(hs) == 1}
     keys_of: dict[str, set[str]] = {}
     for key, entry in handler.items():
@@ -2705,7 +2727,7 @@ def _anchor_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _An
     if hit is not None:
         return hit
     path = _run_source(atlas, run_id)[0]
-    side = _read_anchor_side(path, sha) if path else _AnchorSide()
+    side = _read_anchor_side(path, sha, atlas, run_id) if path else _AnchorSide()
     _ANCHOR_SIDE_CACHE[key] = side
     return side
 

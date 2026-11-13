@@ -37,7 +37,7 @@ from treasure_map.lib.query.sink_impact import (
     PROVABLY_CONSTANT_MARKERS,
     impact_tier,
 )
-from treasure_map.lib.query.string_edges import edges_reaching_callee
+from treasure_map.lib.query.string_edges import edges_reaching_callee, is_candidate_edge
 
 logger = logging.getLogger(__name__)
 
@@ -2213,6 +2213,9 @@ def _edge_leads(
 
     ★ IRON LAW: a lead is a FACT, never a reachability verdict. It NEVER changes the dimension's
     state/value — it rides in ``evidence`` so an agent reads the key without parsing prose.
+
+    A static-table CANDIDATE row (``pairing.basis`` undetermined) gives no lead: the record holds
+    the key and this function, but that the key dispatches HERE is exactly what is not settled.
     """
     leads: list[dict[str, Any]] = [
         {
@@ -2223,7 +2226,7 @@ def _edge_leads(
             "mechanism": e.get("mechanism"),
         }
         for e in edges
-        if e.get("key")
+        if e.get("key") and not is_candidate_edge(e)
     ]
     for lead in _flow_list(flow_evidence, "reachability_leads"):
         if isinstance(lead, dict) and lead.get("key"):
@@ -2257,7 +2260,11 @@ def _string_keyed_edge_note(edges: tuple[dict[str, Any], ...]) -> str:
     """A one-line summary of the string-keyed edge(s) whose callee is this candidate's function — a
     KEY LEAD, never a reachability verdict. Empty when there are none. ★ IRON LAW: this text ADDS a
     lead to the note; it must NEVER change the reachability state to proven/reachable — tmap
-    ENUMERATES the edge (a fact), the agent JUDGES reachability."""
+    ENUMERATES the edge (a fact), the agent JUDGES reachability.
+
+    A static-table CANDIDATE row is not such an edge (its pairing is undetermined) and is not
+    written up here."""
+    edges = tuple(e for e in edges if not is_candidate_edge(e))
     if not edges:
         return ""
     shown = edges[:3]

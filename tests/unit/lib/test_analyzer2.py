@@ -28,6 +28,7 @@ from treasure_map.lib.query.triage import _CONTROLLABILITY_RANK, _controllabilit
 from treasure_map.lib.storage.connection import open_db
 
 from ..boundary_words import listed_words_in
+from .dispatch_image import Image
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
 _HUNT_A2 = _SRC / "lib" / "hunt" / "analyzer2.py"
@@ -126,6 +127,9 @@ def _make_db(
         for func in spec.get("funcs", []):  # type: ignore[union-attr]
             fid += 1
             _insert_func(conn, bid, func, fid=fid)
+        image = spec.get("image")
+        if isinstance(image, Image):
+            image.write_contents(conn, bid)
         for m in spec.get("nvram_defaults", []):  # type: ignore[union-attr]
             conn.execute(
                 "INSERT INTO nvram_defaults "
@@ -1427,87 +1431,73 @@ def test_two_same_named_wrappers_in_one_path_that_disagree_bind_no_edge() -> Non
 # ── detector A: static {string -> funcptr} dispatch tables (same atlas edge table) ───
 
 
+def _key_first_table(img: Image, names: list[str], handlers: list[int]) -> int:
+    """A key-first two-word table ended by an all-zero record; the address of its first key."""
+    keys = [img.string(n) for n in names]
+    img.words(0x7FFF0001, 0x7FFF0002)
+    first = img.words(keys[0], handlers[0])
+    for k, h in zip(keys[1:], handlers[1:], strict=True):
+        img.words(k, h)
+    img.words(0, 0, 0x7FFF0003, 0x7FFF0004)
+    return first
+
+
+def _static_rows(atlas_path: Path) -> list[sqlite3.Row]:
+    conn = open_atlas(atlas_path)
+    try:
+        return conn.execute(
+            "SELECT * FROM string_keyed_edge WHERE mechanism = 'static_string_table' ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
 def test_static_string_table_flattened_to_edges(tmp_path: Path) -> None:
-    # A static {string -> handler} dispatch table (detector A) lands in the SAME string_keyed_edge
-    # table with mechanism='static_string_table', table_addr set, no source function, ladder_size
-    # NULL, and the detector-level completeness (incomplete — absolute-2-field only) on each row.
-    db = _make_db(
-        tmp_path,
-        [
-            {
-                "name": "httpd",
-                "funcs": [_nvram_fn("noop", [])],
-                "string_tables": [
-                    {
-                        "key": "cfg_dump",
-                        "func_name": "FUN_0042741c",
-                        "func_addr": "0x0042741c",
-                        "table_addr": "0x445b58",
-                    },
-                    {
-                        "key": "sys_reboot",
-                        "func_name": "do_reboot",
-                        "func_addr": "0x00011000",
-                        "table_addr": "0x445b58",
-                    },
-                ],
-            }
-        ],
-    )
+    # A static {string -> handler} dispatch table, read from the stored bytes at hunt time, lands in
+    # the SAME string_keyed_edge table with mechanism='static_string_table', table_addr set, no
+    # source function, ladder_size NULL, never 'complete', and its pairing recorded.
+    img = Image()
+    handlers = [img.func(n) for n in ("fx_dump", "fx_reboot", "fx_ping", "fx_list")]
+    first = _key_first_table(img, ["cfg_dump", "sys_reboot", "net_ping", "dir_list"], handlers)
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_nvram_fn("noop", [])], "image": img}])
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_a")
-    rows = _ske_rows(atlas)
-    assert len(rows) == 2
-    by_key = {r["key"]: r for r in rows}
+    by_key = {r["key"]: r for r in _static_rows(atlas)}
+    assert set(by_key) == {"cfg_dump", "sys_reboot", "net_ping", "dir_list"}
     dump = by_key["cfg_dump"]
-    assert dump["mechanism"] == "static_string_table"
     assert dump["binary"] == "httpd"
     assert dump["from_function"] is None  # a static table has no source function
-    assert dump["callee_name"] == "FUN_0042741c"
-    assert dump["callee_addr"] == "0x0042741c"
+    assert dump["callee_name"] == "fx_dump"
+    assert dump["callee_addr"] == f"0x{handlers[0]:x}"
+    assert dump["table_addr"] == f"0x{first:x}"
     assert dump["ladder_size"] is None  # N/A for a static table
     assert dump["completeness_status"] == "incomplete"
-    assert dump["completeness_scope"] == "absolute_2field_only"
+    assert dump["completeness_scope"] == "absolute_records_stride_2_to_8_words"
+    assert dump["pairing_basis"] == "data_terminator"
+    assert dump["handler_offset"] == 1 and dump["stride_words"] == 2
 
 
-def test_static_table_undefined_text_handler_survives_to_the_edge(tmp_path: Path) -> None:
-    # A handler the dispatch table is the ONLY reference to gets no Ghidra Function object, so the
-    # detector anchors it by address and marks kind='undefined_text'. Real firmware measurement: 15
-    # of one 32-entry handler table's targets were undefined, and requiring a defined function there
-    # shattered the table (13 fragments / 80 entries -> 1 table / 203 entries once relaxed). The
-    # honest kind must reach the agent rather than be dropped or silently recoloured as 'direct'.
-    db = _make_db(
-        tmp_path,
-        [
-            {
-                "name": "httpd",
-                "funcs": [_nvram_fn("noop", [])],
-                "string_tables": [
-                    {
-                        "key": "cfg_dump",
-                        "func_name": "FUN_0042741c",
-                        "func_addr": "0x42741c",
-                        "func_kind": "direct",
-                    },
-                    {
-                        "key": "pick_channel",
-                        "func_name": "FUN_003fb9ac",
-                        "func_addr": "0x3fb9ac",
-                        "func_kind": "undefined_text",
-                    },
-                ],
-            }
-        ],
-    )
+def test_static_table_undefined_handler_cuts_the_table(tmp_path: Path) -> None:
+    # A handler slot pointing into executable code Ghidra did not define as a function is not a
+    # handler: it ends the run there (no edge for that key, nothing guessed), and the table says
+    # why it stops (handler_undefined). The extractor's own pass once anchored such a handler by
+    # address as 'undefined_text'; the reader writes no edge to a function nobody defined.
+    img = Image()
+    handlers = [img.func(n) for n in ("fx_a", "fx_b", "fx_c", "fx_d")]
+    undefined = img.code()
+    keys = [img.string(n) for n in ("one", "two", "three", "four", "five")]
+    img.words(0x7FFF0001, 0x7FFF0002)
+    for k, h in zip(keys[:4], handlers, strict=True):
+        img.words(k, h)
+    img.words(keys[4], undefined, 0x7FFF0003, 0x7FFF0004)
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_nvram_fn("noop", [])], "image": img}])
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_ut")
-    by_key = {r["key"]: r for r in _ske_rows(atlas)}
-    assert by_key["cfg_dump"]["callee_kind"] == "direct"
-    # the undefined-but-real handler is an edge like any other, honestly kinded
-    ut = by_key["pick_channel"]
-    assert ut["callee_kind"] == "undefined_text"
-    assert ut["callee_addr"] == "0x3fb9ac"  # the address is the anchor, defined or not
-    assert ut["mechanism"] == "static_string_table"
+    rows = _static_rows(atlas)
+    assert {"one", "two", "three", "four"} <= {r["key"] for r in rows}
+    assert rows and all(r["callee_addr"] != f"0x{undefined:x}" for r in rows)
+    assert all(r["callee_kind"] == "direct" for r in rows)
+    assert all("handler_undefined" in (r["completeness_reason"] or "") for r in rows)
 
 
 def test_static_table_and_strcmp_gate_share_query_and_capability(tmp_path: Path) -> None:
@@ -1515,6 +1505,9 @@ def test_static_table_and_strcmp_gate_share_query_and_capability(tmp_path: Path)
     # mechanism field distinguishes them; edges_reaching_callee finds a static-table handler too.
     from treasure_map.lib.query import edges_reaching_callee, get_string_keyed_edges
 
+    shared_img = Image()
+    hs = [shared_img.func(n) for n in ("FUN_0042741c", "fx_two", "fx_three", "fx_four")]
+    _key_first_table(shared_img, ["cfg_dump", "cfg_two", "cfg_three", "cfg_four"], hs)
     db = _make_db(
         tmp_path,
         [
@@ -1536,9 +1529,7 @@ def test_static_table_and_strcmp_gate_share_query_and_capability(tmp_path: Path)
                         ],
                     )
                 ],
-                "string_tables": [
-                    {"key": "cfg_dump", "func_name": "FUN_0042741c", "func_addr": "0x0042741c"}
-                ],
+                "image": shared_img,
             }
         ],
     )
@@ -3332,7 +3323,12 @@ def test_a2_sources_are_boundary_clean() -> None:
 
 def test_flatten_detector_status_reads_analysis_db(tmp_path: Path) -> None:
     # flatten: _flatten_detector_status reads analysis.db detector_scan_status -> per-run atlas rows
-    # (binary name joined in), so the status can cross to atlas alongside the edges.
+    # (binary name joined in), so the status can cross to atlas alongside the edges. The
+    # extractor's own static-table row ('string_tables', or a NULL detector) is NOT carried: the
+    # hunt-time table reader writes that detector's status itself.
+    #
+    # MUTATION (verified RED, 1 failed): drop the detector filter from the flatten's query -> the
+    # 'string_tables' row crosses beside the other one -> RED.
     from treasure_map.lib.hunt.analyzer2 import _flatten_detector_status
 
     db = tmp_path / "a.db"
@@ -3345,16 +3341,20 @@ def test_flatten_detector_status_reads_analysis_db(tmp_path: Path) -> None:
         "unsupported_note, cap_hit, found_count) "
         "VALUES (1, 'string_tables', 1, 'absolute_2field_only', 'reason', 1, 0)"
     )
+    conn.execute(
+        "INSERT INTO detector_scan_status (binary_id, detector, scanned, found_count) "
+        "VALUES (1, 'listing', 1, 7)"
+    )
     conn.commit()
     conn.close()
     (r,) = _flatten_detector_status(db, "run1")
     assert (r.source_run_id, r.binary, r.detector, r.scanned, r.cap_hit, r.found_count) == (
         "run1",
         "httpd",
-        "string_tables",
-        1,
+        "listing",
         1,
         0,
+        7,
     )
 
 

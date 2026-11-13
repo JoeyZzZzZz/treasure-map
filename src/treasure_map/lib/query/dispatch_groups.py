@@ -31,10 +31,13 @@ explicit UNCOVERED bucket, counted per side by the static-table detector's ``det
 (the atlas row stored beside the edges), so "not enumerated" is never read as "not dispatched".
 
 The static tables are read here from the hunt-flattened atlas ``string_keyed_edge`` rows (by run
-and binary path, per table address). The patch view reads the same detector's output another way —
-from that run's analysis.db ``string_tables`` by binary hash, a key over all the binary's tables,
-kept only when it has exactly one handler — so the two readings can differ on a key; neither is
-rewritten to match the other.
+and binary path, per table address). A row whose pairing is undetermined (a CANDIDATE: the record
+holds the key and the function, but which handler the key is paired with is not settled) still
+places its function in the table's group — the table holds it — but the member says so
+(``pairing_undetermined``: the sides on which it is only a candidate). The patch view reads the
+same rows another way — a key over all the binary's tables, its DETERMINED rows only, kept only
+when it has exactly one handler — so the two readings can differ on a key; neither is rewritten to
+match the other.
 
 Only a grouping: the units, the must-read set, the unit ids and the order are untouched; an entry
 that joins a group also stays in whatever unit held it (ENTRY / S_BATCH / SECOND_TIER / callee
@@ -53,6 +56,7 @@ from treasure_map.lib.diff.layer0 import norm_hex
 
 DISPATCH_GROUP_VERSION = "dispatch-v1"
 STATIC, GATE = "static_string_table", "strcmp_gate"
+UNDETERMINED = "undetermined"  # a static-table candidate row's pairing basis
 _SPLIT = "split_by_undefined_handler"
 SIDES = ("a", "b")
 
@@ -134,6 +138,9 @@ class DispatchGroup:
     # a static group: per side, every table of that side that joins it (more than one = the pieces
     # of a table split by an undefined handler); empty for a gate group
     pieces: dict[str, list[str]] = field(default_factory=_no_keys)
+    # entry_id -> the sides on which the member is only a CANDIDATE handler of the table (its
+    # pairing undetermined); a member absent here is a determined handler on every side it is in
+    undetermined: dict[str, set[str]] = field(default_factory=dict)
 
     @property
     def split_by_undefined_handler(self) -> bool:
@@ -215,30 +222,36 @@ def _static_tables(
     atlas: sqlite3.Connection, run_id: str, paths: set[str]
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """``binary_path -> table_addr -> {"handlers": {callee_addr}, "keys": {callee_addr: [keys]},
-    "reasons": {reason}}`` for the recovered static tables of this run's listed binaries."""
+    "determined": {callee_addr}, "reasons": {reason}}`` for the recovered static tables of this
+    run's listed binaries. ``determined`` holds the handlers some row pairs with a key; a handler
+    only candidate rows name (pairing undetermined) is in ``handlers`` and not there."""
     out: dict[str, dict[str, dict[str, Any]]] = defaultdict(lambda: defaultdict(_new_table))
     if not paths:
         return out
     placeholders = ",".join("?" * len(paths))
+    have = {r[1] for r in atlas.execute("PRAGMA table_info(string_keyed_edge)")}
+    basis = "pairing_basis" if "pairing_basis" in have else "NULL"
     rows = atlas.execute(
-        "SELECT binary_path, table_addr, key, callee_addr, completeness_reason "
+        f"SELECT binary_path, table_addr, key, callee_addr, completeness_reason, {basis} "  # noqa: S608
         "FROM string_keyed_edge WHERE mechanism = ? AND source_run_id = ? "
         f"AND binary_path IN ({placeholders})",
         (STATIC, run_id, *sorted(paths)),
     )
-    for path, table_addr, key, callee_addr, reason in rows:
+    for path, table_addr, key, callee_addr, reason, pairing in rows:
         if key is None or not callee_addr:
             continue
         t = out[path][str(table_addr)]
         ca = norm_hex(callee_addr)
         t["handlers"].add(ca)
+        if pairing != UNDETERMINED:
+            t["determined"].add(ca)
         t["keys"].setdefault(ca, []).append(key)
         t["reasons"] |= _reasons(reason)
     return out
 
 
 def _new_table() -> dict[str, Any]:
-    return {"handlers": set(), "keys": {}, "reasons": set()}
+    return {"handlers": set(), "keys": {}, "determined": set(), "reasons": set()}
 
 
 def _gates(
@@ -470,6 +483,7 @@ def compute_pair(
         reasons: set[str],
         counterpart: str | None = None,
         pieces: dict[str, list[str]] | None = None,
+        candidate_only: bool = False,
     ) -> None:
         key = (mechanism, mem.diff_id, *anchors)
         g = groups.get(key)
@@ -482,6 +496,8 @@ def compute_pair(
         per_side = g.members.setdefault(mem.entry_id, _no_keys())
         per_side[side] = sorted(set(per_side[side]) | set(keys))
         g.member_anchors[mem.entry_id] = mem.anchor_ref
+        if candidate_only:
+            g.undetermined.setdefault(mem.entry_id, set()).add(side)
         g.completeness_reasons |= reasons
         member_mechanisms[(mem.diff_id, mem.entry_id)].add(mechanism)
 
@@ -513,7 +529,17 @@ def compute_pair(
                     (table_addr, None) if s == "a" else (None, table_addr)
                 )
                 pieces = _pieces(tgroups[did], anchors)
-                join(STATIC, mem, binary, anchors, s, keys, tav["reasons"], pieces=pieces)
+                join(
+                    STATIC,
+                    mem,
+                    binary,
+                    anchors,
+                    s,
+                    keys,
+                    tav["reasons"],
+                    pieces=pieces,
+                    candidate_only=addr[s] not in tav["determined"],
+                )
                 in_group = True
 
         # strcmp gates: the member's per-side function is the callee of a dispatch function
@@ -606,6 +632,8 @@ def member_labels(pd: PairDispatch) -> dict[tuple[str, str], list[dict[str, Any]
             cut = {s: len(keys[s]) - MAX_KEYS_PER_MEMBER for s in SIDES}
             if any(n > 0 for n in cut.values()):
                 label["keys_omitted"] = {s: max(n, 0) for s, n in cut.items()}
+            if eid in g.undetermined:
+                label["pairing_undetermined"] = sorted(g.undetermined[eid])
             out[(g.diff_id, eid)].append(label)
     for labels in out.values():
         labels.sort(key=lambda lab: (lab["mechanism"], lab["group_ref"]))
@@ -624,7 +652,16 @@ def group_json(g: DispatchGroup) -> dict[str, Any]:
         **_where(g),
         "member_count": len(g.members),
         "members": [
-            {"entry_id": eid, "anchor_ref": g.member_anchors.get(eid), "keys": g.members[eid]}
+            {
+                "entry_id": eid,
+                "anchor_ref": g.member_anchors.get(eid),
+                "keys": g.members[eid],
+                **(
+                    {"pairing_undetermined": sorted(g.undetermined[eid])}
+                    if eid in g.undetermined
+                    else {}
+                ),
+            }
             for eid in sorted(g.members)
         ],
         "note": NOTE_STATIC if g.mechanism == STATIC else NOTE_GATE,
