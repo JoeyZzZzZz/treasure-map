@@ -368,7 +368,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # The static-table reading's columns (added with the hunt-time table reader): the record's
     # stride, the key's phase, the handler offset and what pairs the two, on string_keyed_edge; the
     # unverified-handler and undetermined-pairing counts on detector_scan_status. NULL on a row
-    # written before they existed — a reader takes NULL as "no pairing recorded", never as paired.
+    # written before they existed (the extractor's own key-first reading): such a row is no
+    # candidate (``string_edges.is_candidate_edge`` is false, so it gives leads as it always did),
+    # but it is never a key anchor across versions, which takes a recorded pairing only.
     # Idempotent; each runs only while its column is missing.
     for table, column, decl in (
         ("string_keyed_edge", "stride_words", "INTEGER"),

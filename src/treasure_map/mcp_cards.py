@@ -379,7 +379,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
             'reach?", "is function Y reached through one?". Filter by key, callee, '
             "from_function, binary, run_id; each edge carries the callee anchor, ladder_size / "
             "table_addr and a completeness. These are ENUMERATED FACTS, NOT a reachability "
-            "verdict. Empty is NOT proof of unreachability."
+            "verdict. Empty is NOT proof of unreachability. A row with pairing.basis "
+            "'undetermined' is a candidate, not a dispatch."
         ),
     ),
     "launched_by": ToolCard(

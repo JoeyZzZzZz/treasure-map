@@ -2559,6 +2559,14 @@ def make_tools(
         input actually arrives. Empty is NOT proof of unreachability (most functions are simply not
         string-key-dispatched).
 
+        A static-table row (``mechanism='static_string_table'``, records of two to eight words
+        read from the stored image) carries a ``pairing``: its ``basis`` says what pairs the key
+        with this handler — ``code_two_index`` / ``code_helper`` (the code that reads the table) or
+        ``data_terminator`` (the all-zero record that ends it). A row whose ``basis`` is
+        ``undetermined`` is a CANDIDATE: the record holds this key and this function, but which
+        handler the key dispatches to is not settled (one row per reading, none chosen) — never
+        read it as "key K dispatches to F".
+
         Paged: ``limit`` (1-200, default 100) edges from ``offset`` (default 0), in one fixed
         order, with ``total_edges`` (every edge the filters match) and ``next_offset`` (null on
         the last page); follow ``next_offset`` until null. ``count`` is the edges on this page and

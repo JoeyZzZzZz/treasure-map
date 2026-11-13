@@ -26,7 +26,7 @@ _BASE_COLS = (
     "completeness_status, completeness_reason, completeness_scope"
 )
 # The static-table reading's columns. An atlas written before them has none: each is then read as
-# NULL ("no pairing recorded"), never as a pairing.
+# NULL ("no pairing recorded") — see is_candidate_edge for what a reader makes of that.
 _PAIRING_COLS = (
     "stride_words",
     "key_phase",
@@ -53,7 +53,12 @@ def _cols(conn: sqlite3.Connection) -> str:
 
 def is_candidate_edge(edge: dict[str, Any]) -> bool:
     """A static-table candidate row: the record holds the key and this function, but its pairing
-    is undetermined — never read as "key K dispatches to F"."""
+    is undetermined — never read as "key K dispatches to F".
+
+    Only ``basis == 'undetermined'`` is a candidate. A row with no pairing recorded (NULL: written
+    by the extractor's own key-first reading, before the pairing columns existed) is not one; it
+    is read as it always was. The cross-version key anchors are stricter still and take only a
+    recorded code or terminator pairing, so such a row never anchors."""
     pairing = edge.get("pairing")
     return isinstance(pairing, dict) and pairing.get("basis") == UNDETERMINED
 

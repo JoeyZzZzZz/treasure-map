@@ -36,12 +36,18 @@ The reading model, in words (the numbers are the record's words, ``s`` the strid
   (``{+1}`` key first, ``{-1}`` key last, ``{+1, +2}``, ...). The handler columns of a run are all
   the columns that qualify over it (the maximal set). Strides are tried from two up; a word a
   shorter stride already used is not offered to a wider one. Within a stride, overlapping
-  readings are chosen by the keys they explain.
+  readings are chosen by the keys they explain. When two key columns explain equally many (a
+  record holding a name and a help text, say), the table that ends first is read — in practice
+  the column nearer the record's start — and its rows carry ``key_column_tied``.
 * the PAIRING of each handler column: a column the reading code names (``code_two_index``, or
   ``code_helper`` for a registration helper) is paired by the code; when the record has a single
-  handler column, the one reading followed by an all-zero record (a key-only record counted into
-  its end first) pairs it (``data_terminator``); every other column is ``undetermined``. A table
-  outside the extractor's own tables whose keys are mostly not names is never paired.
+  handler column over EVERY reading of the table (a column only another rotation holds still
+  counts), the one reading followed by an all-zero record (a key-only record counted into its end
+  first) pairs it (``data_terminator``); every other column is ``undetermined``. Code whose reading
+  the data contradicts (its key column is not the data's, or a slot it calls holds no function)
+  is not used — that is a misread of the code, no evidence against the data — and the rows record
+  it (``pairing_conflict = 'code_inconsistent'``); the terminator still pairs. A table outside the
+  extractor's own tables whose keys are mostly not names is never paired.
 * the extractor's tables are the floor: a table holding one of its key slots is never dropped by
   the noise filters (fewer than four distinct keys, or keys shaped like C++ type names).
 
@@ -96,11 +102,17 @@ PAIRING_BASES = (CODE_TWO_INDEX, CODE_HELPER, DATA_TERMINATOR, UNDETERMINED)
 EVIDENCE_CODE = "code"  # the reading code calls it
 EVIDENCE_STRUCT = "struct"  # the record has this single handler column
 
+# pairing_conflict values: the evidence that disagreed, or was not used, beside the pairing kept.
+CODE_FRAMES_DISAGREE = "code_frames_disagree"  # two accessors name different key columns
+CODE_INCONSISTENT = "code_inconsistent"  # the code's reading is not what the data's slots hold
+# (DATA_TERMINATOR: a terminator that disagreed with the code on a column the code names)
+
 # completeness_reason tokens this module adds (a comma-joined set, as the extractor's).
 SCOPE_TOKEN = "scope_absolute_records_stride_2_to_8"
 SPLIT = "split_by_undefined_handler"
 UNDEFINED = "handler_undefined"
 TRUNCATED = "data_blocks_truncated"
+KEY_COLUMN_TIED = "key_column_tied"  # another key column of the record explains as many keys
 
 SUPPORTED_SCOPE = "absolute_records_stride_2_to_8_words"
 UNSUPPORTED_NOTE = (
@@ -446,6 +458,7 @@ class _Table:
     readings: list[_Reading]
     keyset: set[int]
     hset: set[int]
+    tied: bool = False  # the content choice kept it over another key column explaining as many
 
     @property
     def span(self) -> tuple[int, int]:
@@ -558,7 +571,9 @@ def _stride_tables(w: _Words, s: int, blocked: set[int]) -> list[_Table]:
 
 def _choose(tables: list[_Table]) -> list[_Table]:
     """The content choice within one stride: of the readings whose word spans overlap, the set
-    that explains the most key slots (weighted interval scheduling over the spans)."""
+    that explains the most key slots (weighted interval scheduling over the spans). On a tie the
+    table that ends first is kept; when the one left out reads another key column (another phase)
+    with as many keys, the kept one is marked ``tied``."""
     if not tables:
         return []
     order = sorted(range(len(tables)), key=lambda i: (tables[i].span[1], tables[i].span[0]))
@@ -582,6 +597,16 @@ def _choose(tables: list[_Table]) -> list[_Table]:
             j = prev[j]
         else:
             j -= 1
+    kept = {id(t) for t in chosen}
+    for t in chosen:
+        lo, hi = t.span
+        t.tied = any(
+            id(u) not in kept
+            and u.phase != t.phase
+            and len(u.keyset) == len(t.keyset)
+            and not (u.span[1] < lo or u.span[0] > hi)
+            for u in tables
+        )
     return sorted(chosen, key=lambda t: t.span[0])
 
 
@@ -893,22 +918,23 @@ def decide(table: _Table, code: CodeEvidence, gated: bool) -> Decision:
     """Q1 (is the column a handler the table dispatches to) and Q2 (which key it belongs to),
     column by column. A column the code names answers both from the code. With a single handler
     column over all the table's readings (Q1 holds by definition), the one reading followed by an
-    all-zero record answers Q2. A
-    terminator that disagrees with the code on a column it names is not used, and is recorded. Any
-    other column, a table the content gate stops, and a table whose code conflicts or is
-    inconsistent, stays undetermined."""
+    all-zero record answers Q2. A terminator that disagrees with the code on a column it names is
+    not used, and is recorded. Code the data contradicts (``inconsistent``) names no column — a
+    misread of the code says nothing against the data's own reading — and is recorded; the
+    terminator still decides. Any other column, a table the content gate stops, and a table whose
+    accessors disagree on the key column, stays undetermined."""
     s = table.stride
     columns: dict[int, _Column] = {}
     if gated:
         return Decision(columns, None, True, code)
     if code.status == "conflict":
-        return Decision(columns, "code_frames_disagree", False, code)
+        return Decision(columns, CODE_FRAMES_DISAGREE, False, code)
+    conflict: str | None = None
     if code.status == "inconsistent":
-        return Decision(columns, None, False, code)
-    if code.status == "ok" and code.basis is not None:
+        conflict = CODE_INCONSISTENT
+    elif code.status == "ok" and code.basis is not None:
         for o in code.offsets:
             columns[o % s] = _Column(o, code.basis, EVIDENCE_CODE)
-    conflict: str | None = None
     # The record's handler columns are those of EVERY reading of the table (a column is its offset
     # mod the stride, so the rotations of one column are one column): a reading that lost a column
     # to one bad slot does not make the record single-column.
@@ -1107,6 +1133,8 @@ def detect_binary(
             reasons = {SCOPE_TOKEN} | bounds[id(t)][0] | bounds[id(t)][1] | bounds[id(t)][2]
             if id(t) in split:
                 reasons.add(SPLIT)
+            if t.tied:
+                reasons.add(KEY_COLUMN_TIED)
             if blk.truncated and max(t.keyset) + 2 * t.stride > w.n:
                 reasons.add(TRUNCATED)
             result.tables += 1

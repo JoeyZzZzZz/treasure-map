@@ -3,9 +3,9 @@
 """The hunt-time dispatch-table reader (lib/hunt/dispatch_tables), on synthetic stored images.
 
 Each test builds one binary's stored bytes (``dispatch_image.Image``) — functions, strings and
-pointer words — into an analysis.db, runs the reader, and checks the rows. The teeth are the
-the fix list: each names the fix it guards and the mutation that reddens it. No Ghidra, no
-ELF: the reader reads only the stored rows, so a table's shape is laid out directly.
+pointer words — into an analysis.db, runs the reader, and checks the rows. Each tooth names the
+rule it guards and the mutation that reddens it. No Ghidra, no ELF: the reader reads only the
+stored rows, so a table's shape is laid out directly.
 """
 
 from __future__ import annotations
@@ -252,9 +252,8 @@ def test_fx_single_reading_key_stays_a_candidate() -> None:
     """A key covered by only one reading is still a candidate when nothing pairs it — one
     reading is not a decision.
 
-    STRUCTURAL GUARD: a candidate is emitted for every column the pairing does not settle; the
-    reader has no path that promotes a one-reading key. This documents that, so a future "one
-    candidate -> determined" shortcut reddens here.
+    MUTATION (verified RED): write a key whose candidates are a single function as determined ->
+    RED.
     """
     img = Image()
     # A short run of {key, handler} with no terminator and no code: one reading (+1), undetermined.
@@ -424,9 +423,8 @@ def test_fx_empty_key_first_byte_must_be_printable() -> None:
     """A key pointer at a NUL (an empty string) is not a key: the first byte must be
     printable, so no row has a key starting with \\x00, and 'pkg' pairs only with its own handler.
 
-    STRUCTURAL GUARD: the key scan stops at the first NUL, so an empty-string pointer yields no
-    run and the first byte is always printable. This documents that a key never begins with
-    \\x00, so a future "accept a leading control byte" change reddens here.
+    MUTATION (verified RED): accept one leading control byte and read on to the next NUL ->
+    '\\x00pkg' pairs with the empty string's handler -> RED.
     """
     img = Image()
     hs = [img.func(f"fx_lu{i}") for i in range(4)]
@@ -470,6 +468,432 @@ def test_fx_two_handler_cols_not_crossed() -> None:
     assert det and all(r.handler_offset == 3 for r in det)
     assert det[0].callee_name == "fx_fn0"  # paired with fn, never help
     assert any(r.handler_offset == 4 and r.pairing_basis == dt.UNDETERMINED for r in by["w0"])
+
+
+# ── the code that reads a table: what it may and may not settle ──────────────────────────────
+
+
+def _walker(
+    img: Image,
+    name: str,
+    base: int,
+    *,
+    handler: int,
+    step: int | None,
+    key: int | None = 0,
+    prefetch: int | None = None,
+) -> None:
+    """A Ghidra-style accessor: ``ppVar`` set to ``base``, the word ``key`` compared as a string
+    (None: no compare, so the code gives a handler index only), the word ``handler`` called, and
+    ``ppVar`` stepped ``step`` words a record (None: a matched-record pointer that does not walk).
+    ``prefetch`` loads one more word as a code pointer — a loop reading the next record early."""
+
+    def ref(i: int) -> str:
+        return "*ppVar" if i == 0 else f"ppVar[{i}]"
+
+    img.func(name, size=4)
+    text = f"  undefined **ppVar;\n  int iVar1;\n  code *pcVar2;\n\n  ppVar = &DAT_{base:08x};\n"
+    if prefetch is not None:
+        text += f"  pcVar2 = (code *){ref(prefetch)};\n"
+    if key is not None:
+        text += f"  iVar1 = strcmp({ref(key)}, fx_name);\n"
+    text += f"  if (iVar1 == 0) {{\n    (*(code *){ref(handler)})(fx_arg);\n  }}\n"
+    if step is not None:
+        text += f"  ppVar = ppVar + {step};\n"
+    img.pseudocode[name] = text
+
+
+def _tie_layout(img: Image, names=("pp", "qq", "rr", "ss")) -> tuple[list[int], int]:
+    """A key-first table with functions on both sides and no all-zero record: the data reads it
+    both ways ({+1} and {-1}) and settles neither. Returns the handlers and the first key's
+    address."""
+    pre = [img.func("fx_pa"), img.func("fx_pb")]
+    hs = [img.func(f"fx_x{i}") for i in range(4)]
+    img.words(pre[0], pre[1])
+    first = DATA_BASE + len(img.data)
+    for n, h in zip(names, hs, strict=True):
+        img.words(img.string(n), h)
+    img.words(hs[0], hs[1])
+    return hs, first
+
+
+def _pre_string(img: Image) -> tuple[list[int], int]:
+    """{handler, name} records after zero padding and an unrelated string, with no terminator: the
+    words read both ways, and the {+1} reading takes the stray string as a key. Returns the
+    handlers and the first handler word's address."""
+    hs = [img.func(f"fx_ps{i}") for i in range(4)]
+    stray = img.string("fx_banner")
+    ns = [img.string(n) for n in ("open", "read", "write", "close")]
+    img.words(0, 0, stray)
+    first = DATA_BASE + len(img.data)
+    for h, k in zip(hs, ns, strict=True):
+        img.words(h, k)
+    img.words(0x7FFF0003, 0x7FFF0004)
+    return hs, first
+
+
+def test_fx_pre_string_reads_minus_one_only_from_the_code() -> None:
+    """Zero padding, a stray string, then {handler, name} records and no terminator. The data
+    alone reads it both ways: every row a candidate, the zeros before the table deciding nothing.
+    With an accessor that compares word 1 and calls word 0, the code pairs each name with the
+    handler before it (-1), and the stray string pairs with nothing.
+
+    MUTATION (verified RED): count an all-zero record BEFORE a reading's first key as its
+    terminator (the leading zeros) -> the {+1} reading ends there -> a +1 edge -> RED.
+    """
+    img = Image()
+    _pre_string(img)
+    rows = _rows(img)
+    assert rows and all(r.pairing_basis == dt.UNDETERMINED for r in rows)
+
+    img = Image()
+    hs, first = _pre_string(img)
+    _walker(img, "fx_ps_get", first, key=1, handler=0, step=2)
+    det = _determined(_rows(img))
+    assert {r.key: r.callee_name for r in det} == {
+        "open": "fx_ps0",
+        "read": "fx_ps1",
+        "write": "fx_ps2",
+        "close": "fx_ps3",
+    }
+    assert all(r.handler_offset == -1 and r.pairing_basis == dt.CODE_TWO_INDEX for r in det)
+    del hs
+
+
+def test_code_beats_a_terminator_and_the_disagreement_is_recorded() -> None:
+    """A table both ways readable whose {+1} reading ends at an all-zero record, read by code that
+    compares word 1 and calls word 0 (-1): the stronger evidence, the code, pairs it, and the
+    terminator that said otherwise is recorded on every row.
+
+    MUTATION (verified RED): drop the terminator conflict mark -> pairing_conflict None -> RED.
+    """
+    img = Image()
+    pre = [img.func("fx_a"), img.func("fx_b")]
+    hs = [img.func(f"fx_c{i}") for i in range(4)]
+    img.words(pre[0], pre[1])
+    for n, h in zip(("one", "two", "three", "four"), hs, strict=True):
+        img.words(img.string(n), h)
+    img.words(0, 0)
+    _walker(img, "fx_c_get", DATA_BASE + img.ps, key=1, handler=0, step=2)
+    det = _determined(_rows(img))
+    assert det and all(r.handler_offset == -1 for r in det)
+    assert {r.key: r.callee_name for r in det}["one"] == "fx_b"
+    assert all(r.pairing_basis == dt.CODE_TWO_INDEX for r in det)
+    assert all(r.pairing_conflict == dt.DATA_TERMINATOR for r in det)
+
+
+def test_fx_frame_only_never_pairs() -> None:
+    """Code that walks the table and calls word 1 but never compares a key gives a handler index
+    and no key index: that pairs nothing, and the table stays a candidate.
+
+    MUTATION (verified RED): take a frame with no key index as keyed at word 0 -> +1 lifts -> RED.
+    """
+    img = Image()
+    _hs, first = _tie_layout(img)
+    _walker(img, "fx_fo", first, key=None, handler=1, step=2)
+    rows = _rows(img)
+    assert rows and all(r.pairing_basis == dt.UNDETERMINED for r in rows)
+
+
+def test_fx_ptr_lookalike_is_not_read_handler_first() -> None:
+    """A key-first table ended by an all-zero record, whose function words also read onward as
+    {function, string} records (the -1 reading covers four keys), and a matched-record pointer
+    that calls the word it points at: the call is no key evidence, so the terminator pairs the
+    table +1 and nothing reads -1.
+
+    MUTATION (verified RED): read a call through ``*ptr`` as a handler-first record -> the code's
+    -1 overrides the terminator -> RED.
+    """
+    img = Image()
+    hs = [img.func(f"fx_l{i}") for i in range(5)]
+    img.words(0x7FFF0001, 0x7FFF0002)
+    for n, h in zip(("ma", "mb", "mc", "md", "me"), hs, strict=True):
+        img.words(img.string(n), h)
+    img.words(0, 0)
+    img.words(0x7FFF0003, 0x7FFF0004)
+    _walker(img, "fx_l_hit", DATA_BASE + 3 * img.ps, key=None, handler=0, step=None)
+    det = _determined(_rows(img))
+    assert {r.key for r in det} == {"ma", "mb", "mc", "md", "me"}
+    assert all(r.handler_offset == 1 and r.pairing_basis == dt.DATA_TERMINATOR for r in det)
+
+
+@pytest.mark.parametrize("terminated", [True, False])
+def test_fx_block_edge_is_no_phase_evidence(terminated: bool) -> None:
+    """A key-first table at the very start of its block, so the -1 reading runs to the block's low
+    edge: the edge says nothing. With an all-zero record after it the table is +1; without one it
+    stays undetermined — never -1.
+
+    MUTATION (verified RED): count a reading whose previous record runs off the block's low edge
+    as ended -> both readings end -> the +1 terminator is no longer the only one -> RED.
+    """
+    img = Image()
+    hs = [img.func(f"fx_be{i}") for i in range(5)]
+    for n, h in zip(("ba", "bb", "bc", "bd", "bf"), hs, strict=True):
+        img.words(img.string(n), h)  # the first record is the block's first word
+    if terminated:
+        img.words(0, 0)
+    img.words(0x7FFF0003, 0x7FFF0004)
+    rows = _rows(img)
+    assert rows
+    assert not any(r.handler_offset == -1 and r.pairing_basis != dt.UNDETERMINED for r in rows)
+    if terminated:
+        det = _determined(rows)
+        assert {r.key for r in det} == {"ba", "bb", "bc", "bd", "bf"}
+        assert all(r.handler_offset == 1 for r in det)
+    else:
+        assert all(r.pairing_basis == dt.UNDETERMINED for r in rows)
+
+
+def test_fx_short_str_before_the_table_is_no_undefined_handler() -> None:
+    """The record before the table is {string, "abcd"} with the four-character string in an
+    executable block outside every function (a string array in a read-execute segment): its
+    second word points at a string, not at undefined code, so no bound reads
+    ``handler_undefined``.
+
+    MUTATION (verified RED): classify a 4-aligned pointer into executable bytes as an undefined
+    handler before testing it for a string -> the bound reads handler_undefined -> RED.
+    """
+    img = Image()
+    hs = [img.func(f"fx_ss{i}") for i in range(4)]
+    abcd = img.text_string("abcd")
+    img.words(img.string("normal"), abcd)
+    for n, h in zip(("sa", "sb", "sc", "sd"), hs, strict=True):
+        img.words(img.string(n), h)
+    img.words(0, 0)
+    rows = _rows(img)
+    assert {r.key for r in _determined(rows)} == {"sa", "sb", "sc", "sd"}
+    assert not any(dt.UNDEFINED in (r.completeness_reason or "") for r in rows)
+
+
+@pytest.mark.parametrize("calls_own_handler", [True, False])
+def test_fx_prefetch_of_the_next_record_is_dropped(calls_own_handler: bool) -> None:
+    """An accessor that, besides its own handler, loads the next record's handler (word 3 of a
+    two-word stride) early: an index a record or more from the key is a prefetch and pairs
+    nothing. With its own call (word 1) the code pairs +1; with the prefetch alone the code says
+    nothing and the table stays a candidate — never a +3 pairing, never a lost table.
+
+    MUTATION (verified RED): keep a handler index a record or more from the key -> a false +3
+    column swallows the table's rows -> RED.
+    """
+    img = Image()
+    _hs, first = _tie_layout(img)
+    if calls_own_handler:
+        _walker(img, "fx_pf", first, key=0, handler=1, step=2, prefetch=3)
+    else:
+        _walker(img, "fx_pf", first, key=0, handler=3, step=2)
+    rows = _rows(img)
+    assert {r.key for r in rows} == {"pp", "qq", "rr", "ss"}
+    assert not any(r.handler_offset == 3 for r in rows)
+    if calls_own_handler:
+        det = _determined(rows)
+        assert {r.key for r in det} == {"pp", "qq", "rr", "ss"}
+        assert all(r.handler_offset == 1 and r.pairing_basis == dt.CODE_TWO_INDEX for r in det)
+    else:
+        assert all(r.pairing_basis == dt.UNDETERMINED for r in rows)
+
+
+def _stride3(img: Image, middle: list[int], last: list[int], names) -> int:
+    """{name, middle, last} records after three non-record words, ended by an all-zero record.
+    Returns the first record's address."""
+    img.words(0x7FFF0001, 0x7FFF0002, 0x7FFF0003)
+    first = DATA_BASE + len(img.data)
+    for n, m, la in zip(names, middle, last, strict=True):
+        img.words(img.string(n), m, la)
+    img.words(0, 0, 0, 0x7FFF0004, 0x7FFF0005, 0x7FFF0006)
+    return first
+
+
+def test_fx_slot_mismatch_code_is_not_used() -> None:
+    """A {name, h1, h2} table (two function columns, so the terminator answers no column) read by
+    code whose key column is the data's h1 column — a misread of the code. The code pairs nothing,
+    every row is a candidate, and the rows say the code was not used.
+
+    MUTATION (verified RED): skip the check that the code's slots are the data's -> the code's +1
+    applied to the data's key -> a determined h1 edge -> RED.
+    """
+    img = Image()
+    h1 = [img.func(f"fx_m{i}") for i in range(4)]
+    h2 = [img.func(f"fx_n{i}") for i in range(4)]
+    first = _stride3(img, h1, h2, ("ka", "kb", "kc", "kd"))
+    _walker(img, "fx_mm", first + img.ps, key=0, handler=1, step=3)
+    rows = _rows(img)
+    assert rows and all(r.pairing_basis == dt.UNDETERMINED for r in rows)
+    assert all(r.pairing_conflict == dt.CODE_INCONSISTENT for r in rows)
+
+
+def test_code_the_data_contradicts_leaves_the_terminator_standing() -> None:
+    """A key-first table ended by an all-zero record, read by code whose key column is the data's
+    handler column. A misread of the code is no evidence against the data: the terminator pairs
+    the table (+1), and every row records that the code was not used.
+
+    MUTATION (verified RED): drop the terminator along with inconsistent code -> every row a
+    candidate -> RED.
+    """
+    img = Image()
+    hs = [img.func(f"fx_ci{i}") for i in range(4)]
+    first = _table(img, ["one", "two", "three", "four"], hs)
+    _walker(img, "fx_ci_get", first + img.ps, key=0, handler=1, step=2)
+    det = _determined(_rows(img))
+    assert {r.key: r.callee_name for r in det} == {
+        "one": "fx_ci0",
+        "two": "fx_ci1",
+        "three": "fx_ci2",
+        "four": "fx_ci3",
+    }
+    assert all(r.pairing_basis == dt.DATA_TERMINATOR and r.handler_offset == 1 for r in det)
+    assert all(r.pairing_conflict == dt.CODE_INCONSISTENT for r in det)
+
+
+def test_a_column_only_another_rotation_holds_keeps_the_table_undetermined() -> None:
+    """{name, fn, extra} records whose extra column is NULL down the table and a function only in
+    the word before the first record. Read {+1, +2} the extra column never holds a function, so
+    that reading is single-column — and it is the one that ends at the all-zero record; read
+    {+1, -1} the same column holds that function. The record's handler columns are those of every
+    reading, so it has two, and the terminator settles neither: every row a candidate.
+
+    MUTATION (verified RED): count the columns of the terminated reading only -> one column ->
+    a determined +1 edge -> RED.
+    """
+    img = Image()
+    fn = [img.func(f"fx_r{i}") for i in range(5)]
+    before = img.func("fx_before")
+    names = [img.string(n) for n in ("alpha", "bravo", "charlie", "delta", "echo")]
+    img.words(0x7FFF0001, 0x7FFF0002, before)
+    for i, (k, f) in enumerate(zip(names, fn, strict=True)):
+        img.words(k, f, 0x1 if i == 4 else 0)  # the last extra word is no NULL: no {+1,-1} end
+    img.words(0, 0, 0, 0x7FFF0004, 0x7FFF0005, 0x7FFF0006)
+    rows = _rows(img)
+    assert {r.key for r in rows} >= {"alpha", "bravo", "charlie", "delta", "echo"}
+    assert all(r.pairing_basis == dt.UNDETERMINED for r in rows)
+
+
+@pytest.mark.parametrize("helper", ["luaL_register", "luaL_newlib", "luaL_setfuncs"])
+def test_a_registration_helper_pairs_key_zero_with_handler_one(helper: str) -> None:
+    """A {name, func} array passed to a registration helper whose record layout the ABI fixes:
+    the helper pairs each name with the word after it (``code_helper``), over the terminator.
+
+    MUTATION (verified RED): ignore the helper calls -> the terminator pairs it instead -> RED.
+    """
+    img = Image()
+    hs = [img.func(f"fx_lua{i}") for i in range(4)]
+    first = _table(img, ["open", "close", "read", "write"], hs)
+    img.func("fx_luaopen", size=4)
+    img.pseudocode["fx_luaopen"] = f'  {helper}(L, "fx", &DAT_{first:08x});\n  return 1;\n'
+    det = _determined(_rows(img))
+    assert {r.key: r.callee_name for r in det} == {
+        "open": "fx_lua0",
+        "close": "fx_lua1",
+        "read": "fx_lua2",
+        "write": "fx_lua3",
+    }
+    assert all(r.pairing_basis == dt.CODE_HELPER and r.handler_offset == 1 for r in det)
+    assert all(r.column_evidence == dt.EVIDENCE_CODE for r in det)
+
+
+# ── the content choice ─────────────────────────────────────────────────────────────────────
+
+
+def test_fx_wide_eats_two_small_tables_stay_two() -> None:
+    """Two four-record key-first tables split by an all-zero record: a four-word reading could
+    cross the gap (taking the zeros as NULL handler slots) and read keys from both. The two-word
+    tables come first and keep their words, so each is its own table and no wider reading is
+    written.
+
+    MUTATION (verified RED): offer every stride all the words (no word a shorter stride used is
+    withheld) -> a four-word table over both -> RED.
+    """
+    img = Image()
+    a = [img.func(f"fx_wa{i}") for i in range(4)]
+    b = [img.func(f"fx_wb{i}") for i in range(4)]
+    img.words(0x7FFF0001, 0x7FFF0002)
+    for n, h in zip(("a0", "a1", "a2", "a3"), a, strict=True):
+        img.words(img.string(n), h)
+    img.words(0, 0)
+    for n, h in zip(("b0", "b1", "b2", "b3"), b, strict=True):
+        img.words(img.string(n), h)
+    img.words(0, 0, 0x7FFF0003, 0x7FFF0004)
+    rows = _rows(img)
+    det = _determined(rows)
+    assert {r.key for r in det} == {"a0", "a1", "a2", "a3", "b0", "b1", "b2", "b3"}
+    assert len({r.table_addr for r in det}) == 2
+    assert all(r.stride_words == 2 for r in rows)
+
+
+@pytest.mark.parametrize("help_is_text", [True, False])
+def test_a_key_column_tie_reads_the_first_column_and_says_so(help_is_text: bool) -> None:
+    """{name, help, fn} records: two string columns that explain the same number of keys. The
+    name column (the table that ends first) is read, and every row of it carries
+    ``key_column_tied``; with an integer in place of the help text there is no tie and no mark.
+
+    MUTATION (verified RED): never mark a tie -> no key_column_tied -> RED.
+    """
+    img = Image()
+    fn = [img.func(f"fx_kt{i}") for i in range(4)]
+    names = ("essid", "mode", "freq", "rate")
+    helps = [img.string(f"Set the {n} value") if help_is_text else 0x5 for n in names]
+    _stride3(img, helps, fn, names)
+    rows = _rows(img)
+    det = _determined(rows)
+    assert {r.key: r.callee_name for r in det} == {
+        "essid": "fx_kt0",
+        "mode": "fx_kt1",
+        "freq": "fx_kt2",
+        "rate": "fx_kt3",
+    }
+    tied = [dt.KEY_COLUMN_TIED in (r.completeness_reason or "").split(",") for r in rows]
+    assert all(tied) if help_is_text else not any(tied)
+
+
+# ── what is and is not a key ───────────────────────────────────────────────────────────────
+
+
+def test_unaligned_one_character_keys_are_not_read_wide() -> None:
+    """Keys that read as one character each, whose bytes would read on as wide (4-byte) strings
+    were the pointers 4-aligned — they are not, so they stay one-character keys.
+
+    MUTATION (verified RED): drop the 4-alignment condition of the wide reading -> 'ab', 'cd', ...
+    -> RED.
+    """
+    img = Image()
+    hs = [img.func(f"fx_ua{i}") for i in range(4)]
+    img.raw(b"\0", align=4)  # every key below starts 1 past a 4-aligned address
+    ks = [img.raw(c.encode() + b"\0\0\0" + d.encode() + b"\0" * 7) for c, d in zip("aceg", "bdfh")]
+    assert all(k % 4 == 1 for k in ks)
+    img.words(0x7FFF0001, 0x7FFF0002)
+    for k, h in zip(ks, hs, strict=True):
+        img.words(k, h)
+    img.words(0, 0)
+    assert {r.key for r in _rows(img)} == {"a", "c", "e", "g"}
+
+
+def test_a_string_inside_a_function_body_is_no_key() -> None:
+    """Printable bytes inside a function's body in an executable block are code, not a key: words
+    pointing there make no table. The same bytes as the entry of a function the code recovery
+    made out of string bytes (origin 'promoted') hide no code, and do read as keys.
+
+    MUTATION (verified RED): drop the function-body test of a string in an executable block ->
+    the body bytes read as keys -> RED.
+    """
+
+    def build(origin: str) -> Image:
+        img = Image()
+        hs = [img.func(f"fx_bd{i}") for i in range(4)]
+        if origin == "promoted":
+            ks = [
+                img.func(f"fx_s{i}", origin="promoted", body=f"cmd{i}\0".encode()) for i in range(4)
+            ]
+        else:
+            ks = [
+                img.func(f"fx_s{i}", body=b"\xcc" * 4 + f"cmd{i}\0".encode()) + 4 for i in range(4)
+            ]
+        img.words(0x7FFF0001, 0x7FFF0002)
+        for k, h in zip(ks, hs, strict=True):
+            img.words(k, h)
+        img.words(0, 0)
+        return img
+
+    assert not _rows(build("analysis"))
+    assert {r.key for r in _rows(build("promoted"))} == {"cmd0", "cmd1", "cmd2", "cmd3"}
 
 
 # ── the ELF slot check ──────────────────────────────────────────────────────────────────────
@@ -555,6 +979,38 @@ def test_detect_run_no_stored_bytes_is_scanned_zero(tmp_path: Path) -> None:
     assert res.edges == []
     (status,) = res.statuses
     assert status.scanned == 0
+
+
+def test_the_hunt_fingerprint_moves_with_the_elf_on_disk(tmp_path: Path) -> None:
+    """The slot check reads the ELF on disk, so the hunt's input fingerprint carries whether that
+    file is still there with the scanned sha256: present, deleted and replaced are three different
+    fingerprints over one unchanged analysis.db.
+
+    MUTATION (verified RED): drop the ELF state from ``hunt_input_fingerprint`` -> the three are
+    one -> RED.
+    """
+    import hashlib
+
+    from treasure_map.lib.hunt.analyzer2 import hunt_input_fingerprint
+
+    elf = tmp_path / "fx_bin"
+    elf.write_bytes(b"\x7fELF the scanned bytes")
+    db = tmp_path / "a.db"
+    conn = open_db(db)
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, ghidra_ok, last_seen_at) "
+        "VALUES (1, 'fx', ?, ?, 1, '2026-01-01')",
+        (str(elf), hashlib.sha256(elf.read_bytes()).hexdigest()),
+    )
+    conn.commit()
+    conn.close()
+    present = hunt_input_fingerprint(db)
+    elf.unlink()
+    deleted = hunt_input_fingerprint(db)
+    elf.write_bytes(b"\x7fELF other bytes, another length")
+    replaced = hunt_input_fingerprint(db)
+    assert None not in (present, deleted, replaced)
+    assert len({present, deleted, replaced}) == 3
 
 
 def test_elf_file_state_sha_mismatch(tmp_path: Path) -> None:

@@ -35,10 +35,22 @@ class Image:
     truncated_data: bool = False
 
     # ── layout ──────────────────────────────────────────────────────────────────────────────
-    def func(self, name: str, size: int = 16, origin: str = "analysis") -> int:
+    def func(
+        self, name: str, size: int = 16, origin: str = "analysis", body: bytes | None = None
+    ) -> int:
+        """A function of ``size`` bytes (its ``body`` bytes first, the rest filled)."""
         addr = TEXT_BASE + len(self.text)
-        self.text += bytes([FILL]) * size
+        raw = (body or b"")[:size]
+        self.text += raw + bytes([FILL]) * (size - len(raw))
         self.functions.append((addr, name, size, origin))
+        return addr
+
+    def text_string(self, text: str) -> int:
+        """A NUL-terminated string in the executable block, 4-aligned, outside every function."""
+        while len(self.text) % 4:
+            self.text += bytes([FILL])
+        addr = TEXT_BASE + len(self.text)
+        self.text += text.encode() + b"\0"
         return addr
 
     def thunk(self, size: int = 16) -> int:
