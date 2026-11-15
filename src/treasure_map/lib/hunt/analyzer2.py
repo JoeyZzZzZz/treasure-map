@@ -26,7 +26,7 @@ import json
 import logging
 import sqlite3
 from collections import Counter
-from collections.abc import Hashable, Mapping
+from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -80,6 +80,7 @@ from treasure_map.lib.hunt.evidence import (
     build_fmtstr_evidence,
     build_format_size_evidence,
     build_size_evidence,
+    free_sources_called,
     load_entry_index,
 )
 from treasure_map.lib.hunt.exec_edges import (
@@ -105,12 +106,14 @@ from treasure_map.lib.hunt.wrapper_propagation import (
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import (
     CMD,
+    SOURCE_STRONG,
     ArgRef,
     all_path_calls_literal,
     arg_ref,
     path_arg_ref,
 )
 from treasure_map.lib.pattern.scanner import load_stub_names
+from treasure_map.lib.pattern.shapes import classify
 from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import locate_sink_arg_ref
@@ -199,6 +202,29 @@ def _load_extraction_notes(db_path: Path | str) -> dict[int, dict[str, Any]]:
             note["attempted_pass"] = tpv
         notes[bid] = note
     return notes
+
+
+def _source_names_keys(names: Iterable[str]) -> dict[str, Any]:
+    """``{"source_names": [...]}`` for the external-input sources a candidate's function calls, or
+    ``{}`` when it calls none (the key is then absent). On a direct candidate the names come from
+    the callee list ``source_class`` is set from, so the key is present exactly when the class is
+    ``external_input``. A wrapper candidate's class is read from the forwarded value instead (a
+    parameter can make it external, an unreadable argument keeps it unknown), so there the two can
+    differ.
+
+    Each entry is ``{"name": <source name>, "strength": "strong" | "weak"}``, the strength being the
+    set the name is listed in (classes.SOURCE_STRONG / SOURCE_WEAK). The coarse ``source_class``
+    says only that SOME source is called; this keeps which one, so a stored setting and a network
+    receive are not folded into one label. It names calls, not flows: a name here may never reach
+    the sink."""
+    ordered = sorted(set(names))
+    if not ordered:
+        return {}
+    return {
+        "source_names": [
+            {"name": n, "strength": "strong" if n in SOURCE_STRONG else "weak"} for n in ordered
+        ]
+    }
 
 
 def _with_evidence_keys(flow_evidence: str | None, keys: dict[str, Any]) -> str | None:
@@ -1849,6 +1875,9 @@ def run_analyzer2(
                 evidence_keys.update(
                     _detector_error_keys(detector_errors_by_func, match.func_ref.func_id)
                 )
+                # Which sources the function calls, read from the callee list exactly as the
+                # detector read it to set source_class — on every sink axis, not only cmd.
+                evidence_keys.update(_source_names_keys(classify(callees).source))
                 flow_evidence = _with_evidence_keys(flow_evidence, evidence_keys)
                 pattern_id = upsert_pattern(
                     atlas,
@@ -2126,7 +2155,10 @@ def run_analyzer2(
                             evidence
                             | wrapper_keys
                             | extraction_notes.get(f.binary_id, {})
-                            | _detector_error_keys(detector_errors_by_func, f.func_id),
+                            | _detector_error_keys(detector_errors_by_func, f.func_id)
+                            # The sources called in the body, by the same name check the wrapper
+                            # reading above uses when a called source's flow is not fully traced.
+                            | _source_names_keys(free_sources_called(f_pseudocode)),
                             sort_keys=True,
                         ),
                     ),

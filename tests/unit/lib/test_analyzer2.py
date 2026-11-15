@@ -4951,3 +4951,150 @@ def test_the_four_recalled_gap_sinks_now_make_candidates(tmp_path: Path) -> None
     } <= sinks
     exec_notes = {r[2] for r in rows if r[1] == "execvpe"}
     assert any(n and "no_shell_exec" in n for n in exec_notes), exec_notes
+
+
+# ── which sources a candidate's function calls: source_names, on every axis ─────────────────────
+
+
+def _src_fn(name: str, body: str, callees: list[str]) -> dict[str, object]:
+    return {
+        "name": name,
+        "pseudocode": f"void {name}(void){{ {body} }}",
+        "hash": f"h_{name}",
+        "callees": callees,
+    }
+
+
+def _source_names_db(tmp_path: Path) -> Path:
+    """One function per sink axis that calls a source, a caller that forwards a value to a thin
+    command wrapper after calling a getter that seeds nothing, and functions that call no source."""
+    funcs = [
+        # cmd + format (the snprintf that builds the command is a buffer-formatter write too)
+        _src_fn(
+            "cfg_ping",
+            'char b[64]; char c[128]; apmib_get(0x10,b); snprintf(c,128,"ping -c 1 %s",b); '
+            "system(c);",
+            ["apmib_get", "snprintf", "system"],
+        ),
+        # copy, with a strong and a weak source in one function
+        _src_fn(
+            "cfg_copy",
+            'char d[64]; char s[256]; recv(fd,s,256,0); tcapi_get("n","a",s); strcpy(d,s);',
+            ["recv", "tcapi_get", "strcpy"],
+        ),
+        # format-string
+        _src_fn(
+            "cfg_fmt",
+            'char *v; v = (char *)config_get("k"); printf(v);',
+            ["config_get", "printf"],
+        ),
+        # path
+        _src_fn(
+            "cfg_open",
+            'char p[64]; uci_get_option("a","b","c",p,64); fopen(p,"r");',
+            ["uci_get_option", "fopen"],
+        ),
+        # forwards to the wrapper below; also a direct format candidate (its snprintf)
+        _src_fn(
+            "cfg_fwd",
+            "char c[64]; uci_lookup_ptr(local_10,&local_14,local_18,1); "
+            'snprintf(c,64,"ifup %s",local_14); do_cmd(c);',
+            ["uci_lookup_ptr", "snprintf", "do_cmd"],
+        ),
+        # The body calls getenv but the recorded callee list does not name it: the direct format
+        # candidate reads the callee list (no source), the wrapper candidate reads the body text.
+        _src_fn(
+            "env_fwd",
+            'char *v; v = getenv("X"); char c[64]; snprintf(c,64,"x %s",v); do_cmd(c);',
+            ["snprintf", "do_cmd"],
+        ),
+        _thin_cmd_wrapper_fn(),  # do_cmd: a direct cmd candidate that calls no source
+        _const_via_wrapper_fn(),  # reboot_now: a wrapper candidate that calls no source
+        _src_fn(
+            "plain_ping",
+            'char c[128]; snprintf(c,128,"ping -c 1 %s",local_10); system(c);',
+            ["snprintf", "system"],
+        ),
+    ]
+    return _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
+
+
+def _instances_by_key(atlas_path: Path) -> dict[tuple[str, str, bool], sqlite3.Row]:
+    """Every instance keyed by (function, sink class, reached through a wrapper)."""
+    conn = open_atlas(atlas_path)
+    try:
+        rows = conn.execute(
+            "SELECT i.source_anchor, i.flow_evidence, p.sink_class, p.source_class "
+            "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    out: dict[tuple[str, str, bool], sqlite3.Row] = {}
+    for r in rows:
+        ev = json.loads(r["flow_evidence"])
+        via = bool(ev.get("flow_path", {}).get("sink_via_wrapper"))
+        key = (r["source_anchor"], r["sink_class"], via)
+        assert key not in out, key  # one candidate per (function, axis, route) in this fixture
+        out[key] = r
+    return out
+
+
+def test_source_names_record_the_called_sources_on_every_axis(tmp_path: Path) -> None:
+    """★ ``source_names`` lists the sources a candidate's function calls, with the strength each is
+    listed under. It is written at the point every direct axis passes through, and on the wrapper
+    path, which does not pass through it — so a copy, format, format-string, path and wrapper
+    candidate carry it as well as a command one. A function that calls no source carries no key at
+    all, and no column is added for it.
+
+    The direct reading is the callee list (the one source_class is set from); the wrapper reading
+    is the body-text call check its source_kind falls back on, which is how a getter that seeds no
+    taint (uci_lookup_ptr) still labels a forwarded value. The two readings are kept apart on
+    purpose, and env_fwd is the function they disagree on: its direct candidate is unlabelled, its
+    forwarded one names getenv.
+
+    MUTATION (verified RED, each 1 failed): drop the direct-path key -> every direct axis loses it;
+    drop the wrapper-path key -> the wrapper candidate loses it; write the key on cmd only (inside
+    build_flow_evidence's branch) -> the other axes lose it; write it always (an empty list when no
+    source) -> the source-free candidates gain it; call every name weak -> recv reads weak; read
+    the wrapper candidate's callee list instead of its body -> env_fwd's forwarded one loses it."""
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
+    assert stats.wrapper_propagated == 3  # cfg_fwd, env_fwd and reboot_now, all via do_cmd
+    rows = _instances_by_key(atlas)
+
+    def names(*entries: tuple[str, str]) -> list[dict[str, str]]:
+        return [{"name": n, "strength": s} for n, s in entries]
+
+    expected = {
+        ("cfg_ping", "cmd", False): names(("apmib_get", "weak")),
+        ("cfg_ping", "format", False): names(("apmib_get", "weak")),
+        ("cfg_copy", "copy", False): names(("recv", "strong"), ("tcapi_get", "weak")),
+        ("cfg_fmt", "fmt_string", False): names(("config_get", "weak")),
+        ("cfg_open", "path_sink", False): names(("uci_get_option", "weak")),
+        ("cfg_fwd", "format", False): names(("uci_lookup_ptr", "weak")),
+        ("cfg_fwd", "cmd", True): names(("uci_lookup_ptr", "weak")),
+        ("env_fwd", "cmd", True): names(("getenv", "weak")),
+    }
+    without = {
+        ("env_fwd", "format", False),
+        ("do_cmd", "cmd", False),
+        ("reboot_now", "cmd", True),
+        ("plain_ping", "cmd", False),
+        ("plain_ping", "format", False),
+    }
+    # the fixture really yields every candidate named above, and nothing else
+    assert set(rows) == set(expected) | without
+    for key, want in expected.items():
+        ev = json.loads(rows[key]["flow_evidence"])
+        assert ev.get("source_names") == want, key
+        assert rows[key]["source_class"] == "external_input", key
+    for key in without:
+        ev = json.loads(rows[key]["flow_evidence"])
+        assert "source_names" not in ev, key
+        assert rows[key]["source_class"] == "unknown", key
+    conn = open_atlas(atlas)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(instance)")}
+    finally:
+        conn.close()
+    assert "source_names" not in cols

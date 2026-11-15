@@ -30,6 +30,7 @@ import re
 import sqlite3
 from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -79,10 +80,33 @@ def _charset_converter_called(pseudocode: str) -> bool:
     return any(re.search(rf"\b{re.escape(c)}\s*\(", pseudocode) for c in _CHARSET_SAFE)
 
 
+# A call to any source, by exact name: ``name(`` (optional whitespace before the parenthesis). One
+# alternation read in one pass; at a given start at most one name can be followed by ``(`` (a name
+# that is a prefix of another is followed by the longer name's remaining characters instead).
+_SOURCE_CALL_RE = re.compile(r"\b(" + "|".join(re.escape(s) for s in sorted(SOURCE)) + r")\s*\(")
+
+
+@lru_cache(maxsize=256)
+def _sources_called_in(pseudocode: str) -> tuple[str, ...]:
+    """``free_sources_called`` per body text: a caller with several calls to one wrapper yields one
+    candidate per call, all reading the same body."""
+    return tuple(sorted({m.group(1) for m in _SOURCE_CALL_RE.finditer(pseudocode)}))
+
+
+def free_sources_called(pseudocode: str) -> list[str]:
+    """The free-input sources (network/env/config/json getters) CALLED in the function body, by
+    name, sorted. A name counts only when it is written as a call (``name(``), so a getter whose
+    name is a prefix of another's (``config_get`` / ``config_getall``) is not read into it.
+
+    NOT a flow claim: a name here was called somewhere in the function, which says nothing about
+    whether its value reaches any sink."""
+    return list(_sources_called_in(pseudocode))
+
+
 def _free_source_called(pseudocode: str) -> bool:
-    """Existence check: a free-input source (network/env/config/json getter) is CALLED in the
-    function body. NOT a flow claim — used only for the conservative wrapper-candidate fallback."""
-    return any(re.search(rf"\b{re.escape(s)}\s*\(", pseudocode) for s in SOURCE)
+    """Existence check: a free-input source is CALLED in the function body (``free_sources_called``
+    is not empty). NOT a flow claim — used only for the conservative wrapper-candidate fallback."""
+    return bool(free_sources_called(pseudocode))
 
 
 def _source_kind(pseudocode: str, sink_arg: str | None, *, conservative_free: bool = False) -> str:

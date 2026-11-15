@@ -3,8 +3,10 @@
 """Semantic call classes — generic taint source/sink knowledge.
 
 These frozensets describe WHAT COUNTS AS a source/formatter/command-sink/copy in
-static security analysis — universal, mechanism-only knowledge. They carry only
-generic, public C/libc and common-embedded API names; no vendor-proprietary symbol.
+static security analysis — mechanism-only knowledge. Every entry is a callee NAME, matched
+exactly: generic, public C/libc and common-embedded API names, plus the config-store getters
+that embedded SDKs export under the names listed here (a call can only be recognized by the
+name it is made with). No entry names a firmware, a product or a device.
 """
 
 from __future__ import annotations
@@ -94,6 +96,19 @@ SOURCE_WEAK: frozenset[str] = frozenset(
         "nvram_get",
         "nvram_safe_get",
         "nvram_bufget",
+        # Config-store getters exported by embedded SDKs and configuration libraries. Each reads a
+        # value the device keeps for itself (a stored setting): weak, like the nvram getters above.
+        # A stored value may well have been written by a remote party earlier, but that is not
+        # establishable within one function. Where each one writes its value differs — a buffer
+        # argument, the return value, or a lookup struct two indirections away — so only some of
+        # them seed taint (see reachability/taint); every one of them sets the source label.
+        "apmib_get",
+        "config_get",
+        "tcapi_get",
+        "tcapi_staticGet",
+        "uci_get",
+        "uci_get_option",
+        "uci_lookup_ptr",
         # Generic base64 decoders.
         "b64_decode",
         "base64_decode",

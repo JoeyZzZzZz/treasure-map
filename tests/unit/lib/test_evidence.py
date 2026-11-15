@@ -704,3 +704,31 @@ def test_a_loaded_length_records_its_form_and_path_and_boundary() -> None:
     # a plain variable length records its form and no path
     ev2 = build_size_evidence(pseudocode="void f(int n){ memcpy(d,s,n); }", sink_name="memcpy")
     assert ev2["size_flow"]["size_arg_form"] == "var" and "size_arg_path" not in ev2["size_flow"]
+
+
+def test_free_sources_called_matches_a_per_name_call_check() -> None:
+    """``free_sources_called`` reads every source name in one alternation pass; it must name exactly
+    the sources a separate ``\\bname\\s*\\(`` search per name finds — including names that are
+    prefixes of other names (read / readv, recv / recvfrom, uci_get / uci_get_option), a space
+    before the parenthesis, and a name glued into a longer identifier on either side.
+
+    MUTATION (verified RED, 1 failed): drop ``\\s*`` from the alternation's call anchor -> the
+    ``name (`` forms are missed; drop the trailing ``\\(`` -> prefixes are read out of longer
+    names."""
+    import re
+
+    from treasure_map.lib.hunt.evidence import free_sources_called
+    from treasure_map.lib.pattern.classes import SOURCE
+
+    def reference(text: str) -> list[str]:
+        return sorted(s for s in SOURCE if re.search(rf"\b{re.escape(s)}\s*\(", text))
+
+    texts = []
+    for name in sorted(SOURCE):
+        texts += [f"{name}(a);", f"x = {name} (a,b);", f"my_{name}(a);", f"{name}_x(a);"]
+        texts.append(f"{name};")
+    texts.append(" ".join(texts))
+    texts.append("readv(f,v,2); recvfrom(s,b,1,0,a,l); uci_get_option(a,b,c,d,5); getopt_long(a);")
+    assert any(reference(t) for t in texts) and any(not reference(t) for t in texts)
+    for text in texts:
+        assert free_sources_called(text) == reference(text), text

@@ -73,10 +73,20 @@ _RETURN_SOURCES: frozenset[str] = frozenset(
         # JSON string getters: the returned pointer carries the external value (see classes.py).
         "json_object_get_string",
         "json_object_get_string_len",
+        # Config-store getter that returns the stored value's string (``config_get(key)``).
+        "config_get",
     }
 )
 
 # Buffer-output sources: the source writes into one argument buffer, at a known position.
+#
+# Two config-store getters are recognized as sources (classes.SOURCE_WEAK) but deliberately have
+# no entry here or in _RETURN_SOURCES, so they set the source label and seed nothing:
+#   * uci_lookup_ptr fills a lookup struct passed by pointer; the value sits in a field of that
+#     struct, two indirections from the argument. Seeding the argument would taint the whole
+#     struct root, which over-taints.
+#   * uci_get is called in two shapes under one name — the value through a third, out-argument, or
+#     as the return of a two-argument call — so any single position is wrong for one of them.
 _BUFFER_SOURCE_ARG: dict[str, int] = {
     "recv": 1,
     "recvfrom": 1,
@@ -84,6 +94,11 @@ _BUFFER_SOURCE_ARG: dict[str, int] = {
     "fread": 0,
     "fgets": 0,
     "gets": 0,
+    # Config-store getters that write the stored value into an output buffer argument.
+    "apmib_get": 1,  # (id, out): the key is a numeric id, the value lands in the buffer
+    "tcapi_get": 2,  # (node, attribute, out)
+    "tcapi_staticGet": 2,  # (node, attribute, out), the same shape as tcapi_get
+    "uci_get_option": 3,  # (package, section, option, out, out_size)
 }
 
 # The head of a call: the callee name and its opening parenthesis. Where a call's ARGUMENTS are
@@ -270,8 +285,9 @@ def _seed_source(
         buf = _arg_ident(args, pos)
         if buf is not None:
             target.add(buf)
-    # Sources we cannot precisely attribute (e.g. scanf-family) seed nothing — under-taint
-    # is the safe direction (it biases toward "unknown", never toward over-claiming).
+    # Sources we cannot precisely attribute (e.g. scanf-family, or a getter whose value lands in a
+    # struct field) seed nothing — under-taint is the safe direction (it biases toward "unknown",
+    # never toward over-claiming).
 
 
 def _dep_idents(text: str, call_names: AbstractSet[str]) -> set[str]:

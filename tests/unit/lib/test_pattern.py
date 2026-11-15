@@ -16,6 +16,8 @@ import re
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 import treasure_map.lib.pattern.shapes as shapes
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import (
@@ -1838,6 +1840,9 @@ _SOURCE_WEAK_ALL = frozenset(
         "json_object_get_string", "json_object_get_string_len", "mq_receive", "msgrcv",
         "nvram_bufget", "nvram_get", "nvram_safe_get", "pread", "pread64", "read", "readv",
         "scanf", "sscanf",
+        # config-store getters (stored settings: weak, never strong)
+        "apmib_get", "config_get", "tcapi_get", "tcapi_staticGet", "uci_get", "uci_get_option",
+        "uci_lookup_ptr",
     }
 )  # fmt: skip
 
@@ -1851,3 +1856,63 @@ def test_the_source_vocabulary_is_exactly_what_it_is() -> None:
     assert SOURCE_STRONG == _SOURCE_STRONG_ALL
     assert SOURCE_WEAK == _SOURCE_WEAK_ALL
     assert SOURCE == _SOURCE_STRONG_ALL | _SOURCE_WEAK_ALL
+
+
+# ── config-store getters: they label a candidate's source, as weak input only ───────────────────
+
+_CONFIG_STORE_GETTERS = (
+    "apmib_get",
+    "config_get",
+    "tcapi_get",
+    "tcapi_staticGet",
+    "uci_get",
+    "uci_get_option",
+    "uci_lookup_ptr",
+)
+
+
+def test_config_store_getters_are_weak_sources_and_never_strong() -> None:
+    """A stored setting is device-held input: weak. Listing a getter as strong would let a value it
+    returns grade ``confirmed`` (the strong branch is the only one that can), which claims remote
+    control nothing in one function shows.
+
+    MUTATION (verified RED, 1 failed): move apmib_get from SOURCE_WEAK to SOURCE_STRONG."""
+    for name in _CONFIG_STORE_GETTERS:
+        assert name in SOURCE_WEAK, name
+        assert name not in SOURCE_STRONG, name
+
+
+@pytest.mark.parametrize("getter", _CONFIG_STORE_GETTERS)
+def test_a_call_to_a_config_store_getter_labels_the_candidate_external_input(getter: str) -> None:
+    """Each getter on its own is enough to set ``source_class``. The label reads the callee list,
+    not where (or whether) the getter seeds taint, so the two that seed nothing still set it.
+
+    MUTATION (verified RED): drop any one getter from SOURCE_WEAK -> its case reads ``unknown``
+    (1 failed each; checked for apmib_get and uci_lookup_ptr)."""
+    fr = FuncRef(binary_name="b", func_name="f", func_id=1)
+    body = f"void f(void){{ char c[64]; {getter}(local_10,local_14,c); system(c); }}"
+    (match,) = shapes.pattern_cmd(fr, [getter, "system"], body)
+    assert match.source_class == "external_input"
+    assert match.call_sequence_shape == "source->cmd"
+
+
+def test_a_getter_lookalike_leaves_the_candidate_unknown() -> None:
+    """Relabelling is by exact name. ``apmib_getDef`` reads the compiled-in DEFAULT table (a
+    constant, not a stored setting) and ``config_getall`` takes no key; neither is a source, and
+    neither is caught by a getter its name merely begins with. The body-text check the wrapper path
+    uses (``free_sources_called``) is held to the same exact-call rule.
+
+    MUTATION (verified RED): add apmib_getDef to SOURCE_WEAK -> external_input (1 failed); drop
+    the ``\\s*\\(`` call anchor from free_sources_called -> config_get / apmib_get / uci_get are
+    read out of the longer names (1 failed)."""
+    from treasure_map.lib.hunt.evidence import free_sources_called
+
+    callees = ["apmib_getDef", "config_getall", "uci_get_list", "system"]
+    body = (
+        "void f(void){ char c[64]; apmib_getDef(0x28f,c); config_getall(); "
+        "uci_get_list(local_10,c); system(c); }"
+    )
+    fr = FuncRef(binary_name="b", func_name="f", func_id=1)
+    (match,) = shapes.pattern_cmd(fr, callees, body)
+    assert match.source_class == "unknown"
+    assert free_sources_called(body) == []
