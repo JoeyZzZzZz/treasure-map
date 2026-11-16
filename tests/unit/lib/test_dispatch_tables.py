@@ -1134,3 +1134,148 @@ def test_determined_edge_still_gives_a_lead(tmp_path: Path) -> None:
         atlas.close()
     assert "STRING-KEYED EDGE" in dim.note
     assert any(lead.get("key") == "one" for lead in (dim.evidence or ()))
+
+
+# ── code that names the data's key column but slots the data does not back ──────────────────
+
+
+def _three_word_table(img: Image, names, a, b) -> int:
+    """{name, a, b} records after three non-record words, ended by an all-zero record; ``a`` / ``b``
+    are each a function, 0, or a raw word. Returns the first record's address."""
+    img.words(0x7FFF0001, 0x7FFF0002, 0x7FFF0003)
+    first = DATA_BASE + len(img.data)
+    for n, x, y in zip(names, a, b, strict=True):
+        img.words(img.string(n), x, y)
+    img.words(0, 0, 0, 0x7FFF0004, 0x7FFF0005, 0x7FFF0006)
+    return first
+
+
+def _code_reading(monkeypatch: pytest.MonkeyPatch, img: Image):
+    """The reader's rows, and every ``code_evidence`` result it computed on the way."""
+    seen: list[dt.CodeEvidence] = []
+    real = dt.code_evidence
+
+    def spy(w, table, frames):  # type: ignore[no-untyped-def]
+        out = real(w, table, frames)
+        seen.append(out)
+        return out
+
+    monkeypatch.setattr(dt, "code_evidence", spy)
+    return _rows(img), seen
+
+
+def _assert_code_unused(rows: list[dt.StringKeyedEdgeRow]) -> None:
+    assert rows
+    assert all(r.pairing_conflict == dt.CODE_INCONSISTENT for r in rows)
+    assert not any(r.pairing_basis in (dt.CODE_TWO_INDEX, dt.CODE_HELPER) for r in rows)
+
+
+def test_code_whose_handler_slot_holds_a_non_function_is_inconsistent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The code reads the key at the data's key column (so the key-column check passes) and a
+    handler two words on — a column no data reading takes, because one row holds a raw word there.
+    The code's slot is checked against the data and fails: neither a function nor NULL. The
+    single-column table still ends at its all-zero record, so the terminator pairs it.
+
+    MUTATION (verified RED): treat the code's offsets as backed without checking the slots (the
+    ``offsets <= r.offsets`` test made unconditional) -> ok -> RED; drop the not-a-function-or-NULL
+    check -> the column never holds a function -> ``offset_never_fn`` -> RED."""
+    img = Image()
+    hs = [img.func(f"fx_sn{i}") for i in range(5)]
+    names = ["alpha", "bravo", "charlie", "delta", "echo"]
+    first = _three_word_table(img, names, hs, [0, 0, 0x7FFF0009, 0, 0])
+    _walker(img, "fx_sn_get", first, key=0, handler=2, step=3)
+    rows, seen = _code_reading(monkeypatch, img)
+    assert [(e.status, e.why) for e in seen] == [("inconsistent", "slot_not_fn_or_null")]
+    _assert_code_unused(rows)
+    assert {r.key: r.callee_name for r in _determined(rows)} == dict(
+        zip(names, [f"fx_sn{i}" for i in range(5)], strict=True)
+    )
+    assert all(r.pairing_basis == dt.DATA_TERMINATOR for r in _determined(rows))
+
+
+def test_code_whose_handler_column_never_holds_a_function_is_inconsistent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same layout with the code's column NULL down every row: a column that never holds a
+    function backs no handler, and the terminator still pairs the one real column.
+
+    MUTATION (verified RED): the slot test made unconditional -> ok -> RED; drop the never-a-
+    function check -> no row has a function under the code -> ``row_all_null`` -> RED."""
+    img = Image()
+    hs = [img.func(f"fx_nf{i}") for i in range(5)]
+    names = ["alpha", "bravo", "charlie", "delta", "echo"]
+    first = _three_word_table(img, names, hs, [0] * 5)
+    _walker(img, "fx_nf_get", first, key=0, handler=2, step=3)
+    rows, seen = _code_reading(monkeypatch, img)
+    assert [(e.status, e.why) for e in seen] == [("inconsistent", "offset_never_fn")]
+    _assert_code_unused(rows)
+    assert {r.key for r in _determined(rows)} == set(names)
+    assert all(r.pairing_basis == dt.DATA_TERMINATOR for r in _determined(rows))
+
+
+def test_code_that_leaves_a_keyed_row_without_any_handler_is_inconsistent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The code's one handler column holds a function in one row and NULL in the others, so each
+    slot passes on its own; but a row with a key gets no handler from the code at all. The table is
+    read across the null record by the rotation that takes the previous record's last word, so it
+    has two handler columns and the terminator settles neither: every row a candidate.
+
+    MUTATION (verified RED): the slot test made unconditional -> ok -> RED; drop the row check ->
+    ok -> RED."""
+    img = Image()
+    names = ["alpha", "bravo", "charlie", "delta", "echo"]
+    grid = [(0, 0), (1, 1), (0, 0), (1, 0), (1, 0)]
+    a = [img.func(f"fx_ra{i}") if x else 0 for i, (x, _y) in enumerate(grid)]
+    b = [img.func(f"fx_rb{i}") if y else 0 for i, (_x, y) in enumerate(grid)]
+    first = _three_word_table(img, names, a, b)
+    _walker(img, "fx_ra_get", first, key=0, handler=2, step=3)
+    rows, seen = _code_reading(monkeypatch, img)
+    assert [(e.status, e.why) for e in seen] == [("inconsistent", "row_all_null")]
+    _assert_code_unused(rows)
+    assert {r.key for r in rows} == {"bravo", "charlie", "delta", "echo"}
+    assert all(r.pairing_basis == dt.UNDETERMINED for r in rows)
+
+
+def test_a_wider_stride_never_borrows_a_handler_word_a_shorter_stride_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Four {name, 0, fn} records, then a handler-first two-word table ({fn, name}) whose first
+    handler IS the last three-word record's function. The two-word table is chosen first and takes
+    that word as a handler, so the three-word run is left three records long — short of a table —
+    and no three-word table is read. A wider stride is offered only the words no shorter stride's
+    table used, handler words included.
+
+    MUTATION (verified RED): withhold only a shorter table's KEY words from the wider strides
+    (``blocked |= t.keyset``) -> the three-word table is read through the shared handler -> RED."""
+    tables: list[list] = []  # type: ignore[type-arg]
+    real = dt._find_tables
+
+    def spy(w):  # type: ignore[no-untyped-def]
+        out = real(w)
+        tables.append(out)
+        return out
+
+    monkeypatch.setattr(dt, "_find_tables", spy)
+    img = Image()
+    img.words(0x7FFF0001, 0x7FFF0002)
+    wide = ["cfg_alpha", "cfg_bravo", "cfg_charlie", "cfg_delta"]
+    for i, n in enumerate(wide):
+        img.words(img.string(n), 0, img.func(f"fx_w{i}"))
+    narrow = ["set_one", "set_two", "set_three", "set_four"]
+    img.words(img.string(narrow[0]))
+    for i, n in enumerate(narrow[1:], start=1):
+        img.words(img.func(f"fx_s{i}"), img.string(n))
+    img.words(0, 0, 0x7FFF0003, 0x7FFF0004)
+    rows = _rows(img)
+    assert len(tables) == 1
+    found = tables[0]
+    two = [t for t in found if t.stride == 2]
+    assert two, "the fixture's two-word table was not read"
+    used = set().union(*(t.hset for t in two))
+    assert not any((t.keyset | t.hset) & used for t in found if t.stride >= 3)
+    assert not any(t.stride >= 3 for t in found)
+    assert {r.key for r in rows} == set(narrow)
+    assert all(r.stride_words == 2 for r in rows)

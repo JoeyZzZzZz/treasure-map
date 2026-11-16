@@ -1296,6 +1296,46 @@ def test_one_hop_lead_follows_the_edge_callee_address_not_a_same_named_function(
     assert ev["reachability_leads"] == out[(("path", "/lib/libx.so"), "copy")]
 
 
+def test_one_hop_leads_walk_down_from_a_settled_table_row_and_never_from_a_candidate() -> None:
+    """A static-table row whose pairing is settled hands its key one hop down; a CANDIDATE row
+    (``pairing_basis="undetermined"``: the record holds the key and the function, but that the key
+    dispatches there is not settled) hands it to nothing. Both halves are asserted: the settled one
+    proves the fixture really walks (so the candidate's silence is not the fixture's), and the hunt
+    writes these leads into the stored evidence, so a candidate row walked down from would put an
+    unsettled dispatch into the fact layer.
+
+    Same key, two handlers, each with a function of its own below it.
+
+    MUTATION (verified RED, 1 failed): skip the ``undetermined`` check (``if False:``) -> the
+    candidate's ``leaf_b`` gets a lead."""
+    funcs = [
+        _lead_func(1, "/lib/libx.so", "handler_a", "00000100", ["leaf_a"]),
+        _lead_func(2, "/lib/libx.so", "leaf_a", "00000200", []),
+        _lead_func(3, "/lib/libx.so", "handler_b", "00000300", ["leaf_b"]),
+        _lead_func(4, "/lib/libx.so", "leaf_b", "00000400", []),
+    ]
+    settled = dataclasses.replace(
+        _lead_edge("set", "handler_a", "0x100", "/lib/libx.so", "static_string_table"),
+        pairing_basis="data_terminator",
+    )
+    candidate = dataclasses.replace(
+        _lead_edge("set", "handler_b", "0x300", "/lib/libx.so", "static_string_table"),
+        pairing_basis="undetermined",
+    )
+    out = analyzer2_mod._one_hop_edge_leads(funcs, [settled, candidate])
+    assert out.get((("path", "/lib/libx.so"), "leaf_a")) == [
+        {
+            "via": "string_keyed_edge",
+            "key": "set",
+            "hops": 1,
+            "through": "handler_a",
+            "mechanism": "static_string_table",
+        }
+    ]
+    assert (("path", "/lib/libx.so"), "leaf_b") not in out
+    assert set(out) == {(("path", "/lib/libx.so"), "leaf_a")}
+
+
 def test_one_hop_leads_do_not_depend_on_the_order_rows_were_read_in() -> None:
     """Shuffling the function rows and the edge rows (what a re-scan's new ingest order does) must
     leave the output identical, the order of each function's leads included.
@@ -5008,6 +5048,13 @@ def _source_names_db(tmp_path: Path) -> Path:
             'char *v; v = getenv("X"); char c[64]; snprintf(c,64,"x %s",v); do_cmd(c);',
             ["snprintf", "do_cmd"],
         ),
+        # Calls a getter, but what it forwards to the wrapper carries no variable to read (a
+        # literal): the wrapper candidate stays unknown and still names the getter its body calls.
+        _src_fn(
+            "cfg_reboot",
+            'char b[16]; apmib_get(0x20,b); do_cmd("/sbin/reboot");',
+            ["apmib_get", "do_cmd"],
+        ),
         _thin_cmd_wrapper_fn(),  # do_cmd: a direct cmd candidate that calls no source
         _const_via_wrapper_fn(),  # reboot_now: a wrapper candidate that calls no source
         _src_fn(
@@ -5056,10 +5103,12 @@ def test_source_names_record_the_called_sources_on_every_axis(tmp_path: Path) ->
     drop the wrapper-path key -> the wrapper candidate loses it; write the key on cmd only (inside
     build_flow_evidence's branch) -> the other axes lose it; write it always (an empty list when no
     source) -> the source-free candidates gain it; call every name weak -> recv reads weak; read
-    the wrapper candidate's callee list instead of its body -> env_fwd's forwarded one loses it."""
+    the wrapper candidate's callee list instead of its body -> env_fwd's forwarded one loses it;
+    write the wrapper key only on an external_input candidate -> cfg_reboot's loses it."""
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer2(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
-    assert stats.wrapper_propagated == 3  # cfg_fwd, env_fwd and reboot_now, all via do_cmd
+    # cfg_fwd, env_fwd, cfg_reboot and reboot_now, all via do_cmd
+    assert stats.wrapper_propagated == 4
     rows = _instances_by_key(atlas)
 
     def names(*entries: tuple[str, str]) -> list[dict[str, str]]:
@@ -5074,7 +5123,11 @@ def test_source_names_record_the_called_sources_on_every_axis(tmp_path: Path) ->
         ("cfg_fwd", "format", False): names(("uci_lookup_ptr", "weak")),
         ("cfg_fwd", "cmd", True): names(("uci_lookup_ptr", "weak")),
         ("env_fwd", "cmd", True): names(("getenv", "weak")),
+        ("cfg_reboot", "cmd", True): names(("apmib_get", "weak")),
     }
+    # The one named candidate whose class is not external: its forwarded argument has no value to
+    # trace, so the wrapper reading stays unknown, while the body still calls the getter.
+    unknown_but_named = {("cfg_reboot", "cmd", True)}
     without = {
         ("env_fwd", "format", False),
         ("do_cmd", "cmd", False),
@@ -5087,7 +5140,8 @@ def test_source_names_record_the_called_sources_on_every_axis(tmp_path: Path) ->
     for key, want in expected.items():
         ev = json.loads(rows[key]["flow_evidence"])
         assert ev.get("source_names") == want, key
-        assert rows[key]["source_class"] == "external_input", key
+        want_class = "unknown" if key in unknown_but_named else "external_input"
+        assert rows[key]["source_class"] == want_class, key
     for key in without:
         ev = json.loads(rows[key]["flow_evidence"])
         assert "source_names" not in ev, key
@@ -5098,3 +5152,82 @@ def test_source_names_record_the_called_sources_on_every_axis(tmp_path: Path) ->
     finally:
         conn.close()
     assert "source_names" not in cols
+
+
+def _direct_ref_of(atlas_path: Path, fn: str, sink_class: str) -> str:
+    conn = open_atlas(atlas_path)
+    try:
+        rows = conn.execute(
+            "SELECT i.evidence_ref, i.flow_evidence FROM instance i JOIN pattern p "
+            "ON p.pattern_id = i.pattern_id WHERE i.source_anchor = ? AND p.sink_class = ?",
+            (fn, sink_class),
+        ).fetchall()
+    finally:
+        conn.close()
+    direct = [
+        r[0] for r in rows if not json.loads(r[1]).get("flow_path", {}).get("sink_via_wrapper")
+    ]
+    assert len(direct) == 1, (fn, sink_class, rows)
+    return str(direct[0])
+
+
+_CFG_COPY_NAMES = [
+    {"name": "recv", "strength": "strong"},
+    {"name": "tcapi_get", "strength": "weak"},
+]
+
+
+def test_explain_surfaces_the_recorded_source_names_and_none_when_absent(tmp_path: Path) -> None:
+    """``explain_candidate`` carries the hunt's ``source_names`` verbatim at its top level, and
+    None (never an empty tuple) when the stored evidence holds no list — an absent key is also what
+    a candidate hunted before the key existed carries, so it cannot be read as "calls no source".
+
+    MUTATION (verified RED): the reader never takes the key (always None) -> the cfg_copy half
+    fails; an absent key read as ``()`` -> the plain_ping half fails."""
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
+    conn = open_atlas(atlas)
+    try:
+        with_names = explain_candidate(conn, _direct_ref_of(atlas, "cfg_copy", "copy"))
+        without = explain_candidate(conn, _direct_ref_of(atlas, "plain_ping", "cmd"))
+    finally:
+        conn.close()
+    assert with_names is not None and without is not None
+    assert with_names.source_names == tuple(_CFG_COPY_NAMES)
+    assert without.source_names is None
+
+
+def test_source_names_reach_the_cli_json_and_the_mcp_explain(tmp_path: Path) -> None:
+    """Both consumer surfaces of the explain view carry the key: ``tmap triage --explain --json``
+    in its ``structure`` block (the renderer lists fields one by one, so a new field is not carried
+    unless named), and the MCP ``explain_candidate`` reply (built from the whole explanation).
+    The no-source candidate carries the key as null on both — present, and saying "not recorded".
+
+    MUTATION (verified RED): drop the key from the CLI structure block -> the CLI half fails; the
+    reader never takes the key -> both halves fail."""
+    from click.testing import CliRunner
+
+    from treasure_map import mcp_app
+    from treasure_map.cli.hunt_cli import triage as triage_cmd
+
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
+    refs = {
+        "with": _direct_ref_of(atlas, "cfg_copy", "copy"),
+        "without": _direct_ref_of(atlas, "plain_ping", "cmd"),
+    }
+    want = {"with": _CFG_COPY_NAMES, "without": None}
+    tools = mcp_app.make_tools(atlas)
+    for case, ref in refs.items():
+        result = CliRunner().invoke(
+            triage_cmd, ["run_srcn", "--explain", ref, "--json", "--atlas", str(atlas)]
+        )
+        assert result.exit_code == 0, result.output
+        structure = json.loads(result.output)["structure"]
+        assert "source_names" in structure, case
+        assert structure["source_names"] == want[case], case
+        ex = tools["explain_candidate"](ref)
+        assert ex.get("found") is not False, ex
+        assert "source_names" in ex, case
+        got = ex["source_names"]
+        assert (list(got) if got is not None else None) == want[case], case

@@ -3356,6 +3356,27 @@ class CandidateExplanation:
     # class has no such analysis or the analysis recorded nothing. States what shape was found and
     # what was NOT decided — never that anything is bounded or safe. See ``evidence_surface``.
     evidence_surface: dict[str, Any] | None
+    # Which external-input sources this candidate's function calls, as the hunt recorded them
+    # (``{"name", "strength"}`` per source, sorted by name): the coarse ``source_class`` folds a
+    # stored setting and a network receive into one label, this keeps them apart. Names calls, not
+    # flows. None when the stored evidence carries no record, which is NOT "calls no source": the
+    # hunt writes the key only when the function calls one, and a candidate hunted before the key
+    # existed has none either. See ``recorded_source_names``.
+    source_names: tuple[dict[str, Any], ...] | None
+
+
+def recorded_source_names(flow_evidence: Evidence) -> tuple[dict[str, Any], ...] | None:
+    """The stored ``source_names`` list, verbatim, or None when the evidence holds none.
+
+    None covers three cases a reader cannot tell apart from the stored row: the function calls no
+    source (the hunt then writes no key), the candidate was hunted before the key was recorded, and
+    an unreadable value. So an absent list is never read as "no source" here; ``source_class`` on
+    the pattern row is the reading for that."""
+    data = _as_evidence(flow_evidence)
+    names = data.get("source_names") if data is not None else None
+    if not isinstance(names, list) or not all(isinstance(n, dict) for n in names):
+        return None
+    return tuple(names)
 
 
 def _verify_steps(candidate: TriageCandidate) -> tuple[str, ...]:
@@ -3455,4 +3476,5 @@ def _explain_in_run(
             _row_get(row, "sink_class"),
             _row_get(row, "blocking_mechanism"),
         ),
+        source_names=recorded_source_names(_row_get(row, "flow_evidence")),
     )

@@ -205,7 +205,9 @@ SWAP_PAIRING_NOTE = (
     "pairing proposed by BinDiff below the alignment threshold; compared against the proposed "
     "counterpart and not floated until the pairing is corroborated"
 )
-# Callee-name prefixes of an input source the hunt does not model. Only tagged on A / B entries
+# Callee-name prefixes of an input-source family the hunt mostly does not model: only three of its
+# getters (uci_get, uci_get_option, uci_lookup_ptr) are recognized sources (classes.SOURCE_WEAK),
+# the rest of the family is not. The prefix still matches those three. Only tagged on A / B entries
 # (``source_gap:<family>``); never moves an entry.
 SOURCE_GAP_PREFIXES: dict[str, tuple[str, ...]] = {"uci_ubus": ("uci_", "ubus_")}
 

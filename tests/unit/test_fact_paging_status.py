@@ -333,3 +333,72 @@ def test_the_paged_listing_and_the_whole_one_hold_the_same_judgements(
     finally:
         conn.close()
     assert sorted(whole["overlays"], key=lambda r: r["id"]) == pages
+
+
+def _counted_status_atlas(tmp_path: Path, counts: list[tuple[int | None, int | None]]) -> Path:
+    """One run, one static-table status row per ``(handler_unverified, pairing_undetermined)``."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    conn = open_atlas(tmp_path / "atlas.db")
+    names = [f"lib_{i:04d}" for i in range(len(counts))]
+    begin_run(conn, "run_c", analysis_db_path=_analysis_db(tmp_path / "run_c" / "a.db", names))
+    finish_run(conn, "run_c", binaries=len(names), functions=len(names))
+    add_detector_status(
+        conn,
+        [
+            DetectorScanStatusRow(
+                "run_c",
+                name,
+                "string_tables",
+                scanned=1,
+                supported_scope=SCOPE,
+                found_count=1,
+                binary_path=f"usr/lib/{name}",
+                handler_unverified=unver,
+                pairing_undetermined=undet,
+            )
+            for name, (unver, undet) in zip(names, counts, strict=True)
+        ],
+    )
+    conn.commit()
+    conn.close()
+    return tmp_path / "atlas.db"
+
+
+def _totals(conn: sqlite3.Connection) -> tuple[Any, Any]:
+    block = get_string_keyed_edges(conn, run_id="run_c")["static_string_table_status"]
+    return block["handler_unverified_total"], block["pairing_undetermined_total"]
+
+
+def test_the_static_table_totals_are_null_when_a_row_has_no_count(tmp_path: Path) -> None:
+    """The two recovery totals add the per-binary counts when every row in scope has one, and are
+    null when any row has none: a row written before the counts were recorded, or an atlas whose
+    table has no such column at all, is "not recorded", which must not read as zero undetermined.
+
+    MUTATION (verified RED): add the counts with ``or 0`` again -> the partial and the column-less
+    atlas read 1 / 2 and 0 / 0 -> RED."""
+    whole = _counted_status_atlas(tmp_path / "whole", [(3, 2), (1, 0)])
+    conn = open_atlas(whole)
+    try:
+        assert _totals(conn) == (4, 2)
+    finally:
+        conn.close()
+    partial = _counted_status_atlas(tmp_path / "partial", [(1, 2), (None, None)])
+    conn = open_atlas(partial)
+    try:
+        assert _totals(conn) == (None, None)
+    finally:
+        conn.close()
+    # An atlas from before the columns: the table without them, read without migrating it.
+    old = _counted_status_atlas(tmp_path / "old", [(0, 0), (0, 0)])
+    raw = sqlite3.connect(old)
+    raw.execute("ALTER TABLE detector_scan_status DROP COLUMN handler_unverified")
+    raw.execute("ALTER TABLE detector_scan_status DROP COLUMN pairing_undetermined")
+    raw.commit()
+    raw.row_factory = sqlite3.Row
+    try:
+        assert "handler_unverified" not in {
+            r[1] for r in raw.execute("PRAGMA table_info(detector_scan_status)")
+        }
+        assert _totals(raw) == (None, None)
+    finally:
+        raw.close()

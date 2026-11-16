@@ -148,6 +148,14 @@ def edges_reaching_callee(
     return [_row_to_edge(r) for r in rows]
 
 
+def _recorded_total(rows: list[sqlite3.Row], column: str) -> int | None:
+    """The sum of ``column`` over ``rows``, or None when any row holds no value for it."""
+    values = [r[column] for r in rows]
+    if any(v is None for v in values):
+        return None
+    return sum(int(v) for v in values)
+
+
 def _static_table_status(
     conn: sqlite3.Connection,
     run_id: str | None,
@@ -220,9 +228,11 @@ def _static_table_status(
         },
         "found_total": sum(r["found_count"] or 0 for r in rows),
         # ★ the recovery's own honesty: candidate rows (pairing undetermined) and ELF-unverified
-        # handlers over the scope, so "how much did it NOT settle" rides with the result.
-        "pairing_undetermined_total": sum(r["pairing_undetermined"] or 0 for r in rows),
-        "handler_unverified_total": sum(r["handler_unverified"] or 0 for r in rows),
+        # handlers over the scope, so "how much did it NOT settle" rides with the result. null when
+        # any status row in scope has no count (a row written before the count was recorded, or
+        # an atlas without the column): "not recorded" never adds up to 0.
+        "pairing_undetermined_total": _recorded_total(rows, "pairing_undetermined"),
+        "handler_unverified_total": _recorded_total(rows, "handler_unverified"),
         "binaries_without_status": _binaries_without_status(conn, run_id, binary, rows),
         "statuses": statuses[lo:] if limit is None else statuses[lo : lo + max(0, limit)],
         "total_statuses": len(statuses),

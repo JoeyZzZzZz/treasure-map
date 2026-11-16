@@ -1318,6 +1318,9 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
                     "structure": {
                         "source_class": c.source_class,
                         "source_kind": c.source_kind,
+                        "source_names": (
+                            list(ex.source_names) if ex.source_names is not None else None
+                        ),
                         "sink_class": c.sink_class,
                         "sink_anchor": c.sink_anchor,
                         "nvram_source_key": c.nvram_source_key,
@@ -1353,6 +1356,11 @@ def _render_explain(ex: CandidateExplanation, *, as_json: bool) -> None:
     click.echo("\nstructure:")
     click.echo(f"  source_class = {c.source_class}")
     click.echo(f"  source_kind  = {c.source_kind}")
+    if ex.source_names is None:
+        click.echo("  source_names = (not recorded)")
+    else:
+        names = ", ".join(f"{n.get('name')} ({n.get('strength')})" for n in ex.source_names)
+        click.echo(f"  source_names = {names}")
     if c.nvram_source_key:
         click.echo(f"  nvram_key    = {c.nvram_source_key}")
     click.echo(f"  sink         = {c.sink_anchor or '?'} ({c.sink_class})")
