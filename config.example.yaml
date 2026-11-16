@@ -4,7 +4,7 @@
 # directory the config file is in, never from where tmap is run.
 
 ghidra:
-  headless_timeout_seconds: 300
+  headless_timeout_seconds: 600
   max_parallel_jvms: 4   # `tmap init` overwrites this with a value derived from the machine
                          #   (physical cores + memory); `tmap init --force` re-detects it
 

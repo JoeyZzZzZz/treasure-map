@@ -511,7 +511,7 @@ def test_force_keeps_the_atlas_names_each_reset_and_backs_up(home: Path, tmp_pat
         host=_host(home),
         tmap=None,
     )
-    assert any("reset ghidra.headless_timeout_seconds: 900 -> 300" in ln for ln in dry_lines)
+    assert any("reset ghidra.headless_timeout_seconds: 900 -> 600" in ln for ln in dry_lines)
     assert cfg.read_text() == original  # dry run wrote nothing
     run_init(
         force=True,

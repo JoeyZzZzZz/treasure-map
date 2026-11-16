@@ -1004,7 +1004,9 @@ def test_retry_budget_is_the_isolated_retrys_and_it_is_what_run_all_spends(
     from treasure_map.lib.analyze.ghidra_runner import retry_budget_seconds
 
     rec = _big_rec(tmp_path)
-    _sized_file(rec.path, 28)
+    # 12 MB: scaled past the base, and doubled still under the ceiling, so the value is the
+    # formula's own and not the cap two different formulas would both clip to.
+    _sized_file(rec.path, 12)
     base = GhidraConfig().headless_timeout_seconds
     seen: list[int] = []
 
@@ -1019,7 +1021,7 @@ def test_retry_budget_is_the_isolated_retrys_and_it_is_what_run_all_spends(
         runner.run_all([rec], tmp_path / "out")
 
     expected = retry_budget_seconds(rec.path, base)
-    assert expected == min(1800, int(300 * 2.8) * 2)
+    assert expected == int(base * 1.2) * 2 < 1800
     # _run_subprocess is handed the budget + 60s of overhead; phase 2 is the second call.
     assert seen[1] - 60 == expected
 

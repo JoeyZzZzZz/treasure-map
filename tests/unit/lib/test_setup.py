@@ -192,7 +192,7 @@ def test_init_writes_no_key_that_nothing_reads(fake_home: Path) -> None:
     data["ghidra"]["mode"] = "local"
     data["log_level"] = "DEBUG"
     config.write_text(yaml.safe_dump(data))
-    assert load_config().ghidra.headless_timeout_seconds == 300
+    assert load_config().ghidra.headless_timeout_seconds == 600
 
 
 def test_run_init_check_only_writes_nothing(fake_home: Path) -> None:

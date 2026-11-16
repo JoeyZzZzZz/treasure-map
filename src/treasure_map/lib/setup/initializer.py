@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # missing from config.yaml, config.py's GhidraConfig default (4) is the safety fallback.
 _DEFAULT_CONFIG_YAML: dict[str, Any] = {
     "ghidra": {
-        "headless_timeout_seconds": 300,
+        "headless_timeout_seconds": 600,
         "local": {"home": None},
     },
     "toolchain": {"java_home": None, "bindiff": None},

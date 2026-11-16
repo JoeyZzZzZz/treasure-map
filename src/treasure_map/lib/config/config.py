@@ -58,7 +58,7 @@ class GhidraRemoteConfig(BaseModel):
 
 class GhidraConfig(BaseModel):
     mode: GhidraMode = GhidraMode.LOCAL  # not read; accepted so an older config.yaml still loads
-    headless_timeout_seconds: int = 300
+    headless_timeout_seconds: int = 600
     max_parallel_jvms: int = 4
     local: GhidraLocalConfig = Field(default_factory=GhidraLocalConfig)
     docker: GhidraDockerConfig = Field(default_factory=GhidraDockerConfig)

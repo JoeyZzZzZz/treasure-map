@@ -92,7 +92,7 @@ for review.
 
 ## Case studies
 
-### CVE-2021-26614 was “fixed”. The backdoor never left.
+### CVE-2021-26614 was "fixed". The backdoor code never left.
 
 In 2021 ipTIME patched CVE-2021-26614, a debug backdoor in its C200 IP camera (firmware 1.058 →
 1.060). We gave that patch to DeepSeek-V4.1-Flash, a low-cost general-purpose model, along with

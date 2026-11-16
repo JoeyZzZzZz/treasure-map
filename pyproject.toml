@@ -9,7 +9,7 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [
     {name = "JoeyZzZzZz", email = "86097996+JoeyZzZzZz@users.noreply.github.com"}
 ]
-keywords = ["iot", "firmware", "security", "reverse-engineering", "patch-diff"]
+keywords = ["iot", "firmware", "security", "reverse-engineering", "patch-diff", "mcp"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3.11",
