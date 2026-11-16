@@ -31,6 +31,65 @@ class _ReviewGroup(InterruptGroup):
         return super().parse_args(ctx, args)
 
 
+def _write_handoff_with_analysis(
+    conn: sqlite3.Connection, run_pair: str, paths: tuple[str, ...], output: Path
+) -> None:
+    """``report --handoff --analysis <file> ...``: the driver's document (compose_handoff) with
+    each file's texts under the blocks it names, every changed_real finding a block — one no file
+    names, or names with both texts empty, says the agent wrote nothing for it, and is listed
+    after the line saying what was written. A file that cannot be read whole, an anchor named
+    twice (in one file or across them) or one the hand-off does not hold writes nothing (an
+    existing ``output`` is left as it is)."""
+    from treasure_map.lib import review_driver as rd
+    from treasure_map.lib.query import review_report as rr
+
+    sources: list[tuple[str, dict[str, dict[str, str]]]] = []
+    for path in paths:
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise click.ClickException(
+                f"{path}: the file could not be read as utf-8 text ({exc}); nothing was written"
+            ) from exc
+        texts, err = rd.parse_handoff_analysis(text, source="the file")
+        if texts is None:
+            raise click.ClickException(f"{path}: {err}; nothing was written")
+        sources.append((path, texts))
+    composed = rd.compose_handoff(conn, run_pair, sources)
+    if isinstance(composed, rd.HandoffRefusal):
+        if composed.kind == "twice":
+            raise click.ClickException(
+                f"{composed.source} names {composed.anchors[0][:200]!r} a second time (in this "
+                "file or an earlier one); nothing was written"
+            )
+        raise click.ClickException(
+            "\n".join(
+                [
+                    f"{composed.source} names {len(composed.anchors)} anchor(s) the hand-off does "
+                    "not hold; nothing was written:",
+                    *(f"  {rr.handoff_anchor_text(key)}" for key in composed.anchors),
+                ]
+            )
+        )
+    output.write_text(composed.document, encoding="utf-8")
+    missing = composed.nothing_written
+    counts = f"{composed.findings} findings" + (
+        f"; the agent wrote nothing for {len(missing)} of them" if missing else ""
+    )
+    click.echo(
+        f"wrote {output} ({counts})"
+        + (
+            ""
+            if composed.must_read_complete
+            else " — PARTIAL: must_read_complete is false, not the official hand-off"
+        )
+    )
+    if missing:
+        click.echo("the agent wrote nothing for:")
+        for anchor in missing:
+            click.echo(f"  {rr.handoff_anchor_text(anchor)}")
+
+
 @click.group(
     name="review",
     cls=_ReviewGroup,
@@ -62,6 +121,17 @@ def review() -> None:
     help="Write the standardized findings hand-off (one block per changed_real finding).",
 )
 @click.option(
+    "--analysis",
+    "analysis_files",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help=(
+        "A file of an agent's texts per finding "
+        '({"findings": [{"anchor_ref", "hypotheses", "device_checks"}]}), written under each '
+        "block; repeat for several files. Only with --handoff."
+    ),
+)
+@click.option(
     "-o",
     "--output",
     default=None,
@@ -80,6 +150,7 @@ def report(
     as_md: bool,
     as_html: bool,
     as_handoff: bool,
+    analysis_files: tuple[str, ...],
     output: str | None,
     atlas_db: str | None,
 ) -> None:
@@ -91,6 +162,8 @@ def report(
     from treasure_map.lib.query import review_units as ru
     from treasure_map.version import installed_commit
 
+    if analysis_files and not as_handoff:
+        raise click.UsageError("--analysis goes with --handoff")
     file_flags = sum((as_md, as_html, as_handoff))
     if file_flags > 1:
         raise click.UsageError("pass one of --md / --html / --handoff")
@@ -112,6 +185,10 @@ def report(
                 ", see tmap runs)"
             )
         run_a, run_b = runs
+        if as_handoff and analysis_files:
+            assert output is not None
+            _write_handoff_with_analysis(conn, run_pair, analysis_files, Path(output))
+            return
         if as_handoff:
             assert output is not None
             # The same staleness context and file-judgement reading the MCP get_diff_handoff

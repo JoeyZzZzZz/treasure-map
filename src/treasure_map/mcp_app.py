@@ -949,7 +949,11 @@ _AGENT_GUIDE = (
     "get_diff_handoff(run_pair) pages a standardized hand-off of the changed_real findings — one "
     "block each, tmap's facts and two placeholders for a person (refused before; tmap review "
     "report --handoff writes a partial one for a person); once complete, tmap review report "
-    "--handoff writes the same text to a file."
+    "--handoff writes the same text to a file. A report of the findings is that hand-off, not a "
+    "list rebuilt from summaries (a sub-agent's, an earlier session's): --analysis <file> (once "
+    'per file, each {"findings": [{"anchor_ref", "hypotheses", "device_checks"}]}) puts those '
+    "texts under each block, and a finding no file names (or names with both texts empty) is "
+    "still written, saying the agent wrote nothing for it."
 )
 
 # What the server sends as its standing instructions: the loop and both entry points, within the

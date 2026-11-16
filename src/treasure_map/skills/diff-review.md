@@ -42,6 +42,16 @@ produces no payload: every judgment is yours.
   `start_diff_review(run_pair=..., sweep=true)` and go on as before.
 - `report.not_seen` lists what this view cannot see. Do not claim coverage of those classes.
 - With several workers, give each its own `worker` / `workers` pair so no two judge the same unit.
+- A report of the pair's findings is tmap's hand-off, never a list rebuilt from summaries (a
+  sub-agent's, an earlier session's or your own). `get_diff_handoff(run_pair)` pages it; on the
+  command line `tmap review report <run_pair> --handoff --analysis <file> -o handoff.md` writes it
+  with your texts under each finding, `<file>` holding
+  `{"findings": [{"anchor_ref": …, "hypotheses": …, "device_checks": …}]}` — one `--analysis`
+  per sub-agent's file, never merged by hand. Each sub-agent writes its own file; one that cannot
+  returns that JSON as its final message, which you save to a file as it is. A finding no file
+  names, or names with both texts empty, is still written, saying the agent wrote nothing for it,
+  and the command lists it. A summary of your own may pick some findings out; it names the
+  hand-off file and its finding count as the whole list.
 - The full unit list is not sent over MCP: `tmap review report <run_pair> --md -o review.md`
   writes it for a person to read.
 

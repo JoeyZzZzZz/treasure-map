@@ -2444,3 +2444,289 @@ def test_a_finding_no_longer_listed_or_dangling_says_which_in_its_basis(
         "- basis: MOVED since the judgment (anchor_unresolved — the subject no longer resolves "
         "(pairing moved?))" in blocks[gone]
     ), blocks[gone]
+
+
+# ── the hand-off with texts from files (report --handoff --analysis) ────────────────────────────
+
+
+def _report_handoff(w: Any, out_file: Path, *files: Path) -> Any:
+    """``tmap review report PAIR --handoff --analysis <f> ... -o out_file``."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli import review_cli
+
+    argv = ["report", PAIR, "--handoff"]
+    for f in files:
+        argv += ["--analysis", str(f)]
+    return CliRunner().invoke(
+        review_cli.review, [*argv, "-o", str(out_file), "--atlas", str(w.path)]
+    )
+
+
+def _analysis_file(path: Path, items: list[dict[str, Any]]) -> Path:
+    path.write_text(json.dumps({"findings": items}), encoding="utf-8")
+    return path
+
+
+def _item(anchor: str, hyp: str, check: str) -> dict[str, Any]:
+    return {"anchor_ref": anchor, "hypotheses": hyp, "device_checks": check}
+
+
+def _blocks_by_anchor(doc: str, anchors: list[str]) -> dict[str, str]:
+    """Each finding's block text, keyed by its anchor (the blocks are in anchor order)."""
+    starts = [doc.index(f"## `{a}`") for a in anchors]
+    ends = [*starts[1:], len(doc)]
+    return {a: doc[s:e] for a, s, e in zip(anchors, starts, ends, strict=True)}
+
+
+def _listed(output: str) -> list[str]:
+    """The anchors the command lists after "the agent wrote nothing for:"."""
+    lines = output.splitlines()
+    assert "the agent wrote nothing for:" in lines, output
+    return [
+        x[2:]
+        for x in lines[lines.index("the agent wrote nothing for:") + 1 :]
+        if x.startswith("  ")
+    ]
+
+
+def test_a_finding_no_file_names_is_still_a_block_and_is_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-1: three changed_real findings, the file names two of them with texts: the document has
+    three blocks — the blocks are the findings tmap reads, not the file's keys — the third saying
+    in both sections that the agent wrote nothing, and the command lists that one anchor.
+
+    MUTATION (verified RED, ``1 failed``): render the blocks from the mapping, not the findings
+    (``findings=[f for f in findings if f["anchor_ref"] in named]``) -> two blocks -> RED; drop the
+    list the command prints -> RED."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 3)
+    anchors = [f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR)]
+    assert len(anchors) == 3
+    f1 = _analysis_file(
+        tmp_path / "a.json",
+        [_item(anchors[0], "HYP-ONE", "CHECK-ONE"), _item(anchors[2], "HYP-THREE", "CHECK-THREE")],
+    )
+    out_file = tmp_path / "handoff.md"
+    res = _report_handoff(w, out_file, f1)
+    assert res.exit_code == 0, res.output
+    doc = out_file.read_text(encoding="utf-8")
+    assert doc.count("\n## `") == 3
+    blocks = _blocks_by_anchor(doc, anchors)
+    assert "HYP-ONE" in blocks[anchors[0]] and "CHECK-THREE" in blocks[anchors[2]]
+    assert blocks[anchors[1]].count(rr.HANDOFF_NOTHING_WRITTEN) == 2
+    assert res.output.splitlines()[0] == (
+        f"wrote {out_file} (3 findings; the agent wrote nothing for 1 of them)"
+    )
+    assert _listed(res.output) == [rr.handoff_anchor_text(anchors[1])]
+
+
+def test_a_finding_named_with_both_texts_empty_is_listed_as_written_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-1b: the file names two of three findings, one of them with both texts empty: the list
+    is the unnamed one and the empty one — exactly the blocks whose two sections say the agent
+    wrote nothing — in document order, K = 2.
+
+    MUTATION (verified RED, ``1 failed``): list only the anchors no file names (``named.get(a) is
+    None``) -> RED."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 3)
+    anchors = [f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR)]
+    f1 = _analysis_file(
+        tmp_path / "a.json", [_item(anchors[0], "", "  \n"), _item(anchors[2], "HYP", "")]
+    )
+    out_file = tmp_path / "handoff.md"
+    res = _report_handoff(w, out_file, f1)
+    assert res.exit_code == 0, res.output
+    blocks = _blocks_by_anchor(out_file.read_text(encoding="utf-8"), anchors)
+    assert [blocks[a].count(rr.HANDOFF_NOTHING_WRITTEN) for a in anchors] == [2, 2, 1]
+    assert "(3 findings; the agent wrote nothing for 2 of them)" in res.output
+    assert _listed(res.output) == [rr.handoff_anchor_text(a) for a in anchors[:2]]
+
+
+def test_the_driver_counts_a_finding_named_with_both_texts_empty_as_written_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-1c: the driver's agent names one of two findings with both texts empty: nothing_written
+    is 2, the count of blocks that say the agent wrote nothing — not the count of anchors it did
+    not name.
+
+    MUTATION (verified RED, ``1 failed``): count ``len(known - set(named))`` in run_handoff -> 1
+    -> RED."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 2)
+    anchors = [f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR)]
+    out_file = tmp_path / "handoff.md"
+    res = _run_handoff(w, out_file, _findings_result([_item(anchors[0], "", "")]))
+    assert res["ok"] is True, res
+    assert res["findings"] == 2 and res["nothing_written"] == 2
+
+
+def test_the_command_lines_document_is_the_drivers_byte_for_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-2: the same texts give the same document, whether the driver's agent printed them or
+    a file holds them: one composer.
+
+    MUTATION (verified RED, ``1 failed``): the command line writes a document of its own
+    (``rr.handoff_document(conn, run_pair)`` in place of compose_handoff's) -> RED."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 3)
+    anchors = [f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR)]
+    items = [_item(anchors[0], "HYP-A\n  two lines", "CHECK-A"), _item(anchors[1], "", "C-B")]
+    driver_out = tmp_path / "driver.md"
+    res = _run_handoff(w, driver_out, _findings_result(items))
+    assert res["ok"] is True, res
+    cli_out = tmp_path / "cli.md"
+    cli = _report_handoff(w, cli_out, _analysis_file(tmp_path / "a.json", items))
+    assert cli.exit_code == 0, cli.output
+    assert cli_out.read_bytes() == driver_out.read_bytes()
+    assert b"HYP-A" in cli_out.read_bytes()
+
+
+def test_a_file_naming_anchors_the_handoff_does_not_hold_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-3: a file naming two anchors this pair does not hold is refused: a non-zero exit, both
+    keys listed, and the output file — already there — left as it was.
+
+    MUTATION (verified RED, ``1 failed`` each): skip the unknown check -> written -> RED; list only
+    the first key -> RED."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 2)
+    anchors = [f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR)]
+    wrong = [
+        f"{PAIR}#function_pair#libx::0badc0de::0badc0de",
+        f"{PAIR}#function_pair#libx::0badf00d::0badf00d",
+    ]
+    f1 = _analysis_file(
+        tmp_path / "a.json",
+        [_item(anchors[0], "H", "C"), _item(wrong[1], "H", "C"), _item(wrong[0], "H", "C")],
+    )
+    out_file = tmp_path / "handoff.md"
+    out_file.write_text("EARLIER", encoding="utf-8")
+    res = _report_handoff(w, out_file, f1)
+    assert res.exit_code != 0
+    assert f"{f1} names 2 anchor(s) the hand-off does not hold; nothing was written:" in res.output
+    assert [x for x in res.output.splitlines() if x.startswith("  ")] == [f"  {a}" for a in wrong]
+    assert out_file.read_text(encoding="utf-8") == "EARLIER"
+
+
+def test_two_files_naming_one_anchor_write_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-4: two files naming the same anchor are refused, naming the second file — never the
+    later file's texts over the earlier's.
+
+    MUTATION (verified RED, ``1 failed``): drop the named-twice check (the later overwrites) ->
+    written -> RED."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 2)
+    anchors = [f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR)]
+    f1 = _analysis_file(tmp_path / "a.json", [_item(anchors[0], "HYP-A", "CHECK-A")])
+    f2 = _analysis_file(tmp_path / "b.json", [_item(anchors[0], "HYP-B", "CHECK-B")])
+    out_file = tmp_path / "handoff.md"
+    res = _report_handoff(w, out_file, f1, f2)
+    assert res.exit_code != 0
+    assert f"{f2} names " in res.output and "a second time" in res.output, res.output
+    assert not out_file.exists()
+
+
+def test_each_files_texts_are_under_their_own_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-5: two files naming disjoint anchors: each file's texts are under its own block, and with
+    every finding written the command says only the count.
+
+    MUTATION (verified RED, ``1 failed``): read only the first --analysis (``paths[:1]``) -> RED."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 2)
+    anchors = [f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR)]
+    f1 = _analysis_file(tmp_path / "a.json", [_item(anchors[0], "HYP-A", "CHECK-A")])
+    f2 = _analysis_file(tmp_path / "b.json", [_item(anchors[1], "HYP-B", "CHECK-B")])
+    out_file = tmp_path / "handoff.md"
+    res = _report_handoff(w, out_file, f1, f2)
+    assert res.exit_code == 0, res.output
+    blocks = _blocks_by_anchor(out_file.read_text(encoding="utf-8"), anchors)
+    assert "HYP-A" in blocks[anchors[0]] and "CHECK-A" in blocks[anchors[0]]
+    assert "HYP-B" in blocks[anchors[1]] and "CHECK-B" in blocks[anchors[1]]
+    assert res.output.splitlines() == [f"wrote {out_file} (2 findings)"]
+
+
+def test_a_file_that_is_not_the_json_asked_for_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-6: a file that is not the JSON object asked for is refused with the file's path first
+    and "the file" as what is wrong — the driver still says "the agent's final message".
+
+    MUTATION (verified RED, ``1 failed`` each): on a parse error skip the file (the skeleton's
+    "wrote nothing" blocks are written) -> RED; parse the file with the driver's wording (no
+    ``source``) -> RED."""
+    from treasure_map.lib import review_driver as rd
+
+    w = _wide_findings_world(tmp_path, monkeypatch, 1)
+    bad = tmp_path / "a.json"
+    bad.write_text("Here are my notes: ...", encoding="utf-8")
+    out_file = tmp_path / "handoff.md"
+    res = _report_handoff(w, out_file, bad)
+    assert res.exit_code != 0
+    assert f"Error: {bad}: the file is not the JSON object asked for" in res.output, res.output
+    assert res.output.rstrip().endswith("; nothing was written")
+    assert not out_file.exists()
+    _, err = rd.parse_handoff_analysis("Here are my notes: ...")
+    assert err is not None and err.startswith("the agent's final message is not the JSON")
+
+
+def test_analysis_without_handoff_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A-7: --analysis names texts for the hand-off; with another format, or none, it is a usage
+    error, never silently dropped.
+
+    MUTATION (verified RED, ``1 failed``): drop the check -> the report is written -> RED."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli import review_cli
+
+    w = _wide_findings_world(tmp_path, monkeypatch, 1)
+    f1 = _analysis_file(tmp_path / "a.json", [])
+    out_file = tmp_path / "review.md"
+    for fmt in (["--md", "-o", str(out_file)], []):
+        res = CliRunner().invoke(
+            review_cli.review,
+            ["report", PAIR, *fmt, "--analysis", str(f1), "--atlas", str(w.path)],
+        )
+        assert res.exit_code == 2 and "--analysis goes with --handoff" in res.output, res.output
+    assert not out_file.exists()
+
+
+_SKILL_HANDOFF_RULE = """\
+- A report of the pair's findings is tmap's hand-off, never a list rebuilt from summaries (a
+  sub-agent's, an earlier session's or your own). `get_diff_handoff(run_pair)` pages it; on the
+  command line `tmap review report <run_pair> --handoff --analysis <file> -o handoff.md` writes it
+  with your texts under each finding, `<file>` holding
+  `{"findings": [{"anchor_ref": …, "hypotheses": …, "device_checks": …}]}` — one `--analysis`
+  per sub-agent's file, never merged by hand. Each sub-agent writes its own file; one that cannot
+  returns that JSON as its final message, which you save to a file as it is. A finding no file
+  names, or names with both texts empty, is still written, saying the agent wrote nothing for it,
+  and the command lists it. A summary of your own may pick some findings out; it names the
+  hand-off file and its finding count as the whole list.
+"""
+
+_GUIDE_HANDOFF_SENTENCE = (
+    "tmap review report --handoff writes the same text to a file. A report of the findings is "
+    "that hand-off, not a list rebuilt from summaries (a sub-agent's, an earlier session's): "
+    '--analysis <file> (once per file, each {"findings": [{"anchor_ref", "hypotheses", '
+    '"device_checks"}]}) puts those texts under each block, and a finding no file names (or names '
+    "with both texts empty) is still written, saying the agent wrote nothing for it."
+)
+
+
+def test_the_skill_and_the_guide_say_a_report_is_the_handoff() -> None:
+    """★ A-8: the skill's Rules carry the hand-off rule whole (after the workers rule), and the
+    guide its sentence whole, right after the --handoff one.
+
+    MUTATION (verified RED, ``1 failed`` each): drop the rule's last sentence from the skill ->
+    RED; drop the guide's sentence -> RED."""
+    from treasure_map.lib.query.diff_skill import skill_text
+
+    text = skill_text()
+    rules = text[text.index("## Rules") :]
+    assert _SKILL_HANDOFF_RULE in rules
+    assert rules.index("- With several workers") < rules.index(_SKILL_HANDOFF_RULE)
+    assert _GUIDE_HANDOFF_SENTENCE in mcp_app._AGENT_GUIDE

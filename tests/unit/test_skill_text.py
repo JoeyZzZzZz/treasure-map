@@ -83,13 +83,14 @@ def test_every_command_the_skill_rules_name_exists() -> None:
 
 
 def test_the_rules_name_exactly_the_driver_and_the_report() -> None:
-    """★ T-F2b: the Rules name two commands, the batch driver and the report (both checked by the
-    test above against the real command tree).
+    """★ T-F2b: the Rules name three commands, the batch driver, the hand-off with the agents'
+    texts and the report (each checked by the test above against the real command tree).
 
     MUTATION (verified RED, 1 failed): write the driver's ``--agent`` as ``--agents`` -> the
     command test above RED (exit 2)."""
     assert _rules_commands() == [
         "tmap review run <run_pair> --agent claude-code",
+        "tmap review report <run_pair> --handoff --analysis <file> -o handoff.md",
         "tmap review report <run_pair> --md -o review.md",
     ]
 

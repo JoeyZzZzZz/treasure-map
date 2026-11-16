@@ -39,7 +39,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from treasure_map.lib import tool_call_log as tcl
 from treasure_map.lib.query import review_report as _rr
@@ -706,25 +706,25 @@ def _findings_by_anchor(items: list[Any]) -> tuple[dict[str, Any] | None, str | 
     return out, None
 
 
-def parse_handoff_analysis(text: str) -> tuple[dict[str, dict[str, str]] | None, str | None]:
-    """The agent's texts per anchor_ref from its final message — ``{"findings": [{"anchor_ref":
-    …, "hypotheses": …, "device_checks": …}, …]}`` (HANDOFF_SCHEMA), or the older object keyed by
-    anchor_ref — or ``(None, error)``: not JSON (prose around it included), not an object, an
-    object holding ``findings`` and any other top-level key, an anchor_ref named twice, a value
-    not an object, a field that is not text or a key that is neither field — each refused, never
-    half-read."""
+def parse_handoff_analysis(
+    text: str, source: str = "the agent's final message"
+) -> tuple[dict[str, dict[str, str]] | None, str | None]:
+    """The agent's texts per anchor_ref from its final message (or a file of them: ``source``
+    names it in the errors) — ``{"findings": [{"anchor_ref": …, "hypotheses": …, "device_checks":
+    …}, …]}`` (HANDOFF_SCHEMA), or the older object keyed by anchor_ref — or ``(None, error)``: not
+    JSON (prose around it included), not an object, an object holding ``findings`` and any other
+    top-level key, an anchor_ref named twice, a value not an object, a field that is not text or a
+    key that is neither field — each refused, never half-read."""
     try:
         data = json.loads(_strip_fence(text))
     except ValueError as exc:
-        return None, f"the agent's final message is not the JSON object asked for ({exc})"
+        return None, f"{source} is not the JSON object asked for ({exc})"
     if not isinstance(data, dict):
-        return None, "the agent's final message is JSON but not an object keyed by anchor_ref"
+        return None, f"{source} is JSON but not an object keyed by anchor_ref"
     others = sorted(str(key)[:120] for key in data if key != "findings")
     if "findings" in data and others:
         # The findings shape, with more beside it: refused, not read as the older mapping.
-        return None, (
-            f"the agent's final message holds findings and unexpected top-level keys: {others[:10]}"
-        )
+        return None, (f"{source} holds findings and unexpected top-level keys: {others[:10]}")
     if "findings" in data and isinstance(data["findings"], list):
         listed, err = _findings_by_anchor(data["findings"])
         if listed is None:
@@ -818,6 +818,72 @@ def _refused(launch: Launch, out_file: Path, error: str) -> dict[str, Any]:
     return out
 
 
+@dataclass(frozen=True)
+class HandoffComposed:
+    """A composed hand-off: the document, its findings count, whether the must-read set was done
+    (the header's PARTIAL otherwise), and — in document order — the anchors whose block says the
+    agent wrote nothing in both sections (no source named it, or one named it with both texts
+    empty)."""
+
+    document: str
+    findings: int
+    must_read_complete: bool
+    nothing_written: list[str]
+
+
+@dataclass(frozen=True)
+class HandoffRefusal:
+    """Texts the hand-off cannot take, so nothing is composed: ``twice`` — ``source`` names an
+    anchor some source (it or an earlier one) already named (``anchors`` holds that anchor);
+    ``unknown`` — ``source`` names keys the hand-off does not hold (all of them, sorted)."""
+
+    kind: Literal["twice", "unknown"]
+    source: str
+    anchors: list[str]
+
+
+def compose_handoff(
+    atlas: Any, run_pair: str, sources: list[tuple[str, dict[str, dict[str, str]]]]
+) -> HandoffComposed | HandoffRefusal:
+    """The hand-off document with each source's texts under the blocks they name (a source: its
+    label and parse_handoff_analysis's mapping) — the driver's one agent, or the command line's
+    files. Every changed_real finding is a block whatever the sources name: the blocks are the
+    findings tmap reads, never the sources' keys. A key names a block by its anchor_ref as it is,
+    or as the block's heading writes it. The sources are read in order, each key in its order; an
+    anchor named a second time (by any source) refuses at once, and a source's keys the hand-off
+    does not hold refuse once that source is read — nothing is composed, never half-read."""
+    stamp, file_staleness = _rr.local_handoff_context(atlas)
+    findings = _rr.handoff_findings(atlas, run_pair, file_staleness=file_staleness)
+    known = {str(f["anchor_ref"]) for f in findings}
+    # An agent names a block by its heading's text, whose line breaks are escaped.
+    headed = {_rr.handoff_anchor_text(a): a for a in known}
+    named: dict[str, dict[str, str]] = {}
+    for label, analysis in sources:
+        extra: list[str] = []
+        for key, texts in analysis.items():
+            anchor = key if key in known else headed.get(key)
+            if anchor is None:
+                extra.append(key)
+            elif anchor in named:
+                return HandoffRefusal("twice", label, [anchor])
+            else:
+                named[anchor] = texts
+        if extra:
+            return HandoffRefusal("unknown", label, sorted(extra))
+    rep = _rr.handoff_report(atlas, run_pair, file_staleness=file_staleness)
+    document = _rr.handoff_header(run_pair, len(findings), rep) + "".join(
+        _rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=named)
+    )
+    nothing = [
+        str(f["anchor_ref"])
+        for f in findings
+        if not any(
+            named.get(str(f["anchor_ref"]), {}).get(name, "").strip() for name in HANDOFF_FIELDS
+        )
+    ]
+    return HandoffComposed(document, len(findings), bool(rep["must_read_complete"]), nothing)
+
+
 def run_handoff(
     preset: Preset,
     *,
@@ -828,14 +894,15 @@ def run_handoff(
     timeout: float = DEFAULT_TIMEOUT,
     runner: Callable[..., Launch] = run_agent,
 ) -> dict[str, Any]:
-    """Launch the hand-off agent, then write the document to ``out_file``: handoff_document (the
-    CLI's function) with the agent's texts under each block's placeholders — a finding it wrote
-    nothing for says so. Nothing is written when the launch failed or reported an error, or when
-    its texts name an anchor the hand-off does not hold (an anchor is named as it is, or as its
-    block's heading writes it); the agent's final message, when there is one, is then kept beside
-    it (agent_result_path) — headed as not a hand-off document — and the hand-off file is still not
-    written. The launch carries the preset's handoff_argv (claude-code: --json-schema with
-    HANDOFF_SCHEMA). An experimental preset is refused before the launch (B-5)."""
+    """Launch the hand-off agent, then write the document to ``out_file``: compose_handoff (what
+    ``tmap review report --handoff --analysis`` writes) with the agent's texts under each block's
+    placeholders — a finding it wrote nothing for says so. Nothing is written when the launch
+    failed or reported an error, or when its texts name an anchor the hand-off does not hold (an
+    anchor is named as it is, or as its block's heading writes it); the agent's final message,
+    when there is one, is then kept beside it (agent_result_path) — headed as not a hand-off
+    document — and the hand-off file is still not written. The launch carries the preset's
+    handoff_argv (claude-code: --json-schema with HANDOFF_SCHEMA). An experimental preset is
+    refused before the launch (B-5)."""
     from treasure_map.lib.atlas.connection import open_atlas
 
     if preset.name not in HANDOFF_PRESETS:
@@ -854,44 +921,24 @@ def run_handoff(
         return _refused(launch, out_file, str(err))
     atlas = open_atlas(atlas_path)
     try:
-        stamp, file_staleness = _rr.local_handoff_context(atlas)
-        findings = _rr.handoff_findings(atlas, run_pair, file_staleness=file_staleness)
-        known = {str(f["anchor_ref"]) for f in findings}
-        # An agent names a block by its heading's text, whose line breaks are escaped.
-        headed = {_rr.handoff_anchor_text(a): a for a in known}
-        named: dict[str, dict[str, str]] = {}
-        extra: list[str] = []
-        for key, texts in analysis.items():
-            anchor = key if key in known else headed.get(key)
-            if anchor is None:
-                extra.append(key)
-            elif anchor in named:
-                return _refused(
-                    launch,
-                    out_file,
-                    f"the agent wrote twice for {anchor[:200]!r}; nothing was written",
-                )
-            else:
-                named[anchor] = texts
-        extra.sort()
-        if extra:
-            return _refused(
-                launch,
-                out_file,
-                f"the agent wrote for {len(extra)} anchor(s) the hand-off does not hold "
-                f"(first: {extra[0][:200]!r}); nothing was written",
-            )
-        rep = _rr.handoff_report(atlas, run_pair, file_staleness=file_staleness)
-        document = _rr.handoff_header(run_pair, len(findings), rep) + "".join(
-            _rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=named)
-        )
+        composed = compose_handoff(atlas, run_pair, [("the agent", analysis)])
     finally:
         atlas.close()
-    out_file.write_text(document, encoding="utf-8")
+    if isinstance(composed, HandoffRefusal):
+        anchor = composed.anchors[0]
+        if composed.kind == "twice":
+            why = f"the agent wrote twice for {anchor[:200]!r}; nothing was written"
+        else:
+            why = (
+                f"the agent wrote for {len(composed.anchors)} anchor(s) the hand-off does not hold "
+                f"(first: {anchor[:200]!r}); nothing was written"
+            )
+        return _refused(launch, out_file, why)
+    out_file.write_text(composed.document, encoding="utf-8")
     return {
         "ok": True,
         "out_file": str(out_file),
-        "bytes": len(document),
-        "findings": len(findings),
-        "nothing_written": len(known - set(named)),
+        "bytes": len(composed.document),
+        "findings": composed.findings,
+        "nothing_written": len(composed.nothing_written),
     }
