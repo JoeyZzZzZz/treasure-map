@@ -15,14 +15,13 @@
 
 </div>
 
-Treasure Map scans an unpacked firmware filesystem and finds every place the compiled code runs a
-shell command, copies into a buffer, formats a string or opens a file by path. For each one it
-records where the data comes from and what it could not determine. Given two versions, it shows
-what the update changed around those calls. Your coding agent (Claude Code, Codex, Cursor and
-others) reads all of this through the bundled MCP server.
-
-Treasure Map runs no model and needs no API key. Every fact points to a specific binary, function
-and address. Deciding which leads are real bugs is up to your agent.
+Treasure Map runs a full static analysis of an unpacked firmware and finds four kinds of dangerous
+call sites: command execution, memory copies, format strings and file paths. For each call site it
+records facts such as where the arguments come from, how controllable they are and how the call is
+reached, and it marks explicitly what it could not determine. Given two firmware versions, it
+produces a function-level patch diff. Your agent queries these facts over MCP and decides its own
+path through the analysis. The tool runs no model, needs no API key and gives no vulnerability
+verdicts: the tool supplies the facts, and the model makes the judgment.
 
 ![Treasure Map turns your firmware into facts; your agent reads them over MCP and writes its judgments to a separate layer](https://raw.githubusercontent.com/JoeyZzZzZz/treasure-map/main/docs/images/architecture.svg)
 
@@ -70,8 +69,9 @@ reading and is labeled that way.
 
 ### Diff two versions
 
-`tmap diff` runs Ghidra, BinExport and BinDiff on every binary whose content changed, in parallel;
-you never handle an intermediate file. Changed function pairs are grouped by what changed around
+`tmap diff` compares, in parallel, every binary whose content changed between the two versions.
+Ghidra, BinExport and BinDiff run automatically from start to finish, you never touch an
+intermediate file, and the result is a function-level patch diff. Changed function pairs are grouped by what changed around
 those calls, so your agent reads the few changes that matter instead of thousands of functions. For
 each one it answers: is this a security fix, which weakness in the old version does it close, is
 the fix complete, and does the same call remain elsewhere?
