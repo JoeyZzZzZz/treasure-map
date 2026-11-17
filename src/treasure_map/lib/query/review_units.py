@@ -367,17 +367,18 @@ def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) ->
 
         listed = [o.entry for o in listing.entries]
         for g in callee_groups(atlas, listing.built, listed).values():
-            groups.append(
-                {
-                    "callee_b": g.callee_b,
-                    "callee_a": g.callee_a,
-                    "name": g.callee_name,
-                    "ref": g.ref,
-                    "members": list(g.members),
-                    "members_possibly_incomplete": g.members_possibly_incomplete,
-                    "members_a_side_unread": g.members_a_side_unread,
-                }
-            )
+            group: dict[str, Any] = {
+                "callee_b": g.callee_b,
+                "callee_a": g.callee_a,
+                "name": g.callee_name,
+                "ref": g.ref,
+                "members": list(g.members),
+                "members_possibly_incomplete": g.members_possibly_incomplete,
+                "members_a_side_unread": g.members_a_side_unread,
+            }
+            if g.callee_thunk_unrecorded:
+                group["callee_thunk_unrecorded"] = True
+            groups.append(group)
     # A bucket S entry in a callee group is must-read with its group, rows or none: several entries
     # newly calling one function is the shape the reduce checks call site by call site, and
     # _assign_groups counts must-read members only.

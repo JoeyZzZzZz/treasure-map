@@ -28,8 +28,9 @@ a reading that the series is a dispatch table.
 
 Words are read only at word-aligned absolute addresses (``scope``), only for the functions the
 analysis recorded and the thunks its export listed apart (``binaries.thunk_spans``; a thunk has no
-name there, so it is marked ``thunk`` with no name, never given one), and labels only where the
-analysis recorded an address-taken site. A block whose
+name there, so it is marked ``thunk`` with no name, never given one; where that list is not
+recorded the ``functions`` scope says so instead of reading as "no thunks"), and labels only where
+the analysis recorded an address-taken site. A block whose
 stored bytes fall short of its size makes the image incomplete: a search that finds nothing there
 is ``undetermined``, never ``none_found``.
 """
@@ -72,6 +73,10 @@ SCOPE = {
     "functions": "functions_table_and_thunk_spans",
     "labels": "address_taken_sites_only",
 }
+# The ``functions`` scope of an image whose thunk list is not recorded (NULL or unreadable): entry
+# words are read from the functions table alone, so a word holding a thunk's entry is not seen as
+# one — which is not "this binary has no thunks".
+SCOPE_FUNCTIONS_THUNKS_NOT_RECORDED = "functions_table_only_thunk_spans_not_recorded"
 
 _LINKAGE_PREFIXES = (".got", ".plt", ".rel", ".rela", ".gnu.")
 _LINKAGE_NAMES = frozenset({".dynamic", ".hash"})
@@ -141,6 +146,9 @@ class Image:
     string_ranges: tuple[tuple[int, int], ...]  # merged [start, end) of the stored strings
     complete: bool  # no initialized block's stored bytes fall short of its size
     thunks: frozenset[int] = frozenset()  # the entries read from thunk_spans (no recorded name)
+    # False when thunk_spans is not recorded (NULL, unreadable, or no such column): ``thunks`` is
+    # then empty for want of the list, not because the binary has none.
+    thunks_recorded: bool = True
     # the word index (``word_index``) and the series memo, built on first use
     _index: dict[int, list[int]] | None = None
     _sorted_words: dict[int, list[int]] = field(default_factory=dict)  # block idx -> addresses
@@ -250,17 +258,21 @@ def _labels(conn: sqlite3.Connection, binary_id: int) -> tuple[tuple[int, str], 
 
 def _thunk_entries(
     conn: sqlite3.Connection, binary_id: int, entries: dict[int, tuple[str | None, str]]
-) -> frozenset[int]:
+) -> frozenset[int] | None:
     """Add the thunks the export listed apart (``binaries.thunk_spans``, never in ``functions``) to
     ``entries`` with no name, so a word holding a thunk's entry is an entry word like any other and
     a series does not break at it. Returns the entries so added. A thunk already in ``functions``
-    keeps its row; a column that is missing or unreadable adds none (not recorded, never "none")."""
+    keeps its row. None when the list is not recorded — a column that is missing, NULL or
+    unreadable adds none, and that is "not recorded", never "no thunks"."""
     try:
         row = conn.execute("SELECT thunk_spans FROM binaries WHERE id = ?", (binary_id,)).fetchone()
     except sqlite3.OperationalError:
-        return frozenset()
+        return None
+    thunks = _thunk_spans(row[0] if row else None)
+    if thunks is None:
+        return None
     added: set[int] = set()
-    for address in _thunk_spans(row[0] if row else None):
+    for address in thunks:
         value = _hex_addr_int(address)
         if value and value not in entries:
             entries[value] = (None, address)
@@ -352,7 +364,8 @@ def load_image(conn: sqlite3.Connection, binary_id: int) -> Image:
         strings=strings,
         string_ranges=_merged(ranges),
         complete=not any(b.truncated for b in blocks if b.initialized),
-        thunks=thunks,
+        thunks=thunks if thunks is not None else frozenset(),
+        thunks_recorded=thunks is not None,
     )
 
 
@@ -734,6 +747,8 @@ def entry_words_block(image: Image, entry: int) -> dict[str, Any]:
     if state == "found" and not image.complete:
         out["may_be_incomplete"] = True
     out["scope"] = dict(SCOPE)
+    if not image.thunks_recorded:
+        out["scope"]["functions"] = SCOPE_FUNCTIONS_THUNKS_NOT_RECORDED
     nxt = next((w for w in words if w.comparable and w.run is not None), None)
     out["next"] = (
         {

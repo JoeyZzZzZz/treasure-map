@@ -43,8 +43,10 @@ _BIN_ANCHOR_LEN = 8  # sha256 prefix; distinct across every binary of a real fir
 
 # Per-axis labels for a wrapper-propagated candidate: (call_sequence_shape prefix, evidence_ref
 # suffix), keyed by the candidate's sink_class. "cmd" keeps its historical strings byte-for-byte.
-# The single source of truth for the wrapper axis; analyzer2 reads it when minting refs. It
-# lives HERE,
+# The source of truth for the command and format axes' labels; analyzer2 reads it when minting
+# refs. The path axis's pair, ("wrapper-path", "path_via_wrapper"), is joined onto it there
+# (analyzer2._WRAPPER_AXIS_LABELS) rather than written here: this module is hashed whole into the
+# diff and sink-overlay code versions, and no label in this table feeds either. It lives HERE,
 # with the ref builder, because the second half IS ref vocabulary and this module is the leaf every
 # ref-building caller can import. A wrapper candidate is emitted per CALL to its wrapper, so its ref
 # carries that call's offset like any per-callsite ref (``…@cmd_via_wrapper@<offset>``); the offset

@@ -72,7 +72,10 @@ class World:
             db = tmp / f"analysis_{side}.db"
             conn = open_db(db)
             conn.execute("PRAGMA synchronous = OFF")
-            conn.execute("INSERT INTO binaries (name, sha256) VALUES ('libx', ?)", (sha,))
+            # A current export records its thunk list ('[]': none); NULL would read "not recorded".
+            conn.execute(
+                "INSERT INTO binaries (name, sha256, thunk_spans) VALUES ('libx', ?, '[]')", (sha,)
+            )
             conn.commit()
             self.adb[side] = conn
             self.atlas.execute(

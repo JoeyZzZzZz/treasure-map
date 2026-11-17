@@ -103,11 +103,12 @@ def _mk_analysis(path: Path, binary: str, sha: str, funcs: list[tuple]) -> Path:
         # it yields an EMPTY view and every binary resolution misses. Real scans always write it.
         # A current extraction records what its function promotion left outside every function
         # ('[]': nothing, and not truncated), which a counterpart probe reads; without it an
-        # unmatched function with nothing at its mapped address reads undetermined.
+        # unmatched function with nothing at its mapped address reads undetermined. Its thunk list
+        # likewise ('[]': recorded, none) — a NULL one is "not recorded", the spot then unknown.
         "INSERT INTO binaries (id, name, path, sha256, last_seen_at, promote_residual_ranges, "
         "promote_residual_ranges_truncated, promote_undefined_ranges, "
-        "promote_undefined_ranges_truncated) "
-        "VALUES (1, ?, ?, ?, '2026-01-01T00:00:00', '[]', 0, '[]', 0)",
+        "promote_undefined_ranges_truncated, thunk_spans) "
+        "VALUES (1, ?, ?, ?, '2026-01-01T00:00:00', '[]', 0, '[]', 0, '[]')",
         (binary, binary, sha),
     )
     for addr, name, pc, size in funcs:
@@ -786,8 +787,9 @@ def _mk_analysis_multi(path: Path, bins: list) -> Path:  # type: ignore[type-arg
         con.execute(
             "INSERT INTO binaries (id, name, path, sha256, last_seen_at, promote_residual_ranges, "
             "promote_residual_ranges_truncated, promote_undefined_ranges, "
-            "promote_undefined_ranges_truncated) "
-            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00', '[]', 0, '[]', 0)",  # see _mk_analysis
+            "promote_undefined_ranges_truncated, thunk_spans) "
+            # see _mk_analysis
+            "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00', '[]', 0, '[]', 0, '[]')",
             (bid, binary, binary, sha),
         )
         for addr, name, pc, size in funcs:

@@ -28,7 +28,7 @@ from typing import Any
 from treasure_map.lib.callsite_ref import callsite_abs_addr
 from treasure_map.lib.fmt_spec import arity as fmt_arity
 from treasure_map.lib.fmt_spec import conversions as fmt_conversions
-from treasure_map.lib.pattern.classes import CMD, FMT_STRING
+from treasure_map.lib.pattern.classes import CMD, FMT_STRING, PATH_SINK
 from treasure_map.lib.pattern.extractor_names import REGISTRY as _EXTRACTOR_NAMES
 from treasure_map.lib.query.nvram import _web_settable, run_scope
 from treasure_map.lib.query.sink_impact import (
@@ -2043,6 +2043,11 @@ _WRAPPER_EMPTY_NONCMD_DETAIL = (
     "at the large majority of sampled sites, so most of these are benign, but the vararg was never "
     "verified — reading them const was unproven rather than wrong. Chase after the command ones."
 )
+_WRAPPER_EMPTY_PATH_DETAIL = (
+    "forwarded through a thin wrapper to a path/file sink. Def-use covers command and format sinks "
+    "only, so no provenance is the ordinary state for a path sink, as for a direct path call; the "
+    "path the caller passes is read at the wrapper's forwarded positions (path_arg_positions)."
+)
 _WRAPPER_EMPTY_UNKNOWN_DETAIL = (
     "forwarded through a thin wrapper and never traced, and the wrapper's real sink was not "
     "recorded either — so whether it reaches a command sink is UNKNOWN, not 'no'. Grouped with "
@@ -2060,12 +2065,17 @@ def _wrapper_empty_evidence(flow_evidence: Evidence) -> dict[str, Any]:
 
     Three classes, not two: an unrecorded wrapped_sink is its own
     ``unknown`` rather than being folded into ``non_cmd``, because folding it there would assert
-    "not a command sink" from a fact nobody checked."""
+    "not a command sink" from a fact nobody checked. A recorded PATH sink (the path axis) is told
+    apart from the format/log tail as ``path``: the row would otherwise describe a sink it does not
+    have — and its empty provenance is the ordinary state for a path sink, not a format left
+    unverified. Still evidence only: the reading is the same as for any wrapper candidate."""
     wrapped = _flow_wrapped_sink(flow_evidence)
     if wrapped is None:
         sink_class, detail = "unknown", _WRAPPER_EMPTY_UNKNOWN_DETAIL
     elif wrapped in CMD:
         sink_class, detail = "cmd", _WRAPPER_EMPTY_CMD_DETAIL
+    elif wrapped in PATH_SINK:
+        sink_class, detail = "path", _WRAPPER_EMPTY_PATH_DETAIL
     else:
         sink_class, detail = "non_cmd", _WRAPPER_EMPTY_NONCMD_DETAIL
     return {
@@ -2076,7 +2086,7 @@ def _wrapper_empty_evidence(flow_evidence: Evidence) -> dict[str, Any]:
         # command sink. False covers both "it IS a command sink" and "nobody recorded which sink it
         # is" — so selecting False is the one filter that cannot miss a command sink. (A rank/
         # urgency field is deliberately absent: this layer states what is known, the lens orders.)
-        "command_sink_ruled_out": sink_class == "non_cmd",
+        "command_sink_ruled_out": sink_class in ("non_cmd", "path"),
         "detail": detail,
     }
 

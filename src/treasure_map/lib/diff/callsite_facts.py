@@ -86,11 +86,17 @@ class BinaryCallFacts:
     tokens_at: dict[str, list[str]] = field(default_factory=dict)  # wanted addr -> CALL tokens
 
 
+# The architectures a lazy-binding stub table is built for (``lib/analyze/stub_resolve``): MIPS,
+# 32-bit ARM and AArch64, by the decompiler's language id prefix ("ARM:LE:32:v7", "AARCH64:…").
+STUB_TABLE_ARCHES = ("MIPS", "ARM", "AARCH64")
+
+
 def stub_state(arch: str | None, stub_names_raw: str | None) -> str:
-    """The stub table's state: ``not_applicable`` off MIPS (no lazy-binding stub table is built);
-    on MIPS ``not_determined`` when no table was recorded (NULL) and ``read`` when one was —
-    including ``{}``, which says the table was read and resolved nothing."""
-    if not (arch or "").upper().startswith("MIPS"):
+    """The stub table's state: ``not_applicable`` on an architecture no lazy-binding stub table is
+    built for; on MIPS / ARM / AArch64 ``not_determined`` when no table was recorded (NULL) and
+    ``read`` when one was — including ``{}``, which says the table was read and resolved nothing."""
+    family = (arch or "").upper().split(":", 1)[0]
+    if family not in STUB_TABLE_ARCHES:
         return STUB_NOT_APPLICABLE
     return STUB_NOT_DETERMINED if stub_names_raw is None else STUB_READ
 

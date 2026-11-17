@@ -10,7 +10,9 @@ whose A call list cannot be read is kept (its entry id is recorded in ``members_
 and surfaced to the reader so "newly calls X" is not claimed for it): it cannot rule X
 out, and a group is never dropped for it. X must be defined in the binary — one function of that
 name on the B side, not a thunk — and is no key when its own entry is a function in no pair whose
-counterpart may exist (``counterpart_suspected``): what looks new may be only unpaired.
+counterpart may exist (``counterpart_suspected``): what looks new may be only unpaired. Where the B
+side's thunk list is not recorded X cannot be told from a thunk: the group is kept and marked
+``callee_thunk_unrecorded``.
 
 A read of the facts only (callee lists by name, the alignment, the listed entries): nothing is
 stored. ``members_possibly_incomplete`` marks every group of a B side where some function's callee
@@ -64,30 +66,38 @@ class CalleeGroup:
     # for them (kept as members, never dropped). A list, not a count, so the reader can be shown
     # WHICH members carry the caveat — not merely how many.
     members_a_side_unread: list[str] = field(default_factory=list)
+    # True when the B side's thunk list is not recorded: X could not be checked against it, so X
+    # may be a thunk (calls to an import of that name) rather than a function defined here — the
+    # group is then not shown to be one. Never a drop; the flag says what could not be ruled out.
+    callee_thunk_unrecorded: bool = False
 
     @property
     def ref(self) -> str:
         return group_ref(self.diff_id, self.callee_b)
 
 
-def _thunks(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> frozenset[str]:
+def _thunks(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> frozenset[str] | None:
+    """The B side's thunk entries; None when they are not known (the list not recorded — NULL,
+    unreadable, no such column — or the analysis.db not read), never an empty set for want of
+    the list."""
     from treasure_map.lib.diff.layer0 import _thunk_spans
     from treasure_map.lib.ro_db import ro_connect
 
     row = atlas.execute("SELECT analysis_db_path FROM run WHERE run_id = ?", (run_id,)).fetchone()
     if row is None or not row[0] or not sha:
-        return frozenset()
+        return None
     try:
         conn = ro_connect(row[0])
     except sqlite3.Error:
-        return frozenset()
+        return None
     try:
         if "thunk_spans" not in {r[1] for r in conn.execute("PRAGMA table_info(binaries)")}:
-            return frozenset()
+            return None
         got = conn.execute("SELECT thunk_spans FROM binaries WHERE sha256 = ?", (sha,)).fetchone()
-        return frozenset(_thunk_spans(got[0] if got else None))
+        spans = _thunk_spans(got[0] if got else None)
+        return frozenset(spans) if spans is not None else None
     except sqlite3.Error:
-        return frozenset()
+        return None
     finally:
         conn.close()
 
@@ -133,14 +143,21 @@ def callee_groups(
             if len(addrs) != 1:
                 continue  # not defined here, or not one function: no key
             x = addrs[0]
-            if x == p.addr_b or x in thunks or x in suspected:
+            if x == p.addr_b or (thunks is not None and x in thunks) or x in suspected:
                 continue
             xa = to_a.get(x)
             if xa is not None and side_a.names.get(xa) in a_calls:
                 continue  # the A side calls X's counterpart: not new
             g = groups.get(x)
             if g is None:
-                g = groups[x] = CalleeGroup(d.diff_id, x, name, xa, members_possibly_incomplete=cut)
+                g = groups[x] = CalleeGroup(
+                    d.diff_id,
+                    x,
+                    name,
+                    xa,
+                    members_possibly_incomplete=cut,
+                    callee_thunk_unrecorded=thunks is None,
+                )
             if e.entry_id not in g.members:
                 g.members.append(e.entry_id)
                 if a_unread:

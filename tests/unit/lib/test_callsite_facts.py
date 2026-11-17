@@ -191,10 +191,18 @@ def test_identity_rule_order() -> None:
 @pytest.mark.parametrize(
     ("arch", "raw", "state"),
     [
-        ("ARM:LE:32:v7", None, "not_applicable"),
+        ("x86:LE:64:default", None, "not_applicable"),
+        ("x86:LE:64:default", '{"0x400": "system"}', "not_applicable"),
         ("MIPS:BE:32:default", None, "not_determined"),
         ("MIPS:BE:32:default", "{}", "read"),
         ("MIPS:LE:32:default", '{"0x400": "system"}', "read"),
+        # A-E4-16: 32-bit ARM and AArch64 carry a decoded stub table too, so their state is read
+        # from it exactly as on MIPS — never written off as not applicable.
+        # Mutation: restore the MIPS-only test in stub_state -> RED (the four rows below fail).
+        ("ARM:LE:32:v7", None, "not_determined"),
+        ("ARM:LE:32:v7", '{"0x2710c": "memcpy"}', "read"),
+        ("AARCH64:LE:64:v8A", None, "not_determined"),
+        ("AARCH64:LE:64:v8A", "{}", "read"),
     ],
 )
 def test_stub_state(arch: str, raw: str | None, state: str) -> None:
@@ -441,7 +449,8 @@ def test_the_diff_writes_both_sides_facts_beside_the_pair(
         "stub_state_a, stub_state_b, diff_ok FROM diff_meta WHERE diff_id = ?",
         (summary.diff_id,),
     ).fetchone()
-    assert tuple(meta) == ("read", "read", "pv1", "pv1", "not_applicable", "not_applicable", 1)
+    # An ARM side with no stub table recorded: the table is not determined (ARM carries one).
+    assert tuple(meta) == ("read", "read", "pv1", "pv1", "not_determined", "not_determined", 1)
     assert summary.warnings == ()
 
 

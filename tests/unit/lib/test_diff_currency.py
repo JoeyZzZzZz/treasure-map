@@ -2115,12 +2115,13 @@ def _golden_analysis(path: Path, sha: str, side: str) -> None:
     conn.execute(
         # promote_residual_* / promote_undefined_*: what the extraction's function promotion left
         # outside a function (nothing) and the bytes it never disassembled (none), as a current
-        # extraction records them; the counterpart probe needs both known to read determined.
+        # extraction records them; the counterpart probe needs both known to read determined — and
+        # the thunk list ('[]': none), which it also needs known.
         "INSERT INTO binaries (id, name, path, sha256, arch, pass_version, ghidra_version, "
         "ghidra_ok, last_seen_at, promote_residual_ranges, promote_residual_ranges_truncated, "
-        "promote_undefined_ranges, promote_undefined_ranges_truncated) "
+        "promote_undefined_ranges, promote_undefined_ranges_truncated, thunk_spans) "
         "VALUES (1, 'libshapes.so', 'lib/libshapes.so', ?, 'x86:LE:64:default', 'pvgolden', "
-        "'11.4.3', 1, '2026-01-01T00:00:00', '[]', 0, '[]', 0)",
+        "'11.4.3', 1, '2026-01-01T00:00:00', '[]', 0, '[]', 0, '[]')",
         (sha,),
     )
 

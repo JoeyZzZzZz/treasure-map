@@ -12,7 +12,9 @@ is_thin_cmd_wrapper recognizes a "thin forwarding wrapper": a function whose bod
 more than hand one of its own parameters straight to a shell command sink
 (system / popen / doSystem). is_thin_fmt_wrapper is its format-string counterpart: a thin
 function that forwards a parameter straight into the FORMAT-STRING position of a printf-family
-sink (fprintf's arg1, printf's arg0, syslog's arg1, …). Both are structural facts about the
+sink (fprintf's arg1, printf's arg0, syslog's arg1, …). is_thin_path_wrapper is the path/file
+counterpart: a thin function that forwards a parameter straight into a PATH position of a path
+sink (fopen's arg0, openat's arg1, either of rename's two). All three are structural facts about the
 call graph and the function's shape — they deliberately do NOT claim the forwarded value is
 attacker-controlled; that judgement is left to a later layer's positive evidence. Conservative
 by construction: under any doubt they return (False, None), so a false fact is never asserted.
@@ -26,7 +28,15 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-from treasure_map.lib.pattern.classes import FMT_STRING, format_string_call
+from treasure_map.lib.pattern.classes import (
+    _FMT_LITERAL_RE,
+    FMT_STRING,
+    PATH_SINK,
+    _iter_path_args,
+    arg_ref,
+    format_string_call,
+    path_arg_ref,
+)
 from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.reachability.taint import (
     _CALLER_SUPPLIED_RE,
@@ -313,3 +323,111 @@ def is_thin_fmt_wrapper(
             continue
         return True, sink
     return False, None
+
+
+# ── the PATH axis: a thin wrapper forwarding a parameter into a path sink's PATH position ─────
+
+# The forms in which the argument a path sink receives IS the wrapper's parameter: the parameter
+# itself, or the parameter under a cast. Only through these is a literal the CALLER passes the very
+# path the sink opens; `fopen(param_1 + 4, …)`, or a field read through the parameter, is another
+# value derived from it.
+_PATH_FORWARD_FORMS: frozenset[str] = frozenset({"var", "cast"})
+
+
+def is_thin_path_wrapper(
+    pseudocode: str,
+    callees: list[str],
+    *,
+    max_statements: int = _WRAPPER_MAX_STATEMENTS,
+    stub_names: Mapping[int, str] | None = None,
+) -> tuple[bool, str | None]:
+    """Recognize a thin path-forwarding wrapper. Returns (is_wrapper, wrapped_sink).
+
+    The path/file counterpart of is_thin_cmd_wrapper. A function is a thin path wrapper when ALL
+    hold:
+      1. it calls a path sink (``PATH_SINK``: fopen / open / openat / unlink / rename / …);
+      2. that sink's path argument — as ``path_arg_ref`` reads it over EVERY path position of every
+         call (``PATH_SINK_ARG`` and then ``PATH_SINK_EXTRA_ARGS``): the first non-literal one that
+         has a root — is one of the function's own parameters (or a decompiler caller-supplied
+         placeholder param_N / in_<reg>), forwarded verbatim, not built locally;
+      3. the body is thin (<= max_statements non-empty statements).
+    With several path sinks called, they are tried in NAME order and the first that qualifies is
+    the one wrapped.
+
+    Not judged here: whether the function's OWN name is a path sink (the C library's ``open64``
+    calling ``open``). That is a fact about the name, not the body; the registry that turns this
+    fact into propagated candidates applies it, as it applies the one-name-per-binary rule.
+
+    ``stub_names`` as in ``is_thin_cmd_wrapper``. Structural fact only: it does NOT assert the
+    forwarded path is attacker-controlled. Returns (False, None) under any doubt."""
+    path_sinks = sorted({c.strip() for c in callees} & PATH_SINK)
+    if not path_sinks:
+        return False, None
+
+    if _statement_count(pseudocode) > max_statements:
+        return False, None
+
+    params = _signature_params(pseudocode)
+    for sink in path_sinks:
+        ref = path_arg_ref(pseudocode, sink, stub_names)
+        arg = ref.root if ref is not None else None
+        if arg is None:
+            continue
+        is_param = arg in params or _CALLER_SUPPLIED_RE.fullmatch(arg) is not None
+        if not is_param:
+            continue
+        if not _arg_is_forwarded_verbatim(pseudocode, arg):
+            continue
+        return True, sink
+    return False, None
+
+
+def path_wrapper_param_positions(
+    pseudocode: str, wrapped_sink: str, stub_names: Mapping[int, str] | None = None
+) -> tuple[tuple[int, ...] | None, bool]:
+    """WHERE a thin path wrapper's caller supplies the path: ``(positions, fully_forwarded)``.
+
+    Pairs with ``is_thin_path_wrapper`` as ``fmt_wrapper_format_index`` pairs with the format test:
+    a caller forwards arguments positionally, so these indexes are what turn "the wrapper's path
+    comes from its parameter ``param_2``" into "read the caller's argument 1".
+
+    ``positions`` — the signature slot (``signature_slots``, so an unnamed slot keeps its place) of
+    every parameter the wrapper forwards verbatim into a path position of ``wrapped_sink``, over
+    every call to it, ascending: ``rename(param_1, param_2)`` forwards two. None when the parameter
+    the wrapper was recognised by has no slot — a placeholder such as ``in_stack_8``, or a
+    ``param_3`` the printed signature does not declare. The position then cannot be established,
+    and the caller reads no argument rather than guessing one, because a guessed position reads a
+    DIFFERENT value than the one that reaches the sink.
+
+    ``fully_forwarded`` — True only when every path argument of every call to ``wrapped_sink`` in
+    the wrapper is either a string literal there or one of those parameters passed as itself (or
+    under a cast). Only then do literals at all of ``positions`` fix every path the sink is handed:
+    a wrapper doing ``rename(param_1, g_dest)`` moves the file to a destination no caller argument
+    names, so a literal source does not make that call a constant path."""
+    first = path_arg_ref(pseudocode, wrapped_sink, stub_names)
+    ident = first.root if first is not None else None
+    slots = signature_slots(pseudocode)
+    if ident is None or ident not in slots:
+        return None, False
+    positions: set[int] = set()
+    fully_forwarded = True
+    for call in _iter_path_args(pseudocode, wrapped_sink, stub_names):
+        for text in call:
+            if text is None:
+                fully_forwarded = False  # a path position this call does not have: not fixed
+                continue
+            if _FMT_LITERAL_RE.match(text):
+                continue  # fixed inside the wrapper
+            ref = arg_ref(text)
+            root = ref.root
+            if (
+                root is None
+                or root not in slots
+                or not _arg_is_forwarded_verbatim(pseudocode, root)
+            ):
+                fully_forwarded = False  # a value of the wrapper's own: no caller argument fixes it
+                continue
+            positions.add(slots.index(root))
+            if ref.form not in _PATH_FORWARD_FORMS:
+                fully_forwarded = False  # derived from the parameter, not the parameter itself
+    return tuple(sorted(positions)), fully_forwarded

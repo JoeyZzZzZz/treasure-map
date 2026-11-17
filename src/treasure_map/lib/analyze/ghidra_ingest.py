@@ -181,7 +181,8 @@ def ingest_ghidra_output(
 
         # Resolve this binary's lazy-binding stubs to their import names from ELF structure, so a
         # caller left calling FUN_<stub-addr> is seen calling `system` — recovering a real sink the
-        # decompiler dropped. Ghidra-independent; None for a non-MIPS or unreadable ELF (no change).
+        # decompiler dropped. Ghidra-independent; None for an ELF of another machine, or one it
+        # cannot read (no change).
         # Resolved before EC3 because the extractor was handed this same table and echoes its hash.
         resolution = resolve_stubs(rec.path)
         expected_stub = stub_table_marker(None if resolution is None else resolution.names)
@@ -681,7 +682,8 @@ def _ingest_one_binary(
         # rest of the pipeline reads is `system`, not FUN_<addr>, and no downstream layer needs a
         # second address-to-name step. A call in a stub region the resolver could not name is
         # carried through unchanged AND recorded as an unclassified external call (the hole stays
-        # visible). No resolution (non-MIPS / unreadable) leaves callees exactly as exported.
+        # visible). No resolution (another machine / unreadable) leaves callees exactly as
+        # exported.
         raw_callees = func.get("callees", [])
         if resolution is not None and isinstance(raw_callees, list):
             relabelled = relabel_callees([str(c) for c in raw_callees], resolution)
@@ -814,10 +816,11 @@ def _ingest_one_binary(
     # already relabelled above; this is what the pseudocode TEXT readers need, and they run at hunt
     # time against a database the ELF may no longer sit next to.
     #
-    # ★ Three states, and the first two must not collapse: no resolution at all (not MIPS, or an
-    # unreadable ELF) writes NULL — "not determined" — while a resolution that named nothing writes
-    # '{}' — "read it, nothing resolved". Writing '{}' for both would let "we never looked" be read
-    # as "this binary has no stubs", which is the same false negative the resolver exists to undo.
+    # ★ Three states, and the first two must not collapse: no resolution at all (not MIPS / ARM /
+    # AArch64, or an unreadable ELF) writes NULL — "not determined" — while a resolution that named
+    # nothing writes '{}' — "read it, nothing resolved". Writing '{}' for both would let "we never
+    # looked" be read as "this binary has no stubs", which is the same false negative the resolver
+    # exists to undo.
     stub_names_json = (
         json.dumps({f"{addr:x}": name for addr, name in sorted(resolution.names.items())})
         if resolution is not None

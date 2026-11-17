@@ -3024,6 +3024,9 @@ def make_tools(
                 ),
             },
             "members_possibly_incomplete": bool(g.get("members_possibly_incomplete")),
+            # Present (True) only when the B side's thunk list is not recorded: X could not be
+            # told from a thunk, so the group's premise is not established.
+            **({"callee_thunk_unrecorded": True} if g.get("callee_thunk_unrecorded") else {}),
             # Entry ids of members whose A-side call list could not be read: "newly calls X" is
             # UNCONFIRMED for them (kept, not dropped). Surfaced so the reader does not take the
             # group's premise as established for every member.

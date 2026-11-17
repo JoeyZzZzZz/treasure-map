@@ -1279,3 +1279,34 @@ def test_a_wider_stride_never_borrows_a_handler_word_a_shorter_stride_used(
     assert not any(t.stride >= 3 for t in found)
     assert {r.key for r in rows} == set(narrow)
     assert all(r.stride_words == 2 for r in rows)
+
+
+def test_a_null_thunk_list_is_told_apart_from_an_empty_one(tmp_path: Path) -> None:
+    """★ A-E4-13 (dispatch_tables). The same image with ``thunk_spans`` ``'[]'`` (recorded, none),
+    NULL (not recorded) and a list holding one unreadable entry: the tables read are the same —
+    a missing list cannot supply a thunk — but the status row says what this binary's list could
+    not show instead of reading NULL as "no thunks", and counts the unreadable entries.
+
+    Mutation: read NULL as ``[]`` in ``_thunk_entries`` -> RED (the NULL note is the plain one).
+    Mutation: skip an unreadable entry without counting it -> RED."""
+    import json
+
+    notes = {}
+    for i, raw in enumerate(("[]", None, json.dumps([["0x5000", []], [7, []]]))):
+        img = Image()
+        hs = [img.func(f"fx_s{j}") for j in range(4)]
+        _table(img, ["one", "two", "three", "four"], hs)
+        db = tmp_path / f"t{i}.db"
+        conn = open_db(db)
+        img.write(conn, 1, name="fx", path=str(tmp_path / "missing.bin"), sha256="a" * 64)
+        conn.execute("UPDATE binaries SET thunk_spans = ?", (raw,))
+        conn.commit()
+        conn.close()
+        res = dt.detect_run(db, "r")
+        (status,) = res.statuses
+        assert status.found_count == 1, raw
+        notes[raw] = status.unsupported_note
+    assert notes["[]"] == dt.UNSUPPORTED_NOTE
+    assert notes[None] == f"{dt.UNSUPPORTED_NOTE}; {dt.THUNKS_NOT_RECORDED_NOTE}"
+    bad = json.dumps([["0x5000", []], [7, []]])
+    assert notes[bad] == f"{dt.UNSUPPORTED_NOTE}; {dt.thunks_unreadable_note(1)}"

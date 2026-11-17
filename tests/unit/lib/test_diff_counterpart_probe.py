@@ -51,12 +51,13 @@ def _analysis(
     stubs: dict[int, str] | None = None,
     stub_complete: int | None = None,
     stub_regions: str | None = None,
-    thunks: str | None = None,
+    thunks: str | None = _NO_RESIDUAL,
 ) -> Path:
     """One binary 'lib.so'; funcs = (entry, name, size, body ranges or None).
 
     ``undefined`` defaults to ``'[]'`` (W11: a determined-empty set of undisassembled bytes), as a
-    real extraction writes the undefined ranges in the same record as the residual ones."""
+    real extraction writes the undefined ranges in the same record as the residual ones; so does
+    ``thunks`` (a current export records its thunk list, empty or not — NULL is "not recorded")."""
     con = open_db(path)
     con.execute(
         "INSERT INTO binaries (id, name, path, sha256, last_seen_at, stub_names, "
@@ -323,7 +324,9 @@ def test_probe_counterparts_directly() -> None:
     Mutation: the span taken as the mapped address alone (``hi = y``) -> the overlap at y+0x20 is
     missed, red."""
     own = BaselineDomain(functions={"00002000": ("f", "ok")}, sizes={"00002000": 0x30})
-    other = BaselineDomain(functions={}, residual_ranges=((0x2120, 0x2123),), undefined_ranges=())
+    other = BaselineDomain(
+        functions={}, residual_ranges=((0x2120, 0x2123),), undefined_ranges=(), thunks={}
+    )
     got = probe_counterparts(
         frozenset({"00002000"}), own, other, [("00001000", "00001100")], frozenset()
     )
@@ -343,7 +346,11 @@ def test_a_stub_region_is_half_open_its_end_address_is_not_a_slot() -> None:
         sizes={"00002000": 1, "000020ff": 1, "00002100": 1},
     )
     other = BaselineDomain(
-        functions={}, residual_ranges=(), undefined_ranges=(), stub_regions=((0x2100, 0x2200),)
+        functions={},
+        residual_ranges=(),
+        undefined_ranges=(),
+        stub_regions=((0x2100, 0x2200),),
+        thunks={},
     )
     got = probe_counterparts(
         frozenset({"00002000", "000020ff", "00002100"}),
@@ -778,3 +785,87 @@ def test_a_stub_the_ledger_accounts_reads_occupied_for_the_other_sides_probe(
             "occupied",
             stub,
         )
+
+
+# ── a thunk list that is not recorded is not "no thunk there" ────────────────────────────────
+
+
+def test_the_thunk_list_reads_null_and_unreadable_as_not_known() -> None:
+    """A-E4-13 (the parser). ``[]`` is a recorded empty list; NULL, an unparseable value, a value
+    that is no list and a list with one malformed element are all "not known" (None) — a partly
+    read list cannot show a thunk is absent.
+
+    Mutation: return ``{}`` for NULL -> RED."""
+    from treasure_map.lib.diff.layer0 import _thunk_spans
+
+    assert _thunk_spans("[]") == {}
+    assert _thunk_spans('[["0x10", [["0x10", "0x17"]]]]') == {"00000010": ((0x10, 0x17),)}
+    for raw in (None, "{", "{}", '[["0x10"]]', '[["0x10", [["0x10", "0x17"]]], ["0x20", "x"]]'):
+        assert _thunk_spans(raw) is None, raw
+
+
+def _mapped(other: BaselineDomain) -> str:
+    """The probe of f@0x2000 (size 0x10), mapped through its anchor onto 0x2100 of ``other``."""
+    own = BaselineDomain(functions={"00002000": ("f", "ok")}, sizes={"00002000": 0x10})
+    got = probe_counterparts(
+        frozenset({"00002000"}), own, other, [("00001000", "00001100")], frozenset()
+    )
+    return got["00002000"].probe
+
+
+def test_an_other_side_whose_thunks_are_not_known_leaves_an_empty_spot_unknown() -> None:
+    """★ A-E4-13 (the probe and ``_Coverage``). Nothing at the mapped spot and no leftover code
+    there: with the other side's thunk list recorded empty that is ``uncovered``; with it not
+    known a thunk may cover the spot, so it is ``coverage_unknown`` — never the determined
+    ``uncovered`` (a NULL list once made every thunk position of a binary read as free).
+
+    Mutation: ``_Coverage.thunks_known`` always True -> RED."""
+    known = BaselineDomain(functions={}, residual_ranges=(), undefined_ranges=(), thunks={})
+    unknown = BaselineDomain(functions={}, residual_ranges=(), undefined_ranges=(), thunks=None)
+    assert _mapped(known) == "uncovered"
+    assert _mapped(unknown) == "coverage_unknown"
+
+
+def test_the_unknown_thunks_check_sits_between_the_stub_slots_and_the_leftover_code() -> None:
+    """★ Where the check sits: a function or a stub slot found at the spot still decides it (an
+    unknown thunk list cannot take a found function away); leftover code there does NOT (with the
+    thunks unknown the spot may be a thunk's, so ``residual_code`` is not read).
+
+    Mutation: test the thunks before the function / stub lookups -> the first two RED; test them
+    after the leftover-code reading -> the third RED."""
+    found = BaselineDomain(
+        functions={"00002100": ("g", "ok")},
+        spans={"00002100": ((0x2100, 0x210F),)},
+        residual_ranges=(),
+        undefined_ranges=(),
+        thunks=None,
+    )
+    slot = BaselineDomain(
+        functions={},
+        residual_ranges=(),
+        undefined_ranges=(),
+        stub_regions=((0x2100, 0x2200),),
+        thunks=None,
+    )
+    leftover = BaselineDomain(
+        functions={}, residual_ranges=((0x2104, 0x2107),), undefined_ranges=(), thunks=None
+    )
+    assert _mapped(found) == "unpaired"
+    assert _mapped(slot) == "occupied"
+    assert _mapped(leftover) == "coverage_unknown"
+    # control: the same leftover code with the thunks recorded is read as such
+    assert _mapped(BaselineDomain(**{**leftover.__dict__, "thunks": {}})) == "residual_code"
+
+
+def test_a_null_thunk_list_is_read_as_not_known_from_the_analysis_db(tmp_path: Path) -> None:
+    """A-E4-13 through ``load_baseline``: NULL in the column is None on the domain, ``'[]'`` is
+    ``{}``.
+
+    Mutation: ``thunks = _thunk_spans(...) or {}`` in load_baseline -> RED."""
+    from treasure_map.lib.diff.layer0 import load_baseline
+
+    for raw, want in ((None, None), ("[]", {})):
+        db = _analysis(tmp_path / f"t_{raw}.db", "sha_t", [(0x2000, "f", 0x10, None)], thunks=raw)
+        row, _ = resolve_binary_in_db(str(db), "lib.so")
+        assert row is not None
+        assert load_baseline(str(db), row).thunks == want, raw

@@ -120,6 +120,21 @@ UNSUPPORTED_NOTE = (
     "define as a function (it cuts the table there), an imported handler, two-byte wide keys and "
     "integer-keyed tables"
 )
+# Added to one binary's status note when its thunk list is not recorded (thunk_spans NULL or
+# unreadable) — never read as "no thunks" — or when some of its entries cannot be read.
+THUNKS_NOT_RECORDED_NOTE = (
+    "this binary's thunk list is not recorded: a handler that is a thunk reads as code Ghidra did "
+    "not define as a function, and cuts the table there"
+)
+
+
+def thunks_unreadable_note(count: int) -> str:
+    """The status-note clause for a thunk list some of whose entries could not be read."""
+    return (
+        f"{count} entries of this binary's thunk list could not be read: a handler that is one of "
+        "them cuts the table there"
+    )
+
 
 # Word classes of a handler slot.
 _O, _F, _T, _X, _Z = 0, 1, 2, 3, 4
@@ -178,6 +193,11 @@ class _Image:
     bodies: list[tuple[int, int]]  # sorted, merged [lo, hi) function bodies (string bodies out)
     _starts: list[int] = field(default_factory=list)
     _str_cache: dict[int, str | None] = field(default_factory=dict)
+    # False when thunk_spans is NULL or unreadable as a list: ``thunks`` is then empty for want of
+    # the list, not because the binary has no thunk. ``thunks_unreadable``: entries of a recorded
+    # list that could not be read (each left out of ``thunks``).
+    thunks_recorded: bool = True
+    thunks_unreadable: int = 0
 
     def __post_init__(self) -> None:
         self.blocks.sort(key=lambda b: b.start)
@@ -299,18 +319,17 @@ def _load_image(conn: sqlite3.Connection, bid: int, arch: str, bits: int | None)
                 if lo is not None and hi is not None and hi >= lo:
                     spans.append((lo, hi + 1))
         per_function.append((entry, origin, spans))
-    thunks: set[int] = set()
-    row = conn.execute("SELECT thunk_spans FROM binaries WHERE id = ?", (bid,)).fetchone()
-    try:
-        parsed_thunks = json.loads(row[0]) if row and row[0] else []
-    except (TypeError, ValueError):
-        parsed_thunks = []
-    for ent in parsed_thunks if isinstance(parsed_thunks, list) else []:
-        entry = _hx(ent[0]) if isinstance(ent, list) and ent else None
-        if entry is not None:
-            thunks.add(entry)
+    thunks, recorded, unreadable = _thunk_entries(conn, bid)
     img = _Image(
-        ps, ":BE:" in (arch or ""), (arch or "").startswith("ARM"), blocks, functions, thunks, []
+        ps,
+        ":BE:" in (arch or ""),
+        (arch or "").startswith("ARM"),
+        blocks,
+        functions,
+        thunks,
+        [],
+        thunks_recorded=recorded,
+        thunks_unreadable=unreadable,
     )
     # A promoted or recovered "function" whose entry bytes are a printable string is string bytes
     # the decompiler was made to disassemble: its body hides no code, so it masks no key. On ARM the
@@ -327,6 +346,33 @@ def _load_image(conn: sqlite3.Connection, bid: int, arch: str, bits: int | None)
     img.bodies = _merge(kept)
     img.__post_init__()
     return img
+
+
+def _thunk_entries(conn: sqlite3.Connection, bid: int) -> tuple[set[int], bool, int]:
+    """(thunk entries, whether the list is recorded, entries that could not be read) from
+    ``binaries.thunk_spans``. ★ NULL and ``[]`` are different facts: NULL (an export that predates
+    the column, or an extraction dropped since) or a value that is no list is "not recorded";
+    ``[]`` is "recorded, none". An entry whose address cannot be read is counted, not skipped
+    silently."""
+    row = conn.execute("SELECT thunk_spans FROM binaries WHERE id = ?", (bid,)).fetchone()
+    raw = row[0] if row else None
+    if raw is None:
+        return set(), False, 0
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return set(), False, 0
+    if not isinstance(parsed, list):
+        return set(), False, 0
+    thunks: set[int] = set()
+    unreadable = 0
+    for ent in parsed:
+        entry = _hx(ent[0]) if isinstance(ent, list) and ent and isinstance(ent[0], str) else None
+        if entry is None:
+            unreadable += 1
+        else:
+            thunks.add(entry)
+    return thunks, True, unreadable
 
 
 def _merge(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -963,6 +1009,8 @@ class BinaryResult:
     unverified: int = 0
     undetermined: int = 0
     truncated: bool = False
+    thunks_recorded: bool = True
+    thunks_unreadable: int = 0
 
 
 def _record_reasons(w: _Words, kpos: int, offsets: set[int]) -> set[str]:
@@ -1092,6 +1140,7 @@ def detect_binary(
     slot_memo: list[ElfSlots | None] = []
     img = _load_image(conn, bid, arch, bits)
     result.truncated = any(b.truncated for b in img.blocks)
+    result.thunks_recorded, result.thunks_unreadable = img.thunks_recorded, img.thunks_unreadable
     code_index: _CodeIndex | None = None
     for blk in img.blocks:
         if len(blk.data) // img.ps < 2 * MIN_RUN:
@@ -1203,6 +1252,16 @@ def _slots_for(path: str | None, sha256: str | None) -> tuple[str, ElfSlots | No
     return (ELF_OK, slots) if slots is not None else (ELF_UNREADABLE, None)
 
 
+def _status_note(res: BinaryResult) -> str:
+    """The status row's note for one scanned binary: what is never read, and what this binary's
+    own thunk list could not show."""
+    if not res.thunks_recorded:
+        return f"{UNSUPPORTED_NOTE}; {THUNKS_NOT_RECORDED_NOTE}"
+    if res.thunks_unreadable:
+        return f"{UNSUPPORTED_NOTE}; {thunks_unreadable_note(res.thunks_unreadable)}"
+    return UNSUPPORTED_NOTE
+
+
 @dataclass(frozen=True)
 class RunTables:
     edges: list[StringKeyedEdgeRow]
@@ -1292,7 +1351,7 @@ def detect_run(db_path: Path | str, source_run_id: str) -> RunTables:
                     detector=DETECTOR,
                     scanned=1,
                     supported_scope=SUPPORTED_SCOPE,
-                    unsupported_note=UNSUPPORTED_NOTE,
+                    unsupported_note=_status_note(res),
                     cap_hit=1 if res.truncated else 0,
                     found_count=res.tables,
                     handler_unverified=res.unverified,

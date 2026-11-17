@@ -327,8 +327,10 @@ class BaselineDomain:
     undefined_ranges: tuple[tuple[int, int], ...] | None = None
     # W12: the thunks the export skipped, entry addr -> the thunk's body as inclusive (lo, hi)
     # ranges (binaries.thunk_spans). The functions table holds no thunk, so the counterpart probe
-    # reads these to see an other-side thunk where a function maps. Empty = none recorded.
-    thunks: dict[str, tuple[tuple[int, int], ...]] = field(default_factory=dict)
+    # reads these to see an other-side thunk where a function maps. ``{}`` = recorded, none; None =
+    # not known (NULL — an export that predates the column, or an extraction dropped since — or
+    # unreadable), never read as "no thunk there".
+    thunks: dict[str, tuple[tuple[int, int], ...]] | None = None
     # W13: this binary's .plt / .MIPS.stubs regions as half-open [lo, hi) ranges
     # (binaries.stub_regions). A point that maps into one is a stub-table slot — a taken spot, not
     # "no function". Empty = none recorded.
@@ -410,7 +412,7 @@ def load_baseline(analysis_db_path: str, bin_row: BinaryRow) -> BaselineDomain:
     stubs: dict[str, str] | None = None
     residual: tuple[tuple[int, int], ...] | None = None
     undefined: tuple[tuple[int, int], ...] | None = None
-    thunks: dict[str, tuple[tuple[int, int], ...]] = {}
+    thunks: dict[str, tuple[tuple[int, int], ...]] | None = None
     stub_regions: tuple[tuple[int, int], ...] = ()
     stub_complete: int | None = None
     if brow is not None:
@@ -476,26 +478,31 @@ def _body_spans(addr: str, size: int | None, raw: Any) -> tuple[tuple[int, int],
     return ()
 
 
-def _thunk_spans(raw: Any) -> dict[str, tuple[tuple[int, int], ...]]:
+def _thunk_spans(raw: Any) -> dict[str, tuple[tuple[int, int], ...]] | None:
     """binaries.thunk_spans (``[["0x<entry>", [["0x<lo>","0x<hi>"], ...]], ...]``) as {normalized
-    entry addr: inclusive body ranges}. Empty on NULL / not-recorded / any malformed element — a
-    thunk the diff cannot read is simply not in the index, never a fabricated one."""
+    entry addr: inclusive body ranges}; ``{}`` only for a recorded empty list.
+
+    None when the thunks are not known: NULL (not recorded — an export that predates the column, or
+    an extraction dropped since), unparseable, not a list, or any element malformed — a partly read
+    list cannot show that a thunk is absent. ★ None is not ``{}``: every reader says what it cannot
+    tell without the thunks instead of reading "no thunk" (a reader that writes ``… or {}`` turns
+    the one into the other)."""
     if not isinstance(raw, str):
-        return {}
+        return None
     try:
         data = json.loads(raw)
     except ValueError:
-        return {}
+        return None
     if not isinstance(data, list):
-        return {}
+        return None
     out: dict[str, tuple[tuple[int, int], ...]] = {}
     for item in data:
         if not (isinstance(item, list) and len(item) == 2):
-            return {}
+            return None
         entry = norm_hex(str(item[0]))
         body = _hex_ranges(json.dumps(item[1])) if isinstance(item[1], list) else None
         if entry is None or body is None:
-            return {}
+            return None
         out[entry] = body
     return out
 
@@ -594,7 +601,7 @@ class SidePresence:
 #   undisassembled_bytes — no function there, but bytes the other side's analysis never disassembled
 #                    at all do (W11): code it never built, a gap, not a determined "no function"
 #   coverage_unknown — no function there, and the other side's leftover code / undisassembled bytes
-#                    are not known
+#                    are not known, or its thunks are not (a thunk there could not be seen)
 #   unmappable     — no pair at or below the function to map it by
 # A thunk or an import-stub slot at the mapped address counts as OCCUPIED (a paired thunk / a stub
 # table slot is a taken spot); a thunk there in no pair is UNPAIRED.
@@ -644,14 +651,18 @@ class _Coverage:
 
     Thunks (binaries.thunk_spans) are indexed beside the functions so a point mapping onto an
     other-side thunk is found as that thunk's entry — not read as "no function there" (the functions
-    table holds no thunk). A function entry wins over a thunk at the same address."""
+    table holds no thunk). A function entry wins over a thunk at the same address. ``thunks_known``
+    is False when that side's thunks are not known: the index then holds its functions only, and an
+    address it finds no owner for is not shown to be free of a thunk."""
 
     def __init__(self, baseline: BaselineDomain) -> None:
         self.entries = {int(a, 16): a for a in baseline.functions}
-        for a in baseline.thunks:
+        self.thunks_known = baseline.thunks is not None
+        thunks = baseline.thunks if baseline.thunks is not None else {}
+        for a in thunks:
             self.entries.setdefault(int(a, 16), a)
         pieces = {addr: rs for addr, rs in baseline.spans.items()}
-        for addr, rs in baseline.thunks.items():
+        for addr, rs in thunks.items():
             if addr not in pieces:
                 pieces[addr] = rs
         spans = sorted((lo, hi, addr) for addr, rs in pieces.items() for lo, hi in rs)
@@ -721,6 +732,12 @@ def probe_counterparts(
             # W12: the mapped point lands in the other side's .plt / .MIPS.stubs table — a stub slot
             # is a taken spot, not "no function" (the import it jumps through has no tmap function).
             out[addr] = CounterpartProbe(PROBE_OCCUPIED)
+            continue
+        # With no function or stub slot there and the other side's thunks not known, a thunk may
+        # cover the spot: what is there is not known (before the leftover-code reading, which could
+        # otherwise call the spot free).
+        if not cov.thunks_known:
+            out[addr] = CounterpartProbe(PROBE_COVERAGE_UNKNOWN)
             continue
         # W11: with no function/thunk/stub there, the spot is still not empty if the other side's
         # analysis left code it never turned into a function — leftover instructions (residual) or

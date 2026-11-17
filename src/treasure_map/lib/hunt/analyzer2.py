@@ -103,7 +103,11 @@ from treasure_map.lib.hunt.refs import (
 )
 from treasure_map.lib.hunt.value_helpers import build_helper_tables
 from treasure_map.lib.hunt.wrapper_propagation import (
+    PATH_SINK_CLASS,
+    WrapperCandidate,
     find_wrapper_propagated_candidates,
+    path_wrapper_arg_ref,
+    path_wrapper_calls_literal,
 )
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import (
@@ -380,7 +384,8 @@ class Analyzer2Stats:
     matches: int  # call-sequence shape matches found
     instances_written: int  # graded instances persisted into the atlas
     by_status: dict[str, int]  # reachability_status -> count, over written instances
-    wrapper_propagated: int = 0  # cmd/fmt candidates recovered via one-hop thin-wrapper propagation
+    # cmd/fmt/path candidates recovered via one-hop thin-wrapper propagation
+    wrapper_propagated: int = 0
     data_gap_skipped: int = 0  # shape matches dropped with no decompilable body (Ghidra gap)
     # functions the shape scan could not read a callee list for (malformed stored JSON). A data
     # gap about those functions, not a decision about them — reported so an incomplete candidate
@@ -584,6 +589,17 @@ def _stored_run_row(atlas_path: Path | str, run_id: str) -> dict[str, object] | 
 # The sink_class string the format axis carries (the key _WRAPPER_AXIS uses for it).
 FMT_STRING_CLASS = "fmt_string"
 
+# Every wrapper axis's (call_sequence_shape prefix, evidence_ref suffix), as the hunt mints them:
+# refs._WRAPPER_AXIS plus the path axis's pair, which is joined on HERE rather than written into
+# that table. refs is hashed whole into the diff and sink-overlay code versions, and neither of
+# those layers reads these labels — both recognise a wrapper class by its ``_via_wrapper`` tail
+# (lib/callsite_ref) — so an entry there would read every stored diff and baseline as stale for a
+# change in neither's output. The pair has the same shape as the two in refs.
+_WRAPPER_AXIS_LABELS: dict[str, tuple[str, str]] = {
+    **_WRAPPER_AXIS,
+    PATH_SINK_CLASS: ("wrapper-path", "path_via_wrapper"),
+}
+
 
 def _wrapper_sink_arg(
     pseudocode: str,
@@ -640,8 +656,19 @@ def _wrapper_fingerprint(sink_class: str, source_class: str, wrapped_sink: str) 
     """Deterministic coarse fingerprint for a wrapper-propagated shape (one per sink axis +
     source_class + wrapped sink), distinct from the rich call-sequence fingerprints. The "cmd"
     axis reproduces the historical `wrapper-cmd|…` basis exactly (no fingerprint churn)."""
-    basis = f"{_WRAPPER_AXIS[sink_class][0]}|{source_class}|{wrapped_sink}"
+    basis = f"{_WRAPPER_AXIS_LABELS[sink_class][0]}|{source_class}|{wrapped_sink}"
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def _path_wrapper_keys(wc: WrapperCandidate) -> dict[str, Any]:
+    """The path axis's addition to a candidate's wrapper record: which of the call's arguments were
+    read as the path — ``path_arg_positions``, every position the wrapper forwards into its sink,
+    ascending — or null when the position could not be established and no argument was read. Empty
+    on the command and format axes, whose wrapper record stays as it was."""
+    if wc.sink_class != PATH_SINK_CLASS:
+        return {}
+    positions = wc.path_param_positions
+    return {"path_arg_positions": list(positions) if positions is not None else None}
 
 
 def _parse_callees(raw: str | None) -> list[str]:
@@ -2013,19 +2040,19 @@ def run_analyzer2(
 
             # ── Factor ① recall pass: one-hop thin-wrapper propagation ──────────────────
             # A function whose sink hides inside a thin wrapper it calls becomes a candidate here
-            # (the shape scan could not see the sink among its own callees), on either the command
-            # or the format-string axis (wc.sink_class). The candidate is graded "unknown"/L0 — the
-            # real sink is across a call boundary, so an intra-procedural confirmation cannot hold;
-            # the wrapper hop is stated in evidence. New candidates run through the SAME
+            # (the shape scan could not see the sink among its own callees), on the command, the
+            # format-string or the path axis (wc.sink_class). The candidate is graded "unknown"/L0
+            # — the real sink is across a call boundary, so an intra-procedural confirmation cannot
+            # hold; the wrapper hop is stated in evidence. New candidates run through the SAME
             # FP-suppression (a constant / charset-constrained argument forwarded to the wrapper is
             # downweighted) so a safe fanout stays low. The forwarded-value flow evidence is
             # axis-agnostic: it classifies the value f hands to the wrapper (the danger axis lives
-            # inside the wrapper, named by wrapped_sink), so both axes share build_flow_evidence.
+            # inside the wrapper, named by wrapped_sink), so every axis shares build_flow_evidence.
             for wc in wrapper_candidates:
                 f = wc.func
                 f_pseudocode = f.pseudocode or ""
                 f_callees = _parse_callees(f.callees)
-                shape_prefix, ref_suffix = _WRAPPER_AXIS[wc.sink_class]
+                shape_prefix, ref_suffix = _WRAPPER_AXIS_LABELS[wc.sink_class]
                 # ★ POSITION-AWARE on the format axis. The command axis's dangerous value is the
                 # wrapper's FIRST argument, so locate_sink_arg is right there. On the format axis it
                 # is wrong, and wrong in the direction that hides bugs: argument 0 is the stream,
@@ -2040,9 +2067,27 @@ def run_analyzer2(
                 # every per-call reader below looks at is the call the candidate is anchored to.
                 wc_stub_names = stub_by_binary.get(f.binary_id)
                 wc_helpers = helpers_by_binary.get(f.binary_id, NO_HELPERS)
-                wrapper_ref = _wrapper_sink_arg_ref(
-                    f_pseudocode, wc.wrapper_name, fmt_index, wc_stub_names, wc.occurrence
-                )
+                # ★ POSITION-AWARE on the path axis too, for the same reason and in the same
+                # direction: a path wrapper's argument 0 is often a mode, a flag or a directory
+                # handle, and its path sits at a later position. Measured over 13 real images: of
+                # 3,816 located calls to path wrappers, 601 take the path somewhere other than
+                # argument 0 alone, and 10 pass a string literal at argument 0 beside a path that is
+                # not one — each of those would read as a constant path off argument 0. So the path
+                # is read at every position the wrapper forwards into its sink, never at argument 0
+                # by default, and a wrapper whose path position could not be established has NO
+                # argument read.
+                if wc.sink_class == PATH_SINK_CLASS:
+                    wrapper_ref = path_wrapper_arg_ref(
+                        f_pseudocode,
+                        wc.wrapper_name,
+                        wc.path_param_positions,
+                        wc_stub_names,
+                        wc.occurrence,
+                    )
+                else:
+                    wrapper_ref = _wrapper_sink_arg_ref(
+                        f_pseudocode, wc.wrapper_name, fmt_index, wc_stub_names, wc.occurrence
+                    )
                 sink_arg = wrapper_ref.root if wrapper_ref is not None else None
                 # ★ The form note is a COMMAND-axis reading, and only the command axis may carry it.
                 # All three notes it produces describe the wrapper's FIRST argument: a literal there
@@ -2059,10 +2104,32 @@ def run_analyzer2(
                 # recovered format record (a literal format) or on the honest untraced fallback (a
                 # variable one). Nothing is lost: none of the three notes says anything about
                 # whether a FORMAT is controllable, which is the only danger on this axis.
-                blocking = (
-                    None
-                    if wc.sink_class == FMT_STRING_CLASS
-                    else wrapper_propagation_form_note(
+                #
+                # The path axis does not take the command note either, for the reason above: it
+                # would read argument 0. Its one note is the one a DIRECT path sink gets for a
+                # literal path, by the same rule (path_wrapper_calls_literal, the hop-through form
+                # of all_path_calls_literal): const_sink_arg only when EVERY call to the wrapper in
+                # this function passes a string literal at EVERY position the wrapper forwards into
+                # its sink, and the wrapper hands the sink no path of its own — so a two-path call
+                # with one literal and one variable is not a constant path, exactly as
+                # rename("/tmp/x", param_1) is not. A wrapper whose position could not be
+                # established is never marked: nothing of its call was read.
+                if wc.sink_class == FMT_STRING_CLASS:
+                    blocking = None
+                elif wc.sink_class == PATH_SINK_CLASS:
+                    blocking = (
+                        CONST_SINK_ARG
+                        if path_wrapper_calls_literal(
+                            f_pseudocode,
+                            wc.wrapper_name,
+                            wc.path_param_positions,
+                            wc.path_fully_forwarded,
+                            wc_stub_names,
+                        )
+                        else None
+                    )
+                else:
+                    blocking = wrapper_propagation_form_note(
                         f_pseudocode,
                         wc.wrapper_name,
                         sink_arg,
@@ -2071,7 +2138,6 @@ def run_analyzer2(
                         sink_form=wrapper_ref.form if wrapper_ref is not None else None,
                         helpers=wc_helpers,
                     )
-                )
                 evidence = build_flow_evidence(
                     pseudocode=f_pseudocode,
                     callees=f_callees,
@@ -2085,7 +2151,8 @@ def run_analyzer2(
                         # the wrapper's own entry, so a reader can tell two wrappers apart by
                         # identity — a stripped binary names many of them FUN_<addr>
                         "addr": _norm_addr(wc.wrapper_addr),
-                    },
+                    }
+                    | _path_wrapper_keys(wc),
                 )
                 # ★ Red-line write-side reconciliation (Gate A): a wrapper-forwarded free_string
                 # must never carry a const_sink_arg note (drop it; keep its normal rank).

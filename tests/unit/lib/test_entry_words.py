@@ -1419,3 +1419,25 @@ def test_mcp_get_data_table_takes_hex_strings_and_fits_the_budget(
         "0x100000", binary=SHA, run_id="run_big", limit=256, offset=page["next_offset"]
     )
     assert nxt["records"][0]["index"] == page["next_offset"]
+
+
+def test_an_unrecorded_thunk_list_is_named_in_the_scope_not_read_as_none(tmp_path: Path) -> None:
+    """A-E4-13 (entry_words). The same image read with ``thunk_spans`` NULL and with ``'[]'``: the
+    words found are the same, but the NULL one says its entry words come from the functions table
+    alone (the thunk list is not recorded) instead of claiming the thunks were read.
+
+    Mutation: ``_thunk_entries`` returns an empty set for a NULL list -> RED."""
+    scopes = {}
+    for i, raw in enumerate((None, "[]")):
+        (tmp_path / str(i)).mkdir()
+        b = _be32(tmp_path / str(i))
+        b.conn.execute("UPDATE binaries SET thunk_spans = ? WHERE id = ?", (raw, b.bid))
+        image = b.image()
+        assert image.thunks == frozenset()
+        block = ew.entry_words_block(image, BE_FNS[0])
+        assert block["state"] == "found"
+        scopes[raw] = block["scope"]["functions"]
+    assert scopes == {
+        None: ew.SCOPE_FUNCTIONS_THUNKS_NOT_RECORDED,
+        "[]": ew.SCOPE["functions"],
+    }

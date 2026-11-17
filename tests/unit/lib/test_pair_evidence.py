@@ -1050,3 +1050,45 @@ def test_every_read_first_text_names_every_entry_with_a_lift_basis() -> None:
     for name in ("guide", "instructions", "card", "start_diff_review", "get_diff_patch_view"):
         flat = " ".join(texts[name].split())
         assert re.search(r"entr(y|ies) with a `{0,2}lift_basis", flat), name
+
+
+# ── a side whose thunk list is not recorded ──────────────────────────────────────────────────
+
+
+def test_a_side_whose_thunk_list_is_not_recorded_reads_no_caller_anchor(tmp_path: Path) -> None:
+    """★ A-E4-13 (patch_view). B's thunk list NULL: whether b is a thunk is undetermined, and a
+    callee list cannot tell a call to an import from a call to a function of that name — so the
+    corroborating caller of SUP_CALLER reads nothing (``none``, ``thunk_spans_not_recorded``, the
+    side named), the evidence says which side's list is missing, and the pairing it alone
+    supported is no longer supported. With the list recorded (``'[]'``, the world's own) the same
+    caller corroborates (the three-state test).
+
+    Mutation: read a NULL list as an empty set in ``_read_anchor_side`` -> RED (corroborated).
+    Mutation: drop the not-recorded branch of ``_PairEvidence.of`` -> RED."""
+    w = _evidence_world(tmp_path)
+    w.adb["b"].execute("UPDATE binaries SET thunk_spans = NULL")
+    w.commit()
+    pe = _e(_view(w, sort_by="significance"), SUP_CALLER)["pair_evidence"]
+    assert pe["caller_anchor"] == {
+        "state": "none",
+        "reason": "thunk_spans_not_recorded",
+        "sides": ["b"],
+    }
+    assert pe.get("thunk_spans_not_recorded") == ["b"]
+    assert pe["state"] == "none"
+
+
+def test_the_summary_keeps_the_side_whose_thunk_list_is_not_recorded() -> None:
+    """``detail='summary'`` projects the not-recorded sides with the evidence's state.
+
+    Mutation: leave the key out of ``_summary_pair_evidence`` -> RED."""
+    evidence = {
+        "state": "none",
+        "caller_anchor": {"state": "none", "reason": "thunk_spans_not_recorded", "sides": ["a"]},
+        "thunk_spans_not_recorded": ["a"],
+    }
+    assert pv._summary_pair_evidence(evidence) == {
+        "state": "none",
+        "caller_anchor": "none",
+        "thunk_spans_not_recorded": ["a"],
+    }

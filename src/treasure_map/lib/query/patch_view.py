@@ -2631,13 +2631,15 @@ class _AnchorSide:
     the thunk entries; from the atlas, each static-table key with exactly one handler among the
     rows whose pairing is DETERMINED (a candidate row — pairing undetermined — is never an
     anchor). Empty where a table or column is not recorded — an anchor that cannot be read points
-    nowhere, it is never read as absent."""
+    nowhere, it is never read as absent. ``thunks`` is None when the side's thunk list is not
+    known (NULL, unreadable, no such column, or the side not read): which of its functions is a
+    thunk is then undetermined, so no anchor that must tell a thunk apart is read on it."""
 
     owner_of_string: dict[str, str] = field(default_factory=dict)
     strings_of: dict[str, frozenset[str]] = field(default_factory=dict)
     handler_of_key: dict[str, str] = field(default_factory=dict)
     keys_of: dict[str, frozenset[str]] = field(default_factory=dict)
-    thunks: frozenset[str] = frozenset()
+    thunks: frozenset[str] | None = None
 
 
 # The pairing bases of a static-table row that pairs its key with its handler (a candidate row,
@@ -2693,10 +2695,11 @@ def _read_anchor_side(path: str, sha: str, atlas: sqlite3.Connection, run_id: st
                     spoiled.add(value)
                 else:
                     refs.setdefault(value, set()).add(entry)
-        thunks: frozenset[str] = frozenset()
+        thunks: frozenset[str] | None = None
         if "thunk_spans" in {r[1] for r in conn.execute("PRAGMA table_info(binaries)")}:
             row = conn.execute("SELECT thunk_spans FROM binaries WHERE id = ?", (bid,)).fetchone()
-            thunks = frozenset(_thunk_spans(row[0] if row else None))
+            spans = _thunk_spans(row[0] if row else None)
+            thunks = frozenset(spans) if spans is not None else None
     except sqlite3.Error:
         return _AnchorSide()
     finally:
@@ -2764,7 +2767,8 @@ class _PairEvidence:
         for p in d.pairs:
             for side, addr, name in (("a", p.addr_a, p.name_a), ("b", p.addr_b, p.name_b)):
                 n = _readable_name(name, addr)
-                if addr in self.anchors[side].thunks and n is not None:
+                known = self.anchors[side].thunks  # None: no thunk of this side is known
+                if known is not None and addr in known and n is not None:
                     self.thunk_names[side].setdefault(n, set()).add(addr)
 
     def _pair_of(self, side: str) -> dict[str, _Pair]:
@@ -2986,10 +2990,21 @@ class _PairEvidence:
         return "same_name_function_on_thunk_side", True, hints
 
     def of(self, p: _Pair) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        """(pair_evidence, counterpart_hint or None) of one undetermined pair."""
-        thunk_a = p.addr_a in self.anchors["a"].thunks
-        thunk_b = p.addr_b in self.anchors["b"].thunks
-        caller = self.caller_anchor(p, thunk_a, thunk_b)
+        """(pair_evidence, counterpart_hint or None) of one undetermined pair.
+
+        A side whose thunk list is not recorded leaves undetermined whether its function is a
+        thunk: the caller anchor (which cannot read a call to an import by its name) is then
+        ``none`` for that reason, and the evidence names the side (``thunk_spans_not_recorded``),
+        so its anchors are shown incomplete rather than read as "not a thunk"."""
+        known_a, known_b = self.anchors["a"].thunks, self.anchors["b"].thunks
+        thunk_a = known_a is not None and p.addr_a in known_a
+        thunk_b = known_b is not None and p.addr_b in known_b
+        unrecorded = [s for s, known in (("a", known_a), ("b", known_b)) if known is None]
+        caller = (
+            {"state": PAIR_NONE, "reason": "thunk_spans_not_recorded", "sides": unrecorded}
+            if unrecorded and not (thunk_a or thunk_b)
+            else self.caller_anchor(p, thunk_a, thunk_b)
+        )
         hints = self._string_and_key_hints(p)
         states: set[str] = set()
         for direction, own in (("to_b", p.addr_b), ("to_a", p.addr_a)):
@@ -3029,6 +3044,8 @@ class _PairEvidence:
         else:
             state = PAIR_NONE
         evidence: dict[str, Any] = {"state": state, "caller_anchor": caller}
+        if unrecorded:
+            evidence["thunk_spans_not_recorded"] = unrecorded
         if hint_state is not None:
             evidence["counterpart"] = hint_state
         if thunk_a or thunk_b:
@@ -5241,6 +5258,8 @@ def _summary_pair_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
     caller = evidence.get("caller_anchor")
     if caller is not None:
         out["caller_anchor"] = caller["state"]
+    if evidence.get("thunk_spans_not_recorded"):
+        out["thunk_spans_not_recorded"] = list(evidence["thunk_spans_not_recorded"])
     thunk = evidence.get("thunk")
     if thunk is not None and thunk.get("fact") is not None:
         out["thunk"] = thunk["fact"]

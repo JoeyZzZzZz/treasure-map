@@ -284,3 +284,144 @@ def extractor_image_fields(path: object) -> dict[str, str]:
     except (OSError, ELFError, ValueError):
         return {}
     return {"image_base": f"0x{loaded:x}", "elf_original_image_base": f"0x{linked:x}"}
+
+
+# ── ARM / AArch64: a dynamically linked image with a PLT, and no section headers ──────────────
+
+STT_GNU_IFUNC = 10
+R_ARM_JUMP_SLOT, R_ARM_IRELATIVE = 22, 160
+R_AARCH64_JUMP_SLOT, R_AARCH64_IRELATIVE = 1026, 1032
+# Fixed link-time layout of plt_dynamic_binary (the file is mapped at 0, so offset == address).
+PLT_AT = 0x1000
+GOT_AT = 0x2000
+
+
+def arm_plt_entry(entry: int, slot: int) -> bytes:
+    """The binutils short ARM PLT entry at ``entry`` jumping through GOT ``slot``:
+    ``add ip, pc, #d[27:20]`` / ``add ip, ip, #d[19:12]`` / ``ldr pc, [ip, #d[11:0]]!`` with
+    d = slot - (entry + 8). Encoded here independently of the reader under test."""
+    d = slot - (entry + 8)
+    assert 0 <= d < 0x10000000
+    words = (
+        0xE28FC600 | ((d >> 20) & 0xFF),
+        0xE28CCA00 | ((d >> 12) & 0xFF),
+        0xE5BCF000 | (d & 0xFFF),
+    )
+    return b"".join(struct.pack("<I", w) for w in words)
+
+
+def aarch64_plt_entry(entry: int, slot: int) -> bytes:
+    """The AArch64 PLT entry at ``entry`` jumping through GOT ``slot``:
+    ``adrp x16, slot`` / ``ldr x17, [x16, #lo12]`` / ``add x16, x16, #lo12`` / ``br x17``."""
+    pages = ((slot & ~0xFFF) - (entry & ~0xFFF)) >> 12
+    lo12 = slot & 0xFFF
+    assert lo12 % 8 == 0
+    adrp = 0x90000010 | ((pages & 0x3) << 29) | (((pages >> 2) & 0x7FFFF) << 5)
+    words = (adrp, 0xF9400211 | ((lo12 // 8) << 10), 0x91000210 | (lo12 << 10), 0xD61F0220)
+    return b"".join(struct.pack("<I", w) for w in words)
+
+
+def plt_dynamic_binary(
+    *,
+    machine: int,
+    plt: bytes,
+    got: dict[int, int],
+    jump_slots: list[tuple[int, int]],
+    irelative: tuple[tuple[int, int], ...] = (),
+    other_plt_relocs: tuple[tuple[int, int], ...] = (),
+    symbols: list[tuple[str, int, int, bool]],
+    e_type: int = ET_DYN,
+) -> bytes:
+    """A little-endian ET_DYN image mapped at 0 with NO section headers: one PT_LOAD over the
+    whole file and a PT_DYNAMIC, so every fact is reachable only through the dynamic tags.
+
+    32-bit REL for ``EM_ARM``, 64-bit RELA for ``EM_AARCH64``. ``plt`` is laid out at ``PLT_AT``;
+    ``got`` maps a GOT slot address (at or after ``GOT_AT``) to the word stored there; the
+    ``jump_slots`` (slot, symbol index) go in the PLT relocation table, the ``irelative`` (slot,
+    resolver address) in the dynamic one — REL keeps the resolver in place, RELA as the addend;
+    ``other_plt_relocs`` (slot, relocation type) are further PLT relocations of no symbol (a TLS
+    descriptor, say).
+    ``symbols``: (name, STT type, value, defined); index 0 is the null symbol, these follow."""
+    is64 = machine == EM_AARCH64
+    jump_type = R_AARCH64_JUMP_SLOT if is64 else R_ARM_JUMP_SLOT
+    irel_type = R_AARCH64_IRELATIVE if is64 else R_ARM_IRELATIVE
+    ptr = 8 if is64 else 4
+    dynstr = b"\0"
+    name_at: list[int] = []
+    for name, _t, _v, _d in symbols:
+        name_at.append(len(dynstr))
+        dynstr += name.encode() + b"\0"
+    if is64:
+        dynsym = struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0)
+        for (_n, typ, value, defined), off in zip(symbols, name_at, strict=True):
+            dynsym += struct.pack("<IBBHQQ", off, (1 << 4) | typ, 0, 1 if defined else 0, value, 0)
+    else:
+        dynsym = struct.pack("<IIIBBH", 0, 0, 0, 0, 0, 0)
+        for (_n, typ, value, defined), off in zip(symbols, name_at, strict=True):
+            dynsym += struct.pack("<IIIBBH", off, value, 0, (1 << 4) | typ, 0, 1 if defined else 0)
+    nsym = len(symbols) + 1
+    hashtab = struct.pack("<II", 1, nsym) + struct.pack("<I", 0) + b"\0" * (4 * nsym)
+
+    def reloc(slot: int, sym: int, rtype: int, addend: int) -> bytes:
+        if is64:
+            return struct.pack("<QQq", slot, (sym << 32) | rtype, addend)
+        return struct.pack("<II", slot, (sym << 8) | rtype)
+
+    jmprel = b"".join(reloc(slot, sym, jump_type, 0) for slot, sym in jump_slots)
+    jmprel += b"".join(reloc(slot, 0, rtype, 0) for slot, rtype in other_plt_relocs)
+    rel = b"".join(reloc(slot, 0, irel_type, resolver) for slot, resolver in irelative)
+    got_words = dict(got)
+    if not is64:
+        for slot, resolver in irelative:
+            got_words[slot] = resolver  # REL: the addend is the word in place
+    o_dynstr, o_dynsym, o_hash, o_jmprel, o_rel = 0x100, 0x200, 0x400, 0x600, 0x800
+    o_dyn = 0x3000
+    assert o_dynsym + len(dynsym) <= o_hash and o_jmprel + len(jmprel) <= o_rel
+    rel_tag, relsz_tag, relent_tag = (7, 8, 9) if is64 else (17, 18, 19)
+    entsize = 24 if is64 else 8
+    tags = [
+        (5, o_dynstr),  # STRTAB
+        (10, len(dynstr)),  # STRSZ
+        (6, o_dynsym),  # SYMTAB
+        (11, 24 if is64 else 16),  # SYMENT
+        (4, o_hash),  # HASH
+        (23, o_jmprel),  # JMPREL
+        (2, len(jmprel)),  # PLTRELSZ
+        (20, rel_tag),  # PLTREL
+        (3, GOT_AT),  # PLTGOT
+    ]
+    if rel:
+        tags += [(rel_tag, o_rel), (relsz_tag, len(rel)), (relent_tag, entsize)]
+    fmt = "<qQ" if is64 else "<iI"
+    dynamic = b"".join(struct.pack(fmt, k, v) for k, v in tags) + struct.pack(fmt, 0, 0)
+    total = o_dyn + len(dynamic)
+    body = bytearray(total)
+    for at, blob in (
+        (o_dynstr, dynstr),
+        (o_dynsym, dynsym),
+        (o_hash, hashtab),
+        (o_jmprel, jmprel),
+        (o_rel, rel),
+        (PLT_AT, plt),
+        (o_dyn, dynamic),
+    ):
+        body[at : at + len(blob)] = blob
+    for slot, word in got_words.items():
+        assert GOT_AT <= slot < o_dyn
+        body[slot : slot + ptr] = word.to_bytes(ptr, "little")
+    if is64:
+        ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + b"\0" * 8
+        hdr = ident + struct.pack(
+            "<HHIQQQIHHHHHH", e_type, machine, 1, 0, 64, 0, 0, 64, 56, 2, 64, 0, 0
+        )
+        ph = struct.pack("<IIQQQQQQ", 1, 5, 0, 0, 0, total, total, 0x1000)
+        ph += struct.pack("<IIQQQQQQ", 2, 6, o_dyn, o_dyn, o_dyn, len(dynamic), len(dynamic), 8)
+    else:
+        ident = b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\0" * 8
+        hdr = ident + struct.pack(
+            "<HHIIIIIHHHHHH", e_type, machine, 1, 0, 52, 0, 0, 52, 32, 2, 40, 0, 0
+        )
+        ph = struct.pack("<IIIIIIII", 1, 0, 0, 0, total, total, 5, 0x1000)
+        ph += struct.pack("<IIIIIIII", 2, o_dyn, o_dyn, o_dyn, len(dynamic), len(dynamic), 6, 4)
+    body[0 : len(hdr) + len(ph)] = hdr + ph
+    return bytes(body)

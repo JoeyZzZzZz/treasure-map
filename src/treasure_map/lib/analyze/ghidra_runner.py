@@ -1176,9 +1176,9 @@ class GhidraRunner:
             expected_pass = self.pass_version()
             # This binary's lazy-binding stubs, resolved from ELF structure and handed to the
             # extractor so a call it renders as FUN_<stub-addr> is recognised as the import it
-            # reaches. None (not a readable MIPS ELF with dynamic symbols) hands nothing in, and the
-            # extractor must then report "none" — an empty table and no table are different
-            # answers.
+            # reaches. None (not a readable MIPS / ARM / AArch64 ELF with dynamic linking
+            # information) hands nothing in, and the extractor must then report "none" — an empty
+            # table and no table are different answers.
             resolution = resolve_stubs(binary)
             expected_stub = stub_table_marker(None if resolution is None else resolution.names)
             if resolution is not None:

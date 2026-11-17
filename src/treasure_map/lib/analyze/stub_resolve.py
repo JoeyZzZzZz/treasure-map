@@ -1,6 +1,7 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Resolve a MIPS binary's lazy-binding stubs to their import names, from ELF structure alone.
+"""Resolve a binary's lazy-binding stubs to their import names, from ELF structure alone (MIPS,
+32-bit ARM and AArch64).
 
 When a program calls a libc function like ``system``, the compiler emits a call to a small stub in
 ``.plt`` (or ``.MIPS.stubs``) that jumps through the GOT. If the decompiler does not stitch that
@@ -10,8 +11,23 @@ command-execution sink drops out of every downstream reading. That is a false ne
 that is objectively there.
 
 This recovers the name WITHOUT the decompiler, from structures the ELF already carries, so the
-answer does not depend on whether the decompiler happened to build a thunk. Two paths, tried in
-order, both deterministic:
+answer does not depend on whether the decompiler happened to build a thunk.
+
+On ARM and AArch64 the PLT is DECODED, entry by entry (``decode_plt``): each entry's instructions
+compute the address of the GOT slot it jumps through — ``add ip, pc, #…`` / ``add ip, ip, #…`` /
+``ldr pc, [ip, #…]!`` or its ``movw``/``movt`` form, behind an optional Thumb ``bx pc; nop``
+prefix, on ARM; ``adrp x16`` / ``ldr x17, [x16, #…]`` / ``add x16, x16, #…`` / ``br x17`` on
+AArch64 — and the relocation on that slot names the import: a ``JUMP_SLOT`` its symbol, an
+``IRELATIVE`` the one ``STT_GNU_IFUNC`` symbol of this binary whose value its resolver address
+equals (none, or several, leaves it unnamed). ★ The table's extent comes from decoding, never from
+layout arithmetic: a range derived from section sizes or slot counts runs past the last entry into
+the ``.text`` function laid out next to it, and naming that function after an import is a
+fabricated stub. Decoding stops at the first bytes that are no entry, or whose slot is not one this
+binary binds lazily or was already taken; an entry that cannot be decoded is never guessed, and the
+table is then not complete. The slots come from the dynamic segment, so a binary without section
+headers is read the same way.
+
+On MIPS two paths are tried in order, both deterministic:
 
   * ``.rel.plt`` — a new-ABI PLT carries a ``JUMP_SLOT`` relocation per GOT entry, naming the
     symbol directly. The ``.plt`` stubs are in fixed 1:1 order with those relocations, so a stub
@@ -40,12 +56,14 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Callable, Mapping, Set
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Literal
 
 from elftools.common.exceptions import ELFError
+from elftools.elf.dynamic import DynamicSegment
 from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
 
@@ -69,12 +87,16 @@ class StubResolution:
     ``FUN_<addr>`` callee can be recognised as a stub call even when its name did not resolve (then
     it is an unclassified external call, surfaced rather than dropped).
 
-    ``complete`` says the ``names`` table covers EVERY stub this binary has: no non-empty
-    ``.MIPS.stubs`` section, and every ``.plt`` table entry resolved a name. It is False when a
+    ``complete`` says the ``names`` table covers EVERY stub this binary has. On MIPS: no non-empty
+    ``.MIPS.stubs`` section, and every ``.plt`` table entry resolved a name — False when a
     ``.MIPS.stubs`` table carries stubs this path does not name (``_plt_stub_names`` only reads
-    ``.plt``), so a reader never takes an empty-or-partial table for "these are all the stubs".
-    ``named_regions`` is ``regions`` tagged with each range's section name, carried so a later
-    reader can tell a ``.plt`` region from a ``.MIPS.stubs`` one."""
+    ``.plt``). On ARM / AArch64: every ``JUMP_SLOT`` slot is reached by a decoded entry and every
+    decoded entry is named — False when an entry could not be decoded or an ``IRELATIVE`` one has no
+    single ``STT_GNU_IFUNC`` name. Either way a reader never takes an empty-or-partial table for
+    "these are all the stubs". ``named_regions`` is ``regions`` tagged with each range's section
+    name, carried so a later reader can tell a ``.plt`` region from a ``.MIPS.stubs`` one (the
+    decoded ARM / AArch64 table is tagged ``.plt``; it runs from the table's header to the end of
+    its last decoded entry, an ``.iplt`` laid out right after it included)."""
 
     names: dict[int, str]
     regions: tuple[tuple[int, int], ...]
@@ -239,8 +261,283 @@ def _has_nonempty_mips_stubs(elf: ELFFile) -> bool:
     return sec is not None and bool(sec["sh_size"])
 
 
+# ── ARM / AArch64: the PLT decoded entry by entry ────────────────────────────────────────────
+
+# Relocation types read here, as the ELF ABIs number them. pyelftools 0.33 lists R_ARM_IRELATIVE
+# as 140 and has no R_AARCH64_IRELATIVE, so the numbers are written out rather than looked up.
+_R_ARM_JUMP_SLOT = 22
+_R_ARM_IRELATIVE = 160
+_R_AARCH64_JUMP_SLOT = 1026
+_R_AARCH64_IRELATIVE = 1032
+# The symbol type of an indirect function (10); pyelftools names it by the range it starts.
+_IFUNC_TYPES = frozenset({"STT_GNU_IFUNC", "STT_LOOS"})
+# PLT0, the header every lazily bound GOT slot initially points at: five ARM words, eight AArch64
+# ones. The per-import entries follow it.
+_ARM_PLT_HEADER = 20
+_AARCH64_PLT_HEADER = 32
+_ARM_ENTRY_MAX = 20  # a Thumb prefix and the four-word long form
+_AARCH64_ENTRY = 16
+
+PltMachine = Literal["arm", "aarch64"]
+
+
+@dataclass(frozen=True)
+class PltEntry:
+    """One decoded PLT entry: the address a call enters it at, the GOT slot it jumps through, and
+    its length in bytes. ``thumb_prefix``: it starts with the Thumb ``bx pc; nop`` pair, so its ARM
+    instructions — a second entry point — start four bytes on."""
+
+    addr: int
+    got_slot: int
+    size: int
+    thumb_prefix: bool = False
+
+
+def _le_word(code: bytes, off: int, size: int) -> int | None:
+    if off < 0 or off + size > len(code):
+        return None
+    return int.from_bytes(code[off : off + size], "little")
+
+
+def _arm_rotated_imm(word: int) -> int:
+    """The value of an ARM data-processing immediate: eight bits rotated right by twice the
+    four-bit rotation field."""
+    rot = 2 * ((word >> 8) & 0xF)
+    imm = word & 0xFF
+    return ((imm >> rot) | (imm << (32 - rot))) & 0xFFFFFFFF if rot else imm
+
+
+def _arm_imm16(word: int) -> int:
+    """The 16-bit immediate of ``movw`` / ``movt`` (imm4:imm12)."""
+    return ((word >> 4) & 0xF000) | (word & 0xFFF)
+
+
+_ARM_ADD_IP_PC = 0xE28FC000  # add ip, pc, #imm
+_ARM_ADD_IP_IP = 0xE28CC000  # add ip, ip, #imm
+_ARM_LDR_PC_IP_WB = 0xE5BCF000  # ldr pc, [ip, #imm]!
+_ARM_MOVW_IP = 0xE300C000  # movw ip, #imm16
+_ARM_MOVT_IP = 0xE340C000  # movt ip, #imm16
+_ARM_ADD_IP_IP_PC = 0xE08CC00F  # add ip, ip, pc
+_ARM_LDR_PC_IP = 0xE59CF000  # ldr pc, [ip, #imm]
+_THUMB_BX_PC, _THUMB_NOP = 0x4778, 0x46C0
+
+
+def decode_arm_plt_entry(code: bytes, off: int, addr: int) -> PltEntry | None:
+    """The 32-bit ARM PLT entry at ``code[off:]`` (link-time address ``addr``), or None when the
+    bytes there are no entry. Little-endian instructions.
+
+    Read: ``add ip, pc, #i`` then at most two ``add ip, ip, #i`` then ``ldr pc, [ip, #i]!`` (slot =
+    the first instruction's pc, which reads its own address + 8, plus every immediate); or
+    ``movw ip`` / ``movt ip`` / ``add ip, ip, pc`` / ``ldr pc, [ip, #i]`` (slot = the 32-bit value
+    plus the third instruction's pc plus the offset). Either may sit behind a Thumb ``bx pc; nop``
+    pair."""
+    thumb = _le_word(code, off, 2) == _THUMB_BX_PC and _le_word(code, off + 2, 2) == _THUMB_NOP
+    start = off + 4 if thumb else off
+    pc = addr + (start - off) + 8
+    w0 = _le_word(code, start, 4)
+    if w0 is None:
+        return None
+    if w0 & 0xFFFFF000 == _ARM_ADD_IP_PC:
+        total = _arm_rotated_imm(w0)
+        at = start + 4
+        for _ in range(3):
+            w = _le_word(code, at, 4)
+            if w is None:
+                return None
+            if w & 0xFFFFF000 == _ARM_ADD_IP_IP:
+                total += _arm_rotated_imm(w)
+                at += 4
+                continue
+            if w & 0xFFFFF000 == _ARM_LDR_PC_IP_WB:
+                slot = (pc + total + (w & 0xFFF)) & 0xFFFFFFFF
+                return PltEntry(addr, slot, at + 4 - off, thumb)
+            return None
+        return None
+    if w0 & 0xFFF0F000 == _ARM_MOVW_IP:
+        w1, w2, w3 = (_le_word(code, start + 4 * k, 4) for k in (1, 2, 3))
+        if (
+            w1 is not None
+            and w3 is not None
+            and w1 & 0xFFF0F000 == _ARM_MOVT_IP
+            and w2 == _ARM_ADD_IP_IP_PC
+            and w3 & 0xFFFFF000 == _ARM_LDR_PC_IP
+        ):
+            value = (_arm_imm16(w1) << 16) | _arm_imm16(w0)
+            slot = (value + pc + 8 + (w3 & 0xFFF)) & 0xFFFFFFFF
+            return PltEntry(addr, slot, start + 16 - off, thumb)
+    return None
+
+
+_A64_ADRP_X16 = 0x90000010  # adrp x16, #page   (mask 0x9F00001F)
+_A64_LDR_X17_X16 = 0xF9400211  # ldr x17, [x16, #imm12 * 8]   (mask 0xFFC003FF)
+_A64_ADD_X16_X16 = 0x91000210  # add x16, x16, #imm12   (mask 0xFFC003FF)
+_A64_BR_X17 = 0xD61F0220  # br x17
+
+
+def decode_aarch64_plt_entry(code: bytes, off: int, addr: int) -> PltEntry | None:
+    """The AArch64 PLT entry at ``code[off:]`` (link-time address ``addr``), or None when the
+    bytes there are no entry: ``adrp x16`` / ``ldr x17, [x16, #o]`` / ``add x16, x16, #o`` /
+    ``br x17``, the ``add`` naming the same offset as the load (slot = the ``adrp`` page + o)."""
+    w0, w1, w2, w3 = (_le_word(code, off + 4 * k, 4) for k in range(4))
+    if w0 is None or w1 is None or w2 is None or w3 is None:
+        return None
+    if w0 & 0x9F00001F != _A64_ADRP_X16 or w3 != _A64_BR_X17:
+        return None
+    if w1 & 0xFFC003FF != _A64_LDR_X17_X16 or w2 & 0xFFC003FF != _A64_ADD_X16_X16:
+        return None
+    offset = ((w1 >> 10) & 0xFFF) * 8
+    if (w2 >> 10) & 0xFFF != offset:
+        return None
+    pages = (((w0 >> 5) & 0x7FFFF) << 2) | ((w0 >> 29) & 0x3)
+    if pages & (1 << 20):
+        pages -= 1 << 21
+    page = (addr & ~0xFFF) + (pages << 12)
+    return PltEntry(addr, (page + offset) & 0xFFFFFFFFFFFFFFFF, _AARCH64_ENTRY)
+
+
+def decode_plt(
+    code: bytes, base: int, machine: PltMachine, slots: Set[int]
+) -> tuple[PltEntry, ...]:
+    """Every entry of one PLT, decoded one after another — a pure function of the bytes.
+
+    ``code`` holds the table's bytes from its header (PLT0) on, at link-time address ``base``;
+    ``slots`` the GOT slots this binary binds lazily (its ``JUMP_SLOT`` and ``IRELATIVE`` slots).
+    The entries start right after the header and end at the first bytes that are no entry, or
+    whose slot is not in ``slots`` or was already taken by an earlier entry. Nothing past that point
+    is an entry, however many slots are left: what follows a PLT is ordinary code, and a function
+    there is never a stub."""
+    header, decode = (
+        (_ARM_PLT_HEADER, decode_arm_plt_entry)
+        if machine == "arm"
+        else (_AARCH64_PLT_HEADER, decode_aarch64_plt_entry)
+    )
+    out: list[PltEntry] = []
+    taken: set[int] = set()
+    off = header
+    while True:
+        entry = decode(code, off, base + off)
+        if entry is None or entry.got_slot not in slots or entry.got_slot in taken:
+            break
+        taken.add(entry.got_slot)
+        out.append(entry)
+        off += entry.size
+    return tuple(out)
+
+
+def ifunc_slot_names(initial: Mapping[int, int], ifuncs: Mapping[int, Set[str]]) -> dict[int, str]:
+    """The ``IRELATIVE`` slots that get a name: slot -> the one ``STT_GNU_IFUNC`` symbol name whose
+    value equals the slot's resolver address (``initial``: the relocation's addend, or the word in
+    place for REL). A resolver address no such symbol has, or that several differently named ones
+    share, gives no name: which function the loader selects there is then not read from the ELF."""
+    out: dict[int, str] = {}
+    for slot, value in initial.items():
+        names = ifuncs.get(value, frozenset())
+        if len(names) == 1:
+            out[slot] = next(iter(names))
+    return out
+
+
+def _load_reader(elf: ELFFile, fh: BinaryIO) -> Callable[[int, int], bytes]:
+    """``read(vaddr, n)``: up to ``n`` file-backed bytes of the PT_LOAD segment holding ``vaddr``
+    (fewer at the segment's end, none outside every segment)."""
+    loads = [
+        (s["p_vaddr"], s["p_filesz"], s["p_offset"])
+        for s in elf.iter_segments()
+        if s["p_type"] == "PT_LOAD"
+    ]
+
+    def read(vaddr: int, n: int) -> bytes:
+        for start, size, offset in loads:
+            if start <= vaddr < start + size:
+                fh.seek(offset + vaddr - start)
+                return fh.read(min(n, start + size - vaddr))
+        return b""
+
+    return read
+
+
+def _arm_family_resolution(elf: ELFFile, fh: BinaryIO) -> StubResolution | None:
+    """The decoded PLT of a 32-bit ARM or AArch64 ELF (see the module docstring). None when there
+    is no dynamic segment, or for a big-endian 32-bit ARM ELF, whose instruction byte order (BE8 or
+    BE32) is not read here."""
+    machine: PltMachine = "aarch64" if elf.header.e_machine == "EM_AARCH64" else "arm"
+    if machine == "arm" and not elf.little_endian:
+        return None
+    dyn = next((s for s in elf.iter_segments() if isinstance(s, DynamicSegment)), None)
+    if dyn is None:
+        return None
+    jump_type, irel_type = (
+        (_R_ARM_JUMP_SLOT, _R_ARM_IRELATIVE)
+        if machine == "arm"
+        else (_R_AARCH64_JUMP_SLOT, _R_AARCH64_IRELATIVE)
+    )
+    ptr = 8 if elf.elfclass == 64 else 4
+    order: Literal["little", "big"] = "little" if elf.little_endian else "big"
+    read = _load_reader(elf, fh)
+
+    def word(vaddr: int) -> int | None:
+        raw = read(vaddr, ptr)
+        return int.from_bytes(raw, order) if len(raw) == ptr else None
+
+    jump: dict[int, str | None] = {}  # JUMP_SLOT slot -> its symbol's name (None: unnamed)
+    initial: dict[int, int] = {}  # IRELATIVE slot -> its resolver address
+    tables: dict[str, Any] = dict(dyn.get_relocation_tables())
+    for kind, table in tables.items():
+        if kind == "RELR":
+            continue  # relative relocations only: no slot is bound through them
+        rela = table.is_RELA()
+        for rel in table.iter_relocations():
+            rtype, slot = rel["r_info_type"], rel["r_offset"]
+            if rtype == jump_type:
+                sym = dyn.get_symbol(rel["r_info_sym"]) if rel["r_info_sym"] else None
+                jump[slot] = sym.name if sym is not None and sym.name else None
+            elif rtype == irel_type:
+                value = rel["r_addend"] if rela else word(slot)
+                if value is not None:
+                    initial[slot] = value
+    ifuncs: dict[int, set[str]] = {}
+    for sym in dyn.iter_symbols():
+        if sym["st_info"]["type"] in _IFUNC_TYPES and sym["st_shndx"] != "SHN_UNDEF" and sym.name:
+            ifuncs.setdefault(sym["st_value"], set()).add(sym.name)
+    irel_names = ifunc_slot_names(initial, ifuncs)
+    # PLT0: where the lazily bound slots point before the loader binds them.
+    firsts = Counter(v for v in (word(s) for s in jump) if v)
+    if not firsts:
+        # No lazily bound import (complete: none to name), or slots whose table cannot be found.
+        return StubResolution(names={}, regions=(), complete=not jump and not initial)
+    plt0 = firsts.most_common(1)[0][0]
+    header = _ARM_PLT_HEADER if machine == "arm" else _AARCH64_PLT_HEADER
+    entry_max = _ARM_ENTRY_MAX if machine == "arm" else _AARCH64_ENTRY
+    code = read(plt0, header + entry_max * (len(jump) + len(initial)))
+    entries = decode_plt(code, plt0, machine, set(jump) | set(initial))
+    shift = ghidra_load_shift_of(elf)
+    names: dict[int, str] = {}
+    unnamed = 0
+    for e in entries:
+        name = jump[e.got_slot] if e.got_slot in jump else irel_names.get(e.got_slot)
+        if not name:
+            unnamed += 1
+            continue
+        names[e.addr + shift] = name
+        if e.thumb_prefix:
+            names[e.addr + 4 + shift] = name
+    reached = {e.got_slot for e in entries}
+    complete = set(jump) <= reached and unnamed == 0
+    named_regions: tuple[tuple[str, int, int], ...] = ()
+    if entries:
+        end = entries[-1].addr + entries[-1].size
+        named_regions = ((".plt", plt0 + shift, end + shift),)
+    return StubResolution(
+        names=names,
+        regions=tuple((lo, hi) for _n, lo, hi in named_regions),
+        complete=complete,
+        named_regions=named_regions,
+    )
+
+
 def resolve_stubs(elf_path: Path | str) -> StubResolution | None:
-    """Every resolvable stub's import name + the stub regions, for one MIPS ELF.
+    """Every resolvable stub's import name + the stub regions, for one MIPS, 32-bit ARM or
+    AArch64 ELF.
 
     Addresses are the decompiler's (``ghidra_load_shift_of`` applied), because every consumer
     compares them with the decompiler's: the extractor's stub lookup, the callee relabelling, the
@@ -248,12 +545,16 @@ def resolve_stubs(elf_path: Path | str) -> StubResolution | None:
     once, keeps them all on one number; a shift applied only on the way into the extractor would
     make the ingest-time recomputation disagree with it on every rebased binary.
 
-    None when the file is not a readable MIPS ELF with a dynamic symbol table — an honest "cannot
-    tell", never an empty answer read as "no stubs". A best-effort read: a malformed section makes
-    that path contribute nothing rather than raising."""
+    None when the file is not a readable ELF of those machines with dynamic linking information (a
+    MIPS ELF needs its ``.dynsym`` section; an ARM or AArch64 one its dynamic segment, and a 32-bit
+    ARM one must be little-endian) — an honest "cannot tell", never an empty answer read as "no
+    stubs". A best-effort read on MIPS: a malformed section makes that path contribute nothing
+    rather than raising."""
     try:
         with open(elf_path, "rb") as fh:
             elf = ELFFile(fh)
+            if elf.header.e_machine in ("EM_ARM", "EM_AARCH64"):
+                return _arm_family_resolution(elf, fh)
             if elf.header.e_machine != "EM_MIPS":
                 return None
             dynsym = elf.get_section_by_name(".dynsym")

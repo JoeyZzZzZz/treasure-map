@@ -655,3 +655,37 @@ def test_a_group_material_names_the_call_that_reads_on_a_members_rows(
     line = tcl.build_line(tcl.Session(id="s"), "start_diff_review", {"unit": group.unit_id}, out)
     assert member not in (line.get("unit_whole") or []), line.get("unit_whole")
     assert (line.get("unit_rows") or {}).get(member) == [0, 20, 35], line.get("unit_rows")
+
+
+def test_a_group_on_a_side_whose_thunk_list_is_not_recorded_says_so(tmp_path: Path) -> None:
+    """★ A-E4-13 (callee_groups). X is checked against B's thunk list; with that list NULL the
+    check cannot be made, so the group stands but is marked ``callee_thunk_unrecorded`` — on the
+    group, in the review unit's group and in the material pack. With the list recorded
+    (``'[]'``) it is not marked, and a recorded thunk X keys no group.
+
+    Mutation: ``_thunks`` returns an empty set for a NULL list -> RED (no mark).
+    Mutation: leave the mark out of the review unit's group -> RED."""
+    from treasure_map import mcp_app
+
+    w = _world(tmp_path)
+    assert groups_marked(w) == {X_B: False}
+    w.adb["b"].execute(
+        "UPDATE binaries SET thunk_spans = ?",
+        (json.dumps([[f"0x{X_B}", [[f"0x{X_B}", f"0x{int(X_B, 16) + 7:x}"]]]]),),
+    )
+    w.commit()
+    pv._clear_view_caches()
+    assert _groups(w) == {}  # a recorded thunk keys no group
+    w.adb["b"].execute("UPDATE binaries SET thunk_spans = NULL")
+    w.commit()
+    pv._clear_view_caches()
+    ru.DIFF_CACHE.clear()
+    assert groups_marked(w) == {X_B: True}
+    group = next(u for u in _review(w).units if u.kind == ru.GROUP)
+    assert (group.group or {}).get("callee_thunk_unrecorded") is True
+    out = mcp_app.make_tools(w.path)["start_diff_review"](run_pair="runA::runB", unit=group.unit_id)
+    assert out["material"].get("callee_thunk_unrecorded") is True
+
+
+def groups_marked(w: World) -> dict[str, bool]:
+    return {x: g.callee_thunk_unrecorded for x, g in _groups(w).items()}

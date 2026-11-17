@@ -1708,6 +1708,34 @@ def test_cmd_evidence_names_vararg_surface(tmp_path: Path) -> None:
     assert "OPTIMISTIC" in dim.note
 
 
+def test_a_path_wrapper_drill_down_row_names_a_path_sink(tmp_path: Path) -> None:
+    """A wrapper whose recorded real sink is a PATH sink (the path axis) gets the drill-down row of
+    its own class, ``path`` — not the format/log text, which would describe a sink it does not
+    have. The command sink is ruled out (it was recorded, and is not one). Evidence only: the
+    sink name still reaches no state or value.
+
+    Mutation: drop the PATH_SINK branch of ``_wrapper_empty_evidence`` -> RED (``non_cmd`` and the
+    format/log detail)."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = _pattern(conn, "fp_wrap_path")
+        ref = _inst(
+            conn,
+            pid,
+            sink_anchor="fopen",
+            flow_evidence=_wrapper_flow("fopen"),
+            blocking="const_sink_arg",
+        )
+        dim = _controllability_dim(conn, ref)
+    finally:
+        conn.close()
+    (ev,) = dim.evidence
+    assert ev["wrapped_sink"] == "fopen"
+    assert ev["wrapped_sink_class"] == "path"
+    assert ev["command_sink_ruled_out"] is True
+    assert "path/file sink" in ev["detail"] and "format/log" not in ev["detail"]
+
+
 # ── C-CMD: a command sink one hop inside a thin wrapper now leaves a record ──────────
 #
 # The extractor records a sink argument only where a sink is CALLED, so a caller that hands its
