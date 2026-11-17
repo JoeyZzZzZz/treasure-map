@@ -18,7 +18,11 @@ Two layers, kept apart on purpose:
   * ``build_helper_tables`` — the population gate plus criterion A, per binary. The gate is the
     measured one (M3): a stripped ``FUN_<addr>`` name, called with at least two distinct string
     keys where its return is taken, and a body whose shape reads like a getter. Only a function
-    through the gate is handed to ``helper_slots``.
+    through the gate is handed to ``helper_slots``. ★ Only the ``RETURN_SLOT`` reading enters a
+    table: the return slot's precision was measured on the built tables, and the out-parameter
+    reading has had no member on any corpus it was measured on, so its precision is unknown. It
+    stays computed by ``helper_slots`` (to be measured where it has members) and is not admitted
+    — a table under-collects rather than grow its population through an unmeasured rule.
 
 A helper is read as WEAK input downstream, so it labels a candidate and seeds weak taint and never
 grades one ``confirmed``. Finding one says nothing about whether the value it hands on is
@@ -30,7 +34,15 @@ Deliberately narrow, every boundary stated rather than approximated:
   * the out-parameter slot and the return slot both rest on the existing seeding tables, so a
     helper wrapping a source the taint layer does not seed (uci_get / uci_lookup_ptr; scanf-family)
     falls out as the empty set — under-collection, the safe direction;
-  * a helper that calls another helper is not followed (only a known source name starts a value).
+  * a helper that calls another helper is not followed (only a known source name starts a value);
+  * a value is followed only through value-PRESERVING steps (a copy, a cast, a read-through, one
+    ``strdup`` layer, a buffer builder's destination): arithmetic, a conversion such as ``atoi`` and
+    every other call break the chain. That is narrower than a general flow relation on purpose — a
+    comparison can then never hand on a "value", which is how a predicate is kept out by
+    construction — and the cost is recall on getters that transform what they read;
+  * a variable seeded once and later overwritten (``p = getenv(k); if (p) p = (char *)1; return
+    p;``) still reads as handing on the value: telling that apart from a fallback default needs
+    reaching definitions, which this does not compute.
 """
 
 from __future__ import annotations
@@ -67,13 +79,16 @@ _COMPARE_CALLS: frozenset[str] = frozenset(
 # judgement. ``!`` is caught separately (a leading unary).
 _COMPARE_OPS = ("==", "!=", "<=", ">=", "&&", "||", "<", ">")
 
-_STMT_SPLIT_RE = re.compile(r"[;\n{}]")
 _PARAM_RE = re.compile(r"^param_(\d+)$")
 _STRING_LIT_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 _FUN_NAME_RE = re.compile(r"^FUN_[0-9a-fA-F]+$")
 _LEAD_CALL_RE = re.compile(r"^([A-Za-z_]\w*)\s*\((.*)\)\s*$", re.DOTALL)
 _CAST_RE = re.compile(r"^\s*\((?:unsigned |signed |const )?\w[\w\s]*\**\s*\)\s*")
 _RETURN_PREFIXES = ("param_", "__dest", "pcVar", "puVar", "pvVar")
+# A call's return is TAKEN when its name is preceded by a lone ``=`` (an assignment, wherever it
+# sits — a statement, a condition), with one cast allowed in between.
+_RETURN_TAKEN_RE = re.compile(r"(?<![=!<>+\-*/%&|^])=\s*(?:\(\s*[A-Za-z_][\w\s]*\**\s*\)\s*)?$")
+_FUN_CALL_RE = re.compile(r"\b(FUN_[0-9a-fA-F]+)\s*\(")
 _SHAPE_WINDOW = 800
 
 
@@ -83,7 +98,41 @@ def _body(pseudocode: str) -> str:
 
 
 def _statements(pseudocode: str) -> list[str]:
-    return [s.strip() for s in _STMT_SPLIT_RE.split(_body(pseudocode)) if s.strip()]
+    """The body's statements: split at ``;``, ``{``, ``}`` and a line break, but only outside
+    parentheses / brackets and string literals — a call the decompiler wrapped across two lines is
+    one statement, and a ``;`` inside a string splits nothing. Whitespace is collapsed."""
+    body = _body(pseudocode)
+    out: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    i, n = 0, len(body)
+
+    def flush() -> None:
+        s = " ".join("".join(buf).split())
+        if s:
+            out.append(s)
+        buf.clear()
+
+    while i < n:
+        ch = body[i]
+        if ch in "\"'":
+            j = i + 1
+            while j < n and body[j] != ch and body[j] != "\n":
+                j += 2 if body[j] == "\\" else 1
+            buf.append(body[i : j + 1])
+            i = j + 1
+            continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        if depth == 0 and ch in ";{}\n":
+            flush()
+        else:
+            buf.append(" " if ch == "\n" else ch)
+        i += 1
+    flush()
+    return out
 
 
 def _split_assignment(stmt: str) -> tuple[str, str] | None:
@@ -209,6 +258,9 @@ def _is_judgement(expr: str) -> bool:
         elif ch in ")]":
             depth -= 1
         elif depth == 0:
+            if e.startswith("->", i):  # a field access, not a comparison
+                i += 2
+                continue
             for op in _COMPARE_OPS:
                 if e.startswith(op, i):
                     return True
@@ -325,7 +377,7 @@ def _body_shape_ok(pseudocode: str) -> bool:
     window = _body(pseudocode)[:_SHAPE_WINDOW]
     if "memcpy" in window or "strdup" in window:
         return True
-    for m in re.finditer(r"\breturn\b\s*([A-Za-z_]\w*)", window):
+    for m in re.finditer(r"\breturn\b\s*(?:\([^()]*\)\s*)?([A-Za-z_]\w*)", window):
         if any(m.group(1).startswith(p) for p in _RETURN_PREFIXES):
             return True
     return False
@@ -333,21 +385,23 @@ def _body_shape_ok(pseudocode: str) -> bool:
 
 def _return_taken_call_keys(funcs: Iterable[FuncRow]) -> dict[str, set[str]]:
     """Per callee ``FUN_<addr>`` name, the distinct string literals passed where its RETURN is
-    taken (``x = FUN_...(...)``) across the binary's callers (gate 3)."""
+    taken across the binary's callers (gate 3). A call takes the return when a lone ``=`` sits
+    right before its name (one cast allowed): ``x = FUN_…(…)`` as a statement, and equally
+    ``if ((p = FUN_…(…)) != 0)`` inside a condition. Judged at the call, not per statement."""
     keys: dict[str, set[str]] = defaultdict(set)
     for f in funcs:
-        for stmt in _statements(f.pseudocode or ""):
-            assign = _split_assignment(stmt)
-            if assign is None:
-                continue  # gate 3: only callsites that TAKE the return count
-            expr = assign[1]
-            lead = _lead_call(expr)
-            if lead is None or not _is_fun_addr_name(lead[0]):  # the FUN-<addr> gate, enforced here
-                continue
-            off = call_offsets(expr, lead[0])
-            args = call_args_at(expr, off[0]) if off else []
-            for a in args or []:
-                keys[lead[0]].update(_STRING_LIT_RE.findall(a))
+        pc = f.pseudocode or ""
+        # The FUN-<addr> gate, enforced here: only such a name is ever collected.
+        for name in {m.group(1) for m in _FUN_CALL_RE.finditer(pc)}:
+            for off in call_offsets(pc, name):
+                start = off
+                while start > 0 and pc[start - 1].isspace():
+                    start -= 1
+                start -= len(name)
+                if not _RETURN_TAKEN_RE.search(pc[max(0, start - 120) : start]):
+                    continue  # gate 3: only callsites that TAKE the return count
+                for a in call_args_at(pc, off) or []:
+                    keys[name].update(_STRING_LIT_RE.findall(a))
     return keys
 
 
@@ -368,7 +422,9 @@ def _binary_table(funcs: list[FuncRow]) -> SourceHelpers:
         if not f.pseudocode or not _body_shape_ok(f.pseudocode):  # gate 4
             continue
         for slot in helper_slots(f.pseudocode):
-            slots.add((name, slot))
+            # Only the measured reading is admitted (see the module docstring).
+            if slot == RETURN_SLOT:
+                slots.add((name, slot))
     return SourceHelpers(frozenset(slots))
 
 

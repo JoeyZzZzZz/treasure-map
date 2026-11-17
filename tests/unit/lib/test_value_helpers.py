@@ -106,6 +106,32 @@ _CRITERION = [
         "int h(char *param_1,void *param_2){ uci_lookup_ptr(param_1,param_2,0,1); return 0; }",
         set(),
     ),
+    # rule 3 exclusion: a parameter that is a source's KEY is not an out-parameter, even when the
+    # value is then written into it
+    (
+        "key_param_is_not_an_out_param",
+        "void h(char *param_1,char *param_2){ char *pcVar1; "
+        "pcVar1 = getenv(param_2); strcpy(param_2,pcVar1); }",
+        set(),
+    ),
+    # a call the decompiler wrapped across two lines is ONE statement
+    (
+        "writer_wrapped_across_lines",
+        "void h(char *param_1,char *param_2){ char *pcVar1; "
+        'pcVar1 = getenv("k"); snprintf(param_2,0x40,"%s",\n               pcVar1); }',
+        {1},
+    ),
+    (
+        "return_wrapped_across_lines",
+        "char * h(char *param_1){ return strdup(getenv(\n                      param_1)); }",
+        {R},
+    ),
+    # a field read through the value is the value read through, not a comparison
+    (
+        "return_field_of_the_value",
+        'char * h(void){ char *pcVar1; pcVar1 = getenv("k"); return pcVar1->name; }',
+        {R},
+    ),
 ]
 
 
@@ -122,7 +148,14 @@ def test_criterion_a_reads_the_slots_a_body_hands_a_source_value_through(
     recognition -> the two directly-returned source calls fall to the empty set -> RED; drop the
     out-parameter rule -> write_out_param_2 is empty -> RED. (Rule 1, membership, is redundant with
     rules 2/3 — both need a source-seeded value — so deleting it turns no fixture red; it is kept
-    as a cheap, documenting precondition, not claimed as an independent tooth.)"""
+    as a cheap, documenting precondition, not claimed as an independent tooth.)
+
+    MUTATION (verified RED, 1 failed): drop the key exclusion (``_source_key_params`` returns an
+    empty set) -> key_param_is_not_an_out_param reads {1}.
+    MUTATION (verified RED, 2 failed): split statements at every ``;`` / ``{`` / ``}`` / line break
+    regardless of parentheses (the earlier splitter) -> the two wrapped fixtures read empty.
+    MUTATION (verified RED, 1 failed): let ``_is_judgement`` read the ``>`` of ``->`` as a
+    comparison -> return_field_of_the_value reads empty."""
     assert set(helper_slots(body)) == want
 
 
@@ -173,8 +206,30 @@ def _table_slots(funcs: list[FuncRow]) -> set[tuple[str, int]]:
     return set().union(*(t.slots for t in tables.values())) if tables else set()
 
 
+# A helper that writes into an out-parameter and passes the gate (memcpy satisfies the body shape).
+_OUT_WRITER = (
+    "int FUN_00001000(char *param_1,char *param_2){ char *pcVar1; pcVar1 = getenv(param_1); "
+    "strcpy(param_2,pcVar1); memcpy(param_2,pcVar1,4); return 0; }"
+)
+# A getter by criterion A whose body has none of the shapes gate 4 reads: a non-void return, but no
+# getter-named variable returned and no memcpy / strdup in the window.
+_INT_GETTER = 'int FUN_00001000(char *param_1){ int iVar1; iVar1 = getenv("k"); return iVar1; }'
+_CAST_GETTER = (
+    'char * FUN_00001000(char *param_1){ char *pcVar1; pcVar1 = getenv("k"); '
+    "return (char *)pcVar1; }"
+)
+# One key where the return is taken in a CONDITION, the other in a plain statement.
+_CALL_IN_CONDITION = (
+    "void FUN_00002000(void){ char *p; char *q; "
+    'if ((p = (char *)FUN_00001000("wan")) != (char *)0x0) { q = FUN_00001000("lan"); } }'
+)
+
 _GATE = [
     ("two_keys_in", [_HELPER, _CALL2], {("FUN_00001000", R)}),
+    ("return_taken_in_a_condition_counts", [_HELPER, _CALL_IN_CONDITION], {("FUN_00001000", R)}),
+    ("cast_return_reads_as_getter_shape", [_CAST_GETTER, _CALL2], {("FUN_00001000", R)}),
+    ("no_getter_shape_out", [_INT_GETTER, _CALL2], set()),
+    ("out_parameter_slot_not_admitted", [_OUT_WRITER, _CALL2], set()),
     ("one_key_out", [_HELPER, _CALL1], set()),
     ("no_return_taken_out", [_HELPER, _CALL_NO_RET], set()),
     (
@@ -205,9 +260,25 @@ def test_the_population_gate_admits_only_the_measured_shape(
     MUTATION (verified RED, each clause): drop the ``FUN_<addr>`` check -> named_callee admitted
     -> RED; lower the two-key threshold to one -> one_key admitted -> RED; count callsites that do
     not take the return -> no_return_taken admitted -> RED; drop the bare-void filter ->
-    bare_void_return admitted -> RED."""
+    bare_void_return admitted -> RED.
+
+    MUTATION (verified RED, 1 failed): judge "takes the return" per whole statement again (only a
+    statement that is itself ``x = FUN_…(…)``) -> return_taken_in_a_condition_counts drops out.
+    MUTATION (verified RED, 1 failed): drop the getter-shape half of gate 4 (a non-void body
+    passes) -> no_getter_shape admitted. MUTATION (verified RED, 1 failed): no cast before the
+    returned variable -> cast_return_reads_as_getter_shape drops out.
+    MUTATION (verified RED, 1 failed): admit every slot (drop the ``slot == RETURN_SLOT`` filter)
+    -> out_parameter_slot_not_admitted carries ("FUN_00001000", 1)."""
     funcs = [_fn(i + 1, _name_of(b), b) for i, b in enumerate(bodies)]
     assert _table_slots(funcs) == want
+    assert all(slot == R for _name, slot in _table_slots(funcs))
+
+
+def test_the_gate_fixtures_are_getters_by_criterion_a() -> None:
+    """The two exclusions above are made by the GATE, not by criterion A: both bodies do hand on a
+    source value (precondition, so a gate mutation is what turns them red)."""
+    assert set(helper_slots(_INT_GETTER)) == {R}
+    assert set(helper_slots(_OUT_WRITER)) == {1}
 
 
 def _name_of(body: str) -> str:
@@ -329,3 +400,120 @@ def test_the_moved_fingerprint_re_keys_both_b_class_readers(tmp_path: Path) -> N
     finally:
         conn.close()
     assert fp_with in fingerprints
+
+
+# ── the ordering a helper table may move, and the ordering it must not ─────────────────────────
+
+# B: same binary as the helper, never calls it; its command is built from a global, so its source
+# reads unknown — the reading a stray helper label would flip.
+_PLAIN_CALLER = (
+    "void plain(void){ char acStack_90[128]; "
+    'snprintf(acStack_90,0x80,"ping %s",DAT_00412000); system(acStack_90); }'
+)
+# C: another binary, fed from its own parameter — different facts from B.
+_OTHER_CALLER = (
+    "void other(char *param_1){ char acStack_90[128]; "
+    'snprintf(acStack_90,0x80,"ping %s",param_1); system(acStack_90); }'
+)
+
+
+def _hunt_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, table: bool
+) -> dict[str, dict[str, object]]:
+    from treasure_map.lib.hunt import analyzer2
+    from treasure_map.lib.query import triage
+    from treasure_map.lib.query.triage import _sort_atoms
+
+    if not table:
+        monkeypatch.setattr(analyzer2, "build_helper_tables", lambda funcs: {})
+    d = Path(tempfile.mkdtemp(dir=tmp_path))
+    db = _make_db(
+        d,
+        [
+            {
+                "name": "svcd",
+                "path": "usr/sbin/svcd",
+                "funcs": [
+                    _func("FUN_00001000", _HELPER, ["getenv"]),
+                    _func("handle", _FED_CALLER, ["FUN_00001000", "snprintf", "system"]),
+                    _func("keys", _GATE_KEYS, ["FUN_00001000"]),
+                    _func("plain", _PLAIN_CALLER, ["snprintf", "system"]),
+                ],
+            },
+            {
+                "name": "otherd",
+                "path": "usr/sbin/otherd",
+                "funcs": [_func("other", _OTHER_CALLER, ["snprintf", "system"])],
+            },
+        ],
+    )
+    atlas = d / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_h8")
+    monkeypatch.undo()
+    conn = open_atlas(atlas)
+    try:
+        stored = {
+            r[0]: (r[1], r[2], r[3], r[4])
+            for r in conn.execute(
+                "SELECT i.evidence_ref, p.source_class, p.structural_fingerprint, "
+                "i.exposure_shape, i.flow_evidence FROM instance i "
+                "JOIN pattern p ON p.pattern_id = i.pattern_id"
+            )
+        }
+        ranked = triage(conn, run_id="run_h8")
+    finally:
+        conn.close()
+    out: dict[str, dict[str, object]] = {}
+    for rank, c in enumerate(ranked):
+        ref = str(c.evidence_ref)
+        out[ref] = {
+            "rank": rank,
+            "function": c.function,
+            "source_kind": c.source_kind,
+            "atoms": _sort_atoms(c, None),
+            "stored": stored.get(ref),
+        }
+    return out
+
+
+def test_a_helper_table_moves_only_the_candidates_it_feeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same firmware hunted with and without its helper table. The candidate the helper feeds
+    (``handle``) moves as H8 intends: its source class unknown -> external_input, param_float
+    0 -> 1 and the charset rank of its source kind (the command candidate's source_kind turns
+    free_string). Every other candidate — ``plain`` in the SAME binary that never
+    calls the helper, ``other`` in another binary with different facts — keeps its stored three
+    dimensions byte for byte, its sort atoms, and its order relative to the rest.
+
+    MUTATION (verified RED, 1 failed): let a binary's helper table label every function of that
+    binary (in ``shapes.classify``: ``| frozenset(helpers.names)`` in place of ``| frozenset(names &
+    helpers.names)``) -> ``plain`` is relabelled and its sort atoms change."""
+    from treasure_map.lib.query.triage import _CHARSET_FEASIBILITY_RANK
+
+    on = _hunt_three(tmp_path, monkeypatch, table=True)
+    off = _hunt_three(tmp_path, monkeypatch, table=False)
+    assert set(on) == set(off)
+    fed = [ref for ref, v in on.items() if v["function"] == "handle"]
+    rest = [ref for ref in on if ref not in fed]
+    assert fed, "the fed candidate is missing from the fixture"
+    assert {on[r]["function"] for r in rest} >= {"plain", "other"}, "the controls are missing"
+    cmd = [ref for ref in fed if "@cmd" in ref]
+    assert cmd, "the fed command candidate is missing from the fixture"
+    for ref in cmd:
+        assert (off[ref]["source_kind"], on[ref]["source_kind"]) == ("unknown", "free_string")
+    for ref in fed:
+        stored_off, stored_on = off[ref]["stored"], on[ref]["stored"]
+        assert isinstance(stored_off, tuple) and isinstance(stored_on, tuple)
+        assert (stored_off[0], stored_on[0]) == ("unknown", "external_input")
+        assert (off[ref]["atoms"]["param_float"], on[ref]["atoms"]["param_float"]) == (0, 1)
+        assert off[ref]["atoms"]["charset_rank"] == 0
+        assert on[ref]["atoms"]["charset_rank"] == _CHARSET_FEASIBILITY_RANK.get(
+            str(on[ref]["source_kind"]), 1
+        )
+    for ref in rest:
+        assert on[ref]["stored"] == off[ref]["stored"], on[ref]["function"]
+        assert on[ref]["atoms"] == off[ref]["atoms"], on[ref]["function"]
+    order_on = sorted(rest, key=lambda r: int(on[r]["rank"]))  # type: ignore[call-overload]
+    order_off = sorted(rest, key=lambda r: int(off[r]["rank"]))  # type: ignore[call-overload]
+    assert order_on == order_off
