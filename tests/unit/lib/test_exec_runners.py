@@ -34,6 +34,7 @@ from treasure_map.lib.hunt.exec_edges import (
     build_symlink_index,
     exec_entry_sites,
 )
+from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.query import exec_edges as qee
 from treasure_map.lib.query import launched_by
 from treasure_map.lib.storage.connection import open_db
@@ -247,6 +248,120 @@ def test_a_rebound_image_parameter_is_not_a_runner_but_a_constant_image_does_not
     assert er.runner_shapes("fixed_tool_main", _CONST_RUNNER) != frozenset()
 
 
+def test_shape_two_follows_the_path_parameter_not_argv() -> None:
+    """The rebound guard of shape (ii) is on the parameter the image is read FROM. A runner that
+    writes the image into argv's first slot (``*param_2 = param_1``) still execs the caller's
+    path; a runner that rebinds the path parameter itself (an ``exec`` retried as
+    ``/proc/self/exe``) does not exec what the caller passed for that call.
+
+    MUTATION (verified RED, 1 failed): in runner_shapes also reject on a rebound argv
+    (``if not _rebound(body, path.root) and not _rebound(body, argv.root):``) -> the first runner
+    is no runner and its caller has no edge.
+    MUTATION (verified RED, 1 failed): in runner_shapes drop the shape (ii) guard
+    (``if True:``) -> the second runner reads as shape (ii) and its caller has an edge."""
+    argv_rewritten = """
+int FUN_00015000(char *param_1,char **param_2,char **param_3)
+
+{
+  *param_2 = param_1;
+  execve(param_1,param_2,param_3);
+  return -1;
+}
+"""
+    path_rewritten = """
+int FUN_00016000(char *param_1,char **param_2,char **param_3)
+
+{
+  param_1 = "/proc/self/exe";
+  execve(param_1,param_2,param_3);
+  return -1;
+}
+"""
+    assert er.runner_shapes("FUN_00015000", argv_rewritten) == {
+        er.RunnerShape(er.SHAPE_PATH_PARAM, 1, path_index=0)
+    }
+    assert er.runner_shapes("FUN_00016000", path_rewritten) == frozenset()
+    funcs = [
+        _fn(1, "FUN_00015000", argv_rewritten, callees=("execve",)),
+        _fn(3, "FUN_00016000", path_rewritten, callees=("execve",)),
+        _fn(
+            2,
+            "start_both",
+            _caller(
+                "start_both",
+                '  local_28 = "shown_name";\n'
+                '  FUN_00015000("/usr/sbin/tool_path",&local_28,0);\n'
+                '  FUN_00016000("/usr/sbin/tool_retry",&local_28,0);',
+            ),
+            callees=("FUN_00015000", "FUN_00016000"),
+        ),
+    ]
+    rows = _edges(funcs)
+    assert [(r.exec_api, r.target_token) for r in rows] == [("FUN_00015000", "/usr/sbin/tool_path")]
+
+
+def test_shape_one_reads_argv_at_its_signature_position() -> None:
+    """The argv parameter need not come first (``exec_cmd(path, argv, …)``-style runners take it
+    second): the caller's argument at the SIGNATURE position of argv is the array.
+
+    MUTATION (verified RED, 1 failed): in _target_values read the head slot off the first argument
+    (``slot = _head_slot(args[0])``) -> the token is gone.
+    MUTATION (verified RED, 6 failed): in runner_shapes record position 0 for argv
+    (``argv_index = 0``) -> the shape reads (argv_head, 0)."""
+    body = """
+int FUN_00013000(int param_1,char **param_2)
+
+{
+  execvp(*param_2,param_2);
+  return param_1;
+}
+"""
+    assert er.runner_shapes("FUN_00013000", body) == {er.RunnerShape(er.SHAPE_ARGV_HEAD, 1)}
+    runner = _fn(1, "FUN_00013000", body, callees=("execvp",))
+    caller = _fn(
+        2,
+        "start_second",
+        _caller("start_second", '  local_28 = "tool_b";\n  FUN_00013000(5,&local_28);'),
+        callees=("FUN_00013000",),
+    )
+    rows = _edges([runner, caller], inventory=_inventory("tool_b"))
+    assert [(r.target_token, r.target_resolution) for r in rows] == [("tool_b", "resolved_direct")]
+
+
+def test_a_function_at_a_stub_address_is_the_import_not_a_runner() -> None:
+    """A binary routes an import through a one-line function at the import's stub address
+    (``execvp(param_1,param_2)``). Its callers see the import itself — their callee lists name
+    ``execvp`` — so its calls are the projection's; it is never a runner.
+
+    MUTATION (verified RED, 1 failed): in find_runners drop the stub-address check -> the
+    forwarder is a runner."""
+    body = """
+void FUN_00469400(char *param_1,char **param_2)
+
+{
+  execv(param_1,param_2);
+  return;
+}
+"""
+    forwarder = dataclasses.replace(
+        _fn(1, "FUN_00469400", body, callees=("execv",)), address="00469400"
+    )
+    elsewhere = dataclasses.replace(forwarder, address="00469500")
+    stubs = {1: {0x469400: "execv"}}
+    # The precondition: the body alone reads as a runner, so the stub check is what decides.
+    assert er.runner_shapes("FUN_00469400", body) != frozenset()
+    assert er.find_runners([elsewhere], stubs) != {}
+    assert er.find_runners([forwarder], stubs) == {}
+
+
+def test_the_lexicon_s_forwarding_names_are_never_runners() -> None:
+    """Both halves of the command-sink lexicon are excluded. Today every forwarding name is also a
+    sink name, so dropping the forwarding half changes nothing (an equivalent mutation); this pins
+    the property that would break the day the lexicon gains a forwarding-only name."""
+    assert REGISTRY.forward_cmd <= er.NOT_RUNNER_NAMES
+    assert frozenset(REGISTRY.sink_cmd) <= er.NOT_RUNNER_NAMES
+
+
 def test_the_variadic_family_is_never_a_runner() -> None:
     """``execl`` passes argv as a variadic list — structurally invisible, never read."""
     body = """
@@ -298,6 +413,67 @@ def test_shape_two_reads_the_path_argument_not_the_display_name() -> None:
     )
     rows = _edges([runner, caller])
     assert [r.target_token for r in rows] == ["/usr/sbin/real_image"]
+
+
+def test_shape_two_a_variable_in_the_path_position_is_no_token() -> None:
+    """Only a string literal in the path position is a token: a variable there is kept as an
+    unresolved edge with no token, never its own name read as a program.
+
+    MUTATION (verified RED, 1 failed): in _target_values take the argument text itself
+    (``return [string_literal(args[shape.path_index]) or args[shape.path_index]]``) -> the
+    token is "pcVar1"."""
+    runner = _fn(1, "launch_it", _PATH_RUNNER, callees=("execve",))
+    caller = _fn(
+        2,
+        "start_var",
+        _caller(
+            "start_var",
+            '  pcVar1 = pick_image(0);\n  local_28 = "shown_name";\n'
+            "  launch_it(pcVar1,&local_28,0);",
+        ),
+        callees=("pick_image", "launch_it"),
+    )
+    rows = _edges([runner, caller])
+    assert [(r.target_token, r.target_resolution) for r in rows] == [(None, "unresolved")]
+    assert exec_entry_sites(rows) == {}
+
+
+def test_a_call_with_fewer_arguments_than_the_runner_reads_is_unresolved() -> None:
+    """A call whose argument list stops before the position the runner reads (argv second for
+    shape i, the path for shape ii) keeps its edge with no token — never another argument read in
+    its place, never a crash.
+
+    MUTATION (verified RED, 1 failed — an IndexError in the pass, the crash this guard prevents):
+    in _target_values let a short call through to the slot read
+    (``if args is None or len(args) == 0:``).
+    MUTATION (verified RED, 1 failed — IndexError, likewise): in _target_values let a short call
+    through to the path read (``if args is None or shape.path_index is None:``)."""
+    head_second = """
+int FUN_00013000(int param_1,char **param_2)
+
+{
+  execvp(*param_2,param_2);
+  return param_1;
+}
+"""
+    funcs = [
+        _fn(1, "FUN_00013000", head_second, callees=("execvp",)),
+        _fn(3, "launch_it", _PATH_RUNNER, callees=("execve",)),
+        _fn(
+            2,
+            "start_short",
+            _caller(
+                "start_short",
+                '  local_28 = "tool_one";\n  FUN_00013000(&local_28);\n  launch_it();',
+            ),
+            callees=("FUN_00013000", "launch_it"),
+        ),
+    ]
+    rows = _edges(funcs)
+    assert sorted((r.exec_api, r.target_token, r.target_resolution) for r in rows) == [
+        ("FUN_00013000", None, "unresolved"),
+        ("launch_it", None, "unresolved"),
+    ]
 
 
 def test_shape_three_reads_the_runners_own_constant() -> None:
@@ -363,10 +539,14 @@ def test_a_mixed_slot_yields_each_literal_plus_one_unresolved_row() -> None:
 
 def test_two_calls_with_one_token_are_two_rows_keyed_by_their_addresses() -> None:
     """The fold key is the projection's: (binary, function, sink address, token). Two calls to the
-    runner are two call instructions, so the same token at both is two rows.
+    runner are two call instructions, so the same token at both is two rows. The other call that
+    is handed the same slot is a shape (i) runner, which only reads it: no unresolved row.
 
     MUTATION (verified RED, 1 failed): in build_runner_edges record no address
-    (``sink_addr = None``) -> the two rows fold into one with occurrences 2."""
+    (``sink_addr = None``) -> the two rows fold into one with occurrences 2.
+    MUTATION (verified RED, 2 failed): in build_runner_edges treat only the call being read as a
+    reader (``frozenset({off})`` for ``readers | {off}``) -> each call reads the other as a
+    write, one more row each."""
     runner = _fn(1, "FUN_00012000", _HEAD_RUNNER, callees=("fork", "execvp"))
     lines = '  local_28 = "tool_one";\n  FUN_00012000(&local_28,0);\n  FUN_00012000(&local_28,1);'
     caller = _fn(2, "start_twice", _caller("start_twice", lines), callees=("FUN_00012000",))
@@ -375,6 +555,160 @@ def test_two_calls_with_one_token_are_two_rows_keyed_by_their_addresses() -> Non
     assert len({r.sink_addr for r in rows}) == 2
     assert all(r.sink_addr for r in rows)
     assert all(r.occurrences == 1 for r in rows)
+
+
+def test_a_write_that_is_not_a_plain_statement_adds_the_unresolved_row() -> None:
+    """Only a plain ``slot = …;`` statement is read for its value. Every other write is a write
+    whose value is not read, and adds the unresolved row, so the literal row does not claim the
+    slot held only that: an assignment inside an expression (a comma expression in a loop
+    condition, a one-line ``if``), a compound assignment, ``++``, the slot's address handed to
+    another call that may fill it, or kept in a pointer that is written through — also under the
+    ``&stack0xN`` name of an ``in_stack_N`` slot. A literal written inside an expression is not
+    read as a token either.
+
+    MUTATION (verified RED, 1 failed): in _target_values drop ``or hidden`` from the unresolved
+    test -> every caller reads only "tool_one".
+    MUTATION (verified RED, 1 failed): in other_slot_assignments ``return 0`` -> the comma,
+    one-line-if, compound and step callers read only "tool_one".
+    MUTATION (verified RED, 2 failed): in slot_writes find writes anywhere, not at a line start
+    (``rf"(?<![\\w.>]){re.escape(slot)}[ \\t]*=(?!=)"``) -> "tool_hidden" is read as a token.
+    MUTATION (verified RED, 1 failed): plain ``=`` only in ``_ASSIGN_OP`` -> the compound caller.
+    MUTATION (verified RED, 1 failed): in other_slot_assignments drop the ``++``/``--`` count ->
+    the step caller.
+    MUTATION (verified RED, 1 failed): in _target_values ignore address uses
+    (``paren not in readers for paren in ()``) -> the out-parameter, pointer and alias callers.
+    MUTATION (verified RED, 1 failed): an address in no call counts as read
+    (``paren not in readers and paren != -1``) -> the pointer caller.
+    MUTATION (verified RED, 1 failed): in _address_names return the slot alone -> the alias
+    caller."""
+    runner = _fn(1, "FUN_00012000", _HEAD_RUNNER, callees=("fork", "execvp"))
+    bodies = {
+        "start_comma": (
+            '  local_28 = "tool_one";\n'
+            '  while (pcVar13 = strsep(&local_10,","), local_28 = pcVar13, pcVar13 != 0) {\n'
+            "    FUN_00012000(&local_28,0);\n"
+            "  }"
+        ),
+        "start_oneline": (
+            '  local_28 = "tool_one";\n'
+            '  if (g_mode == 3) local_28 = "tool_hidden";\n'
+            "  FUN_00012000(&local_28,0);"
+        ),
+        "start_outparam": (
+            '  local_28 = "tool_one";\n'
+            '  if (g_mode == 3) {\n    build_path(&local_28,"%s/tool",g_dir);\n  }\n'
+            "  FUN_00012000(&local_28,0);"
+        ),
+        "start_compound": (
+            '  local_28 = "tool_one";\n'
+            "  if (g_mode == 3) {\n    local_28 += 1;\n  }\n"
+            "  FUN_00012000(&local_28,0);"
+        ),
+        "start_step": (
+            '  local_28 = "tool_one";\n'
+            "  if (g_mode == 3) {\n    local_28++;\n  }\n"
+            "  FUN_00012000(&local_28,0);"
+        ),
+        "start_pointer": (
+            '  local_28 = "tool_one";\n'
+            "  ppcVar1 = &local_28;\n"
+            "  *ppcVar1 = pcVar_from_elsewhere;\n"
+            "  FUN_00012000(&local_28,0);"
+        ),
+        "start_alias": (
+            '  in_stack_00000124 = "tool_one";\n'
+            '  if (g_mode == 3) {\n    build_path(&stack0x00000124,"%s/tool",g_dir);\n  }\n'
+            "  FUN_00012000(&stack0x00000124,0);"
+        ),
+    }
+    funcs = [runner] + [
+        _fn(fid, name, _caller(name, lines), callees=("FUN_00012000",))
+        for fid, (name, lines) in enumerate(sorted(bodies.items()), start=2)
+    ]
+    rows = _edges(funcs)
+    by_caller: dict[str, list[str]] = {}
+    for r in rows:
+        by_caller.setdefault(r.launcher_function, []).append(r.target_token or "")
+    assert {k: sorted(v) for k, v in by_caller.items()} == {
+        name: ["", "tool_one"] for name in bodies
+    }
+
+
+def test_a_message_or_a_write_through_the_slot_is_no_write_to_it() -> None:
+    """A printed message that spells ``&local_28`` or ``local_28 = x`` is text;
+    ``*local_28 = …`` / ``*(undefined *)local_28 = …`` write what the slot points at, not the
+    slot; and ``auStack_28`` is another cell than ``uStack_28``, not a write to it. Each slot
+    still reads as its one literal, with no unresolved row.
+
+    MUTATION (verified RED, 1 failed): in _masked return the text unmasked
+    (``return pseudocode``) -> the message reads as a write.
+    MUTATION (verified RED, 1 failed): in other_slot_assignments skip no dereference
+    (``if False:`` for the ``_DEREF_TAIL_RE`` test) -> the writes through the slot count.
+    MUTATION (verified RED, 1 failed): drop ``\\w`` from the assignment's lookbehind ->
+    ``auStack_28 = …`` counts for ``uStack_28``.
+    MUTATION (verified RED, 1 failed): drop ``\\w`` from the ``++``/``--`` lookbehind ->
+    ``auStack_28++`` counts for ``uStack_28``."""
+    runner = _fn(1, "FUN_00012000", _HEAD_RUNNER, callees=("fork", "execvp"))
+    bodies = {
+        "start_logged": (
+            '  local_28 = "tool_one";\n'
+            '  log_line("argv at &local_28, local_28 = %s",local_28);\n'
+            "  FUN_00012000(&local_28,0);"
+        ),
+        "start_through": (
+            '  local_28 = "tool_one";\n'
+            "  *local_28 = 0x2f;\n"
+            "  *(undefined *)local_28 = 0;\n"
+            "  FUN_00012000(&local_28,0);"
+        ),
+        "start_longer": (
+            '  uStack_28 = "tool_one";\n'
+            "  auStack_28 = pcVar_from_elsewhere;\n"
+            "  auStack_28++;\n"
+            "  FUN_00012000(&uStack_28,0);"
+        ),
+    }
+    funcs = [runner] + [
+        _fn(fid, name, _caller(name, lines), callees=("FUN_00012000",))
+        for fid, (name, lines) in enumerate(sorted(bodies.items()), start=2)
+    ]
+    rows = _edges(funcs)
+    assert sorted((r.launcher_function, r.target_token or "") for r in rows) == [
+        ("start_logged", "tool_one"),
+        ("start_longer", "tool_one"),
+        ("start_through", "tool_one"),
+    ]
+
+
+def test_a_runner_of_two_shapes_reads_both_and_its_own_call_is_no_write() -> None:
+    """A runner that execs ``*argv`` and, failing that, a constant with the same argv reads as both
+    shapes, so each call yields both tokens. Handing it the slot is not a write the call being read
+    has to account for: the call is its own reader even though the runner is not shape (i) only.
+
+    MUTATION (verified RED, 1 failed): in build_runner_edges leave the call being read out of its
+    readers (``readers`` for ``readers | {off}``) -> one more, unresolved, row."""
+    body = """
+int FUN_00017000(char **param_1)
+
+{
+  execvp(*param_1,param_1);
+  execvp("/usr/sbin/tool_fallback",param_1);
+  return -1;
+}
+"""
+    assert er.runner_shapes("FUN_00017000", body) == {
+        er.RunnerShape(er.SHAPE_ARGV_HEAD, 0),
+        er.RunnerShape(er.SHAPE_PATH_CONST, 0, path_const="/usr/sbin/tool_fallback"),
+    }
+    runner = _fn(1, "FUN_00017000", body, callees=("execvp",))
+    caller = _fn(
+        2,
+        "start_fallback",
+        _caller("start_fallback", '  local_28 = "tool_one";\n  FUN_00017000(&local_28);'),
+        callees=("FUN_00017000",),
+    )
+    rows = _edges([runner, caller])
+    assert sorted(r.target_token or "" for r in rows) == ["/usr/sbin/tool_fallback", "tool_one"]
 
 
 def test_the_stack_alias_names_one_cell_twice() -> None:
@@ -439,6 +773,46 @@ def test_a_same_binary_runner_is_linked_through_the_callers_callee_list() -> Non
     assert er.link_callers([runner, caller], runners, _no_links()) == {
         2: {"FUN_00012000": runners[1]}
     }
+
+
+def test_a_name_resolved_in_the_callers_binary_is_not_looked_up_across_binaries() -> None:
+    """The caller's binary holds a function of the runner's name and also imports that name (the
+    exported-call table links it, by name, to another binary's exporter). The binary's own one is
+    what the call reaches; the exporter, which reads a different argument, is not consulted.
+
+    MUTATION (verified RED, 1 failed): in link_callers look the name up across binaries even when
+    it resolved locally (``if not any(``) -> the token is the exporter's reading."""
+    local = _fn(
+        1,
+        "run_list",
+        _HEAD_RUNNER.replace("FUN_00012000", "run_list"),
+        binary="daemon_one",
+        bid=2,
+        callees=("execvp",),
+    )
+    exporter = _fn(
+        4,
+        "run_list",
+        "\nint run_list(char **param_1,char *param_2)\n\n{\n"
+        "  execve(param_2,param_1,env_list);\n  return 0;\n}\n",
+        binary="libtwo.so",
+        bid=4,
+        callees=("execve",),
+    )
+    caller = _fn(
+        2,
+        "start_local_first",
+        _caller(
+            "start_local_first",
+            '  local_28 = "tool_local";\n  run_list(&local_28,"/usr/sbin/tool_remote");',
+        ),
+        binary="daemon_one",
+        bid=2,
+        callees=("run_list",),
+    )
+    links = er.LinkTables(exported_calls={2: (4,)}, imports=frozenset({(2, "run_list")}))
+    rows = _edges([local, exporter, caller], links=links)
+    assert [r.target_token for r in rows] == ["tool_local"]
 
 
 def test_a_name_several_functions_hold_is_left_unresolved() -> None:
@@ -596,6 +970,55 @@ def test_the_status_row_is_written_for_every_binary_even_at_zero_edges() -> None
     assert by_binary["dark_bin"].scanned == 0
     assert all(s.found_count == 0 for s in status)
     assert "in_stack" in er.UNSUPPORTED_NOTE and ".data" in er.UNSUPPORTED_NOTE
+
+
+def test_the_status_count_is_each_binarys_own_rows() -> None:
+    """``found_count`` counts the rows launched from that binary — two in one, one in the other,
+    zero in the runner's own binary — never the run's total.
+
+    MUTATION (verified RED, 1 failed): in runner_scan_status count every row of the run for each
+    binary that has one (``found[row.launcher_binary] = len(edge_rows)``) -> 3, 3."""
+    runner = _fn(
+        1,
+        "run_list",
+        _HEAD_RUNNER.replace("FUN_00012000", "run_list"),
+        binary="libtool.so",
+        bid=1,
+        callees=("execvp",),
+    )
+    two = _fn(
+        2,
+        "start_two",
+        _caller(
+            "start_two",
+            '  local_28 = "tool_one";\n  run_list(&local_28,0);\n  run_list(&local_28,1);',
+        ),
+        binary="daemon_one",
+        bid=2,
+        callees=("run_list",),
+    )
+    one = _fn(
+        3,
+        "start_one",
+        _caller("start_one", '  local_28 = "tool_two";\n  run_list(&local_28,0);'),
+        binary="daemon_two",
+        bid=3,
+        callees=("run_list",),
+    )
+    funcs = [runner, two, one]
+    links = er.LinkTables(
+        exported_calls={2: (1,), 3: (1,)},
+        imports=frozenset({(2, "run_list"), (3, "run_list")}),
+    )
+    runners = er.find_runners(funcs)
+    callers = er.link_callers(funcs, runners, links)
+    rows = er.build_runner_edges(funcs, callers, _inventory(), "run1")
+    status = er.runner_scan_status(rows, funcs, callers, links, {"run_list"}, "run1")
+    assert {s.binary: s.found_count for s in status} == {
+        "libtool.so": 0,
+        "daemon_one": 2,
+        "daemon_two": 1,
+    }
 
 
 # ── end to end: the hunt writes the rows, the read layer answers ─────────────────────

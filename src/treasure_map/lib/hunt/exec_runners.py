@@ -24,7 +24,10 @@ Three steps, each narrow on purpose:
      ``execl*`` family is never a runner: its argv is structurally invisible.
      ★ A function whose name is itself in the command-sink lexicon (the C library's own ``execv``
      wrapping ``execve``) is never a runner: every call to it is already projected from the
-     caller's provenance, and a second edge would repeat that edge with the wrong field read. With
+     caller's provenance, and a second edge would repeat that edge with the wrong field read. Nor
+     is a function whose entry address is one of its binary's lazy-binding stubs (a one-line
+     ``execvp(param_1,param_2)`` the binary routes its import through): to its callers it IS the
+     import — their callee lists already name the import — so its calls are projected too. With
      those excluded, the ``exec_api`` of a row built here — the runner's name — is by itself the
      mark of an edge that went through a runner.
 
@@ -42,6 +45,14 @@ Three steps, each narrow on purpose:
      literal one row, plus one unresolved row when any write is not a literal; (ii) the caller's
      argument in the path position, a token only when it is a string literal; (iii) the runner's
      constant. Everything else is read as no token.
+     ★ Only a plain ``slot = …;`` statement is read for its value. Every other write to the slot
+     is a write whose value is not read, so it adds the unresolved row: an assignment inside an
+     expression (``(p = strsep(…), slot = p, …)``), a compound assignment or ``++``/``--``, and
+     the slot's address taken anywhere but in a call to a runner that only reads its argv — handed
+     to another call (``f(&slot, …)`` may fill it) or kept in a pointer (``pp = &slot``,
+     ``(&slot)[i] = …``). A runner of shape (i) only reads: its recognition requires the argv
+     parameter never be assigned, ``*argv`` included. Without this, a slot holding one literal
+     and one such write would read as "only that literal".
 
 ★ IRON LAW (the projection's, unchanged): this ENUMERATES, it does not judge. An edge says a call to
 a runner exists, never that it runs or that input reaches it, and nothing here can produce a
@@ -57,7 +68,7 @@ whichever pass found it.
 spell a program name: the block is writable, and reading its initial bytes as the value would assume
 nothing changes it at run time — a guess, not a read. A slot written only through the decompiler's
 two names for one stack cell (``&stack0xN`` at the call, ``in_stack_N`` at the write) is read
-through that alias, which names one cell twice.
+through that alias, which names one cell twice; its address is looked for under both names.
 
 ★ CALLSITE ATTRIBUTION IS THE SAME OVER-APPROXIMATION as the projection's: a stack slot reused as
 the head of several argv arrays has every one of its writes read at every call that passes it, so
@@ -71,6 +82,7 @@ runner. It is kept apart from the projection's row, whose scope it does not shar
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import sqlite3
@@ -87,7 +99,8 @@ from treasure_map.lib.hunt.exec_edges import (
     _exec_facts,
     replace_occurrences,
 )
-from treasure_map.lib.pattern.classes import arg_ref, call_args_at, call_offsets
+from treasure_map.lib.hunt.refs import _addr_to_int
+from treasure_map.lib.pattern.classes import _literal_spans, arg_ref, call_args_at, call_offsets
 from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.ro_db import ro_uri
 
@@ -137,12 +150,16 @@ UNSUPPORTED_NOTE = (
     "the image from one of the three places above — a path built in a local buffer, a rebound "
     "parameter, or the variadic execl* family is not a runner, and a runner reached only through "
     "another runner is not followed. A name in the command-sink lexicon (the C library's own "
-    "execv/execvp) is never a runner: calls to it are the exec_argv pass's. For shape (i) only the "
+    "execv/execvp), or a function at one of its binary's stub addresses (the import itself to its "
+    "callers), is never a runner: calls to it are the exec_argv pass's. For shape (i) only the "
     "first slot of the caller's argv array is read; the rest of argv is structurally invisible. A "
     "head slot copied from a writable .data word, a variable, a slot never assigned, a root that "
     "is not a stack slot, and a call with fewer arguments than the runner reads are unresolved: "
-    "the edge is kept with no token and never offered as an entry site. A stack slot reused as the "
-    "head of several arrays has every write read at every call that passes it, so sink_addr "
+    "the edge is kept with no token and never offered as an entry site. Only a plain 'slot = ...;' "
+    "statement is read for its value; any other write to the slot (inside an expression, a "
+    "compound assignment, its address handed to another call or kept in a pointer) adds the "
+    "unresolved row, so a literal row never claims the slot held only that. A stack slot reused "
+    "as the head of several arrays has every write read at every call that passes it, so sink_addr "
     "(the call to the runner) means 'some call to the runner in this function'. A slot the "
     "decompiler names twice (&stack0xN at the call, in_stack_N at the write) is read through that "
     "alias. A name held by several functions of one binary, or exported by several binaries that "
@@ -241,7 +258,8 @@ def runner_shapes(
     name: str | None, pseudocode: str | None, stub_names: Mapping[int, str] | None = None
 ) -> frozenset[RunnerShape]:
     """The shapes in which this function execs what its caller handed it — empty when it is not a
-    runner. Judges the body alone; the sink-name exclusion is applied by ``find_runners``."""
+    runner. Judges the body alone; the sink-name and stub-address exclusions are applied by
+    ``find_runners``."""
     params = signature_params(name, pseudocode)
     if not params or not pseudocode:
         return frozenset()
@@ -294,12 +312,15 @@ def find_runners(
     funcs: Iterable[FuncRow], stub_by_binary: Mapping[int, Mapping[int, str]] | None = None
 ) -> dict[int, frozenset[RunnerShape]]:
     """func_id -> shapes for every runner in the run. Only a function that calls an exec-array API
-    is read, and a name in the command-sink lexicon is never one (see the module docstring)."""
+    is read; a name in the command-sink lexicon and a function at one of its binary's stub
+    addresses are never one (see the module docstring)."""
     stubs = stub_by_binary or {}
     out: dict[int, frozenset[RunnerShape]] = {}
     for func in funcs:
         if not func.name or func.name in NOT_RUNNER_NAMES or not func.pseudocode:
             continue
+        if _addr_to_int(func.address) in stubs.get(func.binary_id, {}):
+            continue  # the binary's stub for an import: its callers see the import itself
         if not set(_callees(func.callees)) & set(EXEC_ARRAY_APIS):
             continue
         shapes = runner_shapes(func.name, func.pseudocode, stubs.get(func.binary_id))
@@ -414,8 +435,10 @@ def _head_slot(arg_text: str) -> str | None:
 
 
 def slot_writes(pseudocode: str, slot: str) -> list[str]:
-    """The right-hand side of every plain assignment ``slot = …;`` in the body, in source order —
-    ALL of them, not only the ones that dominate a given call (see the module docstring)."""
+    """The right-hand side of every plain assignment statement ``slot = …;`` in the body, in source
+    order — ALL of them, not only the ones that dominate a given call (see the module docstring).
+    The other writes to the slot, whose value is not read, are ``slot_address_uses`` and
+    ``other_slot_assignments``."""
     out: list[str] = []
     body = _body(pseudocode)
     for m in re.finditer(rf"(?m)^[ \t]*{re.escape(slot)}[ \t]*=(?!=)", body):
@@ -432,8 +455,101 @@ def slot_writes(pseudocode: str, slot: str) -> list[str]:
     return out
 
 
-def _target_values(shape: RunnerShape, args: list[str] | None, pseudocode: str) -> list[str | None]:
-    """The tokens one call reads under one shape; None stands for "no readable token"."""
+# The operator of an assignment, plain or compound — never ``==``.
+_ASSIGN_OP = r"\s*(?:[-+*/%|&^]|<<|>>)?=(?!=)"
+# What precedes a name written THROUGH, not to: a dereference, with or without a cast
+# (``*slot = …``, ``*(undefined *)slot = …`` write what the slot points at).
+_DEREF_TAIL_RE = re.compile(r"\*\s*(?:\([^()]*\)\s*)?$")
+
+
+@functools.lru_cache(maxsize=8)
+def _masked(pseudocode: str) -> str:
+    """``pseudocode`` with every string/char literal's contents blanked, offsets unchanged, so a
+    bracket or ``;`` inside a message never counts."""
+    chars = list(pseudocode)
+    for lo, hi in _literal_spans(pseudocode):
+        for k in range(lo + 1, min(hi, len(chars))):
+            chars[k] = " "
+    return "".join(chars)
+
+
+def _enclosing_paren(masked: str, at: int, floor: int) -> int:
+    """The offset of the innermost unclosed ``(`` before ``at`` in the same statement, or -1 when
+    there is none (or the innermost open bracket is a ``[``)."""
+    depth = 0
+    i = at - 1
+    while i >= floor:
+        ch = masked[i]
+        if ch in ")]":
+            depth += 1
+        elif ch in "([":
+            if depth == 0:
+                return i if ch == "(" else -1
+            depth -= 1
+        elif ch in ";{}" and depth == 0:
+            return -1
+        i -= 1
+    return -1
+
+
+def _address_names(slot: str) -> tuple[str, ...]:
+    alias = re.fullmatch(r"in_stack_([0-9a-fA-F]+)", slot)
+    return (slot, f"stack0x{alias.group(1)}") if alias else (slot,)
+
+
+@functools.lru_cache(maxsize=256)
+def slot_address_uses(pseudocode: str, slot: str) -> tuple[int, ...]:
+    """Every place the body takes the slot's address (``&slot``, or ``&stack0xN`` for an
+    ``in_stack_N`` slot), as the offset of the innermost ``(`` around it — the call it is handed
+    to — or -1 when it is in none (``pp = &slot``). Text inside a literal is not a use."""
+    masked = _masked(pseudocode)
+    floor = max(masked.find("{"), 0)
+    out: list[int] = []
+    for name in _address_names(slot):
+        for m in re.finditer(rf"(?<!&)&{re.escape(name)}\b", masked):
+            if m.start() < floor:
+                continue
+            out.append(_enclosing_paren(masked, m.start(), floor))
+    return tuple(out)
+
+
+@functools.lru_cache(maxsize=256)
+def other_slot_assignments(pseudocode: str, slot: str) -> int:
+    """How many assignments to the slot are NOT a plain statement ``slot = …;`` at the start of a
+    line (the ones ``slot_writes`` reads): inside an expression or a condition, compound, or
+    ``++`` / ``--``. Text inside a literal is not an assignment."""
+    masked = _masked(pseudocode)
+    floor = max(masked.find("{"), 0)
+    s = re.escape(slot)
+    statement = re.finditer(rf"(?m)^[ \t]*({s})[ \t]*=(?!=)", masked)
+    statements = {m.start(1) for m in statement if m.start() >= floor}
+    count = 0
+    # Not the tail of a longer name, not a field (``.x`` / ``->x``), and not a write THROUGH the
+    # slot. (``*slot++`` does step the slot itself, so ``++`` / ``--`` take no such exception.)
+    for m in re.finditer(rf"(?<![\w.>]){s}{_ASSIGN_OP}", masked):
+        if m.start() < floor or m.start() in statements:
+            continue
+        if _DEREF_TAIL_RE.search(masked, max(floor, m.start() - 80), m.start()):
+            continue
+        count += 1
+    count += sum(
+        1
+        for m in re.finditer(rf"(?<![\w.>]){s}\s*(?:\+\+|--)|(?:\+\+|--)\s*{s}\b", masked)
+        if m.start() >= floor
+    )
+    return count
+
+
+def _target_values(
+    shape: RunnerShape,
+    args: list[str] | None,
+    pseudocode: str,
+    readers: frozenset[int] = frozenset(),
+) -> list[str | None]:
+    """The tokens one call reads under one shape; None stands for "no readable token".
+
+    ``readers`` are the ``(`` offsets of the calls that hand the slot's address on without writing
+    it: the call being read, and every call to a runner of shape (i) linked in this function."""
     if shape.kind == SHAPE_PATH_CONST:
         return [shape.path_const]
     if shape.kind == SHAPE_PATH_PARAM:
@@ -448,7 +564,10 @@ def _target_values(shape: RunnerShape, args: list[str] | None, pseudocode: str) 
     writes = slot_writes(pseudocode, slot)
     literals = [string_literal(w) for w in writes]
     values: list[str | None] = [v for v in literals if v is not None]
-    if not writes or len(values) < len(writes):
+    hidden = other_slot_assignments(pseudocode, slot) or any(
+        paren not in readers for paren in slot_address_uses(pseudocode, slot)
+    )
+    if not writes or len(values) < len(writes) or hidden:
         values.append(None)
     return values
 
@@ -472,9 +591,18 @@ def build_runner_edges(
         if func is None or not func.pseudocode:
             continue
         ps = func.pseudocode
+        stub_names = stubs.get(func.binary_id)
+        # Calls that only read an argv they are handed: a runner of shape (i) never assigns its
+        # argv parameter (the recognition requires it), so it does not write the caller's slot.
+        readers = frozenset(
+            off
+            for name, shapes in callers[caller_id].items()
+            if shapes and all(s.kind == SHAPE_ARGV_HEAD for s in shapes)
+            for off in call_offsets(ps, name, stub_names)
+        )
         for name in sorted(callers[caller_id]):
             shapes = callers[caller_id][name]
-            for off in call_offsets(ps, name, stubs.get(func.binary_id)):
+            for off in call_offsets(ps, name, stub_names):
                 args = call_args_at(ps, off)
                 sink_addr = op_addr_at(func.call_tokens, ps, off)
                 values: list[str | None] = []
@@ -482,7 +610,7 @@ def build_runner_edges(
                     values = [None]
                 else:
                     for shape in sorted(shapes, key=_shape_key):
-                        values.extend(_target_values(shape, args, ps))
+                        values.extend(_target_values(shape, args, ps, readers | {off}))
                 seen: set[str | None] = set()
                 for value in values:
                     if value in seen:
