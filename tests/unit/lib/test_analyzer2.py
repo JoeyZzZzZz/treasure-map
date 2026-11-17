@@ -3238,8 +3238,8 @@ def test_a_sink_class_without_a_detector_anchor_is_refused(
     hunt completes and writes an unanchored row instead of raising)."""
     real_scan = analyzer2_mod.scan
 
-    def _scan_with_an_unanchored_class(db_path: Path):  # type: ignore[no-untyped-def]
-        res = real_scan(db_path)
+    def _scan_with_an_unanchored_class(db_path: Path, **kw: object):  # type: ignore[no-untyped-def]
+        res = real_scan(db_path, **kw)  # type: ignore[arg-type]
         return dataclasses.replace(
             res, matches=tuple(dataclasses.replace(m, sink_class="bogus") for m in res.matches)
         )

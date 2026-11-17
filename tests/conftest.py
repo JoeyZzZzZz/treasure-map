@@ -52,6 +52,36 @@ def _isolate_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[N
     os.environ.update(saved)
 
 
+@pytest.fixture(scope="session")
+def _real_code_stamps() -> list[tuple[object, str]]:
+    """Each process-global stamp ``@cache`` function paired with the real package's value for it,
+    read once with the installed tree. A test that points ``rescan_version._PACKAGE`` at an edited
+    copy and warms one of these would otherwise fix its cache at the copy's value for every later
+    test — an order-dependent failure in the staleness and on-disk-stamp tests. The function
+    OBJECTS are captured here so the per-test guard operates on the real caches even inside a test
+    that monkeypatched the attribute to a plain function."""
+    from treasure_map.lib import rescan_version
+
+    return [
+        (rescan_version.hunt_code_version, rescan_version.hunt_code_version()),
+        (rescan_version.pipeline_code_version, rescan_version.pipeline_code_version()),
+    ]
+
+
+@pytest.fixture(autouse=True)
+def _restore_poisoned_code_stamps(
+    _real_code_stamps: list[tuple[object, str]],
+) -> Iterator[None]:
+    """After each test, drop a stamp cache ONLY if it was warmed to a non-real value (by a test
+    that edited the package copy ``_PACKAGE`` points at). The compare is a cached lookup, so a test
+    that never poisoned a cache pays nothing; a poisoned cache is cleared so the next test recovers
+    it from the restored tree. A recompute happens only on a real poison."""
+    yield
+    for fn, real in _real_code_stamps:
+        if fn() != real:  # type: ignore[operator]
+            fn.cache_clear()  # type: ignore[attr-defined]
+
+
 @pytest.fixture(autouse=True)
 def _no_external_toolchain(monkeypatch: pytest.MonkeyPatch) -> None:
     """No test reads the machine's Ghidra / BinExport / BinDiff versions: a GHIDRA_HOME in the

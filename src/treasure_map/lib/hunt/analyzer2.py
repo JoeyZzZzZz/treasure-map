@@ -100,12 +100,14 @@ from treasure_map.lib.hunt.refs import (
     callsite_offset_suffix,
     mint_out_of_body_refs,
 )
+from treasure_map.lib.hunt.value_helpers import build_helper_tables
 from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
 )
 from treasure_map.lib.pattern import scan
 from treasure_map.lib.pattern.classes import (
     CMD,
+    NO_HELPERS,
     SOURCE_STRONG,
     ArgRef,
     all_path_calls_literal,
@@ -1436,8 +1438,12 @@ def run_analyzer2(
             hunt_currency=currency.reason,
         )
 
-    result = scan(db_path)
     all_funcs = load_functions(db_path)
+    # Each binary's value-getter helper table (E-2a H8): which of its own FUN_<addr> functions hand
+    # on a known source's value, so a call to one reads as a WEAK source in that binary. Built from
+    # the loaded functions once and handed to the scan and to every per-candidate reader below.
+    helpers_by_binary = build_helper_tables(all_funcs)
+    result = scan(db_path, helpers_by_binary=helpers_by_binary)
     # Each binary's resolved stub table (see analyze/stub_resolve), loaded once: the readers below
     # run on decompiled TEXT, where a lazy-binding call is spelled after the stub it goes through
     # rather than after the import. Without it those calls are invisible here even though the
@@ -1600,6 +1606,7 @@ def run_analyzer2(
 
                 callees = _parse_callees(row.callees)
                 stub_names = stub_by_binary.get(row.binary_id)
+                helpers = helpers_by_binary.get(row.binary_id, NO_HELPERS)
                 # Every shape chooses its concrete sink in the DETECTOR and carries it in evidence;
                 # anchor to THAT rather than re-deriving one from the callee list. A sink class
                 # whose detector carries no anchor is refused outright: re-deriving one from the
@@ -1657,6 +1664,7 @@ def run_analyzer2(
                         sink_name,
                         copy_occurrence=match.sink_callsite_occurrence,
                         stub_names=stub_names,
+                        helpers=helpers,
                     )
                     status, blocking = verdict.status, verdict.blocking_mechanism
 
@@ -1709,6 +1717,7 @@ def run_analyzer2(
                         occurrence=copy_occurrence,
                         sink_class=match.sink_class,
                         sink_form=sink_ref.form if sink_ref is not None else None,
+                        helpers=helpers,
                     )
                 # Recall fallback: a bare sink with no recognized in-function source (and no
                 # constructed shell command — cmd_injection_shape is exempt; its shell-ish literal
@@ -1746,6 +1755,7 @@ def run_analyzer2(
                         sink_arg=sink_arg,
                         entry_sites=sites,
                         sink_ref=sink_ref,
+                        helpers=helpers,
                     )
                     # ★ Red-line write-side reconciliation (Gate A): never persist a const_sink_arg
                     # note on a candidate whose sink argument is a free_string source. Drop the
@@ -1775,6 +1785,7 @@ def run_analyzer2(
                         callsite_index=match.sink_callsite_index,
                         occurrence=copy_occurrence,
                         stub_names=stub_names,
+                        helpers=helpers,
                     )
                     _attach_edge_leads(
                         size_ev,
@@ -1797,6 +1808,7 @@ def run_analyzer2(
                         callsite_index=match.sink_callsite_index,
                         occurrence=copy_occurrence,
                         stub_names=stub_names,
+                        helpers=helpers,
                     )
                     _attach_edge_leads(
                         fmt_size_ev,
@@ -1817,6 +1829,7 @@ def run_analyzer2(
                         entry_sites=sites,
                         stub_names=stub_names,
                         occurrence=match.sink_callsite_occurrence,
+                        helpers=helpers,
                     )
                     # Same def-use provenance merge as the cmd axis (format-string sinks are in the
                     # provenance lexicon too; key arg = the format position).
@@ -1843,6 +1856,7 @@ def run_analyzer2(
                         sink_arg=sink_arg,
                         entry_sites=sites,
                         sink_ref=sink_ref,
+                        helpers=helpers,
                     )
                     # Gate A (same as the cmd axis): never persist a const_sink_arg note on a path
                     # whose argument is a free_string source.
@@ -1900,7 +1914,7 @@ def run_analyzer2(
                 )
                 # Which sources the function calls, read from the callee list exactly as the
                 # detector read it to set source_class — on every sink axis, not only cmd.
-                evidence_keys.update(_source_names_keys(classify(callees).source))
+                evidence_keys.update(_source_names_keys(classify(callees, helpers).source))
                 flow_evidence = _with_evidence_keys(flow_evidence, evidence_keys)
                 pattern_id = upsert_pattern(
                     atlas,
@@ -1996,6 +2010,7 @@ def run_analyzer2(
                 # The SAME stub table the finder counted this candidate's calls with, so the call
                 # every per-call reader below looks at is the call the candidate is anchored to.
                 wc_stub_names = stub_by_binary.get(f.binary_id)
+                wc_helpers = helpers_by_binary.get(f.binary_id, NO_HELPERS)
                 wrapper_ref = _wrapper_sink_arg_ref(
                     f_pseudocode, wc.wrapper_name, fmt_index, wc_stub_names, wc.occurrence
                 )
@@ -2025,6 +2040,7 @@ def run_analyzer2(
                         wc_stub_names,
                         wc.occurrence,
                         sink_form=wrapper_ref.form if wrapper_ref is not None else None,
+                        helpers=wc_helpers,
                     )
                 )
                 evidence = build_flow_evidence(
@@ -2033,6 +2049,7 @@ def run_analyzer2(
                     sink_arg=sink_arg,
                     sink_ref=wrapper_ref,
                     entry_sites=entry_index.sites_for(f.binary_name, f.binary_path),
+                    helpers=wc_helpers,
                     wrapper={
                         "name": wc.wrapper_name,
                         "wrapped_sink": wc.wrapped_sink,
@@ -2184,7 +2201,7 @@ def run_analyzer2(
                             | _detector_error_keys(detector_errors_by_func, f.func_id)
                             # The sources called in the body, by the same name check the wrapper
                             # reading above uses when a called source's flow is not fully traced.
-                            | _source_names_keys(free_sources_called(f_pseudocode)),
+                            | _source_names_keys(free_sources_called(f_pseudocode, wc_helpers)),
                             sort_keys=True,
                         ),
                     ),
