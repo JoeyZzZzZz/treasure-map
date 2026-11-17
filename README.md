@@ -19,9 +19,11 @@ Treasure Map runs a full static analysis of an unpacked firmware and finds four 
 call sites: command execution, memory copies, format strings and file paths. For each call site it
 records facts such as where the arguments come from, how controllable they are and how the call is
 reached, and it marks explicitly what it could not determine. Given two firmware versions, it
-produces a function-level patch diff. Your agent queries these facts over MCP and decides its own
-path through the analysis. The tool runs no model, needs no API key and gives no vulnerability
-verdicts: the tool supplies the facts, and the model makes the judgment.
+produces a function-level patch diff.
+
+Your agent queries these facts over MCP and decides its own path through the analysis. The tool
+runs no model, needs no API key and gives no vulnerability verdicts: the tool supplies the facts,
+and the model makes the judgment.
 
 ![Treasure Map turns your firmware into facts; your agent reads them over MCP and writes its judgments to a separate layer](https://raw.githubusercontent.com/JoeyZzZzZz/treasure-map/main/docs/images/architecture.svg)
 
