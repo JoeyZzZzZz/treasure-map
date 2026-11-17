@@ -42,8 +42,10 @@ from treasure_map.lib.hunt.downweight import (
 from treasure_map.lib.pattern.classes import (
     FMT_STRING_ARG,
     FORMAT_ARG,
+    NO_HELPERS,
     SOURCE,
     ArgRef,
+    SourceHelpers,
     all_format_calls_literal,
     call_args_at,
     call_offsets,
@@ -86,30 +88,52 @@ def _charset_converter_called(pseudocode: str) -> bool:
 _SOURCE_CALL_RE = re.compile(r"\b(" + "|".join(re.escape(s) for s in sorted(SOURCE)) + r")\s*\(")
 
 
+@lru_cache(maxsize=64)
+def _helper_call_re(names: frozenset[str]) -> re.Pattern[str] | None:
+    """The same ``name(`` alternation as ``_SOURCE_CALL_RE``, over one binary's helper names (None
+    when it has none). Built per helper set — the module-wide pattern holds the fixed names only,
+    and a binary's helpers must never be folded into it."""
+    if not names:
+        return None
+    return re.compile(r"\b(" + "|".join(re.escape(s) for s in sorted(names)) + r")\s*\(")
+
+
 @lru_cache(maxsize=256)
-def _sources_called_in(pseudocode: str) -> tuple[str, ...]:
-    """``free_sources_called`` per body text: a caller with several calls to one wrapper yields one
-    candidate per call, all reading the same body."""
-    return tuple(sorted({m.group(1) for m in _SOURCE_CALL_RE.finditer(pseudocode)}))
+def _sources_called_in(pseudocode: str, helpers: SourceHelpers = NO_HELPERS) -> tuple[str, ...]:
+    """``free_sources_called`` per body text and binary helper set: a caller with several calls to
+    one wrapper yields one candidate per call, all reading the same body. The helpers are part of
+    the key — the same body names a source in one binary and not in another."""
+    found = {m.group(1) for m in _SOURCE_CALL_RE.finditer(pseudocode)}
+    helper_re = _helper_call_re(helpers.names)
+    if helper_re is not None:
+        found |= {m.group(1) for m in helper_re.finditer(pseudocode)}
+    return tuple(sorted(found))
 
 
-def free_sources_called(pseudocode: str) -> list[str]:
-    """The free-input sources (network/env/config/json getters) CALLED in the function body, by
-    name, sorted. A name counts only when it is written as a call (``name(``), so a getter whose
-    name is a prefix of another's (``config_get`` / ``config_getall``) is not read into it.
+def free_sources_called(pseudocode: str, helpers: SourceHelpers = NO_HELPERS) -> list[str]:
+    """The free-input sources (network/env/config/json getters, and the binary's own value-getter
+    ``helpers``) CALLED in the function body, by name, sorted. A name counts only when it is written
+    as a call (``name(``), so a getter whose name is a prefix of another's (``config_get`` /
+    ``config_getall``) is not read into it.
 
     NOT a flow claim: a name here was called somewhere in the function, which says nothing about
     whether its value reaches any sink."""
-    return list(_sources_called_in(pseudocode))
+    return list(_sources_called_in(pseudocode, helpers))
 
 
-def _free_source_called(pseudocode: str) -> bool:
+def _free_source_called(pseudocode: str, helpers: SourceHelpers = NO_HELPERS) -> bool:
     """Existence check: a free-input source is CALLED in the function body (``free_sources_called``
     is not empty). NOT a flow claim — used only for the conservative wrapper-candidate fallback."""
-    return bool(free_sources_called(pseudocode))
+    return bool(free_sources_called(pseudocode, helpers))
 
 
-def _source_kind(pseudocode: str, sink_arg: str | None, *, conservative_free: bool = False) -> str:
+def _source_kind(
+    pseudocode: str,
+    sink_arg: str | None,
+    *,
+    conservative_free: bool = False,
+    helpers: SourceHelpers = NO_HELPERS,
+) -> str:
     """Classify the source reaching the sink argument (mechanism, not a verdict).
 
     Order matters — a free source wins over a charset converter so a genuinely dangerous candidate
@@ -132,20 +156,22 @@ def _source_kind(pseudocode: str, sink_arg: str | None, *, conservative_free: bo
         return "unknown"
     if _charset_inline_constrained(pseudocode, sink_arg):
         return "charset_safe"
-    if free_taint_reaches(pseudocode, sink_arg, safe_vars=set()):
+    if free_taint_reaches(pseudocode, sink_arg, safe_vars=set(), helpers=helpers):
         return "free_string"
-    if conservative_free and _free_source_called(pseudocode):
+    if conservative_free and _free_source_called(pseudocode, helpers):
         return "free_string"  # free source present; flow not fully traced -> report, don't miss
     if _charset_converter_called(pseudocode):
         return "charset_maybe"
     return "unknown"
 
 
-def _real_vars(pseudocode: str, deps: Mapping[str, AbstractSet[str]]) -> set[str]:
+def _real_vars(
+    pseudocode: str, deps: Mapping[str, AbstractSet[str]], helpers: SourceHelpers = NO_HELPERS
+) -> set[str]:
     """The function's real variables — values that are written, depended on, caller-supplied, or
     source-seeded. Used to filter format-literal noise (e.g. the `echo`/`s` of `"echo %s"`) out of
     the reported flow so the evidence lists actual flow variables, not parsed string fragments."""
-    strong, weak, par = _seed_sets(pseudocode)
+    strong, weak, par = _seed_sets(pseudocode, helpers)
     real = set(deps.keys()) | strong | weak | par
     for srcs in deps.values():
         real |= srcs & set(deps.keys())  # intermediate vars that themselves have dependencies
@@ -154,14 +180,17 @@ def _real_vars(pseudocode: str, deps: Mapping[str, AbstractSet[str]]) -> set[str
 
 
 def _flow_path(
-    pseudocode: str, sink_arg: str | None, deps: Mapping[str, AbstractSet[str]]
+    pseudocode: str,
+    sink_arg: str | None,
+    deps: Mapping[str, AbstractSet[str]],
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> dict[str, Any]:
     """The sink argument and its ONE-HOP backward dependencies (the intermediate values feeding
     it directly), filtered to real variables. Reliable range only — direct args + one intermediate
     variable; deeper links are summarized by ``trace_boundary``, not invented here."""
     if sink_arg is None:
         return {"sink_arg": None, "one_hop": []}
-    real = _real_vars(pseudocode, deps)
+    real = _real_vars(pseudocode, deps, helpers)
     one_hop = sorted(v for v in deps.get(sink_arg, set()) if v in real)
     return {"sink_arg": sink_arg, "one_hop": one_hop}
 
@@ -281,8 +310,10 @@ def build_flow_evidence(
     entry_sites: list[dict[str, Any]] | None,
     wrapper: dict[str, Any] | None = None,
     sink_ref: ArgRef | None | Literal["unset"] = "unset",
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> dict[str, Any]:
     """Assemble the five-field flow evidence for one command-sink candidate (JSON-serializable).
+    ``helpers`` is the candidate's binary's value-getter helpers (read as weak sources).
 
     Pure and deterministic. ``entry_sites`` is the rootfs invocation evidence gathered separately
     (see ``EntryIndex.sites_for``); None or [] means none was found — reported as ``unknown``,
@@ -298,12 +329,16 @@ def build_flow_evidence(
     located: its form is recorded (``flow_path.sink_arg_form``) and decides the trace boundary for a
     literal, a value loaded through a pointer, or one no variable could be read from. Left unset,
     the boundary reads ``sink_arg`` alone, as before forms were recorded."""
-    deps = _derives_map(pseudocode)
-    path = ({sink_arg} | flows_into(pseudocode, sink_arg)) if sink_arg is not None else set()
+    deps = _derives_map(pseudocode, helpers)
+    path = (
+        ({sink_arg} | flows_into(pseudocode, sink_arg, helpers)) if sink_arg is not None else set()
+    )
     # Wrapper-propagated candidates reach the forwarded argument possibly through intermediate
     # variables, so a present-but-not-fully-traced free source is reported conservatively.
-    source_kind = _source_kind(pseudocode, sink_arg, conservative_free=wrapper is not None)
-    flow_path = _flow_path(pseudocode, sink_arg, deps)
+    source_kind = _source_kind(
+        pseudocode, sink_arg, conservative_free=wrapper is not None, helpers=helpers
+    )
+    flow_path = _flow_path(pseudocode, sink_arg, deps, helpers)
     if sink_ref != "unset":
         ref = sink_ref if isinstance(sink_ref, ArgRef) else None
         flow_path = {**flow_path, "sink_arg_form": ref.form if ref is not None else None}
@@ -416,6 +451,7 @@ def build_size_evidence(
     callsite_index: int | None = None,
     occurrence: int = 0,
     stub_names: Mapping[int, str] | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> dict[str, Any]:
     """Assemble the size-flow evidence for one copy-sink candidate (JSON-serializable).
 
@@ -437,9 +473,9 @@ def build_size_evidence(
     in the text at all: the record then says ``anchor: "function"`` and leaves the ordinals null,
     rather than printing a 0 that would read as "the first call" for a call nobody found."""
     cs = classify_copy_size(pseudocode, sink_name, occurrence=occurrence, stub_names=stub_names)
-    deps = _derives_map(pseudocode)
+    deps = _derives_map(pseudocode, helpers)
     if cs.size_var is not None:
-        real = _real_vars(pseudocode, deps)
+        real = _real_vars(pseudocode, deps, helpers)
         one_hop = sorted(v for v in deps.get(cs.size_var, set()) if v in real)
     else:
         one_hop = []
@@ -503,6 +539,7 @@ def build_format_size_evidence(
     callsite_index: int | None = None,
     occurrence: int = 0,
     stub_names: Mapping[int, str] | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> dict[str, Any]:
     """The write-length evidence for one buffer-formatter candidate (JSON-serializable).
 
@@ -517,9 +554,9 @@ def build_format_size_evidence(
     carry the destination's size, and inventing one is the failure this whole axis is written
     around."""
     fs = classify_format_size(pseudocode, sink_name, occurrence=occurrence, stub_names=stub_names)
-    deps = _derives_map(pseudocode)
+    deps = _derives_map(pseudocode, helpers)
     if fs.size_var is not None:
-        real = _real_vars(pseudocode, deps)
+        real = _real_vars(pseudocode, deps, helpers)
         one_hop = sorted(v for v in deps.get(fs.size_var, set()) if v in real)
     else:
         one_hop = []
@@ -560,6 +597,7 @@ def build_fmtstr_evidence(
     entry_sites: list[dict[str, Any]] | None,
     stub_names: Mapping[int, str] | None = None,
     occurrence: int | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> dict[str, Any]:
     """Assemble the flow evidence for one format-string-injection candidate (JSON-serializable).
 
@@ -577,6 +615,7 @@ def build_fmtstr_evidence(
         sink_arg=fmt_arg,
         entry_sites=entry_sites,
         sink_ref=fmt_ref,
+        helpers=helpers,
     )
     ev["fmt_arg_pos"] = FMT_STRING_ARG.get(sink_name)
     ev["fmt_arg_literal"] = all_format_calls_literal(pseudocode, sink_name, stub_names)

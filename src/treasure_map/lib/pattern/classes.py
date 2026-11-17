@@ -14,7 +14,7 @@ from __future__ import annotations
 import functools
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from treasure_map.lib.pattern.extractor_names import REGISTRY
 
@@ -123,6 +123,47 @@ SOURCE_WEAK: frozenset[str] = frozenset(
 # Union — the set the shape detector uses for "is this callee an external-input source" (shape, not
 # strength). Keep this equal to the historical SOURCE so the shape detector stays unchanged.
 SOURCE: frozenset[str] = SOURCE_STRONG | SOURCE_WEAK
+
+# The slot a value-getter helper hands its value out through when it RETURNS it (any other slot is
+# the 0-based position of the out-parameter it writes the value into).
+RETURN_SLOT = -1
+
+
+@dataclass(frozen=True)
+class SourceHelpers:
+    """One binary's value-getter helpers: functions DEFINED IN THAT BINARY that call a known source
+    (``SOURCE``) and hand its value on — by returning it (``RETURN_SLOT``) or by writing it into one
+    of their parameters (that parameter's 0-based position). A call to one of them is read as a
+    call to a WEAK source: never a strong one, whatever source the helper calls, so it can label a
+    candidate and seed weak taint but never grade one confirmed.
+
+    Per binary because a helper's name means something only in its own binary: an unnamed
+    function's name is its address, and two binaries can hold different functions under one name.
+    So this is passed, explicitly, to every reader that asks "is this callee a source" — never
+    folded into a module-wide list, and never read from ambient state — and the readers that cache
+    a body's reading take it as part of the cache key: one body read in two binaries can seed
+    differently. ``slots`` is the whole value (equality and hash); ``names`` is derived from it.
+
+    ★ WHICH functions qualify is not decided anywhere yet: nothing in this tree builds a non-empty
+    table, so every reader runs on the empty default and the readings are what they were before
+    this type existed. The mechanism is here, the criterion is not."""
+
+    slots: frozenset[tuple[str, int]] = frozenset()
+    names: frozenset[str] = field(init=False, compare=False, hash=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "names", frozenset(name for name, _slot in self.slots))
+
+    def returns_value(self, name: str) -> bool:
+        return (name, RETURN_SLOT) in self.slots
+
+    def out_positions(self, name: str) -> tuple[int, ...]:
+        """The parameter positions ``name`` writes its value into, ascending."""
+        return tuple(sorted(slot for n, slot in self.slots if n == name and slot != RETURN_SLOT))
+
+
+# A binary with no value-getter helper (and the default wherever none is passed).
+NO_HELPERS = SourceHelpers()
 
 # String formatters: build a buffer from a format and arguments, or append to one. The _chk forms
 # are the fortified (-D_FORTIFY_SOURCE) entry points a compiler substitutes for the plain calls;

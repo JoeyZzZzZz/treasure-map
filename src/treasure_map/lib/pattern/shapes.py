@@ -28,8 +28,10 @@ from treasure_map.lib.pattern.classes import (
     COPY,
     FMT_STRING,
     FORMAT,
+    NO_HELPERS,
     PATH_SINK,
     SOURCE,
+    SourceHelpers,
     all_format_calls_literal,
     format_call_is_risky,
     sink_callsites,
@@ -60,11 +62,14 @@ class CallClasses:
     path_sink: frozenset[str]
 
 
-def classify(callees: list[str]) -> CallClasses:
-    """Bucket callee names into source / format / cmd / copy / fmt_string / path_sink classes."""
+def classify(callees: list[str], helpers: SourceHelpers = NO_HELPERS) -> CallClasses:
+    """Bucket callee names into source / format / cmd / copy / fmt_string / path_sink classes.
+
+    ``helpers`` is the callee's binary's value-getter helpers (classes.SourceHelpers): a call to
+    one counts as a source here, the same as a name in SOURCE."""
     names = {c.strip() for c in callees if isinstance(c, str) and c.strip()}
     return CallClasses(
-        source=frozenset(names & SOURCE),
+        source=frozenset(names & SOURCE) | frozenset(names & helpers.names),
         fmt=frozenset(names & FORMAT),
         cmd=frozenset(names & CMD),
         copy=frozenset(names & COPY),
@@ -139,6 +144,7 @@ def pattern_cmd(
     callees: list[str],
     pseudocode: str,
     stub_names: Mapping[int, str] | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> list[PatternMatch]:
     """Command-sink shape: ONE candidate per command-sink CALLSITE (system/popen/exec*).
 
@@ -173,7 +179,7 @@ def pattern_cmd(
 
     A function whose body spells out no call to any of its command callees yields exactly ONE
     candidate with no callsite anchor — the same recall floor the copy split keeps."""
-    cc = classify(callees)
+    cc = classify(callees, helpers)
     if not cc.cmd:
         return []
     # A constructed shell command needs a formatter to build it AND a shell-ish literal to build.
@@ -207,6 +213,7 @@ def pattern_b(
     callees: list[str],
     pseudocode: str,
     stub_names: Mapping[int, str] | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> list[PatternMatch]:
     """Copy/overflow shape: ONE candidate per copy CALLSITE. Source is a scoring signal, not a gate.
 
@@ -225,7 +232,7 @@ def pattern_b(
     function still yields exactly ONE candidate with no callsite anchor: the function-level match
     it has always produced, byte-for-byte. Emitting nothing there would pay for the split with a
     silent recall loss, which is the trade this change exists to refuse."""
-    cc = classify(callees)
+    cc = classify(callees, helpers)
     if not cc.copy:
         return []
     shape = "source->copy" if cc.source else "copy"
@@ -254,6 +261,7 @@ def pattern_format(
     callees: list[str],
     pseudocode: str,
     stub_names: Mapping[int, str] | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> list[PatternMatch]:
     """Buffer-formatter write shape: ONE candidate per formatter CALLSITE.
 
@@ -279,7 +287,7 @@ def pattern_format(
 
     A function whose body spells out no call (the callee list names one, the text does not) yields
     ONE function-level candidate with no callsite anchor — the same recall floor pattern_b keeps."""
-    cc = classify(callees)
+    cc = classify(callees, helpers)
     if not cc.fmt:
         return []
     shape = "source->format" if cc.source else "format"
@@ -315,6 +323,7 @@ def pattern_fmtstr(
     callees: list[str],
     pseudocode: str,
     stub_names: Mapping[int, str] | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> list[PatternMatch]:
     """Format-string-injection shape: ONE candidate per printf-family CALLSITE whose format
     argument is NOT a literal.
@@ -335,7 +344,7 @@ def pattern_fmtstr(
     floor pattern_b keeps; emitting nothing there would pay for the split with a silent recall
     loss. A call whose format position cannot be read counts as risky, never as exempt:
     prove-safe-to-exempt, never prove-dangerous-to-keep."""
-    cc = classify(callees)
+    cc = classify(callees, helpers)
     if not cc.fmt_string:
         return []
     shape = "source->fmt_string" if cc.source else "fmt_string"
@@ -376,6 +385,7 @@ def pattern_path(
     callees: list[str],
     pseudocode: str,
     stub_names: Mapping[int, str] | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> list[PatternMatch]:
     """Path/file-sink shape: ONE candidate per path-sink CALLSITE (fopen/open/unlink/rename/...).
 
@@ -396,7 +406,7 @@ def pattern_path(
     A function whose body spells out no call to any of its path callees still yields exactly ONE
     candidate with no callsite anchor — the function-level match it has always produced. Emitting
     nothing there would pay for the split with a silent recall loss."""
-    cc = classify(callees)
+    cc = classify(callees, helpers)
     if not cc.path_sink:
         return []
     shape = "source->path_sink" if cc.source else "path_sink"
@@ -427,7 +437,9 @@ def pattern_path(
     ]
 
 
-Detector = Callable[[FuncRef, list[str], str, "Mapping[int, str] | None"], "list[PatternMatch]"]
+Detector = Callable[
+    [FuncRef, list[str], str, "Mapping[int, str] | None", SourceHelpers], "list[PatternMatch]"
+]
 
 # Explicit registry — one entry per shape, plain callables only. The command axis is ONE entry
 # emitting two kinds (a template signal picks which), rather than two detectors that had to be

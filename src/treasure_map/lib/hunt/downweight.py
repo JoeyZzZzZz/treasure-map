@@ -37,8 +37,10 @@ from treasure_map.lib.pattern.classes import (
     COPY,
     FORMAT,
     FORMAT_ARG,
+    NO_HELPERS,
     SAFE_FORMS,
     SOURCE,
+    SourceHelpers,
     _literal_spans,
     arg_ref,
     call_args_at,
@@ -181,6 +183,7 @@ def _sink_arg_is_literal(
     sink_arg: str | None,
     stub_names: Mapping[int, str] | None = None,
     occurrence: int = 0,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> bool:
     """True when THIS candidate's sink argument is a fixed .rodata constant with no free value
     reaching it — `system("/sbin/reboot")`, the highest-frequency command false positive.
@@ -212,7 +215,9 @@ def _sink_arg_is_literal(
         return False  # a constant template is not a constant command: the vararg is the danger
     # Parameter-specific guard: a free value reaching this candidate's sink argument means the
     # literal above is a different callsite — do not downweight this (tainted) candidate.
-    if sink_arg is not None and free_taint_reaches(pseudocode, sink_arg, safe_vars=set()):
+    if sink_arg is not None and free_taint_reaches(
+        pseudocode, sink_arg, safe_vars=set(), helpers=helpers
+    ):
         return False
     return True
 
@@ -637,14 +642,18 @@ def _buf_contained(arg_text: str, buf: str) -> bool:
 
 
 def _value_is_constrained(
-    pseudocode: str, sink_arg: str, converters: frozenset[str], sink_pos: int
+    pseudocode: str,
+    sink_arg: str,
+    converters: frozenset[str],
+    sink_pos: int,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> bool:
     """The sink buffer is numeric-constrained (R5): a converter result is on its path (the range
     filter), AND every write to the buffer up to the sink is a safe write
     (:func:`_buffer_writes_all_safe`). The old SOURCE-name reasoning is gone — a path with no
     converter result is simply not checked (no new mark), and correctness rests on the write
     check, not on which input names reach the argument."""
-    path = {sink_arg} | flows_into(pseudocode, sink_arg)
+    path = {sink_arg} | flows_into(pseudocode, sink_arg, helpers)
     on_path = _constrained_results(pseudocode, path, converters)
     on_path |= _inline_constrained_results(pseudocode, converters) & path
     if not on_path:
@@ -676,6 +685,7 @@ def _caller_only_constants(
     *,
     pseudocode: str = "",
     sink_arg: str | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> bool:
     """One-hop: the sink's dangerous argument IS one of this function's parameters, the function
     neither reads external input nor rewrites that parameter, and EVERY call to it in EVERY
@@ -694,8 +704,9 @@ def _caller_only_constants(
     hint and never a proof (see sink_impact.PROVABLY_CONSTANT_MARKERS)."""
     if not func_name or not callers_pseudocode or sink_arg is None:
         return False
-    if {c.strip() for c in callees} & SOURCE:
-        return False  # the function takes external input directly
+    called = {c.strip() for c in callees}
+    if called & SOURCE or called & helpers.names:
+        return False  # the function takes external input directly (or through its binary's helper)
     slots = signature_slots(pseudocode)
     if sink_arg not in slots:
         return False  # the dangerous value is not a parameter: what callers pass is not it
@@ -729,8 +740,10 @@ def detect_form_signal(
     occurrence: int = 0,
     sink_class: str | None = None,
     sink_form: str | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> str | None:
-    """Return one neutral form note to downweight this candidate, or None.
+    """Return one neutral form note to downweight this candidate, or None. ``helpers`` is the
+    candidate's binary's value-getter helpers, read as weak sources wherever a source is read.
 
     Every branch is parameter-specific (see the module docstring): it fires only when the sink's
     dangerous argument truly comes only from the recognized safe/constant source. Returns None
@@ -747,18 +760,23 @@ def detect_form_signal(
     # The call's own literal first: it is the per-callsite proof; caller_constant is a one-hop
     # hint read from callers that may not all be known, and must not stand in front of it.
     if sink_name is not None and _sink_arg_is_literal(
-        pseudocode, sink_name, sink_arg, stub_names, occurrence
+        pseudocode, sink_name, sink_arg, stub_names, occurrence, helpers
     ):
         return CONST_SINK_ARG
     if sink_form in ("var", "cast") and _caller_only_constants(
-        func_name, callees, callers_pseudocode or [], pseudocode=pseudocode, sink_arg=sink_arg
+        func_name,
+        callees,
+        callers_pseudocode or [],
+        pseudocode=pseudocode,
+        sink_arg=sink_arg,
+        helpers=helpers,
     ):
         return CALLER_CONSTANT
     safe_form = sink_form in SAFE_FORMS
     if (
         safe_form
         and sink_arg is not None
-        and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS, sink_pos)
+        and _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS, sink_pos, helpers)
     ):
         return NUMERIC_SANITIZED
     if safe_form and sink_arg is not None and _charset_downweight(pseudocode, sink_arg, sink_name):
@@ -779,6 +797,7 @@ def wrapper_propagation_form_note(
     stub_names: Mapping[int, str] | None = None,
     occurrence: int | None = None,
     sink_form: str | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> str | None:
     """Form note for a wrapper-propagated command candidate (factor ①).
 
@@ -803,7 +822,8 @@ def wrapper_propagation_form_note(
     # wrapper is a constant command ONLY when no free value also reaches this candidate's forwarded
     # argument — otherwise the literal is a different callsite and downweighting hides the lead.
     if literal_first and not (
-        sink_arg is not None and free_taint_reaches(pseudocode, sink_arg, safe_vars=set())
+        sink_arg is not None
+        and free_taint_reaches(pseudocode, sink_arg, safe_vars=set(), helpers=helpers)
     ):
         return CONST_SINK_ARG
     safe_form = sink_form in SAFE_FORMS
@@ -814,7 +834,7 @@ def wrapper_propagation_form_note(
             if occurrence is not None and 0 <= occurrence < len(offsets)
             else (offsets[0] if offsets else -1)
         )
-        if _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS, sink_pos):
+        if _value_is_constrained(pseudocode, sink_arg, _NUMERIC_VALIDATORS, sink_pos, helpers):
             return NUMERIC_SANITIZED
     if (
         safe_form

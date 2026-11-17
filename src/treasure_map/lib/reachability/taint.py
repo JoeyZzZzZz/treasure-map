@@ -38,10 +38,12 @@ from treasure_map.lib.pattern.classes import (
     COPY,
     FMT_STRING,
     FORMAT,
+    NO_HELPERS,
     SOURCE,
     SOURCE_STRONG,
     SOURCE_WEAK,
     ArgRef,
+    SourceHelpers,
     _literal_spans,
     arg_ref,
     call_args_at,
@@ -51,7 +53,8 @@ from treasure_map.lib.pattern.classes import (
 
 # Identifiers that are NOT variables and must not become flow edges (they pollute the flow
 # set and let an unrelated validator spuriously "cover" a dangerous input). Callee names are
-# detected per-function; these cover C/Ghidra type words and control keywords.
+# detected per-function; these cover C/Ghidra type words and control keywords. A binary's own
+# value-getter helpers (classes.SourceHelpers) are added to this per call, never folded in here.
 _CALL_CLASS_NAMES = SOURCE | FORMAT | COPY | CMD | FMT_STRING
 _BUILDER_NAMES = FORMAT | COPY
 _SOURCE_NAMES = SOURCE_STRONG | SOURCE_WEAK
@@ -232,7 +235,11 @@ def _calls_in(stmt: str, names: frozenset[str]) -> list[tuple[str, list[str]]]:
 
 
 # ★ Per-function memoization (H-4). _derives_map / _seed_sets / _call_names are pure functions of
-# the pseudocode text, and one function's body is read many times over — once per candidate it
+# their arguments — the pseudocode text and, for the first two, the binary's value-getter helpers
+# (classes.SourceHelpers). The helpers are part of the key on purpose: whether a call is a source
+# depends on the binary, so one body read in two binaries can seed differently, and a cache keyed
+# on the text alone would hand the second binary the first one's answer. One function's body is
+# read many times over — once per candidate it
 # holds, and `grader` calls `flows_into` once per covered variable, each rebuilding the whole
 # dependency map. The hunt passes the SAME `row.pseudocode` object to every read of one function
 # (analyzer2 loads it once), so a small bounded cache keyed on that text turns a per-candidate
@@ -271,18 +278,23 @@ def _seed_source(
     rhs: str,
     strong: set[str],
     weak: set[str],
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> None:
-    """Seed taint for one source call onto the value it actually produces."""
+    """Seed taint for one source call onto the value it actually produces. A binary's value-getter
+    helper is never in SOURCE_STRONG, so its value is always seeded WEAK — on the assigned variable
+    when it returns the value, on the argument at each position it writes the value into."""
     target = strong if name in SOURCE_STRONG else weak
-    if name in _RETURN_SOURCES:
+    if name in _RETURN_SOURCES or helpers.returns_value(name):
         # Return-value source: only the assigned variable carries the input.
         if lhs is not None and name in rhs:
             target.add(lhs)
-        return
+        if name in _RETURN_SOURCES:
+            return
+    positions = helpers.out_positions(name)
     pos = _BUFFER_SOURCE_ARG.get(name)
-    if pos is not None:
+    for p in (pos,) if pos is not None else positions:
         # Buffer-output source: only the buffer argument it writes into.
-        buf = _arg_ident(args, pos)
+        buf = _arg_ident(args, p)
         if buf is not None:
             target.add(buf)
     # Sources we cannot precisely attribute (e.g. scanf-family, or a getter whose value lands in a
@@ -290,13 +302,20 @@ def _seed_source(
     # never toward over-claiming).
 
 
-def _dep_idents(text: str, call_names: AbstractSet[str]) -> set[str]:
-    """Plausible variable identifiers in ``text`` — pollution (callee names, type words,
-    hex fragments) removed so the flow set stays trustworthy."""
+def _dep_idents(
+    text: str, call_names: AbstractSet[str], helper_names: AbstractSet[str] = frozenset()
+) -> set[str]:
+    """Plausible variable identifiers in ``text`` — pollution (callee names, the binary's helper
+    names, type words, hex fragments) removed so the flow set stays trustworthy."""
     cleaned = _HEX_LITERAL_RE.sub(" ", text)
     out: set[str] = set()
     for ident in _IDENT_RE.findall(cleaned):
-        if ident in call_names or ident in _CALL_CLASS_NAMES or ident in _TYPE_WORDS:
+        if (
+            ident in call_names
+            or ident in _CALL_CLASS_NAMES
+            or ident in helper_names
+            or ident in _TYPE_WORDS
+        ):
             continue
         if _SIZED_TYPE_RE.match(ident) or _HEX_FRAGMENT_RE.match(ident):
             continue
@@ -305,7 +324,9 @@ def _dep_idents(text: str, call_names: AbstractSet[str]) -> set[str]:
 
 
 @lru_cache(maxsize=_CACHE_SIZE)
-def _derives_map(pseudocode: str) -> Mapping[str, frozenset[str]]:
+def _derives_map(
+    pseudocode: str, helpers: SourceHelpers = NO_HELPERS
+) -> Mapping[str, frozenset[str]]:
     """Map each variable to the variables it is directly assigned/built from.
 
     Edges come from the same real assignment/builder forms the forward taint uses:
@@ -319,18 +340,21 @@ def _derives_map(pseudocode: str) -> Mapping[str, frozenset[str]]:
         assign = _ASSIGN_RE.match(stmt)
         if assign is not None:
             lhs, rhs = assign.group(1), assign.group(2)
-            deps.setdefault(lhs, set()).update(_dep_idents(rhs, call_names) - {lhs})
+            deps.setdefault(lhs, set()).update(_dep_idents(rhs, call_names, helpers.names) - {lhs})
         for _name, parts in _calls_in(stmt, _BUILDER_NAMES):
             dst = arg_ref(parts[0]).root if parts else None
             if dst is not None:
-                rest = _dep_idents(",".join(parts[1:]), call_names) - {dst}
+                rest = _dep_idents(",".join(parts[1:]), call_names, helpers.names) - {dst}
                 deps.setdefault(dst, set()).update(rest)
     return MappingProxyType({k: frozenset(v) for k, v in deps.items()})
 
 
 @lru_cache(maxsize=_CACHE_SIZE)
-def _seed_sets(pseudocode: str) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
-    """Return the directly-seeded (strong, weak, parameter) inputs — pre-propagation.
+def _seed_sets(
+    pseudocode: str, helpers: SourceHelpers = NO_HELPERS
+) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    """Return the directly-seeded (strong, weak, parameter) inputs — pre-propagation. A call to
+    one of the binary's value-getter ``helpers`` seeds like a weak source.
 
     These are the ORIGINATING tainted values (a source's buffer/return, or a parameter),
     not the propagated copies. Coverage is judged against these seeds so that validating a
@@ -340,23 +364,24 @@ def _seed_sets(pseudocode: str) -> tuple[frozenset[str], frozenset[str], frozens
     strong: set[str] = set()
     weak: set[str] = set()
     par: set[str] = set(_CALLER_SUPPLIED_RE.findall(pseudocode))
+    names = (_SOURCE_NAMES | helpers.names) if helpers.slots else _SOURCE_NAMES
     for stmt in re.split(r"[;\n{}]", pseudocode):
         assign = _ASSIGN_RE.match(stmt)
         lhs = assign.group(1) if assign else None
         rhs = assign.group(2) if assign else ""
-        for name, args in _calls_in(stmt, _SOURCE_NAMES):
-            _seed_source(name, args, lhs, rhs, strong, weak)
+        for name, args in _calls_in(stmt, names):
+            _seed_source(name, args, lhs, rhs, strong, weak, helpers)
     return frozenset(strong), frozenset(weak), frozenset(par)
 
 
-def flows_into(pseudocode: str, sink_var: str) -> set[str]:
+def flows_into(pseudocode: str, sink_var: str, helpers: SourceHelpers = NO_HELPERS) -> set[str]:
     """Return the variables that flow into ``sink_var`` (its backward dependency set).
 
     Walks the assignment/builder edges backward from sink_var to a fixed point. The
     returned set does NOT include sink_var itself. Used to recognize a validator applied
     to the value reaching the sink even after intermediate copies/format calls rename it.
     """
-    deps = _derives_map(pseudocode)
+    deps = _derives_map(pseudocode, helpers)
     seen: set[str] = set()
     stack = [sink_var]
     while stack:
@@ -368,7 +393,13 @@ def flows_into(pseudocode: str, sink_var: str) -> set[str]:
     return seen
 
 
-def free_taint_reaches(pseudocode: str, sink_var: str, *, safe_vars: set[str]) -> bool:
+def free_taint_reaches(
+    pseudocode: str,
+    sink_var: str,
+    *,
+    safe_vars: set[str],
+    helpers: SourceHelpers = NO_HELPERS,
+) -> bool:
     """True if a free value reaches ``sink_var`` BYPASSING the recognized safe source.
 
     A free value is an in-function source-call output (strong/weak) or a caller-supplied
@@ -379,8 +410,8 @@ def free_taint_reaches(pseudocode: str, sink_var: str, *, safe_vars: set[str]) -
     a downweight that recognizes one safe source must still be suppressed when some other,
     uncontrolled path also reaches the same dangerous argument.
     """
-    deps = _derives_map(pseudocode)
-    strong, weak, par = _seed_sets(pseudocode)
+    deps = _derives_map(pseudocode, helpers)
+    strong, weak, par = _seed_sets(pseudocode, helpers)
     free = (strong | weak | par) - safe_vars
     seen = {sink_var}
     stack = [sink_var]

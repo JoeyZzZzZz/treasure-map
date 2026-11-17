@@ -25,7 +25,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from treasure_map.lib.pattern.classes import COPY, FMT_STRING, FORMAT
+from treasure_map.lib.pattern.classes import (
+    COPY,
+    FMT_STRING,
+    FORMAT,
+    NO_HELPERS,
+    SourceHelpers,
+)
 from treasure_map.lib.reachability.copy_size import (
     SIZE_APPEND_CONST,
     SIZE_APPEND_VARIABLE,
@@ -167,6 +173,7 @@ def grade_candidate(
     *,
     copy_occurrence: int | None = None,
     stub_names: Mapping[int, str] | None = None,
+    helpers: SourceHelpers = NO_HELPERS,
 ) -> ReachabilityVerdict:
     """Grade one candidate as confirmed / unknown (``blocked`` is reserved, never emitted here).
 
@@ -186,6 +193,9 @@ def grade_candidate(
     is threaded to every reader below so that a sink call the decompiler named after its stub is
     graded like any other; with none, such a call is invisible and the verdict degrades honestly to
     "the sink call or its argument could not be located".
+
+    ``helpers`` is the binary's value-getter helpers (classes.SourceHelpers): their values seed
+    WEAK, so a flow from one grades unknown, never confirmed.
     """
     if not callees:
         return ReachabilityVerdict("unknown", None, _BASIS_NO_CALLEES, degraded=True)
@@ -236,13 +246,13 @@ def grade_candidate(
     # validator on its own path INTO the sink. blocked requires a trustworthy flow set and
     # that EVERY dangerous seed is cleanly, directly covered; ANY doubt grades unknown so a
     # possibly-reachable path is never hidden as unreachable.
-    flow = flows_into(pseudocode, sink_arg)  # cleaned flow set
+    flow = flows_into(pseudocode, sink_arg, helpers)  # cleaned flow set
     path = {sink_arg} | flow
-    strong_seeds, weak_seeds, par_seeds = _seed_sets(pseudocode)
+    strong_seeds, weak_seeds, par_seeds = _seed_sets(pseudocode, helpers)
     dangerous = (strong_seeds | weak_seeds | par_seeds) & path
 
     covered_vars = {var for var in path if has_validator(callees, pseudocode, var)[0]}
-    cover_flow = {w: flows_into(pseudocode, w) for w in covered_vars}
+    cover_flow = {w: flows_into(pseudocode, w, helpers) for w in covered_vars}
 
     def _is_covered(seed: str) -> bool:
         # Covered iff a validated variable W sits on the seed's path to the sink: W is the

@@ -16,9 +16,11 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 
 from treasure_map.lib.errors import ConfigError
+from treasure_map.lib.pattern.classes import NO_HELPERS, SourceHelpers
 from treasure_map.lib.pattern.models import FuncRef, PatternMatch, PatternStats, ScanResult
 from treasure_map.lib.pattern.shapes import DETECTORS
 from treasure_map.lib.ro_db import ro_uri
@@ -99,8 +101,13 @@ def shape_scan_invariant_holds(stats: PatternStats) -> bool:
     return stats.functions_with_callees + stats.callee_parse_failed == stats.functions_scanned
 
 
-def scan(db_path: Path | str) -> ScanResult:
+def scan(
+    db_path: Path | str, helpers_by_binary: Mapping[int, SourceHelpers] | None = None
+) -> ScanResult:
     """Scan an analysis.db (read-only) for call-sequence shape candidates.
+
+    ``helpers_by_binary`` (binary_id -> that binary's value-getter helpers) lets a call to one of
+    a binary's own helpers count as a source in that binary, and in no other.
 
     Every binary is scanned; no binary is skipped by name or by components-table membership
     (origin is a label carried on the instance, never a scan-time filter). A function whose stored
@@ -158,8 +165,9 @@ def scan(db_path: Path | str) -> ScanResult:
         # loop and are incremented once per function — a function that yields six candidates is
         # still one function scanned, so the partition Gate D checks is unaffected by how many
         # candidates come out of it.
+        helpers = (helpers_by_binary or {}).get(row["binary_id"], NO_HELPERS)
         for detector in DETECTORS:
-            for match in detector(func_ref, callees, pseudocode, stub_names):
+            for match in detector(func_ref, callees, pseudocode, stub_names, helpers):
                 matches.append(match)
                 hits[match.pattern_kind] += 1
 
