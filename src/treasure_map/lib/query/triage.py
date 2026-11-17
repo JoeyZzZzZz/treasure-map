@@ -2429,17 +2429,59 @@ def _dim_writer(
     )
 
 
-def _dim_completeness() -> Dimension:
-    """Was the containing function fully decompiled? '?' this phase: the per-function
-    decompile-completeness signal lives in analysis.db, and triage is atlas-only. Honestly
-    deferred, never faked complete."""
+# What the completeness layer cites: the boundary-origin fact the hunt copied into the atlas.
+_FUNCTION_ORIGIN_SOURCE = "function_origin (functions.origin, copied at hunt)"
+# The boundary origins that mark a fragment: a function made by promotion or reached through a
+# data pointer, whose boundary — and so the context the candidate is read in — may be cut short.
+_FRAGMENT_ORIGINS = frozenset({"promoted", "recovered"})
+_PARTIAL_BINARY_HINT = (
+    "cross-check partially_incomplete_binaries at the listing top level for this binary — a "
+    "partial binary means some of its functions never decompiled"
+)
+
+
+def _dim_completeness(function_origin: str | None) -> Dimension:
+    """Was the containing function read whole? Two halves, one of them wired. The boundary origin
+    — how the function was found (``functions.origin``) — is stored in the atlas by the hunt
+    (``instance.function_origin``), so this atlas-only read can say when a candidate sits in a
+    fragment: ``structural:promoted`` / ``structural:recovered``, a structural fact about the
+    boundary, never a judgement of decompile completeness. Per-function decompile completeness
+    is still not wired into the atlas, so every other case stays '?': ``analysis`` (a boundary from
+    the regular analysis — not marked as a fragment, which is NOT "complete") and NULL or any
+    other value (not recorded), each with its own note. The value is never ``complete`` — the one
+    value the only-up completeness promote reads — so this layer moves no candidate's rank."""
+    if function_origin in _FRAGMENT_ORIGINS:
+        how = (
+            "promotion turned a code block into this function"
+            if function_origin == "promoted"
+            else "this function was reached only through a pointer in the binary's data"
+        )
+        return Dimension(
+            "completeness",
+            "structural",
+            function_origin,
+            _FUNCTION_ORIGIN_SOURCE,
+            f"a fragment boundary: {how}, so the function's boundary — and the context the "
+            "candidate is read in — may be cut short. A structural fact about where the boundary "
+            "came from, not a judgement of decompile completeness; read the code around it",
+        )
+    if function_origin == "analysis":
+        return Dimension(
+            "completeness",
+            "unknown",
+            "unknown",
+            _FUNCTION_ORIGIN_SOURCE,
+            "the boundary came from the regular analysis (not marked as a fragment); per-function "
+            "decompile completeness is not wired into the atlas, so this is not a claim the "
+            "function was read whole. " + _PARTIAL_BINARY_HINT,
+        )
     return Dimension(
         "completeness",
         "unknown",
         "unknown",
-        "per-function decompile completeness (not wired into the atlas-only triage this phase)",
-        "cross-check partially_incomplete_binaries at the listing top level for this binary — "
-        "a partial binary means some of its functions never decompiled",
+        _FUNCTION_ORIGIN_SOURCE,
+        "the boundary origin is not recorded (an instance hunted before the column existed, or an "
+        "analysis.db without functions.origin). " + _PARTIAL_BINARY_HINT,
     )
 
 
@@ -2581,6 +2623,7 @@ def _build_dimensions(
     wrapper_names: frozenset[str] = frozenset(),
     string_keyed_edges: tuple[dict[str, Any], ...] = (),
     callsite_addr: int | None = None,
+    function_origin: str | None = None,
 ) -> tuple[Dimension, ...]:
     """The honest map layers for one candidate. web_settable is the SaTC front↔back cross, looked
     up once when the source resolved to an nvram key (shared by source_writability); the
@@ -2608,7 +2651,7 @@ def _build_dimensions(
         _dim_filtering(flow_evidence),
         _dim_sink_impact(sink_class),
         _dim_writer(flow_evidence, sink_anchor, callsite_addr=callsite_addr),
-        _dim_completeness(),
+        _dim_completeness(function_origin),
     )
     return _mark_errored_dimensions(dims, _errored_detectors(flow_evidence))
 
@@ -2701,6 +2744,7 @@ def _candidate_in_run(
             wrapper_names=wrapper_names,
             string_keyed_edges=string_keyed_edges,
             callsite_addr=callsite_addr,
+            function_origin=_row_get(row, "function_origin"),
         ),
     )
 
@@ -3284,7 +3328,8 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
     sql = (
         "SELECT i.reachability_status, i.blocking_mechanism, i.exposure_shape, i.origin, "
         "i.source_anchor, i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, "
-        "i.flow_evidence, p.source_class, p.sink_class, p.structural_fingerprint "
+        "i.flow_evidence, i.function_origin, p.source_class, p.sink_class, "
+        "p.structural_fingerprint "
         "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id"
     )
     params: list[str] = []
@@ -3404,8 +3449,8 @@ def explain_candidate(conn: sqlite3.Connection, evidence_ref: str) -> CandidateE
     rows = conn.execute(
         "SELECT i.reachability_status, i.blocking_mechanism, i.exposure_shape, i.origin, "
         "i.source_anchor, i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, "
-        "i.flow_evidence, p.source_class, p.sink_class, p.call_sequence_shape, "
-        "p.structural_fingerprint "
+        "i.flow_evidence, i.function_origin, p.source_class, p.sink_class, "
+        "p.call_sequence_shape, p.structural_fingerprint "
         "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
         "WHERE i.evidence_ref = ? "
         "ORDER BY i.instance_id",

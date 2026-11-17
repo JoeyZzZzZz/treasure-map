@@ -52,13 +52,18 @@ class InstanceRow:
     # Where this instance's code came from. One of custom/vendor_modified_oss/stock_oss_known/
     # unknown — and 'unknown' is the only one the hunt writes: the guess that read a symbol name
     # to answer this was retired (see lib/hunt/downweight.py). The other three are a slot held
-    # for a classifier that decides from content, not a state the pipeline reaches today.
+    # for a classifier that decides from content, not a state the pipeline reaches today. Not to
+    # be confused with function_origin (how the function's boundary was found — the fragment fact).
     origin: str = "unknown"
     # Neutral structural fact: the function is a thin wrapper forwarding a parameter to a shell
     # command sink, and which sink (system/popen/doSystem). Recorded for a later analysis layer;
     # no recall/downweight/triage path reads these — a fact, not a verdict or a score input.
     is_thin_cmd_wrapper: bool = False
     wrapped_sink: str | None = None
+    # How the containing function's boundary was found: functions.origin of the run's analysis.db,
+    # copied verbatim at hunt (analysis / promoted / recovered). NOT ``origin`` (where the code came
+    # from). None = not recorded (hunted before the column, or an analysis.db without it).
+    function_origin: str | None = None
     # Structured flow evidence for a command-sink candidate (JSON string; see lib/hunt/evidence.py).
     # Read-only structured facts — no recall/score/grade path consumes it.
     flow_evidence: str | None = None

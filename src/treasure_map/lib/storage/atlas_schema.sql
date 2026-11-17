@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS instance (
     --   recall/downweight/triage path reads these (a fact, not a verdict or a score input).
     is_thin_cmd_wrapper INTEGER NOT NULL DEFAULT 0 CHECK (is_thin_cmd_wrapper IN (0,1)),
     wrapped_sink        TEXT,
+    -- How the containing function's BOUNDARY was found: functions.origin of the run's analysis.db,
+    --   copied verbatim by the hunt — analysis (the decompiler's own analysis) / promoted (a code
+    --   block turned into a function by promotion) / recovered (reached only through a pointer in
+    --   the binary's data). NOT ``origin`` below (where the code came from). NULL = not recorded
+    --   (an instance hunted before this column existed, or an analysis.db without the column). A
+    --   fact surfaced by the read layer; not a basis dimension, not a score input.
+    function_origin     TEXT,
     -- Structured flow EVIDENCE for a command-sink candidate (JSON: source_kind / flow_path /
     --   sanitizer_seen[coverage=unjudged] / entry_reach / trace_boundary). Material for a
     --   downstream agent — NOT a verdict; no recall/score/grade path reads it. May hold neutral

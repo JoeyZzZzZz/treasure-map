@@ -1134,8 +1134,9 @@ def add_instance(
            (pattern_id, pseudocode_hash, source_anchor, sink_anchor, source_run_id,
             reachability_status, blocking_mechanism, exposure_shape, provenance_level,
             external_anchor, fix_diff, scope_origin, evidence_ref, binary_path,
-            binary_content_hash, origin, is_thin_cmd_wrapper, wrapped_sink, flow_evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            binary_content_hash, origin, is_thin_cmd_wrapper, wrapped_sink, flow_evidence,
+            function_origin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             instance.pattern_id,
             instance.pseudocode_hash,
@@ -1156,6 +1157,7 @@ def add_instance(
             int(instance.is_thin_cmd_wrapper),
             instance.wrapped_sink,
             instance.flow_evidence,
+            instance.function_origin,
         ),
     )
     if recompute:
@@ -1203,6 +1205,7 @@ def add_instances(
             int(inst.is_thin_cmd_wrapper),
             inst.wrapped_sink,
             inst.flow_evidence,
+            inst.function_origin,
         )
         for inst in instances
     ]
@@ -1211,8 +1214,9 @@ def add_instances(
            (pattern_id, pseudocode_hash, source_anchor, sink_anchor, source_run_id,
             reachability_status, blocking_mechanism, exposure_shape, provenance_level,
             external_anchor, fix_diff, scope_origin, evidence_ref, binary_path,
-            binary_content_hash, origin, is_thin_cmd_wrapper, wrapped_sink, flow_evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            binary_content_hash, origin, is_thin_cmd_wrapper, wrapped_sink, flow_evidence,
+            function_origin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
 

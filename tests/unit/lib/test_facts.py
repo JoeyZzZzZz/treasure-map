@@ -15,7 +15,7 @@ from pathlib import Path
 
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
-from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
+from treasure_map.lib.atlas.writer import add_instance, add_instances, upsert_pattern
 from treasure_map.lib.hunt.facts import (
     _WRAPPER_MAX_STATEMENTS,
     is_thin_cmd_wrapper,
@@ -293,16 +293,82 @@ def test_migration_adds_columns_to_legacy_atlas(tmp_path: Path) -> None:
     conn = open_atlas(db)
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(instance)").fetchall()}
-        row = conn.execute(
-            "SELECT is_thin_cmd_wrapper, wrapped_sink, flow_evidence FROM instance "
-            "WHERE source_run_id='run_old'"
-        ).fetchone()
+        row = conn.execute("SELECT * FROM instance WHERE source_run_id='run_old'").fetchone()
     finally:
         conn.close()
-    assert {"is_thin_cmd_wrapper", "wrapped_sink", "flow_evidence"} <= cols
+    assert {"is_thin_cmd_wrapper", "wrapped_sink", "flow_evidence", "function_origin"} <= cols
     assert row["is_thin_cmd_wrapper"] == 0
     assert row["wrapped_sink"] is None
     assert row["flow_evidence"] is None
+    # H12 T4(a), MUTATION (verified RED, ``1 failed``): drop the function_origin ALTER from
+    # _migrate -> the SELECT above fails on the old atlas -> RED. An old row reads not recorded.
+    assert row["function_origin"] is None
+
+
+_ATLAS_SCHEMA_SQL = _SRC / "lib" / "storage" / "atlas_schema.sql"
+
+
+def test_a_new_atlas_has_the_function_origin_column_without_the_migration(tmp_path: Path) -> None:
+    """The create script itself carries ``instance.function_origin`` — built with the schema alone,
+    never through open_atlas, whose migration would add a column the script forgot.
+
+    MUTATION (verified RED, ``1 failed``): drop the column from atlas_schema.sql -> RED."""
+    conn = sqlite3.connect(tmp_path / "fresh.db")
+    try:
+        conn.executescript(_ATLAS_SCHEMA_SQL.read_text(encoding="utf-8"))
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(instance)").fetchall()}
+    finally:
+        conn.close()
+    assert "function_origin" in cols
+
+
+def test_both_instance_writers_store_the_function_origin(tmp_path: Path) -> None:
+    """H12 T7: ``add_instance`` and ``add_instances`` (the batch path) each store the boundary
+    origin they are given — the column and the value tuple of BOTH inserts carry it.
+
+    MUTATION (verified RED, ``1 failed`` each): leave ``function_origin`` out of add_instances'
+    column list and value tuple -> the batch row reads None -> RED; the same in add_instance ->
+    RED."""
+    conn = open_atlas(tmp_path / "atlas.db")
+    try:
+        pid = upsert_pattern(
+            conn,
+            source_class="unknown",
+            sink_class="cmd",
+            call_sequence_shape="callseq-v1",
+            structural_fingerprint="fp_origin",
+            fingerprint_algo_version="callseq-v1",
+        )
+        add_instance(
+            conn,
+            InstanceRow(
+                pattern_id=pid,
+                pseudocode_hash="h_one",
+                source_run_id="run_o",
+                evidence_ref="run_o#fn1@cmd",
+                function_origin="promoted",
+            ),
+        )
+        add_instances(
+            conn,
+            [
+                InstanceRow(
+                    pattern_id=pid,
+                    pseudocode_hash="h_two",
+                    source_run_id="run_o",
+                    evidence_ref="run_o#fn2@cmd",
+                    function_origin="recovered",
+                )
+            ],
+        )
+        got = dict(
+            conn.execute(
+                "SELECT evidence_ref, function_origin FROM instance WHERE source_run_id = 'run_o'"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+    assert got == {"run_o#fn1@cmd": "promoted", "run_o#fn2@cmd": "recovered"}
 
 
 def test_no_recall_or_score_path_reads_the_fact() -> None:

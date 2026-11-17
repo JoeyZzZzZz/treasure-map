@@ -15,6 +15,7 @@ never sinks a candidate.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -96,6 +97,7 @@ def _inst(
     entry_reach: str | None = None,
     source_kind: str | None = None,
     sink_provenance: list[dict[str, object]] | None = None,
+    function_origin: str | None = None,
 ) -> None:
     _FID[0] += 1
     provenance = "L1" if status in {"confirmed", "blocked"} else "L0"
@@ -128,6 +130,7 @@ def _inst(
             origin=origin,
             binary_path=binary_path,
             flow_evidence=flow_evidence,
+            function_origin=function_origin,
         ),
     )
 
@@ -2105,3 +2108,93 @@ def test_cli_refuses_a_negative_top_and_a_malformed_filter(tmp_path: Path) -> No
         triage_cmd, ["run_cli", "--filter", "controllability", "--atlas", str(atlas)]
     )
     assert bad.exit_code == 2 and "dim=value" in bad.output, bad.output
+
+
+# ── completeness: the boundary origin the hunt copied (H12) ─────────────────────────────────────
+
+# A note "claims complete" when it carries the word itself (not "completeness" / "incomplete").
+_SAYS_COMPLETE = re.compile(r"\bcomplete\b", re.IGNORECASE)
+
+
+def _origin_corpus(conn: sqlite3.Connection) -> dict[str, str]:
+    """One cmd candidate per boundary origin (and one not recorded), alike in every other fact, so
+    the default lens orders them by the function-name tiebreak alone. Returns fn -> evidence_ref."""
+    p = _pattern(conn, "fp_origin", sink_class="cmd", source_class="external_input")
+    origins = {"fn_a": "analysis", "fn_b": "promoted", "fn_c": None, "fn_d": "recovered"}
+    for fn, origin in origins.items():
+        _inst(conn, p, fn=fn, function_origin=origin)
+    return {c.function or "": c.evidence_ref or "" for c in triage(conn)}
+
+
+def test_completeness_reads_the_boundary_origin_in_three_states(tmp_path: Path) -> None:
+    """H12 T4(b)(c): promoted / recovered read ``structural:<origin>``; analysis and NULL both stay
+    '?', each with its own note — analysis is "not marked as a fragment", never "complete", and
+    NULL says "not recorded". The value is never ``complete``.
+
+    MUTATION (verified RED, ``1 failed`` each): map analysis to value ``complete`` -> RED; give
+    NULL the analysis note -> RED; ignore the argument (``_dim_completeness(None)``) -> RED."""
+    conn = _atlas(tmp_path)
+    _origin_corpus(conn)
+    dims = {c.function: c.dim("completeness") for c in triage(conn)}
+    conn.close()
+    assert (dims["fn_b"].state, dims["fn_b"].value) == ("structural", "promoted")
+    assert (dims["fn_d"].state, dims["fn_d"].value) == ("structural", "recovered")
+    assert (dims["fn_a"].state, dims["fn_a"].value) == ("unknown", "unknown")
+    assert (dims["fn_c"].state, dims["fn_c"].value) == ("unknown", "unknown")
+    assert "not recorded" in dims["fn_c"].note
+    assert dims["fn_a"].note != dims["fn_c"].note
+    assert "not marked as a fragment" in dims["fn_a"].note
+    assert not _SAYS_COMPLETE.search(dims["fn_a"].note), dims["fn_a"].note
+    assert len({d.note for d in dims.values()}) == 4
+    assert all(d.value != "complete" for d in dims.values())
+    assert all(
+        d.source == "function_origin (functions.origin, copied at hunt)" for d in dims.values()
+    )
+
+
+def test_the_boundary_origin_moves_no_candidates_rank(tmp_path: Path) -> None:
+    """H12 T5: the same corpus read with its boundary origins and with every origin cleared
+    (NULL — what it read before the column) is ordered identically, under the default lens and
+    every spine, and no candidate earns the completeness promote.
+
+    MUTATION (verified RED, ``1 failed``): map promoted to value ``complete`` -> fn_b lifts above
+    fn_a -> RED."""
+    from treasure_map.lib.query.triage import _VALID_SPINES, _sort_atoms
+
+    conn = _atlas(tmp_path)
+    _origin_corpus(conn)
+    with_origin = triage(conn)
+    assert all(_sort_atoms(c, None)["completeness_promote"] == 0 for c in with_origin)
+    orders = {
+        sp: [c.evidence_ref for c in sort_candidates(with_origin, spine=sp)] for sp in _VALID_SPINES
+    }
+    default = [c.evidence_ref for c in with_origin]
+    conn.execute("UPDATE instance SET function_origin = NULL")
+    conn.commit()
+    cleared = triage(conn)
+    conn.close()
+    assert {c.dim("completeness").state for c in cleared} == {"unknown"}  # the clear took
+    assert [c.evidence_ref for c in cleared] == default
+    for sp, order in orders.items():
+        assert [c.evidence_ref for c in sort_candidates(cleared, spine=sp)] == order, sp
+
+
+def test_an_only_completeness_prune_is_still_refused(tmp_path: Path) -> None:
+    """H12 T8: with fragments beside analysis candidates, ``--only completeness=promoted`` is still
+    refused — an analysis (or unrecorded) boundary never reads as a resolved completeness, so a
+    prune cannot cut every candidate that is not a fragment.
+
+    MUTATION (verified RED, ``1 failed``): map analysis to ``structural:analysis`` (and the corpus
+    to recorded origins only) -> every candidate resolved -> no refusal -> RED."""
+    from treasure_map.lib.query.triage import only_refusal
+
+    conn = _atlas(tmp_path)
+    _origin_corpus(conn)
+    conn.execute("UPDATE instance SET function_origin = 'analysis' WHERE function_origin IS NULL")
+    conn.commit()
+    recorded = {r[0] for r in conn.execute("SELECT function_origin FROM instance")}
+    full = triage(conn)
+    conn.close()
+    assert recorded == {"analysis", "promoted", "recovered"}  # fragments beside analysis rows
+    refusal = only_refusal([("completeness", "promoted")], full)
+    assert refusal is not None and "completeness" in refusal

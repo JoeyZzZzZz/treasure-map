@@ -70,6 +70,9 @@ def _insert_func(
         json.dumps(func.get("call_tokens", [])),
         json.dumps(func.get("body_ranges", [])),
     )
+    if "origin" in func:  # functions.origin, only when the fixture names one (else NULL)
+        cols += ", origin"
+        vals = (*vals, func["origin"])
     if fid is not None:
         cols = "id, " + cols
         vals = (fid, *vals)
@@ -5231,3 +5234,209 @@ def test_source_names_reach_the_cli_json_and_the_mcp_explain(tmp_path: Path) -> 
         assert "source_names" in ex, case
         got = ex["source_names"]
         assert (list(got) if got is not None else None) == want[case], case
+
+
+# ── function_origin: the boundary origin copied onto each instance (H12) ────────────────────────
+
+# One function per boundary origin, each a command candidate (and its snprintf a format one).
+_ORIGINS_BY_FN = {"fn_promoted": "promoted", "fn_recovered": "recovered", "fn_analysis": "analysis"}
+
+
+def _origin_db(tmp_path: Path, origins: dict[str, str | None] | None = None) -> Path:
+    funcs = []
+    for fn, origin in (origins if origins is not None else _ORIGINS_BY_FN).items():
+        func = _cmd_injection_fn(fn)
+        if origin is not None:
+            func["origin"] = origin
+        funcs.append(func)
+    return _make_db(tmp_path, [{"name": "svcd", "path": "usr/sbin/svcd", "funcs": funcs}])
+
+
+def _origin_of_fn(atlas_path: Path) -> dict[str, set[str | None]]:
+    out: dict[str, set[str | None]] = {}
+    for row in _instances(atlas_path):
+        out.setdefault(row["source_anchor"], set()).add(row["function_origin"])
+    return out
+
+
+def _completeness_of(dims: list[dict[str, object]]) -> dict[str, object]:
+    (dim,) = [d for d in dims if d["name"] == "completeness"]
+    return dim
+
+
+def test_the_boundary_origin_reaches_the_instance_and_both_list_surfaces(tmp_path: Path) -> None:
+    """H12 T1: the hunt copies each function's ``functions.origin`` onto every instance it holds;
+    the MCP list carries ``completeness: structural:<origin>`` on the fragment rows only (an
+    analysis row's '?' is not carried), the CLI ``triage --json`` the same states, and the three
+    explain notes differ.
+
+    MUTATION (verified RED, ``1 failed`` each): the loader returns ``{}`` -> RED; the dimension
+    ignores its argument (``_dim_completeness(None)``) -> RED."""
+    from click.testing import CliRunner
+
+    from treasure_map import mcp_app
+    from treasure_map.cli.hunt_cli import triage as triage_cmd
+
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(_origin_db(tmp_path), atlas, source_run_id="run_fo")
+    assert _origin_of_fn(atlas) == {fn: {o} for fn, o in _ORIGINS_BY_FN.items()}
+    fn_of = {r["evidence_ref"]: r["source_anchor"] for r in _instances(atlas)}
+
+    tools = mcp_app.make_tools(atlas)
+    listed = tools["list_candidates"](run_id="run_fo", limit=50)
+    rows = listed["candidates"]
+    assert {fn_of[r["evidence_ref"]] for r in rows} == set(_ORIGINS_BY_FN)
+    for r in rows:
+        want = {"fn_promoted": "structural:promoted", "fn_recovered": "structural:recovered"}
+        assert r["dimensions"].get("completeness") == want.get(fn_of[r["evidence_ref"]]), r
+
+    res = CliRunner().invoke(triage_cmd, ["run_fo", "--json", "--atlas", str(atlas)])
+    assert res.exit_code == 0, res.output
+    cli = {
+        (c["function"], (d := _completeness_of(c["dimensions"]))["state"], d["value"])
+        for c in json.loads(res.output)
+    }
+    assert cli == {
+        ("fn_promoted", "structural", "promoted"),
+        ("fn_recovered", "structural", "recovered"),
+        ("fn_analysis", "unknown", "unknown"),
+    }
+
+    notes = {}
+    conn = open_atlas(atlas)
+    try:
+        for ref, fn in fn_of.items():
+            ex = explain_candidate(conn, ref)
+            assert ex is not None
+            notes.setdefault(fn, set()).add(ex.candidate.dim("completeness").note)
+    finally:
+        conn.close()
+    assert all(len(v) == 1 for v in notes.values()), notes
+    assert len({next(iter(v)) for v in notes.values()}) == 3
+
+
+def test_the_completeness_layer_is_the_same_on_the_mcp_and_cli_explain(tmp_path: Path) -> None:
+    """H12 T2: one candidate's completeness layer reads field for field the same in the MCP
+    ``explain_candidate`` reply and ``tmap triage --explain --json`` — one reader, two renderings.
+
+    MUTATION (verified RED, ``1 failed``): rewrite the layer's note in mcp_app's explain reply
+    -> RED."""
+    from click.testing import CliRunner
+
+    from treasure_map import mcp_app
+    from treasure_map.cli.hunt_cli import triage as triage_cmd
+
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(_origin_db(tmp_path), atlas, source_run_id="run_fo")
+    tools = mcp_app.make_tools(atlas)
+    for fn in _ORIGINS_BY_FN:
+        ref = _direct_ref_of(atlas, fn, "cmd")
+        res = CliRunner().invoke(
+            triage_cmd, ["run_fo", "--explain", ref, "--json", "--atlas", str(atlas)]
+        )
+        assert res.exit_code == 0, res.output
+        cli = _completeness_of(json.loads(res.output)["dimensions"])
+        ex = tools["explain_candidate"](ref)
+        mcp = _completeness_of(ex["dimensions"])
+        keys = ("name", "state", "value", "source", "note")
+        assert {k: mcp.get(k) for k in keys} == {k: cli.get(k) for k in keys}, fn
+
+
+def test_the_boundary_origin_never_moves_a_standing_judgement(tmp_path: Path) -> None:
+    """H12 T3: a judgement written while the boundary origin was not recorded still reads
+    ``unchanged`` once a re-hunt records ``promoted`` — the column is neither a basis dimension nor
+    folded into flow_evidence, so filling it floats no annotation back.
+
+    MUTATION (verified RED, ``1 failed`` each): also write the origin into flow_evidence (one more
+    key) -> changed -> RED; add ``function_origin`` to overlay._BASIS_DIMS -> changed -> RED."""
+    from treasure_map.lib import overlay
+
+    db = _origin_db(tmp_path, {"fn_x": None})
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_fb")
+    assert _origin_of_fn(atlas) == {"fn_x": {None}}
+    ref = _direct_ref_of(atlas, "fn_x", "cmd")
+    conn = open_atlas(atlas)
+    try:
+        overlay.upsert_overlay(conn, evidence_ref=ref, verdict="suspicious", rationale="look here")
+    finally:
+        conn.close()
+    adb = sqlite3.connect(db)
+    adb.execute("UPDATE functions SET origin = 'promoted'")
+    adb.commit()
+    adb.close()
+    run_analyzer2(db, atlas, source_run_id="run_fb")
+    assert _origin_of_fn(atlas) == {"fn_x": {"promoted"}}  # the re-hunt recorded it
+    conn = open_atlas(atlas)
+    try:
+        (raw,) = conn.execute(
+            "SELECT basis_state FROM overlay WHERE anchor_ref = ?", (ref,)
+        ).fetchone()
+        delta = overlay.basis_delta(conn, ref, overlay.Basis.from_json(raw))
+    finally:
+        conn.close()
+    assert delta["state"] == "unchanged", delta
+
+
+def test_an_analysis_db_without_the_origin_column_records_not_recorded(tmp_path: Path) -> None:
+    """H12 T4(d): an analysis.db extracted before functions.origin existed gives the loader no
+    entries, the instances NULL, and the completeness layer its "not recorded" reading — never a
+    guessed value.
+
+    MUTATION (verified RED, ``1 failed``): the loader treats a missing column as every function
+    ``analysis`` -> RED."""
+    db = _origin_db(tmp_path)
+    adb = sqlite3.connect(db)
+    adb.execute("ALTER TABLE functions DROP COLUMN origin")
+    adb.commit()
+    adb.close()
+    assert analyzer2_mod._load_function_origin(db) == {}
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_nc")
+    assert set().union(*_origin_of_fn(atlas).values()) == {None}
+    conn = open_atlas(atlas)
+    try:
+        ex = explain_candidate(conn, _direct_ref_of(atlas, "fn_promoted", "cmd"))
+    finally:
+        conn.close()
+    assert ex is not None
+    dim = ex.candidate.dim("completeness")
+    assert (dim.state, dim.value) == ("unknown", "unknown")
+    assert "not recorded" in dim.note
+
+
+def test_the_wrapper_path_records_the_callers_boundary_origin(tmp_path: Path) -> None:
+    """H12 T6: both write paths store the origin — the direct candidate its own function's, the
+    wrapper-recovered candidate its CALLER's (the candidate is the caller), not the wrapper's.
+
+    MUTATION (verified RED, ``1 failed``): the wrapper path leaves function_origin out -> NULL ->
+    RED. The wrapper and its caller carry different origins, so reading the wrapper's would fail
+    the same assertion."""
+    wrapper = {**_thin_cmd_wrapper_fn(), "origin": "analysis"}
+    caller = {**_free_via_wrapper_fn(), "origin": "promoted"}
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": [wrapper, caller]}])
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_fw")
+    assert stats.wrapper_propagated == 1
+    by_ref = {r["evidence_ref"]: r for r in _instances(atlas)}
+    via = [r for ref, r in by_ref.items() if "@cmd_via_wrapper" in ref]
+    assert [(r["source_anchor"], r["function_origin"]) for r in via] == [("set_route", "promoted")]
+    direct = by_ref[_direct_ref_of(atlas, "do_cmd", "cmd")]
+    assert direct["function_origin"] == "analysis"
+
+
+def test_the_mcp_list_still_refuses_an_only_completeness_prune(tmp_path: Path) -> None:
+    """H12 T8 (MCP half): with fragment and analysis candidates in one run, list_candidates with
+    ``only="completeness=promoted"`` is refused, exactly as before — the analysis candidates'
+    completeness stays '?', so the prune would hide them.
+
+    MUTATION (verified RED, ``1 failed``): map analysis to ``structural:analysis`` -> every
+    candidate resolved -> the list is served pruned -> RED."""
+    from treasure_map import mcp_app
+
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(_origin_db(tmp_path), atlas, source_run_id="run_fo")
+    assert None not in set().union(*_origin_of_fn(atlas).values())  # every origin recorded
+    tools = mcp_app.make_tools(atlas)
+    res = tools["list_candidates"](run_id="run_fo", only="completeness=promoted")
+    assert "refused" in str(res.get("error", "")), res

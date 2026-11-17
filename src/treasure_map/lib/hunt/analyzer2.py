@@ -680,6 +680,26 @@ def _load_sink_provenance(db_path: Path | str) -> dict[int, list[dict[str, Any]]
     return out
 
 
+def _load_function_origin(db_path: Path | str) -> dict[int, str]:
+    """Map func_id -> functions.origin (how the function's boundary was found: analysis / promoted
+    / recovered) from analysis.db, for the atlas instance's function_origin column.
+
+    Transport read (mirrors _load_sink_provenance): the value is carried as stored — not mapped,
+    not checked against the enum; the read layer interprets it. A missing column (older
+    analysis.db) yields no entries, and a NULL or empty cell no entry — the instance then records
+    NULL ("not recorded"), never a guessed value.
+    """
+    uri = ro_uri(Path(db_path))
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        rows = conn.execute("SELECT id, origin FROM functions").fetchall()
+    except sqlite3.OperationalError:
+        return {}  # no column (pre-origin analysis.db) -> no data
+    finally:
+        conn.close()
+    return {func_id: value for func_id, value in rows if isinstance(value, str) and value}
+
+
 def _load_nvram_ops(db_path: Path | str) -> dict[int, list[dict[str, Any]]]:
     """Map func_id -> parsed nvram_ops list (Ghidra def-use fact) from analysis.db.
 
@@ -1442,6 +1462,9 @@ def run_analyzer2(
     # Loaded BEFORE the entry index because the cross-binary launch edges are read out of it and
     # feed that index as a third entry source.
     sink_prov_by_func = _load_sink_provenance(db_path)
+    # How each function's boundary was found (functions.origin), copied onto every instance it
+    # holds — the direct path and the wrapper path below. Empty for an analysis.db without it.
+    function_origin_by_func = _load_function_origin(db_path)
     # Cross-binary launch edges ("A's code execs B"), flattened into the atlas exec_edge table and
     # ALSO offered to the entry index: a binary nothing in the rootfs mentions may still be started
     # by another binary, which used to read as a plain coverage gap. ★ Only edges whose target
@@ -1900,6 +1923,7 @@ def run_analyzer2(
                         reachability_status=status,
                         blocking_mechanism=blocking,
                         exposure_shape=exposure_shape,
+                        function_origin=function_origin_by_func.get(match.func_ref.func_id),
                         provenance_level=provenance,
                         # Neutral, RE-SCAN-STABLE per-instance locator = run + binary/function
                         # anchor + sink-class hit, plus the callsite ordinal when the candidate is
@@ -2126,6 +2150,8 @@ def run_analyzer2(
                         source_run_id=source_run_id,
                         reachability_status="unknown",
                         blocking_mechanism=blocking,
+                        # the CALLER's boundary (this candidate is the caller, not the wrapper)
+                        function_origin=function_origin_by_func.get(f.func_id),
                         provenance_level="L0",
                         # Distinct suffix so a function that is ALSO a direct candidate (it is not,
                         # by construction) never collides; this is the wrapper-recovered instance.

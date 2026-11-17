@@ -82,6 +82,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # carry NULL until re-hunted. Idempotent — runs only while the column is missing.
     if inst_cols and "exposure_shape" not in inst_cols:
         conn.execute("ALTER TABLE instance ADD COLUMN exposure_shape TEXT")
+    # function_origin (added this round): how the containing function's boundary was found
+    # (functions.origin, copied at hunt). Nullable TEXT — old rows carry NULL ("not recorded")
+    # until re-hunted. No index references it. Idempotent — runs only while the column is missing.
+    if inst_cols and "function_origin" not in inst_cols:
+        conn.execute("ALTER TABLE instance ADD COLUMN function_origin TEXT")
 
     # public_cve_pattern.origin (added this round): marks rows as externally imported material (not
     # tmap deterministic extraction). NOT NULL DEFAULT 'external_import'; existing rows take the
@@ -393,7 +398,8 @@ def open_atlas(db_path: Path) -> sqlite3.Connection:
     The schema uses IF NOT EXISTS throughout, so re-applying it to an existing database is
     safe and preserves all rows. An older atlas is first brought forward in place by _migrate
     (adds instance.origin / binary_path / binary_content_hash / is_thin_cmd_wrapper /
-    wrapped_sink / flow_evidence / dimension_delta.binary, renames pattern.recurrence_breadth ->
+    wrapped_sink / flow_evidence / exposure_shape / function_origin / dimension_delta.binary,
+    renames pattern.recurrence_breadth ->
     device_spread, drops legacy pattern.device_category). The instance table is only ever moved
     forward in place — never rebuilt — so its rows and every derived count are kept. The judgement
     layer (overlay, overlay_history) is created and migrated by lib/atlas/overlay_schema.ensure,
