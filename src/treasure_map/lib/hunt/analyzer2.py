@@ -90,6 +90,7 @@ from treasure_map.lib.hunt.exec_edges import (
     build_symlink_index,
     exec_entry_sites,
 )
+from treasure_map.lib.hunt.exec_runners import runner_pass
 from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
 from treasure_map.lib.hunt.fmt_provenance import constant_format_record, format_argument
 from treasure_map.lib.hunt.refs import (
@@ -970,6 +971,21 @@ def _flatten_exec_edges(
     )
 
 
+def _runner_exec_edges(
+    db_path: Path | str,
+    all_funcs: list[FuncRow],
+    source_run_id: str,
+    stub_by_binary: Mapping[int, Mapping[int, str]],
+) -> tuple[list[ExecEdgeRow], list[DetectorScanStatusRow]]:
+    """The launch edges that go through a runner (see lib/hunt/exec_runners), with that pass's own
+    per-binary status rows. A separate pass from ``_flatten_exec_edges``, matched against the same
+    inventory: its rows land in the same table and the same entry index, its status rows stay
+    apart from the projection's (a different scope, so a different detector)."""
+    return runner_pass(
+        db_path, all_funcs, _load_exec_inventory(db_path), source_run_id, stub_by_binary
+    )
+
+
 def _exec_scan_status(
     edge_rows: list[ExecEdgeRow],
     all_funcs: list[FuncRow],
@@ -1476,7 +1492,16 @@ def run_analyzer2(
     # by another binary, which used to read as a plain coverage gap. ★ Only edges whose target
     # resolved to a real binary become entry sites, and a site never produces a 'blocked' status.
     exec_edge_rows = _flatten_exec_edges(db_path, all_funcs, sink_prov_by_func, source_run_id)
-    entry_index = _load_entry_index(db_path, exec_sites=exec_entry_sites(exec_edge_rows))
+    # The launches that go through a runner (a function that execs the argv array its caller
+    # built): a separate pass, read from the callers' text, whose rows join the projection's in the
+    # same table and the same entry index. The same rule holds for them: only a target resolved to
+    # a real binary becomes an entry site.
+    runner_edge_rows, runner_status_rows = _runner_exec_edges(
+        db_path, all_funcs, source_run_id, stub_by_binary
+    )
+    entry_index = _load_entry_index(
+        db_path, exec_sites=exec_entry_sites(exec_edge_rows + runner_edge_rows)
+    )
     # per-function nvram read/write ops, flattened into the atlas nvram_key_flow
     # table below so an agent can trace a key's writers/readers across binaries. Empty when the
     # analysis.db predates the nvram_ops column.
@@ -1513,9 +1538,13 @@ def run_analyzer2(
     detector_status_rows = static_tables.statuses + _flatten_detector_status(db_path, source_run_id)
     # Launch-edge honesty status (per binary), written even at zero edges — an empty result must
     # not read as "this binary launches nothing" when the pass has known structural gaps.
+    # The projection's status is computed from ITS rows only: its scope says what that pass reads,
+    # and counting the runner pass's rows into it would make the row contradict itself. The runner
+    # pass writes its own row per binary, also at zero edges.
     detector_status_rows += _exec_scan_status(
         exec_edge_rows, all_funcs, source_run_id, sink_prov_by_func
     )
+    detector_status_rows += runner_status_rows
     # ONE-HOP string-key leads: which candidates sit one direct call below an edge callee. Computed
     # here because the call graph lives in the analysis DB (the atlas holds no callgraph), and rides
     # to the reachability layer on flow_evidence — the same compute-at-hunt/read-at-triage path as
@@ -1580,7 +1609,7 @@ def run_analyzer2(
             add_string_keyed_edges(atlas, string_keyed_edge_rows, commit=False)
             # Cross-binary launch edges: same replace-by-run refresh, same transaction.
             delete_run_exec_edges(atlas, source_run_id, commit=False)
-            add_exec_edges(atlas, exec_edge_rows, commit=False)
+            add_exec_edges(atlas, exec_edge_rows + runner_edge_rows, commit=False)
             # detector A honesty status: refresh in the SAME txn (replace-by-run). Written even at
             # zero tables so an empty edge result can attach it — the whole reason this exists.
             delete_run_detector_status(atlas, source_run_id, commit=False)

@@ -2634,7 +2634,10 @@ def make_tools(
         callsite runs, nor that an attacker's input reaches it — you confirm the caller. An EMPTY
         result is NOT proof that nothing launches the binary: read ``exec_argv_status``, which
         names what this pass cannot see (most sharply, a caller whose command sink sits behind a
-        thin forwarding wrapper — that callsite is invisible here).
+        thin forwarding wrapper — that callsite is invisible here). A launch through a runner (a
+        function that execs the argv array its caller built) comes from a separate pass: its edges
+        carry ``argv_provenance`` ``runner_text`` and the runner's name in ``exec_api``, and its
+        own honesty status rides as ``exec_runner_status``.
 
         Paged: ``limit`` edges (default 200; a larger value is cut to 200 and the answer carries
         ``limit_clamped`` with the value asked for) from ``offset`` (default 0), with
@@ -2644,7 +2647,8 @@ def make_tools(
         not a size guarantee. ``launcher_binaries`` is read from every edge, not this page's. On an
         empty answer the per-binary rows of ``exec_argv_status`` are paged at the same index (one
         row per binary name of every run in scope), with ``total_statuses``; its ``by_state`` and
-        ``binaries_without_status`` are over the whole scope, readable from the first page."""
+        ``binaries_without_status`` are over the whole scope, readable from the first page.
+        ``exec_runner_status`` pages its per-binary rows the same way, at the same index."""
         clamped = _clamped_limit(limit, 0)
         if isinstance(clamped, dict):
             return clamped
@@ -2662,7 +2666,11 @@ def make_tools(
             conn.close()
         if asked is not None:
             result["limit_clamped"] = asked
-        result = _fit_lists(result, offset, ("edges", ("exec_argv_status", "statuses")))
+        result = _fit_lists(
+            result,
+            offset,
+            ("edges", ("exec_argv_status", "statuses"), ("exec_runner_status", "statuses")),
+        )
         if isinstance(result.get("edges"), list):
             result["count"] = len(result["edges"])
         return result

@@ -255,6 +255,47 @@ def test_an_empty_launched_by_over_every_run_pages_its_status_rows(tmp_path: Pat
     assert len({(r["run_id"], r["binary"]) for r in rows}) == 600
 
 
+def test_the_runner_pass_status_pages_at_the_same_index(tmp_path: Path) -> None:
+    """An empty answer carries TWO per-binary status blocks — the projection's and the runner
+    pass's — and both are cut at the one index: every page fits, and walking next_offset reads
+    every runner status row once, beside every projection row.
+
+    MUTATION (verified RED, 1 failed): fit the edges and the projection's rows only (drop
+    ``("exec_runner_status", "statuses")`` from the launched_by fit) -> a page over the budget."""
+    atlas = _status_atlas(tmp_path, "exec_argv", {"run_a": 300, "run_b": 300})
+    conn = open_atlas(atlas)
+    try:
+        add_detector_status(
+            conn,
+            [
+                DetectorScanStatusRow(
+                    run_id,
+                    f"lib_{i:04d}",
+                    "exec_runner_argv0",
+                    scanned=1,
+                    supported_scope=SCOPE,
+                    unsupported_note=NOTE,
+                    found_count=i % 2,
+                    binary_path=f"usr/lib/lib_{i:04d}",
+                )
+                for run_id in ("run_a", "run_b")
+                for i in range(300)
+            ],
+        )
+        conn.commit()
+        whole = launched_by(conn, "nothing_launches_this")
+    finally:
+        conn.close()
+    runner_rows = whole["exec_runner_status"]["statuses"]
+    assert len(runner_rows) == 600
+    assert whole["exec_runner_status"]["pass_scope"] == "exec_runner_argv0"
+    tool = mcp_app.make_tools(atlas)["launched_by"]
+    edges, rows = _walk(tool, "exec_runner_status", target="nothing_launches_this")
+    assert edges == [] and rows == runner_rows
+    _, argv_rows = _walk(tool, "exec_argv_status", target="nothing_launches_this")
+    assert argv_rows == whole["exec_argv_status"]["statuses"]
+
+
 def test_an_unreadable_analysis_db_leaves_the_missing_count_unknown(tmp_path: Path) -> None:
     """A run whose analysis.db cannot be read: binaries_without_status is None — not known is not
     zero.

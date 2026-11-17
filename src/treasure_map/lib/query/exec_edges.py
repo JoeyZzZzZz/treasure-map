@@ -12,6 +12,11 @@ Two target layers ride in the same table and must not be read the same way:
   * ``shell_command`` — B is the first word of a command string handed to a shell. The image the
     kernel actually runs is /bin/sh, which is deliberately not listed as its own edge.
 The two families are disjoint, so a row is one or the other and never counted twice.
+
+A third kind of row rides in the ``exec_image`` layer: a launch through a RUNNER, a function that
+execs the argv array its caller built. Its callsite is the call to the runner (named in
+``exec_api``), its ``argv_provenance`` is ``runner_text``, and a separate pass with its own honesty
+status (``exec_runner_status``, detector ``exec_runner_argv0``) produced it.
 """
 
 from __future__ import annotations
@@ -27,6 +32,20 @@ _COLS = (
     "symlink_corrupt, symlink_target_unresolved, target_binary, occurrences"
 )
 
+# The detectors whose honesty rows this module reads. The runner pass's name is spelled here rather
+# than imported, which keeps the hunt layer off this module's import surface (a test pins the two
+# spellings together).
+EXEC_ARGV_DETECTOR = "exec_argv"
+RUNNER_DETECTOR = "exec_runner_argv0"
+RUNNER_PROVENANCE = "runner_text"
+
+_RUNNER_NOTE = (
+    "B is the IMAGE a runner launches: this callsite calls the runner named in exec_api, which "
+    "execs the argv array it was handed, and B was read by the runner's shape (the first slot of "
+    "that array, the argument in the runner's path position, or the runner's own constant). argv "
+    "beyond that is structurally invisible — never reconstructed."
+)
+
 _LAYER_NOTES = {
     "exec_image": (
         "B is the IMAGE this callsite runs (exec* arg0). argv is structurally invisible — only "
@@ -36,6 +55,29 @@ _LAYER_NOTES = {
         "B is the FIRST WORD of a command string handed to a shell. The image the kernel runs is "
         "/bin/sh, which is deliberately not listed as a separate edge; the two target layers do "
         "not overlap, so B is counted once."
+    ),
+}
+
+
+# What each pass's status block tells a reader about its silence. The exec_argv text is the one
+# that block has always carried.
+_STATUS_NOTES = {
+    EXEC_ARGV_DETECTOR: (
+        "Honesty status for the exec_argv pass ONLY. An EMPTY launched_by result means "
+        "nothing the pass READ launches it. It covers a launcher only when that binary's "
+        "status has scanned=1 (0: a function there calls a command sink but was not read) "
+        "and none of the unsupported_note shapes covers it. No statuses => not scanned or not "
+        "re-hunted => UNKNOWN, never 'nothing launches it'. "
+        "The per-binary rows ride along whenever the answer is empty — the moment you need "
+        "them to check whether the launcher you suspect was in the scanned set at all."
+    ),
+    RUNNER_DETECTOR: (
+        "Honesty status for the runner pass (launches through a function that execs the argv "
+        "array its caller built) ONLY. Its edges carry argv_provenance runner_text and name the "
+        "runner in exec_api. No runner edge from a launcher means nothing this pass READ there "
+        "launches the target through a runner — it covers that launcher only when its status has "
+        "scanned=1 and none of the unsupported_note shapes covers it. No statuses => not "
+        "re-hunted => UNKNOWN. The per-binary rows ride along whenever the answer is empty."
     ),
 }
 
@@ -70,7 +112,11 @@ def _row_to_edge(r: sqlite3.Row) -> dict[str, Any]:
         },
         "occurrences": r["occurrences"],
         "source_run_id": r["source_run_id"],
-        "note": _LAYER_NOTES.get(str(r["target_layer"]), ""),
+        "note": (
+            _RUNNER_NOTE
+            if r["argv_provenance"] == RUNNER_PROVENANCE
+            else _LAYER_NOTES.get(str(r["target_layer"]), "")
+        ),
     }
 
 
@@ -82,14 +128,20 @@ def _exec_scan_status(
     per_binary: bool,
     offset: int = 0,
     limit: int | None = None,
+    detector: str = EXEC_ARGV_DETECTOR,
 ) -> dict[str, Any]:
-    """The launch-edge pass's honesty status for the queried scope, so an EMPTY result carries
+    """One launch-edge pass's honesty status for the queried scope, so an EMPTY result carries
     whether the silence can be trusted.
 
-    ★ Scoped to the ``exec_argv`` pass only. An empty edge list means 'nothing the pass read
-    launches this'; it covers a launcher only when that binary's status row says scanned=1 (0: a
-    command-calling function there was not read) AND the shapes in ``unsupported_note`` do not
-    apply to it. No status row => not scanned or not re-hunted => UNKNOWN.
+    ``detector`` names the pass: the projection of the extractor's own sink provenance
+    (``exec_argv``, the default) or the pass over calls to a runner (``exec_runner_argv0``). Each
+    pass reads only its own rows — their scopes differ, so one block never describes the other.
+
+    ★ Scoped to ONE pass (what follows reads it for ``exec_argv``). An empty edge list means
+    'nothing the pass read launches this'; it covers a launcher only when that binary's status row
+    says scanned=1 (0: a command-calling function there was not read) AND the shapes in
+    ``unsupported_note`` do not apply to it. No status row => not scanned or not re-hunted =>
+    UNKNOWN.
 
     Two shapes, because the per-binary rows are only ever READ in one situation. ``scanned_total``
     and ``found_total`` always ride along: they are what an "is this pass covering anything?"
@@ -105,8 +157,8 @@ def _exec_scan_status(
     ``offset`` in one total order (run, binary, row id), the page the edges beside them are cut at,
     with ``total_statuses``. ``by_state`` and ``binaries_without_status`` (the binaries of a run,
     counted by short name as the rows are, that have no row) ride with them, over every row."""
-    where = ["detector = 'exec_argv'"]
-    params: list[Any] = []
+    where = ["detector = ?"]
+    params: list[Any] = [detector]
     for col, val in (("source_run_id", run_id), ("binary", binary)):
         if val is not None:
             where.append(f"{col} = ?")
@@ -129,7 +181,7 @@ def _exec_scan_status(
     scopes = {r["supported_scope"] for r in rows if r["supported_scope"]}
     notes = {r["unsupported_note"] for r in rows if r["unsupported_note"]}
     status: dict[str, Any] = {
-        "pass_scope": "exec_argv",
+        "pass_scope": detector,
         # Shared across every row. A set with more than one member would mean rows from runs of
         # DIFFERENT tmap versions are being read together, so they are joined rather than one being
         # picked — a silently-dropped scope would understate what the pass cannot see.
@@ -138,15 +190,7 @@ def _exec_scan_status(
         # The floor: enough to see the pass ran and produced something, without the row list.
         "scanned_total": len(rows),
         "found_total": sum(r["found_count"] or 0 for r in rows),
-        "note": (
-            "Honesty status for the exec_argv pass ONLY. An EMPTY launched_by result means "
-            "nothing the pass READ launches it. It covers a launcher only when that binary's "
-            "status has scanned=1 (0: a function there calls a command sink but was not read) "
-            "and none of the unsupported_note shapes covers it. No statuses => not scanned or not "
-            "re-hunted => UNKNOWN, never 'nothing launches it'. "
-            "The per-binary rows ride along whenever the answer is empty — the moment you need "
-            "them to check whether the launcher you suspect was in the scanned set at all."
-        ),
+        "note": _STATUS_NOTES.get(detector, ""),
     }
     if per_binary:
         lo = max(0, offset)
@@ -177,7 +221,7 @@ def _exec_scan_status(
 def _binaries_without_status(
     conn: sqlite3.Connection, run_id: str | None, binary: str | None, rows: list[sqlite3.Row]
 ) -> int | None:
-    """How many binaries of the runs in scope have no exec_argv status row, counted by SHORT NAME
+    """How many binaries of the runs in scope have no status row of the pass, counted by SHORT NAME
     as the rows are (one row per name, so two files sharing a name share a row): the names in each
     run's analysis.db less the names with a row. None when the scope names one binary, or a run's
     analysis.db cannot be read — a count that is not known is not a zero."""
@@ -301,6 +345,15 @@ def launched_by(
             "exec_argv_status": _exec_scan_status(
                 conn, run_id, None, per_binary=True, offset=offset, limit=limit
             ),
+            "exec_runner_status": _exec_scan_status(
+                conn,
+                run_id,
+                None,
+                per_binary=True,
+                offset=offset,
+                limit=limit,
+                detector=RUNNER_DETECTOR,
+            ),
         }
     from treasure_map.lib.facts import page_list  # here: facts imports this package
 
@@ -318,6 +371,16 @@ def launched_by(
         "exec_argv_status": _exec_scan_status(
             conn, run_id, None, per_binary=not every, offset=offset, limit=limit
         ),
+        # The runner pass answers for its own edges, in its own block (see _exec_scan_status).
+        "exec_runner_status": _exec_scan_status(
+            conn,
+            run_id,
+            None,
+            per_binary=not every,
+            offset=offset,
+            limit=limit,
+            detector=RUNNER_DETECTOR,
+        ),
         "note": (
             "Enumerated cross-binary launch edges (A's code calls a command/exec sink whose "
             "argument names B). A FACT, NOT a reachability verdict: an edge does not say the "
@@ -331,7 +394,9 @@ def launched_by(
             "or symlink inventory to see them. Attribution to a callsite is an OVER-APPROXIMATION: "
             "a stack buffer reused by several exec points carries all of its writers at each of "
             "them, so sink_addr means 'some exec point in this function' — 'this function can run "
-            "B' holds, 'this callsite runs B' does not. Empty is NOT proof of nothing — check "
-            "exec_argv_status."
+            "B' holds, 'this callsite runs B' does not. An edge whose argv_provenance is "
+            "runner_text went through a runner: its callsite is the call to the runner named in "
+            "exec_api. Empty is NOT proof of nothing — check exec_argv_status and "
+            "exec_runner_status."
         ),
     }

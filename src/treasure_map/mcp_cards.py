@@ -396,7 +396,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "launcher (binary + function + address), the API, whether a shell wraps it and the "
             "command template; target_layer says exec_image or shell_command. run_id stays inside "
             "one firmware. These are ENUMERATED FACTS, NOT a reachability verdict. An EMPTY result "
-            "is NOT proof that nothing launches the binary: read exec_argv_status."
+            "is NOT proof that nothing launches the binary: read exec_argv_status (and "
+            "exec_runner_status for launches through a runner)."
         ),
     ),
     "start_diff_review": ToolCard(
