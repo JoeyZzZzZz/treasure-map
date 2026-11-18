@@ -268,22 +268,24 @@ another way, update the same way.
 
 ## Troubleshooting
 
-Run `tmap doctor` first. Each check shows ✅, ⚠ (works, but worth knowing), `·` (info), ❌, or `?`
-(could not be determined; never shown as ✅). It exits non-zero on any ❌ or `?`.
+Run `tmap doctor` first. It checks the toolchain, the config and the agent registrations, changes
+nothing, and exits non-zero on any ❌ or `?`.
 
-- **`tmap: command not found`**: the tool's bin directory is not on PATH. Run
-  `uv tool update-shell` and open a new shell.
-- **`ghidra` / `java` / `bindiff` ❌**: run `tmap init` again to get the pinned download, or pass
-  `--ghidra / --java-home / --bindiff PATH`. On WSL, keep everything on the Linux side, not under
-  `/mnt/c/...`.
-- **`binexport` ❌ "two copies"**: Ghidra loads extensions from both its own `Ghidra/Extensions`
-  and its user settings directory. Remove one of them.
-- **A binary is missing from a diff**: ask your agent for `list_diff_blindspots`, which lists every
-  binary the diff could not analyze and why. After fixing the toolchain,
-  `tmap diff … --force-retry` retries them.
-- **Your own Ghidra 11.4.3 starts with an unexpected JDK**: Ghidra remembers the JDK it last ran
-  with (`java_home.save` in its settings directory), and Treasure Map's runs record their JDK
-  there. Set `JAVA_HOME` when you launch Ghidra yourself.
+| Mark | Meaning |
+|:---:|---|
+| ✅ | Passed |
+| ⚠ | Works, but worth knowing |
+| `·` | Information |
+| ❌ | Failed |
+| `?` | Could not be determined (never shown as ✅) |
+
+| Problem | What to do |
+|---|---|
+| `tmap: command not found` | The tool's bin directory is not on PATH. Run `uv tool update-shell` and open a new shell. |
+| `ghidra`, `java` or `bindiff` ❌ | Run `tmap init` again to get the pinned download, or point to your own with `--ghidra`, `--java-home` or `--bindiff PATH`. On WSL, keep everything on the Linux side, not under `/mnt/c/...`. |
+| `binexport` ❌ "two copies" | Ghidra loads extensions from both its own `Ghidra/Extensions` and its user settings directory. Remove one of them. |
+| A binary is missing from a diff | Ask your agent for `list_diff_blindspots`: every binary the diff could not analyze, and why. Once the toolchain is fixed, `tmap diff … --force-retry` retries them. |
+| Your own Ghidra 11.4.3 starts with an unexpected JDK | Ghidra remembers the JDK it last ran with (`java_home.save` in its settings directory), and Treasure Map's runs record theirs there. Set `JAVA_HOME` when you launch Ghidra yourself. |
 
 ## Uninstalling
 

@@ -204,13 +204,23 @@ tmap diff --before fw-v1 --after fw-v2      # 重新运行对比；过期的 run
 
 ## 故障排查
 
-先运行 `tmap doctor`。每项检查显示 ✅、⚠（能用，但值得注意）、`·`（提示信息）、❌ 或 `?`（无法判定，绝不会显示成 ✅）。出现任何 ❌ 或 `?` 时退出码不为零。
+先运行 `tmap doctor`。它检查工具链、配置和 agent 注册情况，不做任何改动；出现任何 ❌ 或 `?` 时退出码不为零。
 
-- **`tmap: command not found`**：工具的 bin 目录不在 PATH 里。运行 `uv tool update-shell`，再新开一个 shell。
-- **`ghidra` / `java` / `bindiff` ❌**：再运行一次 `tmap init` 获取固定版本的下载，或者传入 `--ghidra / --java-home / --bindiff PATH`。在 WSL 上，所有东西都放在 Linux 一侧，不要放在 `/mnt/c/...` 下。
-- **`binexport` ❌ "two copies"**：Ghidra 会同时从自己的 `Ghidra/Extensions` 和用户设置目录加载扩展，删掉其中一份即可。
-- **某个二进制没出现在对比结果里**：让 agent 调用 `list_diff_blindspots`，它会列出每个没能分析的二进制及原因。修好工具链后，用 `tmap diff … --force-retry` 重试。
-- **自己启动的 Ghidra 11.4.3 用了意料之外的 JDK**：Ghidra 会记住上次运行时用的 JDK（设置目录里的 `java_home.save`），而 Treasure Map 运行时会把它用的 JDK 记在那里。自己启动 Ghidra 时请设置 `JAVA_HOME`。
+| 标记 | 含义 |
+|:---:|---|
+| ✅ | 通过 |
+| ⚠ | 能用，但值得注意 |
+| `·` | 提示信息 |
+| ❌ | 失败 |
+| `?` | 无法判定（绝不会显示成 ✅） |
+
+| 问题 | 怎么办 |
+|---|---|
+| `tmap: command not found` | 工具的 bin 目录不在 PATH 里。运行 `uv tool update-shell`，再新开一个 shell。 |
+| `ghidra`、`java` 或 `bindiff` ❌ | 再运行一次 `tmap init` 获取固定版本的下载，或者用 `--ghidra`、`--java-home`、`--bindiff PATH` 指向你自己的安装。在 WSL 上，所有东西都放在 Linux 一侧，不要放在 `/mnt/c/...` 下。 |
+| `binexport` ❌ "two copies" | Ghidra 会同时从自己的 `Ghidra/Extensions` 和用户设置目录加载扩展，删掉其中一份即可。 |
+| 某个二进制没出现在对比结果里 | 让 agent 调用 `list_diff_blindspots`，它会列出每个没能分析的二进制及原因。修好工具链后，用 `tmap diff … --force-retry` 重试。 |
+| 自己启动的 Ghidra 11.4.3 用了意料之外的 JDK | Ghidra 会记住上次运行时用的 JDK（设置目录里的 `java_home.save`），而 Treasure Map 运行时会把它用的 JDK 记在那里。自己启动 Ghidra 时请设置 `JAVA_HOME`。 |
 
 ## 卸载
 

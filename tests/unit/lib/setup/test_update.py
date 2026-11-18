@@ -122,6 +122,11 @@ def _cli(
     return result.output, result.exit_code, execs
 
 
+# A PyPI version newer than the one running, whatever that is: the next minor one.
+_MAJOR, _MINOR = (int(x) for x in __version__.split(".")[:2])
+_NEWER = f"{_MAJOR}.{_MINOR + 1}.0"
+
+
 def _raise() -> str:
     raise OSError("offline")
 
@@ -136,10 +141,10 @@ def test_update_installs_the_newest_then_runs_the_new_init(
     tools = tmp_path / "tools"
     (tools / "tmap-agents").mkdir(parents=True)
     uv = _Uv(tools, _LISTING + "treasure-map v0.1.3\n- dof\n")
-    out, code, execs = _cli(monkeypatch, tmp_path, uv, ["--yes"], "0.2.0")
+    out, code, execs = _cli(monkeypatch, tmp_path, uv, ["--yes"], _NEWER)
     changes = [c for c in uv.calls if c[1:3] in (["tool", "uninstall"], ["tool", "install"])]
     assert changes == [
-        ["/x/uv", "tool", "install", "--force", "--python", "3.11", "tmap-agents==0.2.0"],
+        ["/x/uv", "tool", "install", "--force", "--python", "3.11", f"tmap-agents=={_NEWER}"],
     ]
     assert execs and execs[0][-1] == "init" and code == 0
 
@@ -148,8 +153,8 @@ def test_check_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     tools = tmp_path / "tools"
     (tools / "tmap-agents").mkdir(parents=True)
     uv = _Uv(tools, _LISTING)
-    out, _code, execs = _cli(monkeypatch, tmp_path, uv, ["--check", "--yes"], "0.2.0")
-    assert "tmap 0.2.0 (newer)" in out and execs == []
+    out, _code, execs = _cli(monkeypatch, tmp_path, uv, ["--check", "--yes"], _NEWER)
+    assert f"tmap {_NEWER} (newer)" in out and execs == []
     assert all(c[1:3] in (["tool", "dir"], ["tool", "list"]) for c in uv.calls)
 
 
@@ -173,8 +178,8 @@ def test_a_failed_install_puts_the_current_version_back(
     """MUTATION: drop the put-back -> a failed update leaves no tmap command -> RED."""
     tools = tmp_path / "tools"
     (tools / "tmap-agents").mkdir(parents=True)
-    uv = _Uv(tools, _LISTING, fail="tmap-agents==0.2.0")
-    out, code, execs = _cli(monkeypatch, tmp_path, uv, ["--yes"], "0.2.0")
+    uv = _Uv(tools, _LISTING, fail=f"tmap-agents=={_NEWER}")
+    out, code, execs = _cli(monkeypatch, tmp_path, uv, ["--yes"], _NEWER)
     assert code == 1 and execs == [] and "put back" in out
     # the version running now — the one a failed update must leave installed
     assert uv.calls[-1][-1] == f"tmap-agents=={__version__}"
