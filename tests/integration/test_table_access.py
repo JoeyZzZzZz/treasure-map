@@ -6,10 +6,10 @@ for real through Ghidra on compiled fixtures (tests/fixtures/elfs/build.sh).
 * libaccess (src/fixture_access.c): code that reads tables in each shape the observations
   describe — a key column handed to a local matcher, a child table, a walked parameter a call
   hands a table, a function pointer read straight from data, a loop whose compare result is
-  tested at its head, and a function with more rows than one function keeps. It is imported with
-  the gcc compiler spec: the production command line names none, and an x86-64 language then
-  takes the Windows calling convention, under which the ELF's calls carry no arguments and no
-  argument use can show.
+  tested at its head, and a function with more rows than one function keeps. Its argument uses
+  show only because an x86 ELF is imported with the System V calling convention (``-cspec gcc``
+  on the production command line); under Ghidra's default for x86, Windows', its calls carry no
+  arguments.
 * libtables: its thunks' targets, and where the image holds each imported function — the
   addresses its {name -> imported function} table points at.
 
@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(_HOME is None, reason="analyzeHeadless not on PA
 
 @pytest.fixture(scope="module")
 def access_json(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
-    return _extract(tmp_path_factory.mktemp("access"), "libaccess_x86_64.so", cspec="gcc")[0]
+    return _extract(tmp_path_factory.mktemp("access"), "libaccess_x86_64.so")[0]
 
 
 @pytest.fixture(scope="module")
@@ -192,9 +192,31 @@ def test_a_compare_tested_at_the_loop_head_says_so_and_the_head_dominates_it(
     ]
     assert hits, rec["rows"]
     m, _row = hits[0]
-    cmp_block, head = int(m.group(1)), int(m.group(2))
+    cmp_block, head, match = int(m.group(1)), int(m.group(2)), int(m.group(3))
     assert "idom" in rec, sorted(rec)
     assert head != cmp_block and _dominates(rec["idom"], head, cmp_block), rec["idom"]
+    # M is the block entered when the result is zero: the one the handler is called in, entered
+    # from the head
+    calls = [r for r in _rows(rec, "read") if any(_bare(u) == "icall" for u in r["uses"])]
+    assert calls and all(r["bb"] == match for r in calls), (match, calls)
+    assert rec["idom"][match] == head, rec["idom"]
+
+
+def test_a_key_that_reaches_its_matcher_through_several_merges_is_followed_there(
+    access_json: dict[str, Any],
+) -> None:
+    """★ fx_deep_key reads the key column, and the value reaches strcmp only through four merges
+    of the variable it is held in. Each read of the column that is merged must still carry the
+    strcmp argument: stopped short of the call, the key column would read like a column that is
+    only tested.
+
+    MUTATION (must go RED): follow a value through 3 copies / phis instead of 6 -> the reads
+    furthest from the call keep only their merges."""
+    rec = _by_name(access_json)["fx_deep_key"]
+    merged = [r for r in _rows(rec, "read") if r["off"] == 0 and "phi" in r["uses"]]
+    assert len(merged) >= 4, rec["rows"]
+    for r in merged:
+        assert any(_bare(u) == "arg:strcmp:0:param" for u in r["uses"]), r
 
 
 def test_each_thunk_has_its_target_in_a_list_of_its_own(tables_json: dict[str, Any]) -> None:

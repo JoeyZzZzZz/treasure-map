@@ -52,6 +52,22 @@ JVM_SET_KEYS: frozenset[str] = frozenset(
 JVM_INHERITED_KEYS: frozenset[str] = frozenset({"PATH", "JAVA_HOME", "LANG", "LC_ALL", "LC_CTYPE"})
 
 
+# The compiler spec an ELF of a language is imported under, where Ghidra's default for that
+# language is not the ELF's. Named no compiler spec, Ghidra reads an x86 language with the Windows
+# calling convention (arguments in RCX / RDX / ...), and an ELF's calls then carry no arguments at
+# all: every call argument, every parameter a function hands on, is lost. Every binary tmap imports
+# is an ELF, so an x86 one is read with the System V convention (Ghidra's "gcc" spec). The other
+# languages' defaults are already their ELF convention.
+ELF_COMPILER_SPECS: Mapping[str, str] = {"x86": "gcc"}
+
+
+def language_args(arch: str) -> list[str]:
+    """``-processor <arch>``, plus ``-cspec`` where the language's default compiler spec is not the
+    one an ELF of it is built for (``ELF_COMPILER_SPECS``)."""
+    cspec = ELF_COMPILER_SPECS.get(arch.split(":", 1)[0])
+    return ["-processor", arch, *(["-cspec", cspec] if cspec is not None else [])]
+
+
 def build_cmd(
     headless: Path,
     binary: Path,
@@ -69,8 +85,7 @@ def build_cmd(
         str(headless),
         str(proj_dir),
         "Proj",
-        "-processor",
-        arch,
+        *language_args(arch),
         "-postScript",
         PROMOTE_SCRIPT,
         "-postScript",

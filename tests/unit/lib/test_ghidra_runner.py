@@ -196,6 +196,37 @@ def test_build_cmd_is_exactly_the_launch_line(tmp_path: Path) -> None:
     ]  # fmt: skip
 
 
+@pytest.mark.parametrize(
+    ("arch", "language"),
+    [
+        ("x86:LE:64:default", ["-processor", "x86:LE:64:default", "-cspec", "gcc"]),
+        ("x86:LE:32:default", ["-processor", "x86:LE:32:default", "-cspec", "gcc"]),
+        ("ARM:LE:32:v7", ["-processor", "ARM:LE:32:v7"]),
+        ("MIPS:BE:32:default", ["-processor", "MIPS:BE:32:default"]),
+        ("AARCH64:LE:64:v8A", ["-processor", "AARCH64:LE:64:v8A"]),
+        ("PowerPC:BE:32:default", ["-processor", "PowerPC:BE:32:default"]),
+    ],
+)
+def test_an_x86_elf_is_imported_with_the_system_v_calling_convention(
+    tmp_path: Path, arch: str, language: list[str]
+) -> None:
+    """★ Named no compiler spec, Ghidra reads an x86 language with the Windows calling convention,
+    and an ELF's calls then carry no arguments. An x86 binary is imported with ``-cspec gcc`` (the
+    System V convention every ELF here uses) on the extraction's command line — the session that
+    also writes the BinExport a diff reads; the other languages' defaults are already theirs and get
+    no ``-cspec``.
+
+    MUTATION (must go RED): drop the x86 entry of ELF_COMPILER_SPECS."""
+    from treasure_map.lib.analyze.ghidra_launch import language_args
+
+    assert language_args(arch) == language
+    cmd = _build_cmd(tmp_path / "hl", tmp_path / "b", arch, tmp_path / "p", tmp_path / "o",
+                     tmp_path / "s", "deadbeef", 300)  # fmt: skip
+    at = cmd.index("-processor")
+    assert cmd[at : at + len(language)] == language
+    assert cmd.count("-cspec") == (1 if arch.startswith("x86:") else 0)
+
+
 # ── _classify_analysis (red-line: success requires produced functions, not file size) ──
 
 MODULE = "treasure_map.lib.analyze.ghidra_runner"

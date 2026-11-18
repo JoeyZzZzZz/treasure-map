@@ -253,6 +253,15 @@ def test_the_builder_reads_the_one_decompile_and_adds_none() -> None:
     assert body.index("hf = dr.getHighFunction();") < body.index("buildTableAccess(func, hf)")
 
 
+def test_a_value_is_followed_six_merges_deep_and_a_pointer_three() -> None:
+    """The use walk's depth: 6 for a value read (a key reaching its matcher through several phis
+    was lost at 3), 3 for a walking pointer's own uses (no escape was lost there). The Ghidra run
+    of the deep case is in tests/integration/test_table_access.py."""
+    src = _java()
+    assert re.findall(r"TA_USE_DEPTH = (\d+);", src) == ["6"]
+    assert re.findall(r"TA_POINTER_DEPTH = (\d+);", src) == ["3"]
+
+
 def test_a_function_is_cut_at_512_rows_and_never_under_300() -> None:
     """★ A-E4-10. The per-function limit: 512 (the largest function measured has 260 rows; the
     limit must not fall under about 300)."""
@@ -316,16 +325,20 @@ def test_a_thunk_is_named_after_its_target_and_an_import_after_itself(tmp_path: 
 
 def test_unrecorded_lists_leave_the_handlers_as_before_and_say_so(tmp_path: Path) -> None:
     """★ A-E4-2. NULL lists and '[]' lists give different results: with both NULL (not recorded)
-    the thunk stays unnamed, the imported handler is not read (the table is cut there), and the
-    status note says which list is missing; with '[]' (recorded, none) the note is the plain one.
+    the thunk stays unnamed, the imported handler reads as the unnamed thunk Ghidra placed at its
+    address (as before either list existed), and the status note says which list is missing; with
+    '[]' (recorded, none) the note is the plain one.
 
     MUTATION (must go RED): read a NULL list as '[]' -> the notes are the same."""
     img, thunk, imp = _image()
     none = _detect(tmp_path / "n", img, thunk_targets=None, external_symbols=None)
     empty = _detect(tmp_path / "e", img, thunk_targets="[]", external_symbols="[]")
     for res in (none, empty):
-        names = {int(e.callee_addr, 16): e.callee_name for e in res.edges}
-        assert names.get(thunk) is None and imp not in names
+        by_addr = {int(e.callee_addr, 16): e for e in res.edges}
+        assert thunk in by_addr and imp in by_addr, sorted(by_addr)
+        assert by_addr[thunk].callee_name is None
+        # not recorded: the import is read as the unnamed thunk Ghidra placed there, as before
+        assert (by_addr[imp].callee_name, by_addr[imp].callee_kind) == (None, "thunk")
     assert empty.statuses[0].unsupported_note == dt.UNSUPPORTED_NOTE
     assert none.statuses[0].unsupported_note == (
         f"{dt.UNSUPPORTED_NOTE}; {dt.TARGETS_NOT_RECORDED_NOTE}; {dt.IMPORTS_NOT_RECORDED_NOTE}"
@@ -337,9 +350,9 @@ def test_an_unreadable_name_entry_is_counted(tmp_path: Path) -> None:
     res = _detect(
         tmp_path,
         img,
-        thunk_targets=json.dumps([[7, None, "x"], ["0x1", None, None]]),
+        thunk_targets=json.dumps([[7, None, "x"], ["0x1", None, None], ["0x2", None, 5]]),
         external_symbols=json.dumps([["0x2", "fx"], ["0x3"]]),
     )
     assert res.statuses[0].unsupported_note == (
-        f"{dt.UNSUPPORTED_NOTE}; {dt.targets_unreadable_note(1)}; {dt.imports_unreadable_note(1)}"
+        f"{dt.UNSUPPORTED_NOTE}; {dt.targets_unreadable_note(2)}; {dt.imports_unreadable_note(1)}"
     )

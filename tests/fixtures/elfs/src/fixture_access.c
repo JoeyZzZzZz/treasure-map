@@ -18,6 +18,8 @@
  *   fx_rotated           compares the first key before its loop, then in the loop steps the pointer
  *                        before comparing; both results are tested at the loop head, and on a
  *                        match the record's handler is called after the loop
+ *   fx_deep_key          walks fx_live (a table the code may write, so its reads stay reads) and
+ *                        hands the key it read first to strcmp only through four merges
  *   fx_many              calls 600 function pointers from one array: more rows than one function
  *                        keeps
  */
@@ -143,6 +145,31 @@ __attribute__((optimize("O0"))) void fx_rotated(const char *s) {
         r = strcmp(p->name, s);
     }
     p->fn();
+}
+
+struct fx_ent fx_live[] = {
+    {"eta", 1, fx_on_a},
+    {"theta", 0, fx_on_b},
+    {0, 0, 0},
+};
+
+/* Built without optimisation, so each `if` that may read the key again leaves a merge of the
+ * variable behind: the key read first reaches strcmp through four of them. */
+__attribute__((optimize("O0"))) fx_fn fx_deep_key(const char *s, int a, int b, int c, int d) {
+    for (const struct fx_ent *p = fx_live; p->name; p++) {
+        const char *k = p->name;
+        if (a)
+            k = p->name;
+        if (b)
+            k = p->name;
+        if (c)
+            k = p->name;
+        if (d)
+            k = p->name;
+        if (strcmp(k, s) == 0)
+            return p->fn;
+    }
+    return 0;
 }
 
 fx_fn fx_fns[600] = {[0 ... 599] = fx_on_a};

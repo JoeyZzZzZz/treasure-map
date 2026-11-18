@@ -544,8 +544,8 @@ def _classify(img: _Image, blk: _Block) -> _Words:
             hcls[i] = _Z
             continue
         if v < lo or v >= hi:
-            # An entry outside every stored block: the loader's external block, where Ghidra puts
-            # each imported function, is never stored.
+            # An entry outside every block with stored bytes: the loader's external block, where
+            # Ghidra puts each imported function, is recorded with its range but no bytes.
             if v in functions or v in thunks or v in imports:
                 hcls[i] = _F if v in functions else _T
             continue

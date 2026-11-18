@@ -376,16 +376,27 @@ public class ExportFunctions extends GhidraScript {
     // ★ At most TA_ROW_LIMIT rows per function. Past it the function says so (truncated, with the
     //   total), and a reader must draw NO negative conclusion ("never called", "only tested")
     //   from a cut function. A value with more than TA_USE_LIMIT uses says so on its row ("uc").
+    // ★ A value is followed through at most TA_USE_DEPTH copies, casts and phis to its uses. A key
+    //   read in a loop often reaches its matcher only through several phis, and stopping short of
+    //   that call leaves a key column reading like a column that is only tested — so the depth is
+    //   set where the measured binaries stop losing such calls. Past it nothing is marked (on a
+    //   global, the chains through a call's side effects pass any small depth almost everywhere): a
+    //   reader judges "never called" per (function, base), not per access.
     //
     // Uses (TA_USES): icall@<call>#bN (the value is called) · arg:<callee>:<pos>@<call>#bN (passed;
     // for a compare-family callee also :<peer kind str|cst|param|var|none> and >tTmM, the block T
-    // whose branch tests the result and the block M entered on a match, ">~t" when the result
+    // whose branch tests the result and the block M entered when the result is zero (a match for
+    // str*cmp, no match for strstr and its kin), ">~t" when the result
     // reaches the test through a phi, ">t?" when no test is reached) · nz#bN / eqc#bN / eqv#bN
     // (compared with zero / a constant / a variable) · ord · deref · store / storeaddr · ret · cbr ·
     // arith (and arith><use> for what the result is called or passed as) · phi, and "~<use>" for a
     // use past a phi (the next iteration) · any other pcode op by its lower-case mnemonic.
     private static final int TA_ROW_LIMIT = 512;
     private static final int TA_USE_LIMIT = 12;
+    private static final int TA_USE_DEPTH = 6;
+    // A walking pointer's own uses (its escape) are followed no deeper: no escape was cut at this
+    // depth on the measured binaries.
+    private static final int TA_POINTER_DEPTH = 3;
 
     // One resolved read address: base + offset, and how it was reached.
     private static final class TaRes {
@@ -736,7 +747,8 @@ public class ExportFunctions extends GhidraScript {
 
     // Where a compare call's result is tested: the CBRANCH block it reaches (through copies,
     // casts, ==0 / !=0, negation, boolean or/and and phis — the matchedBlockForZero walk, carried
-    // through a phi and saying so), and the successor entered on a MATCH (result == 0).
+    // through a phi and saying so), and the successor entered when the result is zero (a match
+    // for str*cmp, no match for strstr and its kin; the use names the callee).
     private String taTestOf(PcodeOp call) {
         Varnode r = call.getOutput();
         if (r == null) return ">t?";
@@ -788,7 +800,7 @@ public class ExportFunctions extends GhidraScript {
 
     // Every use of a value (TA_USES). cut[0] is set when the list stops at TA_USE_LIMIT.
     private void taUsesOf(Varnode v, int depth, Set<Varnode> seen, List<String> out, boolean[] cut) {
-        if (depth > 3 || !seen.add(v)) return;
+        if (depth > TA_USE_DEPTH || !seen.add(v)) return;
         if (out.size() > TA_USE_LIMIT) { cut[0] = true; return; }
         Iterator<PcodeOp> it = v.getDescendants();
         while (it.hasNext()) {
@@ -853,7 +865,7 @@ public class ExportFunctions extends GhidraScript {
 
     // What a walking pointer itself is used for, besides being read through and stepped.
     private void taPointerUses(Varnode v, int depth, Set<Varnode> seen, List<String> out, boolean[] cut) {
-        if (depth > 3 || !seen.add(v)) return;
+        if (depth > TA_POINTER_DEPTH || !seen.add(v)) return;
         if (out.size() > TA_USE_LIMIT) { cut[0] = true; return; }
         Iterator<PcodeOp> it = v.getDescendants();
         while (it.hasNext()) {

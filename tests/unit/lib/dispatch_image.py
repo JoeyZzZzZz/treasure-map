@@ -58,10 +58,14 @@ class Image:
         return addr
 
     def imported(self, name: str) -> int:
-        """An imported function's address: past every stored block, as the loader's external
-        block is (it is never stored)."""
+        """An imported function's address: past every block with stored bytes, as the loader's
+        external block is (data_blocks records its range without bytes, which the reader skips)."""
         addr = 0x7F0000 + 8 * len(self.imports)
         self.imports[addr] = name
+        # As Ghidra does: a thunk at that address, recorded in thunk_spans / thunk_targets and
+        # named after the import (its target, the external function, has no address).
+        self.thunks.append(addr)
+        self.thunk_targets[addr] = name
         return addr
 
     def thunk(self, size: int = 16) -> int:
