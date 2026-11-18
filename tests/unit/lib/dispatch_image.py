@@ -31,6 +31,10 @@ class Image:
     data: bytearray = field(default_factory=bytearray)
     functions: list[tuple[int, str, int, str]] = field(default_factory=list)
     thunks: list[int] = field(default_factory=list)
+    # what a thunk reaches (entry -> target name) and imported functions (address -> name), written
+    # to thunk_targets / external_symbols the way a current extraction records them
+    thunk_targets: dict[int, str] = field(default_factory=dict)
+    imports: dict[int, str] = field(default_factory=dict)
     pseudocode: dict[str, str] = field(default_factory=dict)
     truncated_data: bool = False
 
@@ -51,6 +55,13 @@ class Image:
             self.text += bytes([FILL])
         addr = TEXT_BASE + len(self.text)
         self.text += text.encode() + b"\0"
+        return addr
+
+    def imported(self, name: str) -> int:
+        """An imported function's address: past every stored block, as the loader's external
+        block is (it is never stored)."""
+        addr = 0x7F0000 + 8 * len(self.imports)
+        self.imports[addr] = name
         return addr
 
     def thunk(self, size: int = 16) -> int:
@@ -123,11 +134,14 @@ class Image:
             else "MIPS:BE:32:default"
         )
         conn.execute(
-            "UPDATE binaries SET arch = ?, bits = ?, thunk_spans = ? WHERE id = ?",
+            "UPDATE binaries SET arch = ?, bits = ?, thunk_spans = ?, thunk_targets = ?, "
+            "external_symbols = ? WHERE id = ?",
             (
                 arch,
                 8 * self.ps,
                 json.dumps([[f"0x{a:x}", [[f"0x{a:x}", f"0x{a + 15:x}"]]] for a in self.thunks]),
+                json.dumps([[f"0x{a:x}", None, self.thunk_targets.get(a)] for a in self.thunks]),
+                json.dumps([[f"0x{a:x}", n] for a, n in sorted(self.imports.items())]),
                 bid,
             ),
         )

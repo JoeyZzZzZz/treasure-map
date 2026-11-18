@@ -157,6 +157,11 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # ({"small": n, "large": n}). Back-fill NULL on older DBs: not recorded until a re-scan —
     # never "none left". Must match schema.sql.
     ("binaries", "wrapper_probe_unfinished", "TEXT"),
+    # What each thunk reaches, and where the image holds each imported function. Added, never
+    # back-filled: an older DB reads NULL — not recorded until a re-scan — never '[]' ("none").
+    # Must match schema.sql.
+    ("binaries", "thunk_targets", "TEXT"),
+    ("binaries", "external_symbols", "TEXT"),
 )
 
 

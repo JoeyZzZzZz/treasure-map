@@ -55,11 +55,14 @@ def _extract(
     name: str,
     before_promote: list[str] | None = None,
     after_promote: list[str] | None = None,
+    cspec: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     """The extraction's JSON and the session's log. ``before_promote`` / ``after_promote`` are
     further post-script arguments (``["-postScript", "<Script>.java", <args>...]``) run just before
-    or just after the promotion pass, from the test-only script directory; the production command
-    line is built as always and only added to here."""
+    or just after the promotion pass, from the test-only script directory; ``cspec`` the compiler
+    spec to import with (``-cspec``; the production line names none, and an x86-64 language then
+    defaults to the Windows calling convention, under which an ELF's calls carry no arguments).
+    The production command line is built as always and only added to here."""
     assert _HOME is not None
     real = ghidra_launch.build_cmd
 
@@ -70,13 +73,16 @@ def _extract(
         cmd = (
             cmd[: at - 1] + (before_promote or []) + promote + (after_promote or []) + cmd[at + 1 :]
         )
+        if cspec is not None:
+            p = cmd.index("-processor") + 2
+            cmd = cmd[:p] + ["-cspec", cspec] + cmd[p:]
         sp = cmd.index("-scriptPath") + 1
         cmd[sp] = f"{cmd[sp]};{_TEST_SCRIPTS}"
         return cmd
 
     runner = GhidraRunner(GhidraConfig(local=GhidraLocalConfig(home=_HOME)))
     with pytest.MonkeyPatch.context() as mp:
-        if before_promote or after_promote:
+        if before_promote or after_promote or cspec is not None:
             mp.setattr(ghidra_runner, "build_cmd", build_cmd)
         res = runner.run_ghidra(
             _FIXTURES / name, work / name, 300, _X86_64, "f1x7f1x7", retry=False

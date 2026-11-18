@@ -6,8 +6,9 @@ A dispatch table is an array of records in read-only data, each holding a pointe
 and one or more pointers to the functions that key dispatches to. The extractor's own table pass
 reads one layout only (two-word records, key first); this module reads the stored image instead —
 ``data_blocks`` (the raw bytes of every loaded block, executable ones included), ``functions`` and
-``binaries.thunk_spans`` of the analysis.db — so any stride from two to eight words and either
-order of key and handler is seen, without re-running the decompiler.
+``binaries.thunk_spans`` / ``thunk_targets`` / ``external_symbols`` of the analysis.db — so any
+stride from two to eight words and either order of key and handler is seen, without re-running the
+decompiler.
 
 ★ IRON LAW: a row is an ENUMERATED fact — the bytes hold a key pointer and a function pointer in
 one record — never a reachability verdict.
@@ -28,8 +29,10 @@ The reading model, in words (the numbers are the record's words, ``s`` the strid
   and
   no key starts inside another key's string; else it stays one-character keys.
 * a HANDLER slot is a function entry (an odd pointer to an ARM function entry counts), a thunk
-  entry, or NULL. Each record holds at least one non-NULL handler, each handler column holds a
-  function somewhere in the run, and the run is at least ``MIN_RUN`` records long. A zero key
+  entry (named after what it reaches, from ``thunk_targets``), an imported function's address in
+  the image (``external_symbols``; callee_kind ``import``), or NULL. Each record holds at least
+  one non-NULL handler, each handler column holds a function somewhere in the run, and the run is
+  at least ``MIN_RUN`` records long. A zero key
   slot, a handler slot into executable code that is no function (an undefined handler) or any
   other word ends the run; an undefined handler between two runs cuts one table in two.
 * a READING is a stride, the key's word position and the handler offsets relative to the key
@@ -117,8 +120,7 @@ KEY_COLUMN_TIED = "key_column_tied"  # another key column of the record explains
 SUPPORTED_SCOPE = "absolute_records_stride_2_to_8_words"
 UNSUPPORTED_NOTE = (
     "not read: GOT/PIC-relative records, records wider than 8 words, a handler Ghidra did not "
-    "define as a function (it cuts the table there), an imported handler, two-byte wide keys and "
-    "integer-keyed tables"
+    "define as a function (it cuts the table there), two-byte wide keys and integer-keyed tables"
 )
 # Added to one binary's status note when its thunk list is not recorded (thunk_spans NULL or
 # unreadable) — never read as "no thunks" — or when some of its entries cannot be read.
@@ -133,6 +135,38 @@ def thunks_unreadable_note(count: int) -> str:
     return (
         f"{count} entries of this binary's thunk list could not be read: a handler that is one of "
         "them cuts the table there"
+    )
+
+
+# Added when this binary's thunk targets (binaries.thunk_targets) are not recorded — never read as
+# "no thunk reaches anything" — or when some of their entries cannot be read.
+TARGETS_NOT_RECORDED_NOTE = (
+    "this binary's thunk targets are not recorded: a handler that is a thunk stays unnamed"
+)
+
+
+def targets_unreadable_note(count: int) -> str:
+    """The status-note clause for a thunk-target list some of whose entries could not be read."""
+    return (
+        f"{count} entries of this binary's thunk-target list could not be read: a handler that is "
+        "one of those thunks stays unnamed"
+    )
+
+
+# Added when this binary's imported-function addresses (binaries.external_symbols) are not
+# recorded — never read as "it imports nothing" — or when some of their entries cannot be read.
+IMPORTS_NOT_RECORDED_NOTE = (
+    "this binary's imported-function addresses are not recorded: a handler that is an imported "
+    "function is not read as one, and where no thunk stands for it, it cuts the table there"
+)
+
+
+def imports_unreadable_note(count: int) -> str:
+    """The status-note clause for an imported-function list some of whose entries could not be
+    read."""
+    return (
+        f"{count} entries of this binary's imported-function list could not be read: a handler "
+        "that is one of them is not read as one"
     )
 
 
@@ -198,6 +232,17 @@ class _Image:
     # list that could not be read (each left out of ``thunks``).
     thunks_recorded: bool = True
     thunks_unreadable: int = 0
+    # What a thunk reaches (entry -> the target's name; binaries.thunk_targets) and where the image
+    # holds each imported function (address -> its name; binaries.external_symbols). ★ NULL and
+    # '[]' stay apart here too: ``*_recorded`` False means the list was not recorded, and every
+    # thunk / imported handler is then read as it was before either list existed — a thunk with no
+    # name, an import not read — never as "it reaches nothing".
+    thunk_names: dict[int, str] = field(default_factory=dict)
+    targets_recorded: bool = True
+    targets_unreadable: int = 0
+    imports: dict[int, str] = field(default_factory=dict)
+    imports_recorded: bool = True
+    imports_unreadable: int = 0
 
     def __post_init__(self) -> None:
         self.blocks.sort(key=lambda b: b.start)
@@ -273,8 +318,11 @@ class _Image:
 
     def handler_of(self, value: int) -> tuple[int, str | None, str] | None:
         """``(entry, name, kind)`` of the function a handler pointer names: a function entry
-        (``direct``; an odd pointer to an ARM function entry is a Thumb pointer to it), else a
-        thunk entry (``thunk``, its target not recorded, so no name)."""
+        (``direct``; an odd pointer to an ARM function entry is a Thumb pointer to it), else an
+        imported function's address in the image (``import``, named after the import), else a
+        thunk entry (``thunk``, named after what it reaches; no name when that is not recorded).
+        An import comes before a thunk: Ghidra places a thunk at each imported function's address,
+        and the handler there IS the import."""
         name = self.functions.get(value)
         if name is not None:
             return value, name, "direct"
@@ -282,8 +330,11 @@ class _Image:
             name = self.functions.get(value - 1)
             if name is not None:
                 return value - 1, name, "direct"
+        name = self.imports.get(value)
+        if name is not None:
+            return value, name, "import"
         if value in self.thunks:
-            return value, None, "thunk"
+            return value, self.thunk_names.get(value), "thunk"
         return None
 
 
@@ -320,6 +371,8 @@ def _load_image(conn: sqlite3.Connection, bid: int, arch: str, bits: int | None)
                     spans.append((lo, hi + 1))
         per_function.append((entry, origin, spans))
     thunks, recorded, unreadable = _thunk_entries(conn, bid)
+    thunk_names, targets_recorded, targets_unreadable = _named_entries(conn, bid, "thunk_targets")
+    imports, imports_recorded, imports_unreadable = _named_entries(conn, bid, "external_symbols")
     img = _Image(
         ps,
         ":BE:" in (arch or ""),
@@ -330,6 +383,12 @@ def _load_image(conn: sqlite3.Connection, bid: int, arch: str, bits: int | None)
         [],
         thunks_recorded=recorded,
         thunks_unreadable=unreadable,
+        thunk_names=thunk_names,
+        targets_recorded=targets_recorded,
+        targets_unreadable=targets_unreadable,
+        imports=imports,
+        imports_recorded=imports_recorded,
+        imports_unreadable=imports_unreadable,
     )
     # A promoted or recovered "function" whose entry bytes are a printable string is string bytes
     # the decompiler was made to disassemble: its body hides no code, so it masks no key. On ARM the
@@ -373,6 +432,51 @@ def _thunk_entries(conn: sqlite3.Connection, bid: int) -> tuple[set[int], bool, 
         else:
             thunks.add(entry)
     return thunks, True, unreadable
+
+
+# The two name lists: binaries.thunk_targets ([entry, target | null, name | null]) and
+# binaries.external_symbols ([addr, name]) — the address first, the name last.
+_NAME_LISTS = {"thunk_targets": 3, "external_symbols": 2}
+
+
+def _named_entries(
+    conn: sqlite3.Connection, bid: int, column: str
+) -> tuple[dict[int, str], bool, int]:
+    """(address -> name, whether the list is recorded, entries that could not be read) from one of
+    ``_NAME_LISTS``. NULL, or a value that is no list, is "not recorded"; ``[]`` is "recorded,
+    none". An entry whose address cannot be read, or that has another shape, is counted; a thunk
+    target recorded with no name is simply not named."""
+    width = _NAME_LISTS[column]
+    row = conn.execute(
+        f"SELECT {column} FROM binaries WHERE id = ?",  # noqa: S608 -- a _NAME_LISTS key
+        (bid,),
+    ).fetchone()
+    raw = row[0] if row else None
+    if raw is None:
+        return {}, False, 0
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}, False, 0
+    if not isinstance(parsed, list):
+        return {}, False, 0
+    names: dict[int, str] = {}
+    unreadable = 0
+    for ent in parsed:
+        addr = (
+            _hx(ent[0])
+            if isinstance(ent, list) and len(ent) == width and isinstance(ent[0], str)
+            else None
+        )
+        if addr is None:
+            unreadable += 1
+            continue
+        name = ent[-1]
+        if isinstance(name, str) and name:
+            names[addr] = name
+        elif name is not None:
+            unreadable += 1
+    return names, True, unreadable
 
 
 def _merge(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -434,18 +538,20 @@ def _classify(img: _Image, blk: _Block) -> _Words:
     key: set[int] = set()
     lo = img.blocks[0].start if img.blocks else 0
     hi = max((b.end for b in img.blocks), default=0)
-    functions, thunks, arm = img.functions, img.thunks, img.arm
+    functions, thunks, imports, arm = img.functions, img.thunks, img.imports, img.arm
     for i, v in enumerate(values):
         if v == 0:
             hcls[i] = _Z
             continue
         if v < lo or v >= hi:
-            if v in functions or v in thunks:  # an entry outside every stored block (defensive)
+            # An entry outside every stored block: the loader's external block, where Ghidra puts
+            # each imported function, is never stored.
+            if v in functions or v in thunks or v in imports:
                 hcls[i] = _F if v in functions else _T
             continue
         if v in functions or (arm and v & 1 and (v - 1) in functions):
             hcls[i] = _F
-        elif v in thunks:
+        elif v in thunks or v in imports:
             hcls[i] = _T
         # The key test reads the raw pointer: an odd pointer is a string, never a Thumb function
         # pointer, on the key side.
@@ -1011,6 +1117,10 @@ class BinaryResult:
     truncated: bool = False
     thunks_recorded: bool = True
     thunks_unreadable: int = 0
+    targets_recorded: bool = True
+    targets_unreadable: int = 0
+    imports_recorded: bool = True
+    imports_unreadable: int = 0
 
 
 def _record_reasons(w: _Words, kpos: int, offsets: set[int]) -> set[str]:
@@ -1141,6 +1251,14 @@ def detect_binary(
     img = _load_image(conn, bid, arch, bits)
     result.truncated = any(b.truncated for b in img.blocks)
     result.thunks_recorded, result.thunks_unreadable = img.thunks_recorded, img.thunks_unreadable
+    result.targets_recorded, result.targets_unreadable = (
+        img.targets_recorded,
+        img.targets_unreadable,
+    )
+    result.imports_recorded, result.imports_unreadable = (
+        img.imports_recorded,
+        img.imports_unreadable,
+    )
     code_index: _CodeIndex | None = None
     for blk in img.blocks:
         if len(blk.data) // img.ps < 2 * MIN_RUN:
@@ -1254,12 +1372,21 @@ def _slots_for(path: str | None, sha256: str | None) -> tuple[str, ElfSlots | No
 
 def _status_note(res: BinaryResult) -> str:
     """The status row's note for one scanned binary: what is never read, and what this binary's
-    own thunk list could not show."""
+    own thunk list, thunk targets and imported-function addresses could not show."""
+    clauses = [UNSUPPORTED_NOTE]
     if not res.thunks_recorded:
-        return f"{UNSUPPORTED_NOTE}; {THUNKS_NOT_RECORDED_NOTE}"
-    if res.thunks_unreadable:
-        return f"{UNSUPPORTED_NOTE}; {thunks_unreadable_note(res.thunks_unreadable)}"
-    return UNSUPPORTED_NOTE
+        clauses.append(THUNKS_NOT_RECORDED_NOTE)
+    elif res.thunks_unreadable:
+        clauses.append(thunks_unreadable_note(res.thunks_unreadable))
+    if not res.targets_recorded:
+        clauses.append(TARGETS_NOT_RECORDED_NOTE)
+    elif res.targets_unreadable:
+        clauses.append(targets_unreadable_note(res.targets_unreadable))
+    if not res.imports_recorded:
+        clauses.append(IMPORTS_NOT_RECORDED_NOTE)
+    elif res.imports_unreadable:
+        clauses.append(imports_unreadable_note(res.imports_unreadable))
+    return "; ".join(clauses)
 
 
 @dataclass(frozen=True)

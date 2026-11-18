@@ -291,6 +291,8 @@ def ingest_ghidra_output(
 
 # Every table an extraction fills for one binary (keyed by binary_id).
 _EXTRACTION_TABLES: tuple[str, ...] = (
+    "table_access",
+    "table_access_blocks",
     "functions",
     "imports",
     "exports",
@@ -311,7 +313,9 @@ def _delete_extraction_rows(conn: sqlite3.Connection, binary_id: int) -> None:
 def drop_extraction(conn: sqlite3.Connection, sha256: str) -> None:
     """Remove what an earlier extraction stored for this binary — its rows, and the pass that
     wrote them (``pass_version`` NULL), so it reads as having no extraction rather than as one kept
-    from an earlier pass. ``thunk_spans`` is a Ghidra export product, so it is cleared here too; the
+    from an earlier pass. ``thunk_spans``, ``thunk_targets`` and ``external_symbols`` are Ghidra
+    export products, so they are cleared here too (NULL: not recorded — a hunt must not name a
+    handler from a pass whose extraction is gone); the
     stub columns (stub_table_complete / stub_regions) come from the ELF and do not change for the
     same sha, so they are left to be overwritten by the next ingest. Not committed here."""
     row = conn.execute("SELECT id FROM binaries WHERE sha256 = ?", (sha256,)).fetchone()
@@ -320,7 +324,7 @@ def drop_extraction(conn: sqlite3.Connection, sha256: str) -> None:
     _delete_extraction_rows(conn, int(row[0]))
     conn.execute(
         "UPDATE binaries SET pass_version = NULL, ghidra_version = NULL, thunk_spans = NULL, "  # noqa: S608
-        "wrapper_probe_unfinished = NULL, "
+        "thunk_targets = NULL, external_symbols = NULL, wrapper_probe_unfinished = NULL, "
         + ", ".join(f"{c} = NULL" for c in PROMOTE_COLUMNS)
         + " WHERE id = ?",
         (row[0],),
@@ -483,6 +487,97 @@ def _exported_flag(func_name: Any, exports: frozenset[str] | None) -> int:
     if exports is None or not isinstance(func_name, str):
         return 0
     return 1 if func_name in exports else 0
+
+
+# Every key a table_access row may carry, as the extractor writes them (its taKey calls): "k" is the
+# row's kind (stored in its own column); the rest stay in the row's JSON. A test holds the two lists
+# equal, so a key the extractor starts writing cannot go unlisted.
+TABLE_ACCESS_ROW_KEYS: frozenset[str] = frozenset(
+    {
+        "k",
+        # where and what is read
+        "at",
+        "base",
+        "bk",
+        "slot",
+        "param",
+        "p_at",
+        "p_base",
+        "p_off",
+        "p_form",
+        "p_step",
+        "off",
+        "form",
+        "step",
+        "mult",
+        "ptr",
+        "idx",
+        "sz",
+        "bb",
+        # what the value read is used for, and whether that list was cut
+        "uses",
+        "uc",
+        # a constant data address handed to a call or stored
+        "addr",
+        "callee",
+        "callee_at",
+        "pos",
+    }
+)
+TABLE_ACCESS_KINDS: frozenset[str] = frozenset({"read", "pointer", "arg", "store"})
+# The kind of the row that closes a function the extractor cut at its row limit.
+TABLE_ACCESS_TRUNCATED = "truncated"
+
+
+def _compact(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _ingest_table_access(conn: sqlite3.Connection, binary_id: int, funcs: Any) -> None:
+    """Store the extractor's table-access observations: one ``table_access`` row per observation
+    (in the order exported), one ``table_access_blocks`` row per function that carries its
+    dominator table, and a closing ``truncated`` row for a function the extractor cut — so a
+    reader cannot take a prefix for the whole. Absent (an export predating them) stores nothing.
+    A function the export names that is not among this binary's functions is skipped."""
+    if not isinstance(funcs, list) or not funcs:
+        return
+    ids = {
+        str(addr): int(fid)
+        for fid, addr in conn.execute(
+            "SELECT id, address FROM functions WHERE binary_id = ?", (binary_id,)
+        )
+    }
+    rows: list[tuple[int, int, int, str, str]] = []
+    blocks: list[tuple[int, int, str]] = []
+    for entry in funcs:
+        if not isinstance(entry, dict):
+            continue
+        fid = ids.get(str(entry.get("f")))
+        obs = entry.get("rows")
+        if fid is None or not isinstance(obs, list):
+            continue
+        seq = 0
+        for row in obs:
+            if not isinstance(row, dict) or row.get("k") not in TABLE_ACCESS_KINDS:
+                continue
+            body = {k: v for k, v in row.items() if k != "k"}
+            rows.append((binary_id, fid, seq, str(row["k"]), _compact(body)))
+            seq += 1
+        if entry.get("truncated") is True:
+            cut = {"total": entry.get("total"), "kept": len(obs)}
+            rows.append((binary_id, fid, seq, TABLE_ACCESS_TRUNCATED, _compact(cut)))
+        idom = entry.get("idom")
+        if isinstance(idom, list) and all(isinstance(x, int) for x in idom):
+            blocks.append((binary_id, fid, _compact(idom)))
+    conn.executemany(
+        "INSERT INTO table_access (binary_id, function_id, seq, kind, obs) VALUES (?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.executemany(
+        "INSERT OR REPLACE INTO table_access_blocks (binary_id, function_id, idom) "
+        "VALUES (?, ?, ?)",
+        blocks,
+    )
 
 
 def _ingest_listings(conn: sqlite3.Connection, binary_id: int, funcs: list[dict[str, Any]]) -> None:
@@ -762,6 +857,7 @@ def _ingest_one_binary(
         )
         stats.functions_ingested += len(func_rows)
         _ingest_listings(conn, binary_id, data.get("functions", []))
+    _ingest_table_access(conn, binary_id, data.get("table_access"))
 
     # imports (JSON's lib_name maps to DB's lib_soname), each with where it came from; the
     # dynamic symbols the decompiler's loader left out name no library (the ELF does not say
@@ -851,6 +947,16 @@ def _ingest_one_binary(
         json.dumps(thunks, separators=(",", ":")) if isinstance(thunks, list) else None
     )
     conn.execute("UPDATE binaries SET thunk_spans = ? WHERE id = ?", (thunk_spans_json, binary_id))
+
+    # What each thunk reaches, and where the image holds each imported function: the same two
+    # states as thunk_spans — a list (possibly empty) as given, absent (an export predating them)
+    # NULL, "not recorded", never "none". The dispatch-table detector names a handler from them.
+    for column in ("thunk_targets", "external_symbols"):
+        value = data.get(column)
+        conn.execute(
+            f"UPDATE binaries SET {column} = ? WHERE id = ?",  # noqa: S608 -- literal column
+            (_compact(value) if isinstance(value, list) else None, binary_id),
+        )
 
     # The shell-sink callers the extractor's wrapper probe could not decompile, by body size: not
     # decided either way (neither a wrapper nor not one). Written on every ingest; NULL when the

@@ -16,6 +16,10 @@ gcc -O1 -fPIC -shared -Wl,-soname,libtables.so -o libtables_x86_64.so src/fixtur
     -L"$dep" -lfxdep
 g++ -O1 -fPIC -shared -Wl,-soname,libclasses.so -o libclasses_x86_64.so src/fixture_classes.cc
 
+# The table-access fixture: code that reads tables in the shapes the extractor's observations
+# describe (one function is built unoptimised inside the file; see its comment).
+gcc -O1 -fPIC -shared -Wl,-soname,libaccess.so -o libaccess_x86_64.so src/fixture_access.c
+
 # The code-recovery fixture: its layout is the source order, and three of its parts are named by
 # nothing once their symbols are stripped.
 gcc -O1 -fno-toplevel-reorder -no-pie -o promote_x86_64 src/fixture_promote.c

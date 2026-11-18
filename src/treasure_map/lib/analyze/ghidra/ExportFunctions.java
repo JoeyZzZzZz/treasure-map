@@ -5,6 +5,7 @@
 //   2. Import symbols and their source libraries via ExternalManager
 //   3. Export symbols (ELF external entry points)
 //   4. Defined strings (length 5-300, filtered for noise)
+//   5. The thunks' targets, the imported functions' addresses, and the table-access observations
 //
 // Environment variables:
 //   OUTPUT_DIR  output directory (default /tmp/ghidra_output)
@@ -350,6 +351,719 @@ public class ExportFunctions extends GhidraScript {
         return null;
     }
 
+    // ============================ table-access observations ============================
+    // Raw facts about the code that reads data tables, for the hunt's table readers. Per function:
+    //   * every LOAD whose address resolves to a constant base — an immediate address (imm), a
+    //     pointer loaded from a constant slot (via_load, with the slot), or a pointer read through
+    //     another resolved access (nested: a child table, with its parent access) — plus a constant
+    //     offset, optionally walked (a loop phi with a constant step) or indexed (base + i*N, with
+    //     the index variable);
+    //   * a pointer PARAMETER walked or indexed (param, with its slot) — kept only where some call
+    //     in this binary hands that parameter a constant data address (a table-lookup helper);
+    //   * a read of a data address the decompiler did not express as a LOAD (direct) — kept only
+    //     when the value read is called;
+    //   * one line per walking pointer: what the pointer itself is used for besides being read
+    //     through and stepped (passed, stored, returned — whether it escapes);
+    //   * a constant data address stored to memory, and one handed to a call — the latter kept
+    //     only where the callee walks that parameter.
+    // Every read carries every use of the value read (TA_USES below), each with its block.
+    //
+    // ★ NOTHING here decides which word is a key or a guard. That is a heuristic, and a heuristic
+    //   burnt into the extractor costs a full rescan every time it is tuned: the hunt reads these
+    //   facts and decides there.
+    // ★ Built from the function's ONE decompile — the hf exportFunction already holds — so it adds
+    //   no decompile and no second set of options: what is read here is what the pseudocode shows.
+    // ★ At most TA_ROW_LIMIT rows per function. Past it the function says so (truncated, with the
+    //   total), and a reader must draw NO negative conclusion ("never called", "only tested")
+    //   from a cut function. A value with more than TA_USE_LIMIT uses says so on its row ("uc").
+    //
+    // Uses (TA_USES): icall@<call>#bN (the value is called) · arg:<callee>:<pos>@<call>#bN (passed;
+    // for a compare-family callee also :<peer kind str|cst|param|var|none> and >tTmM, the block T
+    // whose branch tests the result and the block M entered on a match, ">~t" when the result
+    // reaches the test through a phi, ">t?" when no test is reached) · nz#bN / eqc#bN / eqv#bN
+    // (compared with zero / a constant / a variable) · ord · deref · store / storeaddr · ret · cbr ·
+    // arith (and arith><use> for what the result is called or passed as) · phi, and "~<use>" for a
+    // use past a phi (the next iteration) · any other pcode op by its lower-case mnemonic.
+    private static final int TA_ROW_LIMIT = 512;
+    private static final int TA_USE_LIMIT = 12;
+
+    // One resolved read address: base + offset, and how it was reached.
+    private static final class TaRes {
+        long base; long off; String form = "const"; long step = 0; long mult = 0;
+        String baseKind = "imm"; String ptr = null; String idx = null; long slot = -1;
+        int param = -1;
+        long pAt = -1, pBase = -1, pOff = 0; String pForm = null; long pStep = 0;
+        Varnode phi = null;
+
+        TaRes copy() {
+            TaRes r = new TaRes();
+            r.base = base; r.off = off; r.form = form; r.step = step; r.mult = mult;
+            r.baseKind = baseKind; r.ptr = ptr; r.idx = idx; r.slot = slot; r.param = param;
+            r.pAt = pAt; r.pBase = pBase; r.pOff = pOff; r.pForm = pForm; r.pStep = pStep;
+            r.phi = phi;
+            return r;
+        }
+    }
+
+    // One observation row. linkFn/linkPos: for a walked parameter, (this function, its slot); for
+    // a constant data address handed to a call, (the callee, the argument position); else -1.
+    private static final class TaRow {
+        final String json;
+        final boolean needsDom;
+        final long linkFn;
+        final int linkPos;
+        final boolean param;   // a walked-parameter row (kept only when linked)
+        final boolean dataArg; // a data-address argument row (kept only when linked)
+
+        TaRow(String json, boolean needsDom, long linkFn, int linkPos, boolean param,
+              boolean dataArg) {
+            this.json = json; this.needsDom = needsDom; this.linkFn = linkFn;
+            this.linkPos = linkPos; this.param = param; this.dataArg = dataArg;
+        }
+    }
+
+    // One function's rows, held until every function has been read: whether a walked parameter or
+    // a data-address argument is kept depends on the other side of the call, which may be read
+    // later. idom: the immediate dominator of each block (index = block; entry -1; -2 where it
+    // could not be computed), computed from the same decompile when any row might need it.
+    private static final class TaFunc {
+        final String addr;
+        final long entry;
+        final List<TaRow> rows = new ArrayList<>();
+        int[] idom = null;
+
+        TaFunc(String addr, long entry) { this.addr = addr; this.entry = entry; }
+    }
+
+    // Keyed by entry, so a retried decompile replaces the first attempt's rows.
+    private final Map<Long, TaFunc> taFuncs = new LinkedHashMap<>();
+
+    private static String taHex(long v) { return "0x" + Long.toHexString(v); }
+
+    // Every key a row may carry is written through this, so the key set is one list a test can
+    // read (the ingest's TABLE_ACCESS_ROW_KEYS mirrors it).
+    private static void taKey(StringBuilder sb, String key) {
+        if (sb.length() > 1) sb.append(",");
+        sb.append("\"").append(key).append("\":");
+    }
+
+    private static void taStr(StringBuilder sb, String key, String v) {
+        taKey(sb, key);
+        sb.append("\"").append(v).append("\"");
+    }
+
+    private static void taNum(StringBuilder sb, String key, long v) {
+        taKey(sb, key);
+        sb.append(v);
+    }
+
+    private void taUses(StringBuilder sb, List<String> uses, boolean cut) {
+        taKey(sb, "uses");
+        sb.append("[");
+        for (int i = 0; i < uses.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("\"").append(esc(uses.get(i))).append("\"");
+        }
+        sb.append("]");
+        if (cut) taNum(sb, "uc", 1);
+    }
+
+    private static boolean taNeedsDom(List<String> uses) {
+        for (String u : uses) if (u.contains("icall") || u.contains(">t") || u.contains(">~t")) return true;
+        return false;
+    }
+
+    private static boolean taCalled(List<String> uses) {
+        for (String u : uses) {
+            String s = u;
+            boolean more = true;
+            while (more) {
+                more = false;
+                if (s.startsWith("~")) { s = s.substring(1); more = true; }
+                if (s.startsWith("arith>")) { s = s.substring(6); more = true; }
+            }
+            if (s.startsWith("icall")) return true;
+        }
+        return false;
+    }
+
+    private MemoryBlock taBlockOf(long v) {
+        try {
+            MemoryBlock b = currentProgram.getMemory().getBlock(toAddr(v));
+            return (b != null && b.isInitialized() && b.isLoaded()) ? b : null;
+        } catch (Exception e) { return null; }
+    }
+
+    private static Long taCst(Varnode v) { return (v != null && v.isConstant()) ? v.getOffset() : null; }
+
+    private static long taSigned(Varnode v) {
+        long x = v.getOffset(); int sz = v.getSize();
+        if (sz < 8) { long m = 1L << (sz * 8 - 1); x = (x ^ m) - m; }
+        return x;
+    }
+
+    private static String taBlk(PcodeOp d) {
+        PcodeBlockBasic b = d.getParent();
+        return b != null ? "#b" + b.getIndex() : "";
+    }
+
+    // A stable id for the variable behind an index (multiplies, shifts and casts stripped), so two
+    // reads of parallel arrays by the same index say so; null when it has none.
+    private static String taVarId(Varnode v) {
+        for (int i = 0; v != null && i < 6; i++) {
+            PcodeOp d = v.getDef();
+            if (d == null) break;
+            int oc = d.getOpcode();
+            if (oc == PcodeOp.COPY || oc == PcodeOp.CAST || oc == PcodeOp.INT_ZEXT
+                    || oc == PcodeOp.INT_SEXT) { v = d.getInput(0); continue; }
+            if (oc == PcodeOp.INT_MULT || oc == PcodeOp.INT_LEFT) {
+                v = d.getInput(0).isConstant() ? d.getInput(1) : d.getInput(0);
+                continue;
+            }
+            break;
+        }
+        if (v == null) return null;
+        HighVariable hv = v.getHigh();
+        Varnode rep = hv != null ? hv.getRepresentative() : v;
+        if (rep instanceof VarnodeAST) return "v" + ((VarnodeAST) rep).getUniqueId();
+        return (v instanceof VarnodeAST) ? "v" + ((VarnodeAST) v).getUniqueId() : null;
+    }
+
+    private TaRes taResolve(Varnode v, int depth, Set<Long> seen) {
+        if (v == null || depth > 12) return null;
+        if (v.isConstant()) {
+            if (taBlockOf(v.getOffset()) == null) return null;
+            TaRes r = new TaRes(); r.base = v.getOffset(); return r;
+        }
+        PcodeOp d = v.getDef();
+        if (d == null) {
+            HighVariable hv = v.getHigh();
+            if (hv instanceof HighParam) {
+                TaRes r = new TaRes(); r.base = 0; r.baseKind = "param";
+                r.param = ((HighParam) hv).getSlot();
+                return r;
+            }
+            return null;
+        }
+        switch (d.getOpcode()) {
+            case PcodeOp.COPY: case PcodeOp.CAST: case PcodeOp.INDIRECT:
+                return taResolve(d.getInput(0), depth + 1, seen);
+            case PcodeOp.PTRSUB: {
+                Long c0 = taCst(d.getInput(0)), c1 = taCst(d.getInput(1));
+                if (c0 != null && c0 == 0 && c1 != null) {
+                    if (taBlockOf(c1) == null) return null;
+                    TaRes r = new TaRes(); r.base = c1; return r;
+                }
+                TaRes r = taResolve(d.getInput(0), depth + 1, seen);
+                if (r == null || c1 == null) return null;
+                r.off += c1; return r;
+            }
+            case PcodeOp.INT_ADD: {
+                Varnode a = d.getInput(0), b = d.getInput(1);
+                if (b.isConstant()) {
+                    TaRes r = taResolve(a, depth + 1, seen);
+                    if (r != null) r.off += taSigned(b);
+                    return r;
+                }
+                if (a.isConstant()) {
+                    TaRes r = taResolve(b, depth + 1, seen);
+                    if (r != null) r.off += taSigned(a);
+                    return r;
+                }
+                TaRes r = taResolve(a, depth + 1, seen);
+                Varnode idx = b;
+                if (r == null) { r = taResolve(b, depth + 1, seen); idx = a; }
+                if (r == null) return null;
+                r.form = r.form.equals("walk") ? "walk+index" : "index";
+                r.mult = taMultOf(idx);
+                r.idx = taVarId(idx);
+                return r;
+            }
+            case PcodeOp.PTRADD: {
+                TaRes r = taResolve(d.getInput(0), depth + 1, seen);
+                if (r == null) return null;
+                Long i = taCst(d.getInput(1)), n = taCst(d.getInput(2));
+                if (i != null && n != null) { r.off += taSigned(d.getInput(1)) * n; return r; }
+                r.form = r.form.equals("walk") ? "walk+index" : "index";
+                r.mult = (n != null ? n : 1) * Math.max(1, taMultOf(d.getInput(1)));
+                r.idx = taVarId(d.getInput(1));
+                return r;
+            }
+            case PcodeOp.MULTIEQUAL: {
+                Varnode out = d.getOutput();
+                long key = (out instanceof VarnodeAST) ? ((VarnodeAST) out).getUniqueId() : out.hashCode();
+                if (!seen.add(key)) return null;
+                TaRes init = null; Long step = null;
+                for (int i = 0; i < d.getNumInputs(); i++) {
+                    Varnode in = d.getInput(i);
+                    Long st = taStepOf(in, out, 0);
+                    if (st != null) { if (step == null) step = st; continue; }
+                    TaRes r = taResolve(in, depth + 1, seen);
+                    if (r != null && init == null) init = r;
+                }
+                if (init == null) return null;
+                TaRes r = init.copy();
+                if (step != null) { r.form = "walk"; r.step = step; } else r.form = "phi";
+                r.ptr = "phi" + key; r.phi = out;
+                return r;
+            }
+            case PcodeOp.LOAD: {
+                TaRes s = taResolve(d.getInput(1), depth + 1, seen);
+                if (s == null) return null;
+                if (s.form.equals("const")) {
+                    if (s.param >= 0) return null;   // a field of a parameter, not a table slot
+                    long slot = s.base + s.off;
+                    try {
+                        Memory mem = currentProgram.getMemory();
+                        long val = currentProgram.getDefaultPointerSize() == 8
+                                ? mem.getLong(toAddr(slot)) : (mem.getInt(toAddr(slot)) & 0xffffffffL);
+                        if (taBlockOf(val) == null) return null;
+                        TaRes r = new TaRes(); r.base = val; r.baseKind = "via_load"; r.slot = slot;
+                        return r;
+                    } catch (Exception e) { return null; }
+                }
+                // A pointer read out of another resolved access: the child table is not known here.
+                // Read through a walked parameter, it belongs to that parameter (param kept).
+                TaRes r = new TaRes(); r.base = s.base; r.baseKind = "nested"; r.param = s.param;
+                r.pAt = d.getSeqnum().getTarget().getOffset(); r.pBase = s.base; r.pOff = s.off;
+                r.pForm = s.form; r.pStep = s.step != 0 ? s.step : s.mult;
+                return r;
+            }
+            default:
+                return null;
+        }
+    }
+
+    private Long taStepOf(Varnode x, Varnode phiOut, int depth) {
+        if (x == null || depth > 4) return null;
+        PcodeOp d = x.getDef();
+        if (d == null) return null;
+        switch (d.getOpcode()) {
+            case PcodeOp.COPY: case PcodeOp.CAST: case PcodeOp.INDIRECT:
+                return taStepOf(d.getInput(0), phiOut, depth + 1);
+            case PcodeOp.INT_ADD:
+                if (d.getInput(0) == phiOut && d.getInput(1).isConstant()) return taSigned(d.getInput(1));
+                if (d.getInput(1) == phiOut && d.getInput(0).isConstant()) return taSigned(d.getInput(0));
+                return null;
+            case PcodeOp.PTRADD:
+                if (d.getInput(0) == phiOut && d.getInput(1).isConstant() && d.getInput(2).isConstant())
+                    return taSigned(d.getInput(1)) * d.getInput(2).getOffset();
+                return null;
+            case PcodeOp.PTRSUB:
+                if (d.getInput(0) == phiOut && d.getInput(1).isConstant()) return d.getInput(1).getOffset();
+                return null;
+            default:
+                return null;
+        }
+    }
+
+    private static long taMultOf(Varnode idx) {
+        PcodeOp d = idx != null ? idx.getDef() : null;
+        if (d == null) return 1;
+        if (d.getOpcode() == PcodeOp.INT_MULT) {
+            Long c = taCst(d.getInput(1));
+            if (c == null) c = taCst(d.getInput(0));
+            return c != null ? c : 1;
+        }
+        if (d.getOpcode() == PcodeOp.INT_LEFT) {
+            Long c = taCst(d.getInput(1));
+            return c != null ? (1L << c) : 1;
+        }
+        return 1;
+    }
+
+    // The callee of a call, as the uses name it: "<ind>" for an indirect call, "?" when unknown.
+    private String taCallee(PcodeOp call) {
+        if (call.getOpcode() != PcodeOp.CALL) return "<ind>";
+        String n = calleeNameOf(call);
+        return n != null ? n : "?";
+    }
+
+    // The entry of the function a direct call reaches (a thunk followed to a function in this
+    // binary), or -1.
+    private long taCalleeEntry(PcodeOp call) {
+        if (call.getOpcode() != PcodeOp.CALL) return -1;
+        Varnode t = call.getInput(0);
+        if (t == null || !t.isAddress()) return -1;
+        Function g = currentProgram.getFunctionManager().getFunctionAt(t.getAddress());
+        if (g != null && g.isThunk()) g = g.getThunkedFunction(true);
+        if (g == null || g.isExternal()) return -1;
+        return g.getEntryPoint().getOffset();
+    }
+
+    // The kind of the other operand of a compare-family call: a string constant, another
+    // constant, a parameter, a variable, or none.
+    private String taPeer(PcodeOp call, int self) {
+        for (int i = 1; i < call.getNumInputs() && i <= 3; i++) {
+            if (i == self) continue;
+            Varnode v = call.getInput(i);
+            Long c = taConstPtr(v, 0);
+            if (c != null) return taStrAt(c) != null ? "str" : "cst";
+            HighVariable hv = v.getHigh();
+            if (hv != null && hv.getSymbol() != null && hv.getSymbol().isParameter()) return "param";
+            return "var";
+        }
+        return "none";
+    }
+
+    private Long taConstPtr(Varnode v, int depth) {
+        if (v == null || depth > 4) return null;
+        if (v.isConstant()) return v.getOffset();
+        PcodeOp d = v.getDef();
+        if (d == null) return null;
+        if (d.getOpcode() == PcodeOp.COPY || d.getOpcode() == PcodeOp.CAST)
+            return taConstPtr(d.getInput(0), depth + 1);
+        if (d.getOpcode() == PcodeOp.PTRSUB) {
+            Long a = taCst(d.getInput(0)), b = taCst(d.getInput(1));
+            if (a != null && a == 0 && b != null) return b;
+        }
+        return null;
+    }
+
+    private String taStrAt(long a) {
+        try {
+            Memory mem = currentProgram.getMemory();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 64; i++) {
+                byte c = mem.getByte(toAddr(a + i));
+                if (c == 0) return sb.length() > 0 ? sb.toString() : null;
+                if (c < 0x20 || c > 0x7e) return null;
+                sb.append((char) c);
+            }
+        } catch (Exception e) { /* not readable: no string */ }
+        return null;
+    }
+
+    // Where a compare call's result is tested: the CBRANCH block it reaches (through copies,
+    // casts, ==0 / !=0, negation, boolean or/and and phis — the matchedBlockForZero walk, carried
+    // through a phi and saying so), and the successor entered on a MATCH (result == 0).
+    private String taTestOf(PcodeOp call) {
+        Varnode r = call.getOutput();
+        if (r == null) return ">t?";
+        ArrayDeque<Object[]> q = new ArrayDeque<>();
+        q.add(new Object[]{r, Boolean.FALSE, Boolean.FALSE, 0});   // value, nonzero<=>match, via phi, depth
+        Set<Varnode> seen = new HashSet<>();
+        while (!q.isEmpty()) {
+            Object[] it = q.poll();
+            Varnode v = (Varnode) it[0];
+            boolean s = (Boolean) it[1];
+            boolean phi = (Boolean) it[2];
+            int dep = (Integer) it[3];
+            if (dep > 8 || !seen.add(v)) continue;
+            Iterator<PcodeOp> ds = v.getDescendants();
+            while (ds.hasNext()) {
+                PcodeOp d = ds.next();
+                Varnode o = d.getOutput();
+                switch (d.getOpcode()) {
+                    case PcodeOp.CBRANCH: {
+                        PcodeBlock p = d.getParent();
+                        if (p == null) break;
+                        PcodeBlock m = s ? p.getTrueOut() : p.getFalseOut();
+                        return ">" + (phi ? "~" : "") + "t" + ((PcodeBlockBasic) p).getIndex() + "m"
+                                + (m instanceof PcodeBlockBasic ? ((PcodeBlockBasic) m).getIndex() : -1);
+                    }
+                    case PcodeOp.COPY: case PcodeOp.CAST: case PcodeOp.INT_ZEXT: case PcodeOp.INT_SEXT:
+                    case PcodeOp.SUBPIECE: case PcodeOp.BOOL_OR: case PcodeOp.BOOL_AND: case PcodeOp.INDIRECT:
+                        if (o != null) q.add(new Object[]{o, s, phi, dep + 1});
+                        break;
+                    case PcodeOp.MULTIEQUAL:
+                        if (o != null) q.add(new Object[]{o, s, Boolean.TRUE, dep + 1});
+                        break;
+                    case PcodeOp.BOOL_NEGATE:
+                        if (o != null) q.add(new Object[]{o, !s, phi, dep + 1});
+                        break;
+                    case PcodeOp.INT_EQUAL: case PcodeOp.INT_NOTEQUAL: {
+                        Varnode other = d.getInput(0) == v ? d.getInput(1) : d.getInput(0);
+                        if (o != null && other != null && other.isConstant() && other.getOffset() == 0)
+                            q.add(new Object[]{o, d.getOpcode() == PcodeOp.INT_EQUAL ? !s : s, phi, dep + 1});
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+        }
+        return ">t?";
+    }
+
+    // Every use of a value (TA_USES). cut[0] is set when the list stops at TA_USE_LIMIT.
+    private void taUsesOf(Varnode v, int depth, Set<Varnode> seen, List<String> out, boolean[] cut) {
+        if (depth > 3 || !seen.add(v)) return;
+        if (out.size() > TA_USE_LIMIT) { cut[0] = true; return; }
+        Iterator<PcodeOp> it = v.getDescendants();
+        while (it.hasNext()) {
+            PcodeOp d = it.next();
+            int oc = d.getOpcode();
+            String at = "@" + taHex(d.getSeqnum().getTarget().getOffset()) + taBlk(d);
+            switch (oc) {
+                case PcodeOp.COPY: case PcodeOp.CAST: case PcodeOp.INT_ZEXT: case PcodeOp.INT_SEXT:
+                case PcodeOp.INDIRECT:
+                    if (d.getOutput() != null) taUsesOf(d.getOutput(), depth + 1, seen, out, cut);
+                    break;
+                case PcodeOp.MULTIEQUAL: {
+                    out.add("phi");
+                    List<String> sub = new ArrayList<>();
+                    if (d.getOutput() != null) taUsesOf(d.getOutput(), depth + 1, seen, sub, cut);
+                    for (String u : sub) out.add(u.startsWith("~") ? u : "~" + u);
+                    break;
+                }
+                case PcodeOp.CALLIND:
+                    if (d.getInput(0) == v) { out.add("icall" + at); break; }
+                    // fall through: an argument of an indirect call
+                case PcodeOp.CALL: {
+                    for (int i = 1; i < d.getNumInputs(); i++) {
+                        if (d.getInput(i) != v) continue;
+                        String cn = taCallee(d);
+                        String u = "arg:" + cn + ":" + (i - 1);
+                        if (cn.matches(".*(cmp|strstr|casestr).*")) {
+                            out.add(u + ":" + taPeer(d, i) + at + taTestOf(d));
+                        } else {
+                            out.add(u + at);
+                        }
+                    }
+                    break;
+                }
+                case PcodeOp.INT_EQUAL: case PcodeOp.INT_NOTEQUAL: {
+                    Varnode other = (d.getInput(0) == v) ? d.getInput(1) : d.getInput(0);
+                    if (other.isConstant()) out.add((other.getOffset() == 0 ? "nz" : "eqc") + taBlk(d));
+                    else out.add("eqv" + taBlk(d));
+                    break;
+                }
+                case PcodeOp.INT_LESS: case PcodeOp.INT_SLESS: case PcodeOp.INT_LESSEQUAL:
+                case PcodeOp.INT_SLESSEQUAL:
+                    out.add("ord"); break;
+                case PcodeOp.LOAD: out.add("deref"); break;
+                case PcodeOp.STORE: out.add(d.getInput(2) == v ? "store" : "storeaddr"); break;
+                case PcodeOp.RETURN: out.add("ret"); break;
+                case PcodeOp.CBRANCH: out.add("cbr"); break;
+                case PcodeOp.INT_ADD: case PcodeOp.PTRADD: case PcodeOp.PTRSUB: {
+                    out.add("arith");
+                    // what the result is called or passed as (a record holding a relative pointer)
+                    if (d.getOutput() != null && depth < 2) {
+                        List<String> sub = new ArrayList<>();
+                        taUsesOf(d.getOutput(), depth + 1, seen, sub, cut);
+                        for (String u : sub) if (u.startsWith("icall") || u.startsWith("arg:")) out.add("arith>" + u);
+                    }
+                    break;
+                }
+                default: out.add(d.getMnemonic().toLowerCase()); break;
+            }
+        }
+    }
+
+    // What a walking pointer itself is used for, besides being read through and stepped.
+    private void taPointerUses(Varnode v, int depth, Set<Varnode> seen, List<String> out, boolean[] cut) {
+        if (depth > 3 || !seen.add(v)) return;
+        if (out.size() > TA_USE_LIMIT) { cut[0] = true; return; }
+        Iterator<PcodeOp> it = v.getDescendants();
+        while (it.hasNext()) {
+            PcodeOp d = it.next();
+            switch (d.getOpcode()) {
+                case PcodeOp.LOAD: break;          // read through: the read rows say it
+                case PcodeOp.MULTIEQUAL: break;    // the loop back edge
+                case PcodeOp.COPY: case PcodeOp.CAST: case PcodeOp.INT_ADD: case PcodeOp.PTRADD:
+                case PcodeOp.PTRSUB:
+                    if (d.getOutput() != null) taPointerUses(d.getOutput(), depth + 1, seen, out, cut);
+                    break;
+                case PcodeOp.CALL: case PcodeOp.CALLIND:
+                    for (int i = 1; i < d.getNumInputs(); i++)
+                        if (d.getInput(i) == v)
+                            out.add("arg:" + taCallee(d) + ":" + (i - 1) + "@"
+                                    + taHex(d.getSeqnum().getTarget().getOffset()) + taBlk(d));
+                    break;
+                case PcodeOp.STORE: if (d.getInput(2) == v) out.add("store"); break;
+                case PcodeOp.RETURN: out.add("ret"); break;
+                case PcodeOp.INT_EQUAL: case PcodeOp.INT_NOTEQUAL: case PcodeOp.INT_LESS:
+                case PcodeOp.INT_LESSEQUAL: case PcodeOp.INT_SLESS: case PcodeOp.INT_SLESSEQUAL:
+                    out.add("cmp"); break;
+                default: out.add(d.getMnemonic().toLowerCase());
+            }
+        }
+    }
+
+    private String taReadRow(long at, TaRes r, int sz, int bb, List<String> uses, boolean cut) {
+        StringBuilder sb = new StringBuilder("{");
+        taStr(sb, "k", "read");
+        boolean rooted = r.param < 0;   // a constant base, not a parameter's
+        taStr(sb, "at", taHex(at));
+        if (rooted) taStr(sb, "base", taHex(r.base));
+        taStr(sb, "bk", r.baseKind);
+        if (r.slot >= 0) taStr(sb, "slot", taHex(r.slot));
+        if (r.param >= 0) taNum(sb, "param", r.param);
+        if (r.pAt >= 0) {
+            taStr(sb, "p_at", taHex(r.pAt));
+            if (rooted) taStr(sb, "p_base", taHex(r.pBase));
+            taNum(sb, "p_off", r.pOff);
+            taStr(sb, "p_form", r.pForm);
+            taNum(sb, "p_step", r.pStep);
+        }
+        taNum(sb, "off", r.off);
+        taStr(sb, "form", r.form);
+        if (r.step != 0) taNum(sb, "step", r.step);
+        if (r.mult != 0) taNum(sb, "mult", r.mult);
+        if (r.ptr != null) taStr(sb, "ptr", r.ptr);
+        if (r.idx != null) taStr(sb, "idx", r.idx);
+        taNum(sb, "sz", sz);
+        taNum(sb, "bb", bb);
+        taUses(sb, uses, cut);
+        return sb.append("}").toString();
+    }
+
+    // Read one decompiled function's table accesses into taFuncs (replacing an earlier attempt's).
+    private void buildTableAccess(Function func, HighFunction hf) {
+        long entry = func.getEntryPoint().getOffset();
+        taFuncs.remove(entry);
+        TaFunc tf = new TaFunc(func.getEntryPoint().toString(), entry);
+        boolean anyDom = false;
+        Map<Varnode, TaRes> phis = new LinkedHashMap<>();
+        Set<Varnode> directSeen = new HashSet<>();
+        Iterator<PcodeOpAST> ops = hf.getPcodeOps();
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            PcodeBlockBasic pb = op.getParent();
+            int bb = pb != null ? pb.getIndex() : -1;
+            long opAt = op.getSeqnum().getTarget().getOffset();
+            // a read of a data address the decompiler did not express as a LOAD
+            for (int i = 0; i < op.getNumInputs(); i++) {
+                Varnode v = op.getInput(i);
+                if (v == null || !v.isAddress() || directSeen.contains(v)) continue;
+                if (op.getOpcode() == PcodeOp.CALL && i == 0) continue;   // a call target, not a read
+                if (op.getOpcode() == PcodeOp.INDIRECT) continue;
+                MemoryBlock b = taBlockOf(v.getOffset());
+                if (b == null || b.isExecute()) continue;
+                directSeen.add(v);
+                List<String> uses = new ArrayList<>();
+                boolean[] cut = {false};
+                taUsesOf(v, 0, new HashSet<>(), uses, cut);
+                if (!taCalled(uses)) continue;   // kept only when the value read is called
+                TaRes r = new TaRes(); r.base = v.getOffset(); r.form = "direct";
+                boolean nd = taNeedsDom(uses);
+                anyDom |= nd;
+                tf.rows.add(new TaRow(taReadRow(opAt, r, v.getSize(), bb, uses, cut[0]), nd, -1, -1,
+                        false, false));
+            }
+            // a constant data address handed to a call, or stored
+            int oc = op.getOpcode();
+            if (oc == PcodeOp.CALL || oc == PcodeOp.CALLIND || oc == PcodeOp.STORE) {
+                int first = oc == PcodeOp.STORE ? 2 : 1;
+                for (int i = first; i < op.getNumInputs(); i++) {
+                    Long c = taConstPtr(op.getInput(i), 0);
+                    if (c == null) continue;
+                    MemoryBlock cb = taBlockOf(c);
+                    if (cb == null || cb.isExecute() || taStrAt(c) != null) continue;   // data, not a string
+                    StringBuilder sb = new StringBuilder("{");
+                    if (oc == PcodeOp.STORE) {
+                        taStr(sb, "k", "store");
+                        taStr(sb, "at", taHex(opAt));
+                        taStr(sb, "addr", taHex(c));
+                        taNum(sb, "bb", bb);
+                        tf.rows.add(new TaRow(sb.append("}").toString(), false, -1, -1, false, false));
+                    } else {
+                        long ce = taCalleeEntry(op);
+                        if (ce < 0) continue;   // no callee in this binary: nothing it can link to
+                        taStr(sb, "k", "arg");
+                        taStr(sb, "at", taHex(opAt));
+                        taStr(sb, "addr", taHex(c));
+                        taStr(sb, "callee", esc(taCallee(op)));
+                        taStr(sb, "callee_at", taHex(ce));
+                        taNum(sb, "pos", i - 1);
+                        taNum(sb, "bb", bb);
+                        tf.rows.add(new TaRow(sb.append("}").toString(), false, ce, i - 1, false, true));
+                    }
+                }
+            }
+            if (oc != PcodeOp.LOAD) continue;
+            TaRes res = taResolve(op.getInput(1), 0, new HashSet<>());
+            if (res == null) continue;
+            boolean param = res.param >= 0;
+            if (res.baseKind.equals("param")) {
+                // a pointer parameter stepped through (a walk / an index), never a plain field read
+                if (!(res.form.startsWith("walk") || res.form.equals("index"))) continue;
+            } else if (!param && taBlockOf(res.base) == null) {
+                continue;
+            }
+            if (res.phi != null) phis.putIfAbsent(res.phi, res);
+            Varnode o = op.getOutput();
+            List<String> uses = new ArrayList<>();
+            boolean[] cut = {false};
+            if (o != null) taUsesOf(o, 0, new HashSet<>(), uses, cut);
+            boolean nd = taNeedsDom(uses);
+            anyDom |= nd;
+            tf.rows.add(new TaRow(taReadRow(opAt, res, o != null ? o.getSize() : 0, bb, uses, cut[0]),
+                    nd, param ? entry : -1, param ? res.param : -1, param, false));
+        }
+        for (Map.Entry<Varnode, TaRes> e : phis.entrySet()) {
+            TaRes r = e.getValue();
+            List<String> uses = new ArrayList<>();
+            boolean[] cut = {false};
+            taPointerUses(e.getKey(), 0, new HashSet<>(), uses, cut);
+            StringBuilder sb = new StringBuilder("{");
+            taStr(sb, "k", "pointer");
+            taStr(sb, "ptr", r.ptr);
+            if (r.param < 0) taStr(sb, "base", taHex(r.base));
+            taStr(sb, "bk", r.baseKind);
+            if (r.param >= 0) taNum(sb, "param", r.param);
+            taStr(sb, "form", r.form);
+            taNum(sb, "step", r.step);
+            taUses(sb, uses, cut[0]);
+            boolean param = r.param >= 0;
+            tf.rows.add(new TaRow(sb.append("}").toString(), false, param ? entry : -1,
+                    param ? r.param : -1, param, false));
+        }
+        if (tf.rows.isEmpty()) return;
+        if (anyDom) tf.idom = new DomCtx(hf).idomTable();
+        taFuncs.put(entry, tf);
+    }
+
+    // Every function's kept rows, after the walked parameters and data-address arguments are
+    // linked across the binary: [{"f":<entry as the function record writes it>,"rows":[...],
+    // "total":N,"truncated":bool[,"idom":[...]]}, ...]. idom only where a kept row is called or
+    // carries a compare test.
+    private String tableAccessJson() {
+        Set<String> walked = new HashSet<>();   // "<entry>:<slot>" of every walked parameter
+        Set<String> handed = new HashSet<>();   // "<callee entry>:<pos>" of every data-address argument
+        for (TaFunc tf : taFuncs.values()) {
+            for (TaRow r : tf.rows) {
+                if (r.param) walked.add(r.linkFn + ":" + r.linkPos);
+                if (r.dataArg) handed.add(r.linkFn + ":" + r.linkPos);
+            }
+        }
+        StringBuilder out = new StringBuilder("[");
+        boolean firstF = true;
+        for (TaFunc tf : taFuncs.values()) {
+            List<TaRow> kept = new ArrayList<>();
+            for (TaRow r : tf.rows) {
+                String link = r.linkFn + ":" + r.linkPos;
+                if (r.param && !handed.contains(link)) continue;
+                if (r.dataArg && !walked.contains(link)) continue;
+                kept.add(r);
+            }
+            if (kept.isEmpty()) continue;
+            int n = Math.min(kept.size(), TA_ROW_LIMIT);
+            boolean dom = false;
+            if (!firstF) out.append(",");
+            firstF = false;
+            out.append("{\"f\":\"").append(esc(tf.addr)).append("\",\"rows\":[");
+            for (int i = 0; i < n; i++) {
+                if (i > 0) out.append(",");
+                out.append(kept.get(i).json);
+                dom |= kept.get(i).needsDom;
+            }
+            out.append("],\"total\":").append(kept.size())
+               .append(",\"truncated\":").append(kept.size() > TA_ROW_LIMIT);
+            if (dom && tf.idom != null) {
+                out.append(",\"idom\":[");
+                for (int i = 0; i < tf.idom.length; i++) {
+                    if (i > 0) out.append(",");
+                    out.append(tf.idom[i]);
+                }
+                out.append("]");
+            }
+            out.append("}");
+        }
+        return out.append("]").toString();
+    }
+
     // ============================ sink_arg_provenance (the provenance design) ============================
     // Backward def-use over the HighFunction Varnode graph + Ghidra CHK dominance over its block
     // graph. Pure fact extraction: where does each command/format sink's key argument come from.
@@ -400,6 +1114,37 @@ public class ExportFunctions extends GhidraScript {
             } catch (Exception e) { /* leave empty on failure */ }
             cache.put(idx, res);
             return res;
+        }
+
+        // The immediate dominator of every block — index = block index, the entry -1, -2 where it
+        // could not be computed: each block's parent in the dominance tree.
+        int[] idomTable() {
+            ArrayList<PcodeBlockBasic> blocks = hf.getBasicBlocks();
+            int n = blocks.size();
+            int[] idom = new int[n];
+            Arrays.fill(idom, -2);
+            if (n == 1) {   // one block: the entry, which nothing dominates (the algorithm needs an edge)
+                idom[0] = -1;
+                return idom;
+            }
+            build();
+            if (!built) return idom;
+            try {
+                GDirectedGraph<PcodeBlockBasic, GEdge<PcodeBlockBasic>> tree = algo.getDominanceTree();
+                for (PcodeBlockBasic b : blocks) {
+                    int i = b.getIndex();
+                    if (i < 0 || i >= n || !tree.containsVertex(b)) continue;
+                    int d = -1;
+                    Collection<GEdge<PcodeBlockBasic>> in = tree.getInEdges(b);
+                    if (in != null) {
+                        for (GEdge<PcodeBlockBasic> e : in) { d = e.getStart().getIndex(); break; }
+                    }
+                    idom[i] = (d >= -1 && d < n) ? d : -2;
+                }
+            } catch (Exception e) {
+                Arrays.fill(idom, -2);
+            }
+            return idom;
         }
     }
 
@@ -2865,6 +3610,16 @@ public class ExportFunctions extends GhidraScript {
             detectorErrors.add("string_keyed_edges");
         }
 
+        // Table-access observations: raw facts for the hunt's table readers, read from this same
+        // hf (no second decompile). Held until every function is read (see tableAccessJson);
+        // a failure drops this function's rows and says so.
+        try {
+            if (hf != null) buildTableAccess(func, hf);
+        } catch (Throwable ignore) {
+            taFuncs.remove(func.getEntryPoint().getOffset());
+            detectorErrors.add("table_access");
+        }
+
         // address-taken: who references THIS function's entry as data/pointer (non-call, non-flow)
         // — a static-table slot or a literal-pool `ldr =F`. Reference-driven (no decompile needed),
         // additive and isolated; a failure just yields no takes, never breaking the scan.
@@ -3047,6 +3802,13 @@ public class ExportFunctions extends GhidraScript {
         // there" (the analysis.db holds no thunk row). External symbols carry no body and are left
         // out. Top-level: [["0x<entry>", [["0x<lo>","0x<hi>"], ...]], ...].
         StringBuilder thunksJson = new StringBuilder("[");
+        // The function each of those thunks reaches, one entry per thunk, in the same order:
+        // [["0x<thunk entry>", "0x<target entry>" | null, "<target name>" | null], ...]. The target
+        // entry is null when the target is an imported function (it has no address in this image)
+        // or not known; the name is null only when Ghidra records no target at all. A list of its
+        // own, never a third element of a thunks entry: four readers take an entry of any other
+        // length as an unreadable list.
+        StringBuilder thunkTargetsJson = new StringBuilder("[");
         boolean firstThunk = true;
         for (Function func : fm.getFunctions(true)) {
             if (monitor.isCancelled()) break;
@@ -3059,6 +3821,16 @@ public class ExportFunctions extends GhidraScript {
                     thunksJson.append("[\"0x")
                         .append(Long.toHexString(func.getEntryPoint().getOffset()))
                         .append("\",").append(buildBodyRanges(func)).append("]");
+                    Function th = null;
+                    try { th = func.getThunkedFunction(true); } catch (Exception ignore) { th = null; }
+                    if (thunkTargetsJson.length() > 1) thunkTargetsJson.append(",");
+                    thunkTargetsJson.append("[\"").append(addrHex(func.getEntryPoint())).append("\",")
+                        .append(th == null || th.isExternal() ? "null"
+                                : "\"" + addrHex(th.getEntryPoint()) + "\"")
+                        .append(",")
+                        .append(th == null || th.getName() == null ? "null"
+                                : "\"" + esc(th.getName()) + "\"")
+                        .append("]");
                 }
                 continue;
             }
@@ -3073,6 +3845,7 @@ public class ExportFunctions extends GhidraScript {
             funcCount++;
         }
         thunksJson.append("]");
+        thunkTargetsJson.append("]");
         // A decompile that timed out in the loop is retried once here, at a larger limit and one
         // at a time: under load a function can need more than the loop's limit, and its empty
         // pseudocode would otherwise silently take its sink calls and provenance with it. Still
@@ -3174,6 +3947,27 @@ public class ExportFunctions extends GhidraScript {
                        .append("}");
         }
         importsJson.append("]");
+
+        // 2b. Where the image holds each imported function: the address in the loader's external
+        //     block a pointer to it is relocated to (Ghidra places a thunk to the import there), and
+        //     the import's name — so a data word holding that address reads as that import:
+        //     [["0x<addr>", "<name>"], ...]. An imported DATA symbol (a plain label there) is not
+        //     a function and is left out.
+        StringBuilder externalSymbolsJson = new StringBuilder("[");
+        for (MemoryBlock xblk : currentProgram.getMemory().getBlocks()) {
+            if (!xblk.isExternalBlock()) continue;
+            FunctionIterator xfs = fm.getFunctions(new AddressSet(xblk.getStart(), xblk.getEnd()), true);
+            while (xfs.hasNext()) {
+                Function xf = xfs.next();
+                if (!xf.isThunk()) continue;
+                Function th = xf.getThunkedFunction(true);
+                if (th == null || !th.isExternal() || th.getName() == null) continue;
+                if (externalSymbolsJson.length() > 1) externalSymbolsJson.append(",");
+                externalSymbolsJson.append("[\"").append(addrHex(xf.getEntryPoint())).append("\",\"")
+                    .append(esc(th.getName())).append("\"]");
+            }
+        }
+        externalSymbolsJson.append("]");
 
         // 3. Export symbols (ELF external entry points)
         StringBuilder exportsJson = new StringBuilder("[");
@@ -3372,6 +4166,10 @@ public class ExportFunctions extends GhidraScript {
             // W12: the thunks skipped above (entry + body ranges), so the diff's counterpart probe
             // can see an other-side thunk where a function maps instead of reading "no function".
             pw.print("\"thunks\":" + thunksJson + ",");
+            // What each of those thunks reaches (same order), and where the image holds each
+            // imported function: a handler pointer to either is named by them.
+            pw.print("\"thunk_targets\":" + thunkTargetsJson + ",");
+            pw.print("\"external_symbols\":" + externalSymbolsJson + ",");
             // Written record by record: no second copy of the array is built.
             pw.print("\"functions\":[");
             for (int k = 0; k < entries.size(); k++) {
@@ -3379,6 +4177,8 @@ public class ExportFunctions extends GhidraScript {
                 pw.print(entries.get(k));
             }
             pw.print("],");
+            // Table-access observations, per function that has any (see tableAccessJson).
+            pw.print("\"table_access\":" + tableAccessJson() + ",");
             pw.print("\"imports\":"    + importsJson  + ",");
             pw.print("\"exports\":"    + exportsJson  + ",");
             pw.print("\"strings\":"    + stringsJson + ",");

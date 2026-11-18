@@ -89,6 +89,16 @@ CREATE TABLE IF NOT EXISTS binaries (
     -- a diff reads these to tell an other-side thunk where a function maps from "no function there".
     -- NULL = not recorded (extracted before this existed).
     thunk_spans TEXT,
+    -- What each of those thunks reaches, JSON [["0x<thunk entry>", "0x<target entry>" | null,
+    -- "<target name>" | null], ...] — a list of its own, never a third element of a thunk_spans entry
+    -- (its strict readers take any other length as an unreadable list). The target entry is null
+    -- for an imported target (no address in this image). NULL = not recorded; '[]' = recorded, the
+    -- binary has no thunk.
+    thunk_targets TEXT,
+    -- Where the image holds each imported function — the address in the loader's external block a
+    -- pointer to it is relocated to — and its name, JSON [["0x<addr>", "<name>"], ...]. NULL = not
+    -- recorded; '[]' = recorded, none.
+    external_symbols TEXT,
     -- The shell-sink callers the extractor's command-wrapper probe could not decompile, so could
     -- not decide, by body size: JSON {"small": n, "large": n}. NULL = not recorded.
     wrapper_probe_unfinished TEXT,
@@ -389,6 +399,39 @@ CREATE TABLE IF NOT EXISTS string_tables (
     completeness_scope  TEXT,
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE
 );
+
+-- Table-access observations: raw facts about the code that reads data tables, one row per
+-- observation of one function (kind: read = a load or a direct read with every use of the value;
+-- pointer = what a walking pointer itself is used for; arg = a constant data address handed to a
+-- call whose callee walks that parameter; store = a constant data address stored; truncated = the
+-- function had more rows than the extractor keeps, the stored rows are a prefix — a reader draws no
+-- negative conclusion, such as "never called", from such a function). obs is the row's JSON object
+-- (keys: lib/analyze/ghidra_ingest.TABLE_ACCESS_ROW_KEYS). NOTHING here says which word is a key:
+-- the hunt decides that. WIPE-AND-REBUILD per binary each extraction.
+CREATE TABLE IF NOT EXISTS table_access (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    binary_id   INTEGER NOT NULL,
+    function_id INTEGER NOT NULL,
+    seq         INTEGER NOT NULL,   -- the row's position within its function, as exported
+    kind        TEXT NOT NULL,      -- read | pointer | arg | store | truncated
+    obs         TEXT NOT NULL,      -- JSON object
+    FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE,
+    FOREIGN KEY(function_id) REFERENCES functions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_table_access_function ON table_access(function_id);
+CREATE INDEX IF NOT EXISTS idx_table_access_binary ON table_access(binary_id);
+
+-- The immediate dominator of each block of a function with a table_access row that is called or
+-- carries a compare test: JSON list, index = the block number the rows' bb / #bN name, the entry
+-- block -1, -2 where it could not be computed. One row per such function.
+CREATE TABLE IF NOT EXISTS table_access_blocks (
+    binary_id   INTEGER NOT NULL,
+    function_id INTEGER PRIMARY KEY,
+    idom        TEXT NOT NULL,
+    FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE,
+    FOREIGN KEY(function_id) REFERENCES functions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_table_access_blocks_binary ON table_access_blocks(binary_id);
 
 -- raw initialized data-segment bytes (.rodata/.data), one row per memory block. Stored at
 -- ingest so a query slices the bytes at ANY data-segment address the agent meets in pseudocode
