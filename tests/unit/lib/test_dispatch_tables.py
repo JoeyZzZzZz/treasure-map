@@ -1246,7 +1246,8 @@ def test_a_wider_stride_never_borrows_a_handler_word_a_shorter_stride_used(
     handler IS the last three-word record's function. The two-word table is chosen first and takes
     that word as a handler, so the three-word run is left three records long — short of a table —
     and no three-word table is read. A wider stride is offered only the words no shorter stride's
-    table used, handler words included.
+    table used, handler words included; a word at that table's edge, which a wider table may
+    still share, never founds one.
 
     MUTATION (verified RED): withhold only a shorter table's KEY words from the wider strides
     (``blocked |= t.keyset``) -> the three-word table is read through the shared handler -> RED."""
@@ -1279,6 +1280,192 @@ def test_a_wider_stride_never_borrows_a_handler_word_a_shorter_stride_used(
     assert not any(t.stride >= 3 for t in found)
     assert {r.key for r in rows} == set(narrow)
     assert all(r.stride_words == 2 for r in rows)
+
+
+# ── a word two tables of different strides both read ───────────────────────────────────────
+
+
+def test_a_shorter_tables_edge_handler_never_costs_a_wider_table_its_column() -> None:
+    """The shape a full rescan met (a tokenizer table right before a syscall table): three
+    {name, 0, fn, 0} records and three {name, create, delete, tokenize} records, a non-record word,
+    then {name, handler, 0} records whose handlers are a thunk and imported functions. The
+    three-word table is read first, and its key-last reading takes the last tokenize slot as its
+    first record's handler. That one word must not cost the four-word table its whole third column:
+    every record keeps its +3 pairing, the last one included, and the three-word table keeps its
+    own reading of the word (each reading is a candidate).
+
+    MUTATION (verified RED): ``_widen`` adds no column -> no record has its +3 row -> RED.
+    """
+    img = Image()
+    img.words(0x7FFF0001, 0x7FFF0002)
+    first = DATA_BASE + len(img.data)
+    for i, n in enumerate(("aux_alpha", "aux_bravo", "aux_charlie")):
+        img.words(img.string(n), 0, img.func(f"fx_aux{i}"), 0)
+    toks = ("tok_alpha", "tok_bravo", "tok_charlie")
+    for n in toks:
+        img.words(img.string(n), *(img.func(f"{n}_{p}") for p in ("create", "delete", "tokenize")))
+    img.words(0x1)
+    calls = ("sys_open", "sys_close", "sys_access", "sys_getcwd", "sys_stat", "sys_fstat")
+    head = img.thunk()
+    img.thunk_targets[head] = calls[0]
+    img.words(img.string(calls[0]), head, 0)
+    for n in calls[1:]:
+        img.words(img.string(n), img.imported(n), 0)
+    img.words(0x7FFF0003, 0x7FFF0004, 0x7FFF0005)
+    rows = _rows(img)
+    four = [r for r in rows if r.stride_words == 4]
+    for n in toks:
+        assert (n, f"{n}_tokenize", 3) in {(r.key, r.callee_name, r.handler_offset) for r in four}
+    assert {r.table_addr for r in four} == {f"0x{first:x}"}
+    three = {(r.key, r.callee_name, r.handler_offset) for r in rows if r.stride_words == 3}
+    assert ("sys_open", "tok_charlie_tokenize", -2) in three
+    assert ("sys_close", "sys_close", 1) in three
+
+
+def test_a_shorter_tables_last_key_is_read_by_the_wider_table_it_opens() -> None:
+    """The shape a full rescan met (a four-word {name, read, write, hex} table right before a
+    seven-word {name, read, write, canonicalise, 0, compare, operator} table): the first seven-word
+    record's first four words read as one more four-word record, so the four-word table, read
+    first, ends on that record's key. The seven-word table still reads the record it opens: the key
+    keeps its compare and operator pairings (+5, +6), as candidates on the seven-word table's own
+    address, and the four-word table keeps its own reading of the key.
+
+    MUTATION (verified RED): ``_widen`` adds no record -> the key has no +5 / +6 row -> RED.
+    """
+    img = Image()
+    img.words(0x7FFF0001, 0x7FFF0002)
+    for n in ("dn_sid", "dn_guid", "dn_wkguid", "dn_invocid", "dn_flags"):
+        img.words(img.string(n), *(img.func(f"{n}_{p}") for p in ("read", "write", "hex")))
+    starts: list[int] = []
+    for n in ("syn_sid", "syn_sddl", "syn_guid", "syn_category", "syn_schema", "syn_prefix"):
+        starts.append(DATA_BASE + len(img.data))
+        fns = [img.func(f"{n}_{p}") for p in ("read", "write", "norm", "compare", "operator")]
+        img.words(img.string(n), *fns[:3], 0, *fns[3:])
+    img.words(0x7FFF0003, 0x7FFF0004)
+    rows = _rows(img)
+    seven = [r for r in rows if r.stride_words == 7]
+    opened = {
+        (r.callee_name, r.handler_offset, r.pairing_basis) for r in seven if r.key == "syn_sid"
+    }
+    assert ("syn_sid_compare", 5, dt.UNDETERMINED) in opened
+    assert ("syn_sid_operator", 6, dt.UNDETERMINED) in opened
+    assert {r.table_addr for r in seven} == {f"0x{starts[1]:x}"}
+    four = {r.callee_name for r in rows if r.stride_words == 4 and r.key == "syn_sid"}
+    assert {"syn_sid_read", "syn_sid_write", "syn_sid_norm"} <= four
+
+
+def _three_and_two(img: Image, records: int) -> list[str]:
+    """``records`` {name, 0, fn} records, then a handler-first two-word table whose first handler
+    is the last three-word record's function (the layout of the test above it)."""
+    img.words(0x7FFF0001, 0x7FFF0002)
+    names = [f"cfg_{n}" for n in ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot")]
+    for i, n in enumerate(names[:records]):
+        img.words(img.string(n), 0, img.func(f"fx_w{i}"))
+    narrow = ["set_one", "set_two", "set_three", "set_four"]
+    img.words(img.string(narrow[0]))
+    for i, n in enumerate(narrow[1:], start=1):
+        img.words(img.func(f"fx_s{i}"), img.string(n))
+    img.words(0, 0, 0x7FFF0003, 0x7FFF0004)
+    return names[:records]
+
+
+def test_a_wider_tables_own_record_is_not_cut_by_a_shorter_tables_edge_handler() -> None:
+    """Five {name, 0, fn} records before the two-word table: the three-word table is found on the
+    first four, and the fifth — whose function the two-word table also reads — is not cut off by
+    that one word: both tables read it.
+
+    MUTATION (verified RED): ``_widen`` adds a record only on a shared key -> the fifth record has
+    no row -> RED.
+    """
+    img = Image()
+    names = _three_and_two(img, 5)
+    rows = _rows(img)
+    three = {(r.key, r.callee_name, r.handler_offset) for r in rows if r.stride_words == 3}
+    assert (names[-1], "fx_w4", 2) in three
+    assert {(n, f"fx_w{i}", 2) for i, n in enumerate(names)} <= three
+    two = {(r.key, r.callee_name, r.handler_offset) for r in rows if r.stride_words == 2}
+    assert ("set_one", "fx_w4", -1) in two
+
+
+def test_a_record_made_only_of_another_tables_words_is_not_read_twice() -> None:
+    """A {name, fn} table, two NULL words, then four-word {name, fn, fn, fn} records: the
+    four-word framing would read the two-word table's last record (its key and its function, both
+    at that table's edge) as one more record of its own. Nothing in it is the wider table's, so the
+    wider table does not take it on.
+
+    MUTATION (verified RED): ``_widen`` takes on a record holding no word of its own -> the last
+    two-word key is read in the four-word table -> RED.
+    """
+    img = Image()
+    img.words(0x7FFF0001, 0x7FFF0002)
+    for n in ("pick_one", "pick_two", "pick_three", "pick_four"):
+        img.words(img.string(n), img.func(f"{n}_fn"))
+    img.words(0, 0)
+    for n in ("wide_one", "wide_two", "wide_three", "wide_four"):
+        img.words(img.string(n), *(img.func(f"{n}_{i}") for i in range(3)))
+    img.words(0x7FFF0003, 0x7FFF0004)
+    rows = _rows(img)
+    assert {r.key for r in rows if r.stride_words == 4} >= {"wide_one", "wide_four"}
+    assert "pick_four" not in {r.key for r in rows if r.stride_words == 4}
+    assert ("pick_four", "pick_four_fn") in {(r.key, r.callee_name) for r in rows}
+
+
+def test_a_wide_keyed_table_stays_wide_when_a_shared_key_joins_it() -> None:
+    """A {name, fn} table right before four-word records keyed by wide (four-byte) strings, laid out
+    so that the two-word table's last key opens one more four-word record (with a function of its
+    own). The four-word table's key form is decided on its own keys: it stays wide, and the shared
+    key, which reads as no wide string, adds no row to it.
+
+    MUTATION (verified RED): decide the key form on every key slot, shared ones included -> the
+    four-word keys read as one character -> RED.
+    """
+    img = Image()
+    img.words(0x7FFF0001, 0x7FFF0002)
+    for n in ("pick_one", "pick_two", "pick_three", "pick_four"):
+        img.words(img.string(n), img.func(f"{n}_fn"))
+    img.words(img.func("fx_mid1"), img.func("fx_mid2"))
+    wide = ("alpha", "bravo", "charlie", "delta")
+    for n in wide:
+        img.words(img.wide(n), *(img.func(f"{n}_{i}") for i in range(3)))
+    img.words(0x7FFF0003, 0x7FFF0004)
+    rows = _rows(img)
+    four = [r for r in rows if r.stride_words == 4]
+    assert {r.key for r in four} == set(wide)
+    assert ("pick_four", "pick_four_fn") in {(r.key, r.callee_name) for r in rows}
+
+
+def test_a_table_widened_by_a_shared_key_is_judged_as_found() -> None:
+    """A {name, fn} table whose last key is no name, then four-word {name, 0, fn, 0} records ended
+    by an all-zero record, three of their four keys names, laid out so that the two-word table's
+    last key opens one more four-word record (its function the four-word table's own). That key
+    joins the four-word table's rows and nothing else: the table's address is its own first key,
+    the content gate is judged on its own keys (with the shared key it would fall below three
+    quarters), so the terminator still pairs its own records; the shared key's row is a candidate.
+    The two-word table's last function also sits in the four-word framing's +1 slot of that
+    record: a column holding no function but that shared word is no column of the table.
+
+    MUTATION (verified RED): each of — the address from every key slot; the content gate on every
+    key; the shared key's row paired with the column; a column of shared words only (the table is
+    then two-column and the terminator pairs nothing) — -> RED.
+    """
+    img = Image()
+    img.words(0x7FFF0001, 0x7FFF0002)
+    for n in ("pick_one", "pick_two", "pick_three", "%s: bad"):
+        img.words(img.string(n), img.func(f"fx_p_{len(img.data)}"))
+    img.words(img.func("fx_opened"), 0)
+    first = DATA_BASE + len(img.data)
+    names = ("mode", "rate", "freq", "%d items")
+    for n in names:
+        img.words(img.string(n), 0, img.func(f"fx_{n[:2]}"), 0)
+    img.words(0, 0, 0, 0, 0x7FFF0003, 0x7FFF0004)
+    rows = _rows(img)
+    four = [r for r in rows if r.stride_words == 4]
+    assert {r.table_addr for r in four} == {f"0x{first:x}"}
+    own = [r for r in four if r.key in names]
+    assert {r.key for r in own} == set(names)
+    assert all(r.pairing_basis == dt.DATA_TERMINATOR and r.handler_offset == 2 for r in own)
+    shared = [r for r in four if r.key == "%s: bad"]
+    assert [(r.callee_name, r.pairing_basis) for r in shared] == [("fx_opened", dt.UNDETERMINED)]
 
 
 def test_a_null_thunk_list_is_told_apart_from_an_empty_one(tmp_path: Path) -> None:

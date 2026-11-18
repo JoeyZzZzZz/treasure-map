@@ -42,6 +42,13 @@ The reading model, in words (the numbers are the record's words, ``s`` the strid
   readings are chosen by the keys they explain. When two key columns explain equally many (a
   record holding a name and a help text, say), the table that ends first is read — in practice
   the column nearer the record's start — and its rows carry ``key_column_tied``.
+* a SHARED word: where two tables of different strides meet, the shorter one's first and last
+  key slots and the handler slots it reads past them may belong to either. A wider table found
+  without them still reads them: a reading keeps a handler column that such a word alone kept
+  out, and a record at its end that only such words held out (one with a word of its own). It
+  only adds — a shared word never founds a table, and the table is judged as found (its address,
+  key form, filters, code window and bounds). Both tables then read the word, and a key taken on
+  this way is a candidate in the wider table whatever pairs the rest.
 * the PAIRING of each handler column: a column the reading code names (``code_two_index``, or
   ``code_helper`` for a registration helper) is paired by the code; when the record has a single
   handler column over EVERY reading of the table (a column only another rotation holds still
@@ -611,11 +618,20 @@ class _Table:
     keyset: set[int]
     hset: set[int]
     tied: bool = False  # the content choice kept it over another key column explaining as many
+    # Key slots a reading took on only through a word a shorter stride's table also reads
+    # (``_widen``). The table is judged without them: its address, key text form, filters, code
+    # window and bounds are those of the table as found.
+    added_keys: set[int] = field(default_factory=set)
 
     @property
     def span(self) -> tuple[int, int]:
         ws = self.keyset | self.hset
         return min(ws), max(ws)
+
+    @property
+    def own_keys(self) -> set[int]:
+        """The key slots of the table as found, before any shared word widened it."""
+        return self.keyset - self.added_keys
 
 
 def _runs(flags: list[bool]) -> list[tuple[int, int]]:
@@ -762,15 +778,82 @@ def _choose(tables: list[_Table]) -> list[_Table]:
     return sorted(chosen, key=lambda t: t.span[0])
 
 
+def _widen(w: _Words, t: _Table, held: set[int], shared: set[int]) -> None:
+    """Let a table found without them read the words a shorter stride's table holds at its edge
+    (``shared``: that table's first and last key slots and the handler slots it reads past them).
+    Only adds, never removes: a reading gains a handler column that a shared word alone kept out
+    (the column must hold a function outside the shared words too), and a record at either end
+    that only shared words held out (the record must hold a word that is not shared). ``held``
+    are the other words shorter strides' tables use, never offered. Both tables then read the
+    word: each reading is one candidate."""
+    s = t.stride
+    blocked = held | shared
+
+    def fits(k: int, offs: frozenset[int], bar: set[int]) -> bool:
+        return (
+            k in w.key
+            and k not in bar
+            and all(w.hok(k + o) and (k + o) not in bar for o in offs)
+            and any(w.hf(k + o) and (k + o) not in bar for o in offs)
+        )
+
+    def grows(k: int, offs: frozenset[int]) -> bool:
+        return (
+            fits(k, offs, held)
+            and not fits(k, offs, blocked)
+            and (k not in shared or any(w.hf(k + o) and (k + o) not in shared for o in offs))
+        )
+
+    readings: list[_Reading] = []
+    for r in t.readings:
+        widened: dict[frozenset[int], _Reading] = {}  # this reading's rotations, by what they read
+        for rot in r.rotations:
+            offs = set(r.offsets)
+            for o in sorted({c if c <= rot else c - s for c in range(1, s)} - r.offsets):
+                slots = [k + o for k in r.keys]
+                if (
+                    all(w.hok(i) and i not in held for i in slots)
+                    and any(w.hf(i) and i not in blocked for i in slots)
+                    and not all(w.hok(i) and i not in blocked for i in slots)
+                ):
+                    offs.add(o)
+            got = frozenset(offs)
+            keys = list(r.keys)
+            while keys[0] - s >= 0 and grows(keys[0] - s, got):
+                keys.insert(0, keys[0] - s)
+            while keys[-1] + s < w.n and grows(keys[-1] + s, got):
+                keys.append(keys[-1] + s)
+            prev = widened.get(got)
+            if prev is None:
+                widened[got] = _Reading(got, [rot], keys)
+            else:
+                prev.rotations.append(rot)
+        readings += widened.values()
+    found = set(t.keyset)
+    t.readings = readings
+    t.keyset = {k for r in t.readings for k in r.keys}
+    t.hset = {k + o for r in t.readings for k in r.keys for o in r.offsets if w.hf(k + o)}
+    t.added_keys = t.keyset - found
+
+
 def _find_tables(w: _Words) -> list[_Table]:
     """The tables of one block: strides from two up, each stride's content choice made on the
-    words no shorter stride's table uses."""
-    blocked: set[int] = set()
+    words no shorter stride's table uses. A word at a shorter table's edge — its first or last key
+    slot, or a handler slot it reads past them — is then shared: a wider table found without it
+    may still read it (``_widen``), so one contested word never costs that table a column or a
+    record."""
+    held: set[int] = set()
+    shared: set[int] = set()
     out: list[_Table] = []
     for s in STRIDES:
-        accepted = _choose(_stride_tables(w, s, blocked))
+        accepted = _choose(_stride_tables(w, s, held | shared))
         for t in accepted:
-            blocked |= t.keyset | t.hset
+            _widen(w, t, held, shared)
+        for t in accepted:
+            lo, hi = min(t.keyset), max(t.keyset)
+            held |= {k for k in t.keyset if lo < k < hi} | {i for i in t.hset if lo <= i <= hi}
+            shared |= {lo, hi} | {i for i in t.hset if not lo <= i <= hi}
+        shared -= held
         out += accepted
     return sorted(out, key=lambda t: t.span[0])
 
@@ -952,7 +1035,7 @@ def code_evidence(w: _Words, table: _Table, code_frames: list[Frame]) -> CodeEvi
     reads — the key column a key slot, each handler slot a function or NULL over the table's rows
     (at least one function per column, one non-NULL per row) — or the code is inconsistent."""
     s, ps = table.stride, w.ps
-    keys = sorted(table.keyset)
+    keys = sorted(table.own_keys)
     key0 = w.addr(keys[0])
     groups: dict[int, dict[str, Any]] = {}
     frame_only = 0
@@ -1018,12 +1101,27 @@ class TableKeys:
     wide: bool
 
 
-def table_keys(img: _Image, w: _Words, keyset: Iterable[int]) -> TableKeys:
+def table_keys(
+    img: _Image, w: _Words, keyset: Iterable[int], added: Iterable[int] = ()
+) -> TableKeys:
     """The key text of each key slot. When every key reads as one character, the keys are read
     as wide (4-byte) strings instead — only when all of them then read as two or more printable
     units, every pointer is 4-aligned and no key pointer falls inside another key's string;
-    otherwise the one-character reading stands for the whole table (never a mix)."""
-    slots = sorted(keyset)
+    otherwise the one-character reading stands for the whole table (never a mix). The form is
+    decided on ``keyset`` alone; a key slot in ``added`` (taken on through a shared word) is read
+    in that form, and left without text — so without rows — when it does not read so."""
+    keys = _key_text(img, w, sorted(keyset))
+    for k in added:
+        if keys.wide:
+            got = img.wide_at(w.values[k])
+            if got is not None:
+                keys.text[k] = got[0]
+        else:
+            keys.text[k] = img.string_at(w.values[k]) or ""
+    return keys
+
+
+def _key_text(img: _Image, w: _Words, slots: list[int]) -> TableKeys:
     narrow = {k: img.string_at(w.values[k]) or "" for k in slots}
     if not narrow or any(len(t) != 1 for t in narrow.values()):
         return TableKeys(narrow, False)
@@ -1143,7 +1241,7 @@ def _bound_reasons(w: _Words, table: _Table) -> tuple[set[str], set[str], set[st
     or that points into code Ghidra did not define."""
     s = table.stride
     offsets = {o for r in table.readings for o in r.offsets}
-    keys = sorted(table.keyset)
+    keys = sorted(table.own_keys)
     inner: set[str] = set()
     for k in keys:
         inner |= _record_reasons(w, k, offsets)
@@ -1168,6 +1266,8 @@ def _table_rows(
     edges: dict[tuple[int, int], int] = {}  # (key slot, offset) -> handler slot
     for r in table.readings:
         for k in r.keys:
+            if k not in keys.text:
+                continue  # a key taken on through a shared word that does not read in this form
             for o in r.offsets:
                 if w.hf(k + o):
                     edges[(k, o)] = k + o
@@ -1175,7 +1275,9 @@ def _table_rows(
     candidates: dict[tuple[int, int], set[int]] = defaultdict(set)
     cand_slot: dict[tuple[int, int], int] = {}
     for (k, o), slot in sorted(edges.items()):
-        col = dec.columns.get(o % s)
+        # A key the table took on through a shared word is read by another table too: which
+        # table it belongs to is not settled, so its rows stay candidates whatever pairs the rest.
+        col = None if k in table.added_keys else dec.columns.get(o % s)
         if col is not None:
             if col.offset == o:
                 determined.append((k, o, slot))
@@ -1190,7 +1292,7 @@ def _table_rows(
     ):
         reasons = reasons | {HANDLER_UNVERIFIED}
     reason = ",".join(sorted(reasons))
-    table_addr = f"0x{w.addr(min(table.keyset)):x}"
+    table_addr = f"0x{w.addr(min(table.own_keys)):x}"
 
     def row(k: int, slot: int, offset: int | None, basis: str, **extra: Any) -> None:
         h = img.handler_of(w.values[slot])
@@ -1272,26 +1374,26 @@ def detect_binary(
         tables = _find_tables(w)
         if not tables:
             continue
-        starts = {(t.stride, min(t.keyset)): t for t in tables}
+        starts = {(t.stride, min(t.own_keys)): t for t in tables}
         bounds = {id(t): _bound_reasons(w, t) for t in tables}
         split: set[int] = set()
         for t in tables:
             after = bounds[id(t)][1]
-            nxt = starts.get((t.stride, max(t.keyset) + 2 * t.stride))
+            nxt = starts.get((t.stride, max(t.own_keys) + 2 * t.stride))
             if UNDEFINED in after and nxt is not None and UNDEFINED in bounds[id(nxt)][0]:
                 split |= {id(t), id(nxt)}
         for t in tables:
             for r in t.readings:
                 _terminate(w, t.stride, r)
-            keys = table_keys(img, w, t.keyset)
-            texts = [keys.text[k] for k in sorted(t.keyset)]
-            java = any(w.addr(k) in java_key_slots for k in t.keyset)
+            keys = table_keys(img, w, t.own_keys, t.added_keys)
+            texts = [keys.text[k] for k in sorted(t.own_keys)]
+            java = any(w.addr(k) in java_key_slots for k in t.own_keys)
             if not java and excluded_as_noise(texts):
                 continue
             gated = not java and fails_content_gate(texts)
             if code_index is None:
                 code_index = _CodeIndex(conn, bid)
-            key0 = w.addr(min(t.keyset))
+            key0 = w.addr(min(t.own_keys))
             code = code_evidence(
                 w,
                 t,
@@ -1302,7 +1404,7 @@ def detect_binary(
                 reasons.add(SPLIT)
             if t.tied:
                 reasons.add(KEY_COLUMN_TIED)
-            if blk.truncated and max(t.keyset) + 2 * t.stride > w.n:
+            if blk.truncated and max(t.own_keys) + 2 * t.stride > w.n:
                 reasons.add(TRUNCATED)
             result.tables += 1
             _table_rows(img, w, t, keys, decide(t, code, gated), reasons, common, result)
