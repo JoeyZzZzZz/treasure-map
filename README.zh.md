@@ -23,7 +23,7 @@ agent 通过 MCP 查询这些事实，自主决定分析路径。工具本身不
 
 ## 为什么 agent 需要地图
 
-agent 读懂单个函数已经不成问题。但面对整个根文件系统（上百个二进制、几万个函数），它往往看了前几条线索就收手，对没读过的代码也报“没发现问题”。
+agent 读懂单个函数已经不成问题。但面对整个根文件系统（上百个二进制、几万个函数），它往往看了前几个候选就收手，对没读过的代码也报“没发现问题”。
 
 有些问题，只看一个二进制回答不了：
 
@@ -90,7 +90,7 @@ tmap scan ./firmware.extracted -w my-fw
 
 ```text
 用 Treasure Map 审计固件 my-fw。
-最后列出值得跟进的线索，每条附上 evidence_ref 和理由。
+最后列出值得跟进的候选，每个附上 evidence_ref 和理由。
 ```
 
 **3. 对比两个版本。**
@@ -204,23 +204,17 @@ tmap diff --before fw-v1 --after fw-v2      # 重新运行对比；过期的 run
 
 ## 故障排查
 
-先运行 `tmap doctor`。它检查工具链、配置和 agent 注册情况，不做任何改动；出现任何 ❌ 或 `?` 时退出码不为零。
+先运行 `tmap doctor`。它检查工具链、配置和 agent 注册情况，不做任何改动；出现 ❌ 或 `?` 时退出码不为零。
 
-| 标记 | 含义 |
-|:---:|---|
-| ✅ | 通过 |
-| ⚠ | 能用，但值得注意 |
-| `·` | 提示信息 |
-| ❌ | 失败 |
-| `?` | 无法判定（绝不会显示成 ✅） |
+✅ 通过 · ⚠ 能用但值得注意 · `·` 提示 · ❌ 失败 · `?` 无法判定（绝不显示成 ✅）
 
 | 问题 | 怎么办 |
 |---|---|
-| `tmap: command not found` | 工具的 bin 目录不在 PATH 里。运行 `uv tool update-shell`，再新开一个 shell。 |
-| `ghidra`、`java` 或 `bindiff` ❌ | 再运行一次 `tmap init` 获取固定版本的下载，或者用 `--ghidra`、`--java-home`、`--bindiff PATH` 指向你自己的安装。在 WSL 上，所有东西都放在 Linux 一侧，不要放在 `/mnt/c/...` 下。 |
-| `binexport` ❌ "two copies" | Ghidra 会同时从自己的 `Ghidra/Extensions` 和用户设置目录加载扩展，删掉其中一份即可。 |
-| 某个二进制没出现在对比结果里 | 让 agent 调用 `list_diff_blindspots`，它会列出每个没能分析的二进制及原因。修好工具链后，用 `tmap diff … --force-retry` 重试。 |
-| 自己启动的 Ghidra 11.4.3 用了意料之外的 JDK | Ghidra 会记住上次运行时用的 JDK（设置目录里的 `java_home.save`），而 Treasure Map 运行时会把它用的 JDK 记在那里。自己启动 Ghidra 时请设置 `JAVA_HOME`。 |
+| `tmap: command not found` | 工具的 bin 目录不在 PATH 里：运行 `uv tool update-shell`，再新开一个 shell。 |
+| `ghidra`、`java` 或 `bindiff` ❌ | 再运行一次 `tmap init`，或用 `--ghidra`、`--java-home`、`--bindiff PATH` 指向自己的安装。WSL 上不要放在 `/mnt/c/...` 下。 |
+| `binexport` ❌ "two copies" | Ghidra 从 `Ghidra/Extensions` 和用户设置目录各加载了一份，删掉其中一份。 |
+| 某个二进制没出现在对比结果里 | 让 agent 调用 `list_diff_blindspots` 查原因，修好后用 `tmap diff … --force-retry` 重试。 |
+| 自己启动的 Ghidra 11.4.3 用了意料之外的 JDK | Treasure Map 的运行会改写它的 `java_home.save`。自己启动 Ghidra 时请设置 `JAVA_HOME`。 |
 
 ## 卸载
 

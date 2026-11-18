@@ -30,7 +30,7 @@ and the model makes the judgment.
 ## Why an agent needs a map
 
 Agents read a single function well. Given a whole root filesystem (a hundred binaries, tens of
-thousands of functions), they tend to stop after the first few leads and report "nothing found"
+thousands of functions), they tend to stop after the first few candidates and report "nothing found"
 for code they never read.
 
 Some questions can't be answered by looking at one binary:
@@ -135,7 +135,7 @@ Then ask your agent:
 
 ```text
 Audit firmware my-fw with Treasure Map.
-End with the leads worth following up, each with its evidence_ref and why.
+End with the candidates worth following up, each with its evidence_ref and why.
 ```
 
 **3. Diff two versions.**
@@ -268,24 +268,18 @@ another way, update the same way.
 
 ## Troubleshooting
 
-Run `tmap doctor` first. It checks the toolchain, the config and the agent registrations, changes
+Start with `tmap doctor`. It checks the toolchain, the config and the agent registrations, changes
 nothing, and exits non-zero on any ❌ or `?`.
 
-| Mark | Meaning |
-|:---:|---|
-| ✅ | Passed |
-| ⚠ | Works, but worth knowing |
-| `·` | Information |
-| ❌ | Failed |
-| `?` | Could not be determined (never shown as ✅) |
+✅ passed · ⚠ works, worth knowing · `·` info · ❌ failed · `?` could not tell (never shown as ✅)
 
-| Problem | What to do |
+| Problem | Fix |
 |---|---|
-| `tmap: command not found` | The tool's bin directory is not on PATH. Run `uv tool update-shell` and open a new shell. |
-| `ghidra`, `java` or `bindiff` ❌ | Run `tmap init` again to get the pinned download, or point to your own with `--ghidra`, `--java-home` or `--bindiff PATH`. On WSL, keep everything on the Linux side, not under `/mnt/c/...`. |
-| `binexport` ❌ "two copies" | Ghidra loads extensions from both its own `Ghidra/Extensions` and its user settings directory. Remove one of them. |
-| A binary is missing from a diff | Ask your agent for `list_diff_blindspots`: every binary the diff could not analyze, and why. Once the toolchain is fixed, `tmap diff … --force-retry` retries them. |
-| Your own Ghidra 11.4.3 starts with an unexpected JDK | Ghidra remembers the JDK it last ran with (`java_home.save` in its settings directory), and Treasure Map's runs record theirs there. Set `JAVA_HOME` when you launch Ghidra yourself. |
+| `tmap: command not found` | Its bin directory is not on PATH: run `uv tool update-shell`, then open a new shell. |
+| `ghidra`, `java` or `bindiff` ❌ | Run `tmap init` again, or point to your own with `--ghidra`, `--java-home` or `--bindiff PATH`. On WSL, keep everything off `/mnt/c/...`. |
+| `binexport` ❌ "two copies" | Ghidra loads one from `Ghidra/Extensions` and one from its user settings directory. Remove either. |
+| A binary is missing from a diff | Ask your agent for `list_diff_blindspots` to see why, then rerun with `tmap diff … --force-retry`. |
+| Your own Ghidra 11.4.3 picks an unexpected JDK | Treasure Map's runs update its `java_home.save`. Set `JAVA_HOME` when you launch Ghidra yourself. |
 
 ## Uninstalling
 
