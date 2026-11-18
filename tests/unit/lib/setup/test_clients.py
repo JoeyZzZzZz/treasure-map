@@ -324,10 +324,18 @@ def _profile(home: Path, name: str, patch: str) -> Path:
     return prof / "cordis.patch.yml"
 
 
+# The comment dsh writes at the top of every profile layer it creates, verbatim. It mentions
+# `!!js`; the file holds no tag.
+_DSH_PROFILE_HEADER = (
+    "# Your patch layer for this dsh profile, applied after every bundle layer:\n"
+    "# a top-level YAML array of loader patch entries (id-targeted config\n"
+    "# overrides, disables, and insert lists; `!!js` expressions allowed).\n"
+)
+
+
 def _hand_entry(command: str, entry_id: str = "mcp-treasure-map") -> str:
     return (
-        "# Your patch layer for this dsh profile\n"
-        "- insert:\n"
+        _DSH_PROFILE_HEADER + "- insert:\n"
         f"    - id: {entry_id}\n"
         "      name: '@deepseek-ai/dsh-mcp-client'\n"
         "      config:\n"
@@ -346,7 +354,8 @@ def test_dsh_reads_a_hand_written_profile_entry_and_adds_no_second_one(
     home layer would start the server twice.
 
     MUTATION: recognise tmap's entry by tmap's own id only -> 'missing' -> a second entry is
-    appended -> RED."""
+    appended -> RED. MUTATION: judge `!!js` by the text -> dsh's own header comment makes the
+    profile unreadable -> 'unknown', init refuses and lists dsh under "Needs you" -> RED."""
     home = tmp_path / "h"
     prof = _profile(home, "web", _hand_entry(str(tmap)))
     before = prof.read_text()
@@ -374,6 +383,95 @@ def test_dsh_a_profile_entry_for_another_tmap_is_stale_and_not_edited(
     out = cl.register("dsh", host, tmap)
     assert not out.ok and out.manual
     assert not (home / ".dsh" / "cordis.patch.yml").exists()
+
+
+@pytest.mark.parametrize(
+    ("text", "refused"),
+    [
+        (_DSH_PROFILE_HEADER + "[]\n", False),
+        ("# *web* profile, &co\n- id: x\n", False),
+        ('- id: x\n  note: "run *.sh &more"\n', False),
+        ("- id: x\n  note: '!!js is allowed'\n", False),
+        ("- insert: !!js/function 'x'\n", True),
+        ('- id: x\n  config: !!js "1 + 1"\n', True),
+        ("- &a {x: 1}\n- *a\n", True),
+        ("- id: x\n  config: &c {a: 1}\n", True),
+    ],
+)
+def test_dsh_refuses_a_real_js_tag_or_anchor_never_a_mention_of_one(
+    tmp_path: Path, text: str, refused: bool
+) -> None:
+    """★ tmap edits a patch layer as text, so a real `!!js` tag, anchor or alias keeps its hands
+    off. A comment or a quoted string that only mentions one is not one.
+
+    MUTATION: match the raw text (comments and strings included) -> the readable cases are
+    refused -> RED. MUTATION: stop looking for anchors -> the anchor cases read -> RED."""
+    path = tmp_path / "cordis.patch.yml"
+    path.write_text(text)
+    read = cl._read_dsh(path)
+    assert (read.items is None) is refused, (text, read.why)
+    if refused:
+        assert read.why == "uses !!js tags or YAML anchors/aliases"
+
+
+# A profile layer tmap really cannot read (a `!!js` expression) that names treasure-map.
+_UNREADABLE_PROFILE = (
+    _DSH_PROFILE_HEADER + "- insert:\n"
+    "    - id: mcp-treasure-map\n"
+    "      name: '@deepseek-ai/dsh-mcp-client'\n"
+    "      config: !!js \"({serverName: 'treasure-map', command: 'tmap', args: ['mcp']})\"\n"
+)
+
+
+def test_dsh_an_unreadable_profile_is_left_alone_and_never_a_failed_removal(
+    tmp_path: Path, tmap: Path
+) -> None:
+    """★ A profile layer is only read. One tmap cannot read is reported for the user to check
+    (the state is unknown: whether it serves this tmap cannot be told), init does not add a
+    second entry beside it, and an uninstall leaves it alone without failing — it never looks
+    for tmap's block in a home layer that has none.
+
+    MUTATION: keep the editable default on this path -> unregister edits the home layer, finds
+    no block and fails -> RED."""
+    home = tmp_path / "h"
+    prof = _profile(home, "web", _UNREADABLE_PROFILE)
+    host = _host(home)
+    st = cl.inspect("dsh", host, tmap)
+    assert st.state == "unknown" and st.config_path == prof and not st.editable
+    assert "cannot read its treasure-map entry" in st.detail
+    assert len(st.reported) == 1 and st.reported[0].startswith(str(prof))
+    assert "check it by hand" in st.reported[0]
+    out = cl.register("dsh", host, tmap)
+    assert not out.ok and out.manual
+    outs = cl.unregister("dsh", host, tmap)
+    assert outs and all(o.ok and o.message.startswith("left alone") for o in outs)
+    assert prof.read_text() == _UNREADABLE_PROFILE
+    assert not (home / ".dsh" / "cordis.patch.yml").exists()
+
+
+def test_dsh_an_unreadable_profile_does_not_hide_tmaps_block_in_the_home_layer(
+    tmp_path: Path, tmap: Path
+) -> None:
+    """★ tmap's own block in the home layer is still found, reported and removed when a profile
+    layer cannot be read; the profile stays as it was.
+
+    MUTATION: return early on the unreadable profile -> the home block is not seen as editable
+    and stays after the uninstall -> RED."""
+    home = tmp_path / "h"
+    host = _host(home)
+    (home / ".dsh").mkdir(parents=True)
+    assert cl.register("dsh", host, tmap).ok
+    home_patch = home / ".dsh" / "cordis.patch.yml"
+    prof = _profile(home, "web", _UNREADABLE_PROFILE)
+    st = cl.inspect("dsh", host, tmap)
+    assert st.state == "unknown" and st.config_path == prof and st.editable
+    assert any(r.startswith(str(prof)) and "check it by hand" in r for r in st.reported)
+    outs = cl.unregister("dsh", host, tmap)
+    assert all(o.ok for o in outs), [o.message for o in outs]
+    assert outs[0].message == f"removed {home_patch}: it held only tmap's block"
+    assert [o.message.startswith("left alone") for o in outs[1:]] == [True]
+    assert not home_patch.exists()
+    assert prof.read_text() == _UNREADABLE_PROFILE
 
 
 def test_dsh_writes_the_home_layer_that_reaches_every_profile(tmp_path: Path, tmap: Path) -> None:

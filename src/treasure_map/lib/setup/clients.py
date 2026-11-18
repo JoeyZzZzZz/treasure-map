@@ -356,7 +356,22 @@ def _inspect_json_client(
     return ClientState(client, found, c.state, c.why, path)
 
 
-_YAML_UNSAFE = re.compile(r"!!js|(^|[\s\[{,:-])[&*][A-Za-z0-9_.-]+", re.MULTILINE)
+def _yaml_unsafe(text: str) -> bool:
+    """A real ``!!js`` tag, anchor or alias, as YAML's own scanner reads the text. A comment or a
+    quoted string that only mentions one is not: every profile layer dsh creates opens with a
+    comment saying "`!!js` expressions allowed". Text the scanner refuses is not judged here —
+    the parse that follows reports it as invalid YAML."""
+    try:
+        for token in yaml.scan(text, Loader=yaml.SafeLoader):
+            if isinstance(token, (yaml.AnchorToken, yaml.AliasToken)):
+                return True
+            if isinstance(token, yaml.TagToken):
+                handle, suffix = token.value
+                if handle == "!!" and suffix.startswith("js"):
+                    return True
+    except yaml.YAMLError:
+        return False
+    return False
 
 
 @dataclass(frozen=True)
@@ -373,7 +388,7 @@ def _read_dsh(path: Path) -> _DshRead:
         text = path.read_text()
     except (OSError, UnicodeDecodeError) as exc:
         return _DshRead("", None, str(exc))
-    if _YAML_UNSAFE.search(text):
+    if _yaml_unsafe(text):
         return _DshRead(text, None, "uses !!js tags or YAML anchors/aliases")
     try:
         data = yaml.safe_load(text)
@@ -436,53 +451,56 @@ _DSH_SEVERITY = ("foreign", "invalid", "stale", "unknown", "aligned")
 
 
 def _inspect_dsh(host: ClientHost, tmap: Path | None) -> ClientState:
-    """Read the home layer AND every profile layer: an entry in any of them is the server."""
+    """Read the home layer AND every profile layer: an entry in any of them is the server.
+
+    A profile layer is only ever read. One tmap cannot read that names treasure-map is reported
+    for the user to check, and makes the state ``unknown`` unless something worse was found; it
+    never stops the home layer from being read, and only tmap's block in the home layer is ever
+    edited (``editable``), so an uninstall does not fail over a file it would not touch."""
     home_patch = dsh_patch(host)
     found = detected("dsh", host)
     read = _read_dsh(home_patch)
     if read.items is None:
         return ClientState("dsh", found, "invalid", f"{home_patch} {read.why}", home_patch)
     hits: list[tuple[Path, dict[str, Any]]] = [(home_patch, e) for e in _dsh_entries(read.items)]
+    unreadable: list[tuple[Path, str]] = []
     for prof in dsh_profile_patches(host):
         pr = _read_dsh(prof)
         if pr.items is None:
             if SERVER in pr.text:
-                return ClientState(
-                    "dsh",
-                    found,
-                    "unknown",
-                    f"{prof} {pr.why}; cannot read its {SERVER} entry",
-                    prof,
-                )
+                unreadable.append((prof, f"{prof} {pr.why}; cannot read its {SERVER} entry"))
             continue
         hits += [(prof, e) for e in _dsh_entries(pr.items)]
+    unread_notes = tuple(
+        f"{why} (a profile layer: check it by hand; tmap never edits it)" for _p, why in unreadable
+    )
     if not hits:
+        if unreadable:
+            prof, why = unreadable[0]
+            return ClientState(
+                "dsh", found, "unknown", why, prof, reported=unread_notes, editable=False
+            )
         return ClientState("dsh", found, "missing", "", home_patch)
     states = [(_dsh_classify(e, tmap), where) for where, e in hits]
     worst = min(states, key=lambda s: _DSH_SEVERITY.index(s[0].state))
     in_home = any(w == home_patch for _c, w in states)
-    reported = [
+    reported = tuple(
         f"{w} (a profile layer: tmap reads it, never edits it)"
         for w in dict.fromkeys(w for _c, w in states if w != home_patch)
-    ]
-    if len(hits) > 1 and worst[0].state == "aligned":
+    )
+    state, detail, where = worst[0].state, worst[0].why, worst[1]
+    if len(hits) > 1 and state == "aligned":
         files = ", ".join(str(w) for _c, w in states)
-        return ClientState(
-            "dsh",
-            found,
-            "stale",
-            f"{SERVER} is inserted {len(hits)} times: {files}",
-            worst[1],
-            reported=tuple(reported),
-            editable=in_home,
-        )
+        state, detail = "stale", f"{SERVER} is inserted {len(hits)} times: {files}"
+    if unreadable and _DSH_SEVERITY.index(state) > _DSH_SEVERITY.index("unknown"):
+        (where, detail), state = unreadable[0], "unknown"
     return ClientState(
         "dsh",
         found,
-        worst[0].state,
-        worst[0].why,
-        worst[1],
-        reported=tuple(reported),
+        state,
+        detail,
+        where,
+        reported=reported + unread_notes,
         editable=in_home,
     )
 

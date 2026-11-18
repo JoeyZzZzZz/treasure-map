@@ -462,6 +462,88 @@ def test_an_unwritable_agent_config_is_a_manual_step_and_the_toolchain_still_goe
     assert not jdk.exists()
 
 
+# The comment dsh writes at the top of every profile layer it creates (it mentions `!!js`).
+_DSH_HEADER = (
+    "# Your patch layer for this dsh profile, applied after every bundle layer:\n"
+    "# a top-level YAML array of loader patch entries (id-targeted config\n"
+    "# overrides, disables, and insert lists; `!!js` expressions allowed).\n"
+)
+
+
+def _dsh_profile(home: Path, body: str) -> Path:
+    prof = home / ".dsh" / "profiles" / "web"
+    prof.mkdir(parents=True)
+    (prof / "cordis.yml").write_text("[]\n")
+    path = prof / cl.DSH_PATCH_FILE
+    path.write_text(_DSH_HEADER + body)
+    return path
+
+
+def _plan(home: Path, tmap: Path | None = None) -> list[str]:
+    tm = home / ".treasure-map"
+    return un.plan_lines(
+        Ledger(tm / "toolchain" / LEDGER_NAME),
+        cl.survey(_chost(home), tmap),
+        toolchain_dir=tm / "toolchain",
+        home=home,
+        environ={},
+    )
+
+
+def test_a_dsh_profile_entry_is_left_alone_and_never_fails_the_uninstall() -> None:
+    """★ The profile layer dsh created, with an entry the user wrote: the plan says it is left
+    alone, and the uninstall neither edits it nor fails over it — so the tmap program itself can
+    still be removed.
+
+    MUTATION: judge `!!js` by the text -> dsh's header makes the profile unreadable -> the plan
+    promises a removal and the uninstall fails ("cannot locate tmap's block") -> RED."""
+    home = Path.home()
+    body = (
+        "- insert:\n"
+        "    - id: mcp-treasure-map\n"
+        "      name: '@deepseek-ai/dsh-mcp-client'\n"
+        "      config:\n"
+        "        serverName: treasure-map\n"
+        "        transport: stdio\n"
+        "        command: /home/u/.local/bin/tmap\n"
+        "        args: [ 'mcp' ]\n"
+    )
+    prof = _dsh_profile(home, body)
+    plan = _plan(home)
+    assert not any(line.startswith("remove treasure-map from dsh") for line in plan), plan
+    assert f"leave alone: {prof} (a profile layer: tmap reads it, never edits it)" in plan
+    report = _run(home)
+    assert not report.failed, report.manual + report.refused
+    assert not [m for m in report.manual if m.startswith("dsh:")]
+    assert prof.read_text() == _DSH_HEADER + body
+
+
+def test_the_dsh_plan_names_the_home_layer_it_edits_beside_an_unreadable_profile(
+    tmp_path: Path,
+) -> None:
+    """★ tmap's block in the home layer is what the uninstall removes, so that is the file the
+    plan names — though the state names the profile layer it could not read, which is listed to
+    check by hand and stays.
+
+    MUTATION: name the state's file -> the plan names the profile layer -> RED."""
+    home = Path.home()
+    tmap = fakes._exe(tmp_path / "bin" / "tmap")
+    home_patch = home / ".dsh" / cl.DSH_PATCH_FILE
+    prof = _dsh_profile(home, "- insert:\n    - config: !!js \"({serverName: 'treasure-map'})\"\n")
+    home_patch.write_text(cl.dsh_block(tmap))
+    st = cl.inspect("dsh", _chost(home), tmap)
+    assert st.state == "unknown" and st.config_path == prof and st.editable
+    plan = _plan(home, tmap)
+    assert f"remove treasure-map from dsh ({home_patch})" in plan, plan
+    assert any(
+        line.startswith(f"leave alone: {prof} ") and "check it by hand" in line for line in plan
+    ), plan
+    report = _run(home)
+    assert not report.failed, report.manual + report.refused
+    assert f"dsh: removed {home_patch}: it held only tmap's block" in report.removed
+    assert not home_patch.exists() and prof.exists()
+
+
 @_needs_non_root
 def test_an_unwritable_dsh_patch_file_is_a_manual_step() -> None:
     """MUTATION: drop _unregister_dsh's OSError guard -> only the catch-all answers, without

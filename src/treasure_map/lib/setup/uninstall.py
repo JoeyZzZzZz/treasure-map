@@ -188,7 +188,14 @@ def plan_lines(
     for cid in cl.CLIENT_IDS:
         st = survey.states[cid]
         if st.state in ("aligned", "stale", "shadowed", "unknown") and st.editable:
-            lines.append(f"remove treasure-map from {st.label} ({st.config_path})")
+            # the file the removal edits: for dsh always the home layer, never the profile layer
+            # the state may name (that one is read, reported and left alone)
+            target = (
+                cl.dsh_home_dir(home, environ) / cl.DSH_PATCH_FILE
+                if cid == "dsh"
+                else st.config_path
+            )
+            lines.append(f"remove treasure-map from {st.label} ({target})")
         for d in st.shadowing:
             lines.append(f"remove the local-scope entry in {d}")
         for r in st.reported:
