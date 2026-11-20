@@ -169,7 +169,7 @@ your agent chooses which firmware or diff to work on.
 |---|---|
 | `tmap scan DIR -w NAME` | Map one extracted firmware (run again to resume) |
 | `tmap diff --before A --after B` | Diff two scanned versions (`--binary NAME` for one binary) |
-| `tmap runs` | List scanned firmware, and which runs are out of date |
+| `tmap runs` | List scans and diffs, show which are out of date, and delete them (`--delete`) |
 | `tmap rescan [NAME ...]` | Re-scan runs left out of date by an upgrade (`--dry-run` lists them) |
 | `tmap doctor` | Check the toolchain, config and agent registrations (changes nothing) |
 | `tmap update` | Install the newest version, then run its `tmap init` |

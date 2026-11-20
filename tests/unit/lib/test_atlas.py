@@ -642,6 +642,9 @@ def test_static_no_unscoped_wipe_in_atlas() -> None:
         "DELETE FROM exec_edge WHERE source_run_id = ?",
         "DELETE FROM detector_scan_status WHERE source_run_id = ?",
         "DELETE FROM run_capability WHERE run_id = ?",
+        # delete_run removes one run's lineage row as part of `tmap runs --delete`; scoped to its
+        # run_id, like every per-run refresh above (the diffs and per-run tables go with it).
+        "DELETE FROM run WHERE run_id = ?",
         # diff-scoped replace-by-diff refresh (idempotent layer-0 / layer-2 re-parse), one diff_id
         "DELETE FROM function_alignment WHERE diff_id = ?",
         "DELETE FROM function_presence WHERE diff_id = ?",

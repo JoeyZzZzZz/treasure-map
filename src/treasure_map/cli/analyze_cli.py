@@ -221,6 +221,35 @@ def _report_timeout_skips(skipped: list[dict[str, Any]]) -> None:
         click.echo(f"    … and {len(skipped) - 20} more")
 
 
+def confirm_overwrite(hits: list[str], *, assume_yes: bool, run_id_hint: bool = True) -> None:
+    """Prompt (or decide) before a scan overwrites an earlier scan of DIFFERENT firmware.
+
+    ``hits`` are the one-line reasons (empty -> this scan overwrites nothing of another firmware, so
+    return at once). With --yes, show them and go on. Without a usable terminal there is no one to
+    ask, so refuse (exit 1); interactively, ask, and a 'no' stops the scan (exit 1). ``run_id_hint``
+    adds ``--run-id`` to the "keep it" advice — true for `tmap scan`, false for `tmap analyze`,
+    which has no such option. Everything prints to stderr so a --json scan's stdout stays clean."""
+    if not hits:
+        return
+    from treasure_map.lib.setup.selector import can_use_tty
+
+    keep = "--run-id / -w" if run_id_hint else "-w"
+    click.echo("this scan overwrites an earlier scan of different firmware:", err=True)
+    for line in hits:
+        click.echo(f"  {line}", err=True)
+    if assume_yes:
+        click.echo("continuing (--yes)", err=True)
+        return
+    if not can_use_tty():
+        raise click.ClickException(
+            "this scan overwrites an earlier scan of different firmware (listed above); "
+            f"pass --yes to overwrite, or use another {keep} to keep it"
+        )
+    if not click.confirm("Continue and overwrite?", default=False, err=True):
+        click.echo(f"Nothing scanned; use another {keep} to keep the earlier scan.", err=True)
+        raise SystemExit(1)
+
+
 _ANALYZE_EPILOG = """\
 Examples:
 
@@ -294,12 +323,21 @@ scopes that to just the binary you are validating.
     "isolated re-run to binaries whose large decompiles an earlier one at this budget did not "
     "finish. Use after raising the timeout, or on a machine with more to spare.",
 )
+@click.option(
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    default=False,
+    help="Overwrite an earlier scan of other firmware in the same workspace without asking.",
+)
 def analyze(
     fs_root: Path,
     workspace: str | None,
     config: Path | None,
     reanalyze: str | None,
     force_retry: bool,
+    assume_yes: bool,
 ) -> None:
     """Analyze an extracted firmware filesystem root.
 
@@ -325,6 +363,15 @@ def analyze(
     # written from this root, and a relative one breaks `tmap diff` from another directory). After
     # resolve_workspace, which names an automatic workspace after the root as it was typed.
     fs_root = fs_root.resolve()
+
+    # Read-only, before Workspace (no mkdir) and any Ghidra: when the workspace already holds a scan
+    # of OTHER firmware, confirm before overwriting it. analyze has no atlas and no --run-id, so
+    # only the workspace check (S2) applies here.
+    from treasure_map.lib.workspace.workspace import workspace_holds_other_firmware
+
+    other_fw = workspace_holds_other_firmware(ws_path / "analysis.db", fs_root)
+    hits = [f"workspace {ws_path} holds a scan of {other_fw}"] if other_fw else []
+    confirm_overwrite(hits, assume_yes=assume_yes, run_id_hint=False)
 
     def _progress(step: str, meta: dict[str, Any]) -> None:
         click.echo(f"  [{step}] {meta}")

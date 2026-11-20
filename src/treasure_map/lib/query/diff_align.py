@@ -1135,6 +1135,54 @@ def list_diffs(
     return result
 
 
+def list_diff_pairs(atlas: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every binary diff grouped by its run pair, newest pair first — the per-pair browse view.
+
+    The rows are ``list_diffs(atlas)["diffs"]`` unchanged (an unfiltered list_diffs computes no
+    coverage and reads no file_staleness). Each entry carries the pair's run ids, its most recent
+    diff date, the four NON-OVERLAPPING status counts (current / stale / unverified / failed, which
+    sum to total), and the pair's rows. A diff that did not run is ``failed``; an unanswerable side
+    is ``unverified`` (source_stale is None), never rounded into ``current`` or ``stale``."""
+    diffs = list_diffs(atlas)["diffs"]
+    # Newest created_at per pair, over EVERY diff_meta row: a leftover whole-run row (which
+    # list_diffs drops) still dates its pair, so it can move the date but never add a pair here.
+    dates = {
+        (a, b): ts
+        for a, b, ts in atlas.execute(
+            "SELECT run_a_id, run_b_id, MAX(created_at) FROM diff_meta GROUP BY run_a_id, run_b_id"
+        ).fetchall()
+    }
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in diffs:
+        grouped.setdefault((row["run_a_id"], row["run_b_id"]), []).append(row)
+    entries: list[dict[str, Any]] = []
+    for (a, b), rows in grouped.items():
+        counts = {"total": len(rows), "current": 0, "stale": 0, "unverified": 0, "failed": 0}
+        for row in rows:
+            if not row["diff_ok"]:
+                counts["failed"] += 1
+            elif row["source_stale"] is True:
+                counts["stale"] += 1
+            elif row["source_stale"] is False:
+                counts["current"] += 1
+            else:  # source_stale is None: diffed, but a side could not be confirmed
+                counts["unverified"] += 1
+        entries.append(
+            {
+                "run_pair": f"{a}::{b}",
+                "run_a_id": a,
+                "run_b_id": b,
+                "last_diffed_at": dates.get((a, b)),
+                "counts": counts,
+                "diffs": rows,
+            }
+        )
+    # created_at is an ISO timestamp, so a string sort is chronological; a pair with no date sorts
+    # last. Ties keep list_diffs' order (run id, then binary, then diff id).
+    entries.sort(key=lambda e: e["last_diffed_at"] or "", reverse=True)
+    return entries
+
+
 def run_pair_coverage(
     atlas: sqlite3.Connection,
     run_a: str,

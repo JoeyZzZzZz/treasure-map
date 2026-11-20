@@ -384,6 +384,7 @@ def test_rescan_invokes_scan_per_runnable_run(
         atlas_path: Path | None,
         config: Path | None,
         rehunt: bool,
+        assume_yes: bool,
         top_n: int | None,
     ) -> None:
         calls.append(
@@ -393,6 +394,7 @@ def test_rescan_invokes_scan_per_runnable_run(
                 "run_id": run_id,
                 "rehunt": rehunt,
                 "top_n": top_n,
+                "assume_yes": assume_yes,
             }
         )
 
@@ -406,6 +408,8 @@ def test_rescan_invokes_scan_per_runnable_run(
     # rehunt mirrors --force (absent here); the candidate list is a separate command, so a
     # multi-run refresh does not bury its own summary under six triage tables.
     assert all(c["rehunt"] is False and c["top_n"] == 0 for c in calls)
+    # A refresh never stops to confirm an overwrite: scan is invoked with assume_yes=True.
+    assert all(c["assume_yes"] is True for c in calls)
     assert "rescanned 2/2" in out.output
 
 
@@ -430,6 +434,7 @@ def test_every_run_of_a_rescan_scans_inside_one_shared_block(
         atlas_path: Path | None,
         config: Path | None,
         rehunt: bool,
+        assume_yes: bool,
         top_n: int | None,
     ) -> None:
         seen.append(pipeline._SHARE.get())
@@ -461,6 +466,7 @@ def test_one_failing_firmware_does_not_abandon_the_rest(
         atlas_path: Path | None,
         config: Path | None,
         rehunt: bool,
+        assume_yes: bool,
         top_n: int | None,
     ) -> None:
         seen.append(run_id)
@@ -530,6 +536,7 @@ def test_force_rescans_a_run_that_is_confirmed_current(
         atlas_path: Path | None,
         config: Path | None,
         rehunt: bool,
+        assume_yes: bool,
         top_n: int | None,
     ) -> None:
         scanned.append((run_id, workspace, rehunt))
@@ -800,6 +807,7 @@ def test_an_auto_named_run_is_re_scanned_into_the_very_same_auto_workspace(
         atlas_path: Path | None,
         config: Path | None,
         rehunt: bool,
+        assume_yes: bool,
         top_n: int | None,
     ) -> None:
         seen.append(workspace)
@@ -949,6 +957,7 @@ def test_a_hunt_tier_run_with_no_stored_facts_is_announced_before_it_decompiles(
         atlas_path: Path | None,
         config: Path | None,
         rehunt: bool,
+        assume_yes: bool,
         top_n: int | None,
     ) -> None:
         seen.append(workspace)
@@ -995,6 +1004,7 @@ def test_a_run_that_recorded_no_database_is_announced_too(
         atlas_path: Path | None,
         config: Path | None,
         rehunt: bool,
+        assume_yes: bool,
         top_n: int | None,
     ) -> None:
         seen.append(workspace)
@@ -1081,6 +1091,7 @@ def test_a_file_that_is_not_a_database_fails_one_run_and_is_left_untouched(
         atlas_path: Path | None,
         config: Path | None,
         rehunt: bool,
+        assume_yes: bool,
         top_n: int | None,
     ) -> None:
         seen.append(run_id)
@@ -1199,8 +1210,10 @@ def test_a_direct_scan_still_reports_three_stages_and_keeps_its_triage_list(
     fw.mkdir()
     ws_dir = tmp_path / "workspaces"
     _cache_hit_scan(monkeypatch, ws_dir, "my_device")
+    # -y: the seeded cache holds a different firmware than this empty cpio-root, so the overwrite
+    # check would otherwise stop to confirm; this test is about the three stages, not that prompt.
     out = CliRunner().invoke(
-        scan, [str(fw), "-w", "my_device", "--atlas", str(tmp_path / "atlas.db")]
+        scan, [str(fw), "-w", "my_device", "-y", "--atlas", str(tmp_path / "atlas.db")]
     )
     assert out.exit_code == 0, out.output
     assert "[1/3] analyzing" in out.output, out.output
@@ -1340,7 +1353,7 @@ def test_a_binary_the_running_pass_failed_on_does_not_hold_its_run_stale(
 
     js = CliRunner().invoke(runs, ["--atlas", str(atlas), "--json"])
     assert js.exit_code == 0, js.output
-    (row,) = json.loads(js.output)
+    (row,) = json.loads(js.output)["runs"]
     assert row.get("staleness") is None
     assert row.get("kept_earlier") == [
         {"binary": "svc_x", "reason": "incomplete", "earlier_pass": _OLD_PASS, "has_rows": True}
@@ -1499,6 +1512,7 @@ def test_rescan_leaves_the_last_run_pointer_as_it_found_it(
         atlas_path: Path | None,
         config: Path | None,
         rehunt: bool,
+        assume_yes: bool,
         top_n: int | None,
     ) -> None:
         last_run.write_last_run(tmp_path / f"{workspace}.db", Path(str(atlas_path)), str(run_id))
@@ -1534,6 +1548,7 @@ def test_an_interrupted_rescan_puts_the_pointer_back(
         atlas_path: Path | None,
         config: Path | None,
         rehunt: bool,
+        assume_yes: bool,
         top_n: int | None,
     ) -> None:
         last_run.write_last_run(tmp_path / f"{workspace}.db", Path(str(atlas_path)), str(run_id))

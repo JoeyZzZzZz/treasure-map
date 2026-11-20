@@ -750,6 +750,61 @@ def add_web_form_field_rows(
     return len(rows)
 
 
+def delete_run(conn: sqlite3.Connection, run_id: str, *, commit: bool = True) -> dict[str, int]:
+    """Delete one run: its ``run`` row, its rows in the eight per-run tables, and every diff it is a
+    side of. Returns per-kind counts (0 where the run held nothing).
+
+    Pattern rows are KEPT — the shared accumulation layer is never deleted — but
+    delete_run_instances recounts the device_spread of every pattern the run held, so one deleted
+    from and not written again drops
+    the run from its count (it may fall to 0, exactly as a re-hunt that no longer writes it would
+    leave it). Human annotations (overlay / overlay_history) are not touched here. With commit=False
+    the whole delete joins the caller's transaction, so an atlas delete is all-or-nothing."""
+    counts = {
+        "instances": delete_run_instances(conn, run_id, commit=False),
+        "nvram_flow": delete_run_nvram_flow(conn, run_id, commit=False),
+        "string_keyed_edges": delete_run_string_keyed_edges(conn, run_id, commit=False),
+        "exec_edges": delete_run_exec_edges(conn, run_id, commit=False),
+        "detector_status": delete_run_detector_status(conn, run_id, commit=False),
+        "capabilities": delete_run_capabilities(conn, run_id, commit=False),
+        "nvram_defaults": delete_run_nvram_defaults(conn, run_id, commit=False),
+        "web_form_fields": delete_run_web_form_fields(conn, run_id, commit=False),
+    }
+    diff_ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT diff_id FROM diff_meta WHERE run_a_id = ? OR run_b_id = ?", (run_id, run_id)
+        ).fetchall()
+    ]
+    for did in diff_ids:
+        delete_diff(conn, did, commit=False)
+    counts["diffs"] = len(diff_ids)
+    counts["run"] = conn.execute("DELETE FROM run WHERE run_id = ?", (run_id,)).rowcount
+    if commit:
+        conn.commit()
+    return counts
+
+
+def delete_run_pair_diffs(
+    conn: sqlite3.Connection, run_a_id: str, run_b_id: str, *, commit: bool = True
+) -> int:
+    """Delete every diff_meta row recorded for (run_a_id, run_b_id) — the leftover whole-run-pair
+    row (diff_id == 'a::b') included — through delete_diff, so each diff's layer-0 and layer-2 rows
+    go with it. Returns the number of diff ids deleted. commit=False joins the caller's txn."""
+    diff_ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT diff_id FROM diff_meta WHERE run_a_id = ? AND run_b_id = ?",
+            (run_a_id, run_b_id),
+        ).fetchall()
+    ]
+    for did in diff_ids:
+        delete_diff(conn, did, commit=False)
+    if commit:
+        conn.commit()
+    return len(diff_ids)
+
+
 def add_private_exploit(
     conn: sqlite3.Connection,
     *,

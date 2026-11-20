@@ -68,7 +68,7 @@ def test_runs_json_mode(tmp_path: Path) -> None:
     atlas = _atlas_with_runs(tmp_path)
     r = CliRunner().invoke(runs, ["--atlas", str(atlas), "--json"])
     assert r.exit_code == 0, r.output
-    data = json.loads(r.output)
+    data = json.loads(r.output)["runs"]
     by_id = {row["run_id"]: row for row in data}
     assert by_id["rt_scanned"]["scan_status"] == "complete"
     assert by_id["rt_scanned"]["resolved"] is True
@@ -329,7 +329,7 @@ def test_runs_json_carries_the_stamp_and_the_classification(tmp_path: Path) -> N
 
     out = CliRunner().invoke(runs, ["--atlas", str(atlas), "--json"])
     assert out.exit_code == 0, out.output
-    row = json.loads(out.output)[0]
+    row = json.loads(out.output)["runs"][0]
     assert row["hunt_commit"] == "f" * 40
     assert row["hunt_instances"] == 12
     assert row["staleness"]["axis"] == "extraction"
@@ -479,7 +479,7 @@ def test_the_unfinished_tier_reaches_the_json_contract(
     monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
     out = CliRunner().invoke(runs, ["--atlas", str(_unfinished_atlas(tmp_path)), "--json"])
     assert out.exit_code == 0, out.output
-    by_id = {r["run_id"]: r for r in json.loads(out.output)}
+    by_id = {r["run_id"]: r for r in json.loads(out.output)["runs"]}
     assert by_id["stopped"]["staleness"]["axis"] == "incomplete"
     assert "did not finish" in by_id["stopped"]["staleness"]["reason"]
     assert by_id["fine"]["staleness"] is None  # the counterweight: current really is null

@@ -142,6 +142,21 @@ def list_runs(conn: sqlite3.Connection) -> list[RunRow]:
     return resolved + unresolved
 
 
+def run_recorded_elsewhere(
+    conn: sqlite3.Connection, *, run_id: str, fs_root: Path
+) -> RunRow | None:
+    """S1 overwrite check: the run named ``run_id`` when its recorded ``firmware_path`` names a
+    firmware OTHER than ``fs_root`` — the earlier scan that re-using this run id would overwrite.
+
+    None when the run is absent from this atlas, records no firmware_path, or records this same
+    root. ``fs_root`` is the resolved root the scan is about to write; firmware_path was stored
+    resolved the same way, so the same firmware compares equal."""
+    run = get_run(conn, run_id)
+    if run is None or not run.firmware_path:
+        return None
+    return run if run.firmware_path != str(fs_root) else None
+
+
 @dataclass(frozen=True)
 class Staleness:
     """Whether a run's stored result was PROVABLY produced by different code than is running now.

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import fcntl
 import logging
+import os
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import IO, Any
 
 from treasure_map.lib.errors import WorkspaceError
+from treasure_map.lib.ro_db import ro_connect
 
 logger = logging.getLogger(__name__)
 
@@ -81,3 +84,42 @@ def workspace_of(db_path: Path, workspace_dir: Path) -> Path | None:
         return ws if under_base or (ws / Workspace._LOCK_NAME).is_file() else None
     except OSError:
         return None
+
+
+def workspace_holds_other_firmware(db_path: Path, fs_root: Path) -> str | None:
+    """The firmware root a workspace's ``analysis.db`` was last scanned from, when that is NOT
+    ``fs_root``; else None. Read-only, and any error reading the database answers None.
+
+    A scan writes each current binary's path into the database. When every one of them sits under
+    ``fs_root`` the workspace already holds this same firmware (a re-scan, not an overwrite) and the
+    answer is None. Otherwise the answer is the common root of the paths it does hold — the firmware
+    a caller is about to overwrite. ``fs_root`` is the resolved root the caller passes; the binary
+    paths a current scan writes are resolved the same way, so a same-firmware re-scan compares
+    equal. The query matches ``current_binaries`` but is spelled out so a pre-view db reads too."""
+    if not db_path.is_file():
+        return None
+    try:
+        conn = ro_connect(db_path)
+        try:
+            paths = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT path FROM binaries "
+                    "WHERE last_seen_at IS (SELECT MAX(last_seen_at) FROM binaries) "
+                    "AND path IS NOT NULL AND path <> ''"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    if not paths:
+        return None
+    root = str(fs_root)
+    if any(p == root or p.startswith(root + os.sep) for p in paths):
+        return None
+    try:
+        return str(os.path.commonpath(paths))
+    except ValueError:
+        # Mixed absolute and relative paths have no common root; name the first as the witness.
+        return str(paths[0])

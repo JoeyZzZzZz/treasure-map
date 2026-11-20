@@ -1547,7 +1547,189 @@ def _echo_run_lineage(atlas_path: Path, selected_run: str) -> None:
     click.echo(f"atlas: {n} run(s), none named {selected_run!r} — `tmap runs` to list them")
 
 
-@click.command("runs", short_help="List scanned firmware runs")
+def _human_bytes(n: int | None) -> str:
+    """A size like '3.2 GiB'; 'size unknown' when it could not be read."""
+    if n is None:
+        return "size unknown"
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024:
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def _diff_row_status(row: dict[str, Any]) -> str:
+    """One diff row's status: failed / stale / unverified / current — the same split as the counts.
+    A diff that did not run is failed; an unanswerable side is unverified, never rounded to current
+    or stale (UNKNOWN is not 'no change')."""
+    if not row["diff_ok"]:
+        return "failed"
+    if row["source_stale"] is True:
+        return "stale"
+    if row["source_stale"] is None:
+        return "unverified"
+    return "current"
+
+
+def _render_diff_pairs(pairs: list[dict[str, Any]], *, show_all: bool) -> list[str]:
+    """The per-pair diff listing. One summary line per pair; under it the binaries that are FAILED /
+    stale / unverified, and with ``show_all`` the current ones too. A trailing line points at `tmap
+    diff` when any pair holds a stale diff."""
+    lines = [f"\ndiffs ({len(pairs)} pair(s)):"]
+    for entry in pairs:
+        counts = entry["counts"]
+        fields = [
+            f"{label} {counts[key]}"
+            for key, label in (
+                ("current", "current"),
+                ("stale", "stale"),
+                ("unverified", "unverified"),
+                ("failed", "FAILED"),
+            )
+            if counts[key]
+        ]
+        date = (entry["last_diffed_at"] or "")[:10] or "unknown"
+        summary = f"  {entry['run_pair']}   {counts['total']} diffs"
+        if fields:
+            summary += "   " + "   ".join(fields)
+        lines.append(f"{summary}   last diffed {date}")
+        shown = [
+            (row, status)
+            for row in entry["diffs"]
+            if (status := _diff_row_status(row)) != "current" or show_all
+        ]
+        width = max((len(row.get("binary") or "?") for row, _ in shown), default=0)
+        for row, status in shown:
+            binary = (row.get("binary") or "?").ljust(width)
+            if status == "failed":
+                reason = row.get("diff_status_reason") or "bindiff_failed"
+                lines.append(f"    {binary}   FAILED   {reason}")
+            elif status == "stale":
+                lines.append(f"    {binary}   stale: {row.get('source_stale_reason')}")
+            elif status == "unverified":
+                lines.append(f"    {binary}   unverified: {row.get('source_stale_reason')}")
+            else:
+                lines.append(f"    {binary}   current {row.get('matched_pairs') or 0} pairs")
+    if any(e["counts"]["stale"] for e in pairs):
+        lines.append(
+            "`tmap diff --before <run_a> --after <run_b>` recomputes a pair's stale diffs."
+        )
+    return lines
+
+
+def _workspace_report_lines(report: Any) -> list[str]:
+    """The kept-files block for one deleted run (files are never removed by a delete)."""
+    if report.path is None:
+        return [f"  run '{report.run_id}' recorded no analysis.db"]
+    if report.path.name == "analysis.db":
+        return [f"  analysis.db kept: {report.path} (not in a tmap workspace)"]
+    if report.also_recorded_by:
+        recorded = "also recorded by run(s) in this atlas: " + ", ".join(report.also_recorded_by)
+    else:
+        recorded = "no other run in this atlas records it"
+    return [
+        f"  workspace kept: {report.path} ({_human_bytes(report.size_bytes)})",
+        f"    {recorded}",
+        "    other atlases may also record this workspace; delete it by hand once you are sure",
+    ]
+
+
+def _delete_preview_lines(plan: Any) -> list[str]:
+    """What `tmap runs --delete` is about to remove, before it is confirmed."""
+    lines = ["To delete (atlas records only; files are kept):"]
+    if plan.runs:
+        lines.append(f"  run(s): {', '.join(plan.runs)}")
+    if plan.pairs:
+        lines.append("  pair(s): " + ", ".join(f"{a}::{b}" for a, b in plan.pairs))
+    if plan.diff_ids:
+        by_pair: dict[str, int] = {}
+        for diff_id in plan.diff_ids:
+            parts = diff_id.split("::")
+            key = "::".join(parts[:2]) if len(parts) >= 2 else diff_id
+            by_pair[key] = by_pair.get(key, 0) + 1
+        grouped = "; ".join(f"{k}: {v}" for k, v in sorted(by_pair.items()))
+        lines.append(f"  diff rows: {len(plan.diff_ids)} ({grouped})")
+    lines.append(
+        f"  annotations kept: {plan.annotations_kept} (they re-attach if the same run id is "
+        "scanned or the same pair is diffed again)"
+    )
+    for report in plan.workspaces:
+        lines.extend(_workspace_report_lines(report))
+    return lines
+
+
+def _delete_runs(conn: Any, ids: list[str], *, cfg: Any, assume_yes: bool, as_json: bool) -> None:
+    """Resolve, preview, confirm and apply `tmap runs --delete`. The plan's scan locks are always
+    released, deletion applied or not."""
+    import json
+
+    from treasure_map.lib.errors import TreasureMapError
+    from treasure_map.lib.run_delete import execute_delete, plan_delete
+    from treasure_map.lib.setup.selector import can_use_tty
+
+    if as_json and not assume_yes:
+        raise click.ClickException("pass --yes to delete with --json")
+    try:
+        plan = plan_delete(conn, ids, workspace_dir=cfg.workspace_dir)
+    except TreasureMapError as exc:
+        raise click.ClickException(str(exc)) from exc
+    try:
+        if as_json:
+            deleted = execute_delete(conn, plan)
+            click.echo(
+                json.dumps(
+                    {
+                        "runs": plan.runs,
+                        "pairs": [f"{a}::{b}" for a, b in plan.pairs],
+                        "diff_ids": plan.diff_ids,
+                        "annotations_kept": plan.annotations_kept,
+                        "workspaces": [
+                            {
+                                "run_id": w.run_id,
+                                "path": str(w.path) if w.path is not None else None,
+                                "size_bytes": w.size_bytes,
+                                "also_recorded_by": w.also_recorded_by,
+                            }
+                            for w in plan.workspaces
+                        ],
+                        "deleted": deleted,
+                    },
+                    indent=2,
+                    default=str,
+                )
+            )
+            return
+        for line in _delete_preview_lines(plan):
+            click.echo(line)
+        if not assume_yes:
+            if not can_use_tty():
+                raise click.ClickException("pass --yes to delete without a prompt")
+            if not click.confirm("Proceed?", default=True):
+                click.echo("Nothing changed.")
+                return
+        deleted = execute_delete(conn, plan)
+        detail = ", ".join(
+            f"{deleted[k]} {k}"
+            for k in (
+                "instances",
+                "nvram_flow",
+                "string_keyed_edges",
+                "exec_edges",
+                "detector_status",
+                "capabilities",
+                "nvram_defaults",
+                "web_form_fields",
+            )
+            if deleted[k]
+        )
+        suffix = f" ({detail})" if detail else ""
+        click.echo(f"deleted {deleted['runs']} run(s), {deleted['diffs']} diff(s){suffix}.")
+    finally:
+        plan.release()
+
+
+@click.command("runs", short_help="List scans and diffs; delete them")
 @click.option(
     "--config",
     "-c",
@@ -1563,14 +1745,47 @@ def _echo_run_lineage(atlas_path: Path, selected_run: str) -> None:
     help="Atlas DB path (defaults to the configured atlas.db_path).",
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
-def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
-    """List every firmware run (scan) in the atlas with its lineage.
+@click.option(
+    "--delete",
+    "delete",
+    multiple=True,
+    shell_complete=_complete_run_id,
+    help="Delete atlas records for an id. Accepts a run id, run_a::run_b, or "
+    "run_a::run_b::binary. Removes atlas records only; files are kept. Repeatable, and applied "
+    "atomically. Does not stop a tmap diff of the same run that is running now — let it finish "
+    "first.",
+)
+@click.option(
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    default=False,
+    help="Delete without the confirmation prompt.",
+)
+@click.option(
+    "--diffs",
+    "show_diffs",
+    is_flag=True,
+    default=False,
+    help="In the listing, show every binary of every diff pair, not just the ones out of date.",
+)
+def runs(
+    config: Path | None,
+    atlas_path: Path | None,
+    as_json: bool,
+    delete: tuple[str, ...],
+    assume_yes: bool,
+    show_diffs: bool,
+) -> None:
+    """List every scan and every version diff in the atlas, and delete them.
 
     Each run shows its scan_status (in_progress / complete / partial / failed / unknown), build
     hash (the extraction pass_version — a differing build for the same firmware means a STALE
-    scan), scan date, and binary/function counts. Use a run id here as ``--run`` for ``tmap
-    triage`` or as run_id for the MCP fact tools. A run with no lineage row (a pre-existing scan) is
-    shown but flagged, never hidden."""
+    scan), scan date, and binary/function counts. Diffs follow, grouped by run pair, with each
+    pair's current / stale / unverified / failed counts. ``--delete`` removes a run, a run pair's
+    diffs, or one binary diff from the atlas (records only — files are always kept). Use a run id
+    here as ``--run`` for ``tmap triage`` or as run_id for the MCP fact tools."""
     import json
     from dataclasses import asdict
 
@@ -1578,14 +1793,19 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.query import list_runs as run_list_runs
+    from treasure_map.lib.query.diff_align import list_diff_pairs
 
     cfg = load_config(config)
     resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
     _require_atlas(resolved_atlas)
     conn = open_atlas(resolved_atlas)
     try:
+        if delete:
+            _delete_runs(conn, list(delete), cfg=cfg, assume_yes=assume_yes, as_json=as_json)
+            return
         run_rows = run_list_runs(conn)
         live = _live_instance_counts(conn)
+        pairs = list_diff_pairs(conn)
     finally:
         conn.close()
     current_build = current_pass_version()
@@ -1620,57 +1840,63 @@ def runs(config: Path | None, atlas_path: Path | None, as_json: bool) -> None:
                     "kept_earlier": kept.get(r.run_id, []),
                 }
             )
-        click.echo(json.dumps(rows, indent=2, default=str))
+        # ``diffs`` is ALWAYS the full per-pair view (--diffs changes only the human listing); a
+        # script reads every binary. The object shape holds even when there is nothing: a bare
+        # ``[]`` of runs would have hidden the diffs entirely.
+        click.echo(json.dumps({"runs": rows, "diffs": pairs}, indent=2, default=str))
         return
-    if not run_rows:
+    if not run_rows and not pairs:
         click.echo("no runs in this atlas yet — run `tmap scan <firmware>` first.")
         return
-    click.echo(f"{len(run_rows)} run(s) in {resolved_atlas}:")
-    id_w, status_w, bins_w = _line_widths(run_rows)
-    # Grouped by WHICH input has moved on, not merely by whether something has. The two groups cost
-    # different amounts of time to bring forward, so a reader deciding what to do next needs them
-    # apart; the same classifier answers `tmap rescan`, so the two commands cannot disagree.
-    for axis in _TIER_ORDER:
-        tier = tiers[axis]
-        if not tier:
-            continue
-        click.echo(f"\n{_TIER_LABEL[axis]} ({len(tier)}):")
-        for r, _why in tier:
+    if run_rows:
+        click.echo(f"{len(run_rows)} run(s) in {resolved_atlas}:")
+        id_w, status_w, bins_w = _line_widths(run_rows)
+        # Grouped by WHICH input has moved on, not merely by whether something has. The two groups
+        # cost different amounts of time to bring forward, so a reader deciding what to do next
+        # needs them apart; the same classifier answers `tmap rescan`, so they cannot disagree.
+        for axis in _TIER_ORDER:
+            tier = tiers[axis]
+            if not tier:
+                continue
+            click.echo(f"\n{_TIER_LABEL[axis]} ({len(tier)}):")
+            for r, _why in tier:
+                line = _run_lineage_line(r, id_width=id_w, status_width=status_w, bins_width=bins_w)
+                click.echo(f"  {line}")
+            # The reason once per tier, not once per run. Six runs out of date for the same reason
+            # is one fact about the install, and repeating it beside every line hid the list it
+            # annotates. Several reasons -> several lines, each naming the runs it is about, so
+            # grouping never merges two different situations into whichever sentence came first.
+            for reason, ids in _reasons_grouped(tier, axis).items():
+                named = "" if len(ids) == len(tier) else f": {', '.join(ids)}"
+                click.echo(f"  → {reason}{named}")
+        if current:
+            click.echo(f"\nup to date ({len(current)}):")
+            for r in current:
+                line = _run_lineage_line(r, id_width=id_w, status_width=status_w, bins_width=bins_w)
+                click.echo(f"  {line}")
+        kept_lines = _kept_earlier_lines(run_rows, current_build=current_build)
+        if kept_lines:
+            click.echo("")
+            for line in kept_lines:
+                click.echo(line)
+        # ★ EVERY tier, not the two that happen to be named. The closing line claims what `tmap
+        # rescan` can do about what was just listed, so a tier left out of this check is a tier
+        # whose runs are quietly assumed refreshable — and the tier most likely to hold
+        # un-refreshable runs is the one for runs that never finished.
+        stale_runs = [r for axis in _TIER_ORDER for r, _why in tiers[axis]]
+        if any(not r.firmware_path or not Path(r.firmware_path).is_dir() for r in stale_runs):
+            # Some of what is listed above cannot be refreshed at all — saying "rescan them"
+            # without that would send the reader at a command that fails on a subset, with no hint.
             click.echo(
-                f"  {_run_lineage_line(r, id_width=id_w, status_width=status_w, bins_width=bins_w)}"
+                "\n`tmap rescan` refreshes the runs that still have a firmware root; the others "
+                "are readable via `tmap fact pseudocode <func> --analysis-db <path>`."
             )
-        # The reason once per tier, not once per run. Six runs out of date for the same reason is
-        # one fact about the install, and repeating it beside every line hid the list it annotates.
-        # Several reasons -> several lines, each naming the runs it is about, so grouping never
-        # merges two different situations into whichever sentence happened to come first.
-        for reason, ids in _reasons_grouped(tier, axis).items():
-            named = "" if len(ids) == len(tier) else f": {', '.join(ids)}"
-            click.echo(f"  → {reason}{named}")
-    if current:
-        click.echo(f"\nup to date ({len(current)}):")
-        for r in current:
-            click.echo(
-                f"  {_run_lineage_line(r, id_width=id_w, status_width=status_w, bins_width=bins_w)}"
-            )
-    kept_lines = _kept_earlier_lines(run_rows, current_build=current_build)
-    if kept_lines:
-        click.echo("")
-        for line in kept_lines:
+        else:
+            click.echo("\n`tmap rescan` refreshes them.")
+    if pairs:
+        for line in _render_diff_pairs(pairs, show_all=show_diffs):
             click.echo(line)
-    # ★ EVERY tier, not the two that happen to be named. The closing line claims what `tmap
-    # rescan` can do about what was just listed, so a tier left out of this check is a tier whose
-    # runs are quietly assumed refreshable — and the tier most likely to hold un-refreshable runs
-    # is the one for runs that never finished.
-    stale_runs = [r for axis in _TIER_ORDER for r, _why in tiers[axis]]
-    if any(not r.firmware_path or not Path(r.firmware_path).is_dir() for r in stale_runs):
-        # Some of what is listed above cannot be refreshed at all — saying "rescan them" without
-        # that would send the reader at a command that fails on a subset, with no hint which.
-        click.echo(
-            "\n`tmap rescan` refreshes the runs that still have a firmware root; the others are "
-            "readable via `tmap fact pseudocode <func> --analysis-db <path>`."
-        )
-    else:
-        click.echo("\n`tmap rescan` refreshes them.")
+    click.echo("\n`tmap runs --delete <run | run_a::run_b | run_a::run_b::binary>` removes one.")
 
 
 @click.command(
@@ -2099,6 +2325,15 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     "skipped by default (a timeout is deterministic — the same budget reproduces it). Use after "
     "raising the timeout, or on a machine with more to spare.",
 )
+@click.option(
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    default=False,
+    help="Overwrite an earlier scan of other firmware under the same run id or workspace without "
+    "asking.",
+)
 def scan(
     fs_root: Path,
     workspace: str | None,
@@ -2113,6 +2348,7 @@ def scan(
     config: Path | None,
     atlas_path: Path | None,
     force_retry: bool,
+    assume_yes: bool,
 ) -> None:
     """Run the whole main path on one extracted firmware: analyze -> hunt -> triage.
 
@@ -2163,6 +2399,40 @@ def scan(
 
         effective_run_id = run_id if run_id is not None else ws_path.name
         resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
+
+        # Read-only overwrite check, before the atlas is opened for writing and before any Ghidra:
+        # confirm when this run id already records OTHER firmware (S1), or the workspace already
+        # holds a scan of other firmware (S2). A missing atlas is neither opened nor created — an
+        # unreadable one just skips S1. (A same-firmware re-scan and `tmap rescan` match and pass.)
+        import sqlite3
+
+        from treasure_map.cli.analyze_cli import confirm_overwrite
+        from treasure_map.lib.query.runs import run_recorded_elsewhere
+        from treasure_map.lib.ro_db import ro_connect
+        from treasure_map.lib.workspace.workspace import workspace_holds_other_firmware
+
+        overwrite_hits: list[str] = []
+        if resolved_atlas.exists():
+            elsewhere = None
+            try:
+                _ro = ro_connect(resolved_atlas, row_factory=True)
+                try:
+                    elsewhere = run_recorded_elsewhere(
+                        _ro, run_id=effective_run_id, fs_root=fs_root
+                    )
+                finally:
+                    _ro.close()
+            except sqlite3.Error:
+                elsewhere = None
+            if elsewhere is not None:
+                overwrite_hits.append(
+                    f"run '{effective_run_id}' was a scan of {elsewhere.firmware_path} "
+                    "(same run id)"
+                )
+        other_fw = workspace_holds_other_firmware(ws_path / "analysis.db", fs_root)
+        if other_fw:
+            overwrite_hits.append(f"workspace {ws_path} holds a scan of {other_fw}")
+        confirm_overwrite(overwrite_hits, assume_yes=assume_yes)
 
         def _progress(step: str, meta: dict[str, Any]) -> None:
             click.echo(f"  [{step}] {meta}")
@@ -3074,6 +3344,10 @@ def _rescan_each_sharing(
                 atlas_path=resolved_atlas,
                 config=config,
                 rehunt=force,
+                # A rescan re-scans the SAME firmware into its own workspace, so the overwrite
+                # check matches and would pass anyway; assume_yes keeps it silent for certain (a
+                # refresh never asks).
+                assume_yes=True,
                 # This command refreshes; it does not read. The candidate list is a separate act —
                 # `tmap triage <run>` — so a multi-run rescan does not bury its own summary.
                 top_n=0,

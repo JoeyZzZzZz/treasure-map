@@ -119,7 +119,7 @@ tmap diff --before fw-v1 --after fw-v2
 |---|---|
 | `tmap scan DIR -w NAME` | 扫描一个已解包的固件（再运行一次即续跑） |
 | `tmap diff --before A --after B` | 对比两个扫描过的版本（`--binary NAME` 只比一个二进制） |
-| `tmap runs` | 列出扫过的固件，以及哪些 run 已过期 |
+| `tmap runs` | 列出扫描和对比、标出哪些已过期，并可删除（`--delete`） |
 | `tmap rescan [NAME ...]` | 重扫因工具升级而过期的 run（`--dry-run` 只列出） |
 | `tmap doctor` | 检查工具链、配置和 agent 注册情况（不做改动） |
 | `tmap update` | 装上最新版本，再运行它的 `tmap init` |
