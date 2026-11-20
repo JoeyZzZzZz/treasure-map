@@ -127,13 +127,17 @@ def _invoke(atlas: Path, args: list[str]):
 
 
 def test_listing_shows_runs_and_diff_pairs(tmp_path: Path) -> None:
-    out = _invoke(_atlas(tmp_path), [])
+    atlas = _atlas(tmp_path)
+    out = _invoke(atlas, [])
     assert out.exit_code == 0, out.output
     assert "av" in out.output and "bv" in out.output
     assert "diffs (1 pair(s)):" in out.output
     assert "av::bv" in out.output and "2 diffs" in out.output
-    # a FAILED binary is ALWAYS listed under its pair (a blind spot must never read as 'no change')
-    assert "libbad" in out.output and "FAILED" in out.output
+    # a failed diff is never silent: its count and reason are on the pair's line (a blind spot
+    # must never read as 'no change'); the binary itself is named under --diffs
+    assert "FAILED 1 (bindiff_flowgraph)" in out.output
+    assert "libbad" not in out.output
+    assert "libbad" in _invoke(atlas, ["--diffs"]).output
     assert "--delete" in out.output  # the removal hint
 
 
@@ -154,11 +158,79 @@ def test_render_diff_pairs_hides_current_unless_diffs_flag() -> None:
             },
         ],
     }
-    default = "\n".join(_render_diff_pairs([pair], show_all=False))
-    assert "libbad" in default and "FAILED" in default  # a failed binary is always listed
-    assert "libok" not in default  # a current one is hidden by default
+    default = _render_diff_pairs([pair], show_all=False)
+    (pair_line,) = [ln for ln in default if "a::b" in ln]  # exactly one line for the pair
+    assert "current 1" in pair_line and "FAILED 1 (bindiff_failed)" in pair_line
+    assert not any("libok" in ln or "libbad" in ln for ln in default)  # no per-binary lines
+    assert "`tmap runs --diffs` lists each binary." in default
     every = "\n".join(_render_diff_pairs([pair], show_all=True))
     assert "libok" in every and "current 10 pairs" in every
+    assert "libbad" in every and "FAILED   bindiff_failed" in every
+
+
+def _stale_rows(reasons: list[str]) -> list[dict[str, object]]:
+    return [
+        {"binary": f"b{i}", "diff_ok": 1, "source_stale": True, "source_stale_reason": r}
+        for i, r in enumerate(reasons)
+    ]
+
+
+def test_a_pair_stale_for_one_reason_is_one_line() -> None:
+    # The reported case: every diff of a pair stale for the same reason. One line, the reason
+    # once — not 32 lines repeating it.
+    rows = _stale_rows(["diff_logic_changed"] * 32)
+    pair = {
+        "run_pair": "a::b",
+        "last_diffed_at": "2026-11-06 00:00:00",
+        "counts": {"total": 32, "current": 0, "stale": 32, "unverified": 0, "failed": 0},
+        "diffs": rows,
+    }
+    lines = _render_diff_pairs([pair], show_all=False)
+    body = [ln for ln in lines if ln.startswith("  ")]
+    assert body == ["  a::b   32 diffs   stale 32 (diff_logic_changed)   last diffed 2026-11-06"]
+
+
+def test_mixed_reasons_are_counted_most_frequent_first() -> None:
+    # The more frequent reason sorts LATER alphabetically, so frequency order is what is checked.
+    rows = _stale_rows(["diff_logic_changed"] * 2 + ["hunt_inputs_changed"] * 3)
+    pair = {
+        "run_pair": "a::b",
+        "last_diffed_at": None,
+        "counts": {"total": 5, "current": 0, "stale": 5, "unverified": 0, "failed": 0},
+        "diffs": rows,
+    }
+    (line,) = [ln for ln in _render_diff_pairs([pair], show_all=False) if "a::b" in ln]
+    assert "stale 5 (hunt_inputs_changed 3, diff_logic_changed 2)" in line
+
+
+def test_a_failure_with_no_recorded_reason_says_so() -> None:
+    # Never a guessed reason: a failed row without diff_status_reason is reported as unrecorded.
+    pair = {
+        "run_pair": "a::b",
+        "last_diffed_at": None,
+        "counts": {"total": 1, "current": 0, "stale": 0, "unverified": 0, "failed": 1},
+        "diffs": [{"binary": "x", "diff_ok": 0, "source_stale": None}],
+    }
+    text = "\n".join(_render_diff_pairs([pair], show_all=True))
+    assert "FAILED 1 (reason not recorded)" in text
+    assert "bindiff_failed" not in text
+
+
+def test_pair_names_are_aligned_in_one_column() -> None:
+    def entry(name: str) -> dict[str, object]:
+        return {
+            "run_pair": name,
+            "last_diffed_at": None,
+            "counts": {"total": 1, "current": 1, "stale": 0, "unverified": 0, "failed": 0},
+            "diffs": [{"binary": "x", "diff_ok": 1, "source_stale": False}],
+        }
+
+    lines = [
+        ln
+        for ln in _render_diff_pairs([entry("a::b"), entry("long_a::long_b")], show_all=False)
+        if "diffs   " in ln
+    ]
+    assert len({ln.index("1 diffs") for ln in lines}) == 1  # the counts start in one column
 
 
 def test_counts_sum_to_total(tmp_path: Path) -> None:

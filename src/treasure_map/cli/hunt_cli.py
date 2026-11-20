@@ -1572,49 +1572,73 @@ def _diff_row_status(row: dict[str, Any]) -> str:
     return "current"
 
 
+_NO_REASON = "reason not recorded"
+
+
+def _diff_row_reason(row: dict[str, Any], status: str) -> str:
+    """Why one diff row has its status: the failure reason for a failed diff, the staleness reason
+    otherwise. A row that recorded none says so — never a guessed reason."""
+    key = "diff_status_reason" if status == "failed" else "source_stale_reason"
+    return row.get(key) or _NO_REASON
+
+
+def _reason_summary(rows: list[dict[str, Any]], status: str) -> str:
+    """The reasons of the rows with one status, once each: ``(r)`` when they share one reason,
+    ``(r1 20, r2 12)`` otherwise, most frequent first."""
+    tally: dict[str, int] = {}
+    for row in rows:
+        if _diff_row_status(row) == status:
+            reason = _diff_row_reason(row, status)
+            tally[reason] = tally.get(reason, 0) + 1
+    if len(tally) == 1:
+        return f"({next(iter(tally))})"
+    ordered = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+    return "(" + ", ".join(f"{reason} {n}" for reason, n in ordered) + ")"
+
+
 def _render_diff_pairs(pairs: list[dict[str, Any]], *, show_all: bool) -> list[str]:
-    """The per-pair diff listing. One summary line per pair; under it the binaries that are FAILED /
-    stale / unverified, and with ``show_all`` the current ones too. A trailing line points at `tmap
-    diff` when any pair holds a stale diff."""
+    """The diff listing: ONE line per run pair, its counts with the reasons behind every count that
+    is not current written once on that line — a pair gone stale for one reason is one fact, and a
+    line per binary repeating it hid the list. ``show_all`` (--diffs) adds a line per binary under
+    each pair. Trailing lines point at `tmap diff` for stale pairs and at --diffs for the detail."""
     lines = [f"\ndiffs ({len(pairs)} pair(s)):"]
+    pair_w = max((len(e["run_pair"]) for e in pairs), default=0)
     for entry in pairs:
         counts = entry["counts"]
-        fields = [
-            f"{label} {counts[key]}"
-            for key, label in (
-                ("current", "current"),
-                ("stale", "stale"),
-                ("unverified", "unverified"),
-                ("failed", "FAILED"),
-            )
-            if counts[key]
-        ]
+        fields = []
+        for key, label in (
+            ("current", "current"),
+            ("stale", "stale"),
+            ("unverified", "unverified"),
+            ("failed", "FAILED"),
+        ):
+            if not counts[key]:
+                continue
+            field = f"{label} {counts[key]}"
+            if key != "current":
+                field += " " + _reason_summary(entry["diffs"], key)
+            fields.append(field)
         date = (entry["last_diffed_at"] or "")[:10] or "unknown"
-        summary = f"  {entry['run_pair']}   {counts['total']} diffs"
-        if fields:
-            summary += "   " + "   ".join(fields)
-        lines.append(f"{summary}   last diffed {date}")
-        shown = [
-            (row, status)
-            for row in entry["diffs"]
-            if (status := _diff_row_status(row)) != "current" or show_all
-        ]
-        width = max((len(row.get("binary") or "?") for row, _ in shown), default=0)
-        for row, status in shown:
+        parts = [entry["run_pair"].ljust(pair_w), f"{counts['total']} diffs", *fields]
+        lines.append("  " + "   ".join(parts) + f"   last diffed {date}")
+        if not show_all:
+            continue
+        width = max((len(row.get("binary") or "?") for row in entry["diffs"]), default=0)
+        for row in entry["diffs"]:
             binary = (row.get("binary") or "?").ljust(width)
-            if status == "failed":
-                reason = row.get("diff_status_reason") or "bindiff_failed"
-                lines.append(f"    {binary}   FAILED   {reason}")
-            elif status == "stale":
-                lines.append(f"    {binary}   stale: {row.get('source_stale_reason')}")
-            elif status == "unverified":
-                lines.append(f"    {binary}   unverified: {row.get('source_stale_reason')}")
-            else:
+            status = _diff_row_status(row)
+            if status == "current":
                 lines.append(f"    {binary}   current {row.get('matched_pairs') or 0} pairs")
+            elif status == "failed":
+                lines.append(f"    {binary}   FAILED   {_diff_row_reason(row, status)}")
+            else:
+                lines.append(f"    {binary}   {status}: {_diff_row_reason(row, status)}")
     if any(e["counts"]["stale"] for e in pairs):
         lines.append(
             "`tmap diff --before <run_a> --after <run_b>` recomputes a pair's stale diffs."
         )
+    if not show_all and any(e["counts"]["total"] != e["counts"]["current"] for e in pairs):
+        lines.append("`tmap runs --diffs` lists each binary.")
     return lines
 
 
@@ -1768,7 +1792,7 @@ def _delete_runs(conn: Any, ids: list[str], *, cfg: Any, assume_yes: bool, as_js
     "show_diffs",
     is_flag=True,
     default=False,
-    help="In the listing, show every binary of every diff pair, not just the ones out of date.",
+    help="In the listing, show every binary of every diff pair under its pair's line.",
 )
 def runs(
     config: Path | None,
