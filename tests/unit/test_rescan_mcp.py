@@ -202,23 +202,79 @@ def test_the_restart_hint_is_recomputed_on_every_refusal_not_cached(
     assert second.get("found") is False and "Restart the MCP server" in second["remedy"]
 
 
-def test_on_disk_code_stamp_is_computed_fresh_not_from_the_cache(
-    monkeypatch: pytest.MonkeyPatch,
+def _package_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A copy of the package the on-disk stamp reads instead of the installed one, so a test can
+    edit "the code on disk" (or count its hashing) without touching what other tests read. The
+    cached startup stamps are computed first, from the installed package."""
+    import shutil
+
+    rescan_version.current_code_stamp(Config())
+    pkg = tmp_path / "pkg"
+    shutil.copytree(rescan_version._PACKAGE, pkg, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(rescan_version, "_PACKAGE", pkg)
+    return pkg
+
+
+def test_on_disk_code_stamp_follows_the_tree_not_the_startup_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``on_disk_code_stamp`` reads the tree RIGHT NOW (uncached) so the restart hint can see the
-    code move under a long-lived server; ``current_code_stamp`` is the cached construction-time
-    value. This pins that the on-disk stamp follows the uncached ``code_version_of``, not the cache.
+    """``on_disk_code_stamp`` reads the tree as it is NOW so the restart hint can see the code move
+    under a long-lived server; ``current_code_stamp`` is the cached construction-time value. A file
+    of the package edited between two reads moves the on-disk hunt hash, and only that one.
 
     MUTATION (audit G10): make ``on_disk_code_stamp`` return the cached ``current_code_stamp`` -> it
-    stops reflecting an on-disk change and this goes RED.
+    stops reflecting the edit and this goes RED.
     """
     cfg = Config()
-    on_disk_hunt = "src-0d0d0d0d0d0d0d0d"
-    cached = rescan_version.hunt_code_version()  # lock the cached value before patching
-    monkeypatch.setattr(rescan_version, "code_version_of", lambda _pkg, _root: on_disk_hunt)
-    on_disk = rescan_version.on_disk_code_stamp(cfg)
-    assert on_disk.hunt == on_disk_hunt, "on_disk reads the tree now, via code_version_of"
+    cached = rescan_version.hunt_code_version()
+    pkg = _package_copy(tmp_path, monkeypatch)
+    before = rescan_version.on_disk_code_stamp(cfg)
+    target = pkg / "lib" / "hunt" / "analyzer2.py"
+    target.write_text(target.read_text() + "\n_MOVED_ON_DISK = 1\n")
+    after = rescan_version.on_disk_code_stamp(cfg)
+    assert before.hunt == cached, "an unedited copy hashes as the installed package"
+    assert after.hunt != before.hunt, "on_disk reads the tree now"
+    assert after.scan == before.scan, "analyzer2 is outside the scan's closure"
     assert rescan_version.hunt_code_version() == cached, "the cached stamp is untouched"
+
+
+def test_servers_in_one_process_share_the_on_disk_hash_until_a_file_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The on-disk code hash is kept for the process, not for one ``make_tools``: a second server
+    over the same package reuses it (a hash takes most of a second; the tests build a server per
+    call), and an edit to a package file makes the next response hash again.
+
+    MUTATION (verified RED): keep the hash per ``make_tools`` again -> the second server hashes
+    again and this goes RED; reuse the hash whatever the files -> the edit is missed, RED."""
+    pkg = _package_copy(tmp_path, monkeypatch)
+    calls: list[str] = []
+    real = rescan_version.code_version_of
+
+    def counted(package_dir: Path, root: str) -> str:
+        calls.append(root)
+        return real(package_dir, root)
+
+    monkeypatch.setattr(rescan_version, "code_version_of", counted)
+    _mk_analysis(tmp_path)
+    atlas = _atlas(
+        tmp_path,
+        hunt_code=rescan_version.hunt_code_version(),
+        scan_stamp=rescan_version.scan_stamp_for(Config()),
+    )
+    both = sorted([rescan_version.HUNT_ROOT, rescan_version.PIPELINE_ROOT])
+
+    first = mcp_app.make_tools(atlas, config=Config())["list_runs"]()["server"]
+    assert sorted(calls) == both
+    second = mcp_app.make_tools(atlas, config=Config())["list_runs"]()["server"]
+    assert sorted(calls) == both, "the second server reused the first one's hash"
+    assert first["code_moved_on_disk"] is False and second["code_moved_on_disk"] is False
+
+    target = pkg / "lib" / "hunt" / "analyzer2.py"
+    target.write_text(target.read_text() + "\n_MOVED_ON_DISK = 1\n")
+    third = mcp_app.make_tools(atlas, config=Config())["list_runs"]()["server"]
+    assert sorted(calls) == sorted(both * 2), "an edited package is hashed again"
+    assert third["code_moved_on_disk"] is True
 
 
 def test_a_cross_run_refusal_also_carries_the_restart_hint(

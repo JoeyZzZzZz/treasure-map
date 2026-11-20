@@ -473,14 +473,58 @@ def current_code_stamp(cfg: BaseModel) -> CodeStamp:
     return CodeStamp(hunt=hunt_code_version(), scan=scan_stamp_for(cfg))
 
 
+def _package_signature(package_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    """``(relative path, mtime_ns, size)`` of every file under ``package_dir`` (``__pycache__``
+    left out), sorted: what the on-disk code hash is recomputed on. Any edit, addition or removal
+    of a package file changes it. A file that vanishes while it is listed is skipped."""
+    sig = []
+    for p in sorted(package_dir.rglob("*")):
+        if "__pycache__" in p.parts or not p.is_file():
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        sig.append((p.relative_to(package_dir).as_posix(), st.st_mtime_ns, st.st_size))
+    return tuple(sig)
+
+
+# The on-disk code hash per (package dir, root): the package signature it was computed on, and the
+# hash. Kept for the life of the process, so every server in it (and every ``make_tools`` a test
+# builds) shares it; an entry is used only while its package's signature is unchanged. A test that
+# swaps ``code_version_of`` must first point ``_PACKAGE`` at a copy of the package, or the swapped
+# value is kept here under the real package and read by the tests after it.
+_disk_code_memo: dict[tuple[str, str], tuple[tuple[tuple[str, int, int], ...], str]] = {}
+
+
+def _disk_code_version(package_dir: Path, root: str, sig: tuple[tuple[str, int, int], ...]) -> str:
+    """``code_version_of(package_dir, root)``, computed again only when ``sig`` (the package
+    signature) differs from the one the kept value was computed on."""
+    key = (str(package_dir), root)
+    kept = _disk_code_memo.get(key)
+    if kept is not None and kept[0] == sig:
+        return kept[1]
+    value = code_version_of(package_dir, root)
+    _disk_code_memo[key] = (sig, value)
+    return value
+
+
 def on_disk_code_stamp(cfg: BaseModel) -> CodeStamp:
-    """The stamp of the code on disk RIGHT NOW, computed without any cache. Only for the MCP hint
-    that warns when the server started before the code it is serving from was edited — a long-lived
-    process holds the cached ``current_code_stamp`` from its startup, and this says whether a rescan
-    run from the command line (which uses the on-disk code) could ever match it."""
+    """The stamp of the code on disk RIGHT NOW. Only for the MCP hint that warns when the server
+    started before the code it is serving from was edited — a long-lived process holds the cached
+    ``current_code_stamp`` from its startup, and this says whether a rescan run from the command
+    line (which uses the on-disk code) could ever match it.
+
+    The two code hashes are recomputed whenever a file of the package changed (path, mtime, size)
+    since they were last computed, and reused otherwise: hashing the code takes most of a second,
+    and list_runs, start_diff_review and get_diff_meta ask on every response. The pyelftools
+    version and the config are read on every call."""
+    sig = _package_signature(_PACKAGE)
     return CodeStamp(
-        hunt=code_version_of(_PACKAGE, HUNT_ROOT),
-        scan=_scan_stamp_json(code_version_of(_PACKAGE, PIPELINE_ROOT), _read_pyelftools(), cfg),
+        hunt=_disk_code_version(_PACKAGE, HUNT_ROOT, sig),
+        scan=_scan_stamp_json(
+            _disk_code_version(_PACKAGE, PIPELINE_ROOT, sig), _read_pyelftools(), cfg
+        ),
     )
 
 

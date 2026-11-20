@@ -1292,27 +1292,6 @@ def make_tools(
     ws_root = Path(workspaces_root) if workspaces_root is not None else None
     _config = config if config is not None else load_config(None)
     _current = rescan_version.current_code_stamp(_config)
-    _disk_cache: dict[str, Any] = {}
-
-    def _disk_stamp() -> rescan_version.CodeStamp:
-        """The on-disk code stamp, recomputed only when a file of the package (path, mtime, size)
-        or the pyelftools version changed since the last call: hashing the code takes most of a
-        second, and start_diff_review asks on every call."""
-        pkg = rescan_version._PACKAGE
-        files = sorted(p for p in pkg.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
-        sig = []
-        for p in files:
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            sig.append((p.relative_to(pkg).as_posix(), st.st_mtime_ns, st.st_size))
-        key = (tuple(sig), rescan_version._read_pyelftools())
-        if _disk_cache.get("key") != key:
-            _disk_cache["stamp"] = rescan_version.on_disk_code_stamp(_config)
-            _disk_cache["key"] = key
-        stamp: rescan_version.CodeStamp = _disk_cache["stamp"]
-        return stamp
 
     # D33: the server's own version fields, every one the IN-PROCESS loaded value, fixed once here
     # at startup (``_current`` is this process's code stamp; _current_pass_version and
@@ -1334,10 +1313,10 @@ def make_tools(
         the newer on-disk code, but the server is still grading against the code it started with.
         Also the ``server`` block's ``code_moved_on_disk`` (D33: list_runs / start_diff_review /
         get_diff_meta call it on every response, not only on a refusal). Reads the on-disk
-        stamp (rehashed only when a package file changed, ``_disk_stamp``), at most once per tool
-        call: a refusal on those three
+        stamp (``on_disk_code_stamp``, rehashed only when a package file changed, the hash shared
+        by every server in the process), at most once per tool call: a refusal on those three
         tools reuses the head's result (``_MOVED_UNSET``). None when they match."""
-        disk = _disk_stamp()
+        disk = rescan_version.on_disk_code_stamp(_config)
         if disk == _current:
             return None
         scans = "equal" if disk.scan == _current.scan else "differ"
