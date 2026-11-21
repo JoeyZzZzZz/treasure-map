@@ -195,15 +195,18 @@ def report(
             # builds, so the file and the tool's pages are the same text (B-4(d)).
             stamp, file_staleness = rr.local_handoff_context(conn)
             findings = rr.handoff_findings(conn, run_pair, file_staleness=file_staleness)
+            open_items = rr.handoff_open_items(conn, run_pair, file_staleness=file_staleness)
             # Not gated: before the must-read set is done the file is written all the same, its
             # header saying it is a PARTIAL hand-off (the MCP tool serves none then).
             hrep = rr.handoff_report(conn, run_pair, file_staleness=file_staleness)
-            text = rr.handoff_header(run_pair, len(findings), hrep) + "".join(
-                rr.handoff_blocks(conn, run_pair, findings, stamp=stamp)
+            text = (
+                rr.handoff_header(run_pair, len(findings), hrep, open_items=len(open_items))
+                + "".join(rr.handoff_blocks(conn, run_pair, findings, stamp=stamp))
+                + "".join(rr.handoff_open_blocks(conn, run_pair, open_items))
             )
             Path(output).write_text(text, encoding="utf-8")
             click.echo(
-                f"wrote {output} ({len(findings)} findings)"
+                f"wrote {output} ({len(findings)} findings, {len(open_items)} open items)"
                 + (
                     ""
                     if hrep["must_read_complete"]

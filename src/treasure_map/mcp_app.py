@@ -4504,29 +4504,37 @@ def make_tools(
 
     def _handoff_blocks(
         conn: sqlite3.Connection, run_pair: str, rep: dict[str, Any]
-    ) -> tuple[str, list[str]]:
-        """The pair's hand-off blocks (header + one per changed_real finding): the finding blocks
-        from the process cache when the pair's findings read the same as when they were built, else
-        rebuilt from that same reading; the header always from ``rep`` (the pair's report at the
-        default k, read by this call), never cached — what it counts moves with judgements the
-        findings do not hold. Returns (digest, blocks); the digest is a sha256 of the findings."""
+    ) -> tuple[str, list[str], int, int]:
+        """The pair's hand-off blocks (header, one per changed_real finding, then one per
+        change_inconclusive open item): the finding and open item blocks from the process cache
+        when the pair's findings and open items read the same as when they were built, else rebuilt
+        from that same reading; the header always from ``rep`` (the pair's report at the default
+        k, read by this call), never cached — what it counts moves with judgements the findings do
+        not hold. Returns (digest, blocks, findings, open items); the digest is a sha256 of the
+        findings and the open items (with their history)."""
         import hashlib
 
-        findings = _rr.handoff_findings(conn, run_pair, file_staleness=_file_staleness(conn))
+        staleness = _file_staleness(conn)
+        findings = _rr.handoff_findings(conn, run_pair, file_staleness=staleness)
+        open_items = _rr.handoff_open_items(conn, run_pair, file_staleness=staleness)
         digest = hashlib.sha256(
-            json.dumps(findings, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(
+                {"findings": findings, "open_items": open_items}, sort_keys=True, default=str
+            ).encode("utf-8")
         ).hexdigest()
         key = (str(atlas_path.resolve()), run_pair)
-        header = _rr.handoff_header(run_pair, len(findings), rep)
+        header = _rr.handoff_header(run_pair, len(findings), rep, open_items=len(open_items))
+        counts = (len(findings), len(open_items))
         cached = _HANDOFF_CACHE.get(key)
         if cached is not None and cached[0] == digest:
-            return digest, [header, *cached[1]]
+            return digest, [header, *cached[1]], *counts
         stamp = _rr.HandoffStamp(
             build_hash=_current_pass_version(), current=_current, commit=_installed_commit()
         )
         body = _rr.handoff_blocks(conn, run_pair, findings, stamp=stamp)
+        body += _rr.handoff_open_blocks(conn, run_pair, open_items)
         _HANDOFF_CACHE[key] = (digest, body)
-        return digest, [header, *body]
+        return digest, [header, *body], *counts
 
     def _handoff_cut(block: str, room: int) -> str:
         """A block alone larger than a page (a budget below the render cap): its longest prefix
@@ -4556,14 +4564,20 @@ def make_tools(
         fact is what its own tool answers (get_diff_patch_view, get_xrefs, get_file_diff,
         same_shape_siblings); a list cut short says so and names the call that reads the rest.
 
-        Blocks are in a fixed order (by anchor_ref); follow ``next_offset`` (null = done; an
-        ``offset`` past ``total_blocks`` is an error). The pages concatenated are byte-for-byte the
-        file ``tmap review report --handoff`` writes: a block too long for a page is cut where it
-        is rendered, with a note, the same in the file. ``findings_digest`` changes when a finding
-        reads differently mid-paging (a judgement written or rewritten, a basis moved) — re-fetch
-        from offset 0 when it does. Throughout, the status stays awaiting human verification. The
-        pair's files are read through the same stale-run gate as the other pair tools; a stale run
-        is refused, with the ``server`` block.
+        After the findings, one open item block per change_inconclusive judgement of the pair
+        (``open_items`` counts them): the judgement as recorded, its review state, a function
+        pair's alternative pairings and every earlier write and delete on its anchor — no
+        placeholders, nothing to write for it.
+
+        Blocks are in a fixed order (findings, then open items, each by anchor_ref); follow
+        ``next_offset`` (null = done; an ``offset`` past ``total_blocks`` is an error). The pages
+        concatenated are byte-for-byte the file ``tmap review report --handoff`` writes: a block
+        too long for a page is cut where it is rendered, with a note, the same in the file.
+        ``findings_digest`` changes when a finding or an open item reads differently mid-paging (a
+        judgement written or rewritten, a basis moved) — re-fetch from offset 0 when it does.
+        Throughout, the status stays awaiting human verification. The pair's files are read
+        through the same stale-run gate as the other pair tools; a stale run is refused, with the
+        ``server`` block.
 
         Every page is refused (``refused: must_read_incomplete``, with the review's ``progress``)
         until the pair's ``must_read_complete`` is true at the default k — read afresh on each
@@ -4620,7 +4634,7 @@ def make_tools(
                     ),
                     "server": server,
                 }
-            digest, blocks = _handoff_blocks(conn, run_pair, review.report)
+            digest, blocks, n_findings, n_open = _handoff_blocks(conn, run_pair, review.report)
             total = len(blocks)
             if offset >= total:
                 return {
@@ -4636,8 +4650,9 @@ def make_tools(
                 # While the page is measured: the widest value it can take — null (the last page)
                 # or a block index, at most ``total`` — whichever is longer as JSON.
                 "next_offset": max((None, total), key=lambda v: len(json.dumps(v))),
-                "total_blocks": total,
-                "findings": total - 1,  # blocks[0] is the header
+                "total_blocks": total,  # the header, the findings, then the open items
+                "findings": n_findings,
+                "open_items": n_open,
                 "findings_digest": digest,
                 "block_truncated": False,
                 "text": "",
@@ -7027,6 +7042,8 @@ def make_tools(
                 "error": "no scope given: pass run_id, evidence_ref or anchor_ref to clear one "
                 "scope, or clear_all=true to delete every annotation (cannot be undone)",
             }
+        from treasure_map.lib.overlay import WriteContext
+
         atlas = open_atlas(atlas_path)
         try:
             removed = _clear_overlay(
@@ -7036,6 +7053,7 @@ def make_tools(
                 anchor_ref=anchor_ref,
                 anchor_kind=anchor_kind,
                 clear_all=clear_all,
+                ctx=WriteContext(channel="mcp", session=_session_id()),
             )
         except ConfigError as exc:
             return {"cleared": 0, "error": str(exc)}

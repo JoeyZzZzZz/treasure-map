@@ -533,7 +533,7 @@ def test_the_two_direction_wording_is_tmaps_own_and_judges_nothing(world: World)
     rep = rr.handoff_report(world.atlas, PAIR)
     # Both forms of the header: the official one and the partial one (the must-read set not done).
     for done in (True, False):
-        header = rr.handoff_header(PAIR, 1, {**rep, "must_read_complete": done})
+        header = rr.handoff_header(PAIR, 1, {**rep, "must_read_complete": done}, open_items=2)
         assert dw.PAIR_SIDES in header and dw.PAIR_SIDES in dw.PAIR_WORKFLOW
         assert ("PARTIAL" in header) is (not done)
         texts += [header.replace(rr.HANDOFF_BOUNDARY, "")]

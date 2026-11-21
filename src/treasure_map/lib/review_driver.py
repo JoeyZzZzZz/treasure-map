@@ -677,7 +677,8 @@ def handoff_prompt(run_pair: str) -> str:
         '{"anchor_ref": "<the block\'s anchor_ref exactly as written>", "hypotheses": "<your '
         'unverified hypotheses>", "device_checks": "<concrete things a person could verify on a '
         'device>"}, each anchor_ref once. Do not repeat the facts — tmap writes the document '
-        "and puts your two texts under each block's placeholders. " + _rr.HANDOFF_BOUNDARY
+        "and puts your two texts under each block's placeholders. Open-item blocks carry no "
+        "placeholders: write no analysis for them. " + _rr.HANDOFF_BOUNDARY
     )
 
 
@@ -871,8 +872,12 @@ def compose_handoff(
         if extra:
             return HandoffRefusal("unknown", label, sorted(extra))
     rep = _rr.handoff_report(atlas, run_pair, file_staleness=file_staleness)
-    document = _rr.handoff_header(run_pair, len(findings), rep) + "".join(
-        _rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=named)
+    # The open items follow the findings as they are: the analysis is for the findings only.
+    open_items = _rr.handoff_open_items(atlas, run_pair, file_staleness=file_staleness)
+    document = (
+        _rr.handoff_header(run_pair, len(findings), rep, open_items=len(open_items))
+        + "".join(_rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=named))
+        + "".join(_rr.handoff_open_blocks(atlas, run_pair, open_items))
     )
     nothing = [
         str(f["anchor_ref"])

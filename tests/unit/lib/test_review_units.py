@@ -774,9 +774,13 @@ def test_an_overwrite_by_another_session_is_a_disagreement(world: World) -> None
     assert _review(world, k=0).audits.disagreements == []
     world.judge(DX, A1, "change_inconclusive", ctx=_ctx("s2"))
     found = [x for x in _review(world, k=0).audits.disagreements if x["anchor_ref"] == A1]
-    assert len(found) == 1
-    assert found[0]["why"] == "overwritten_by_another_session"
-    assert found[0]["before"] == "changed_real"
+    # The changed_real it overwrote is also an earlier_changed_real (always read on its own).
+    assert sorted(x["why"] for x in found) == [
+        "earlier_changed_real",
+        "overwritten_by_another_session",
+    ]
+    over = [x for x in found if x["why"] == "overwritten_by_another_session"]
+    assert over[0]["before"] == "changed_real"
 
 
 def test_judged_unread_is_needs_recheck(world: World) -> None:
@@ -1546,10 +1550,14 @@ def test_an_overwrite_by_another_session_alone_holds_must_read_complete(world: W
     with another verdict -> must_read_complete false, with blind auditing sealed.
 
     MUTATION (verified RED, 1 failed): drop disagreements from must_read_complete -> RED."""
+    # A1 is first judged change_inconclusive and overwritten to changed_real: no earlier
+    # changed_real reads otherwise now, so the overwrite is the one thing left.
     for anchor in sorted(_must_at(world, 0)):
-        world.judge(_diff_of(anchor), anchor, "changed_real", ctx=_read("s1"))
+        verdict = "change_inconclusive" if anchor == A1 else "changed_real"
+        world.judge(_diff_of(anchor), anchor, verdict, ctx=_read("s1"))
+    assert A1 in _must_at(world, 0)
     assert _review(world, k=0).report["must_read_complete"] is True
-    world.judge(DX, A1, "change_inconclusive", ctx=_read("s2"))
+    world.judge(DX, A1, "changed_real", ctx=_read("s2"))
     r = _review(world, k=0)
     assert [d["why"] for d in r.audits.disagreements] == ["overwritten_by_another_session"]
     assert r.report["must_read_complete"] is False
@@ -2991,3 +2999,144 @@ def test_the_review_layer_is_outside_the_code_a_diff_or_baseline_is_versioned_by
             if isinstance(node, ast.ImportFrom) and node.module:
                 imported = {node.module, *(f"{node.module}.{a.name}" for a in node.names)}
                 assert f"treasure_map.{name}" not in imported, module
+
+
+# ── earlier_changed_real: a changed_real an agent wrote that no longer stands ──────────────────
+
+
+def _agent(session: str = "s1", attributed_to: str = "agent-via-mcp") -> dict[str, Any]:
+    return {"ctx": _read(session), "attributed_to": attributed_to}
+
+
+def _earlier(r: ru.PairReview) -> dict[str, dict[str, Any]]:
+    return {
+        d["anchor_ref"]: d for d in r.audits.disagreements if d["why"] == "earlier_changed_real"
+    }
+
+
+def _dispose_all_but(w: World, keep: str) -> None:
+    for anchor in sorted(_must_at(w, 0) - {keep}):
+        w.judge(_diff_of(anchor), anchor, "changed_real", ctx=_read("s0"))
+
+
+def _history_id(w: World, anchor: str, event: str) -> int:
+    row = w.atlas.execute(
+        "SELECT max(id) FROM overlay_history WHERE anchor_ref = ? AND event = ?", (anchor, event)
+    ).fetchone()
+    return int(row[0])
+
+
+def test_an_agents_changed_real_turned_otherwise_holds_the_pair_until_a_person_writes(
+    world: World,
+) -> None:
+    """★ R-H-2: an agent writes changed_real, clears it, then writes change_inconclusive in the
+    same session: an ``earlier_changed_real`` disagreement, the one thing holding
+    must_read_complete. A ``human-via-agent`` write does not settle it; a person's write does; an
+    agent's changed_real after the person's write, turned otherwise again, counts anew — and a
+    ``human-via-agent`` changed_real is not a person's.
+
+    MUTATION (verified RED, ``1 failed``): count human-via-agent as a person's write -> it settles
+    -> RED; read the writes from the start whatever a person wrote -> the person's write does not
+    settle -> RED; leave the disagreements out of must_read_complete -> RED."""
+    _dispose_all_but(world, A1)
+    assert A1 in _must_at(world, 0)
+    world.judge(DX, A1, "changed_real", **_agent())
+    first = _history_id(world, A1, "insert")
+    overlay.clear_overlay(world.atlas, anchor_ref=A1, anchor_kind="diff_subject")
+    world.judge(DX, A1, "change_inconclusive", **_agent())
+    r = _review(world, k=0)
+    got = _earlier(r)
+    assert list(got) == [A1]
+    assert got[A1]["current"] == "change_inconclusive"
+    assert got[A1]["earlier"]["history_id"] == first
+    assert got[A1]["earlier"]["attributed_to"] == "agent-via-mcp"
+    assert got[A1]["earlier"]["at"]
+    assert r.report["must_read_complete"] is False
+    # a person's judgement an agent wrote down does not settle it
+    world.judge(DX, A1, "change_inconclusive", **_agent(attributed_to="human-via-agent"))
+    assert list(_earlier(_review(world, k=0))) == [A1]
+    # a person's own write does, and an agent's write after it that is no changed_real reads
+    # nothing earlier: the changed_real before the person's write is settled
+    world.judge(DX, A1, "change_inconclusive", ctx=_ctx("p"), attributed_to="human")
+    r = _review(world, k=0)
+    assert _earlier(r) == {} and r.report["must_read_complete"] is True
+    world.judge(DX, A1, "change_inconclusive", **_agent("s3"))
+    assert _earlier(_review(world, k=0)) == {}
+    # after it, a human-via-agent changed_real turned otherwise counts again
+    world.judge(DX, A1, "changed_real", **_agent(attributed_to="human-via-agent"))
+    world.judge(DX, A1, "change_inconclusive", **_agent())
+    got = _earlier(_review(world, k=0))
+    assert got[A1]["earlier"]["attributed_to"] == "human-via-agent"
+
+
+def test_a_cleared_changed_real_left_unwritten_is_a_disagreement_with_no_current(
+    world: World,
+) -> None:
+    """★ R-H-2: a changed_real cleared and never written again still reads, ``current`` null.
+
+    MUTATION (verified RED, ``1 failed``): read only the anchors with a current judgement -> RED."""
+    world.judge(DX, A1, "changed_real", **_agent())
+    overlay.clear_overlay(world.atlas, anchor_ref=A1, anchor_kind="diff_subject")
+    got = _earlier(_review(world, k=0))
+    assert list(got) == [A1] and got[A1]["current"] is None
+
+
+def test_an_earlier_changed_real_on_a_subject_no_unit_holds_is_read(world: World) -> None:
+    """★ R-H-2: a candidate row's subject is no unit's member (the units hold the entries), and an
+    earlier changed_real on it, turned otherwise, still reads.
+
+    MUTATION (verified RED, ``1 failed``): read only the units' members -> RED."""
+    d = next(d for d in _review(world, k=0).facts.diffs if d.diff_id == DX)
+    (cand,) = [a for a in d.listed_anchors if "#candidate#" in a]
+    assert cand not in {m.anchor_ref for u in _review(world, k=0).units for m in u.members}
+    world.judge(DX, cand, "changed_real", **_agent())
+    world.judge(DX, cand, "change_inconclusive", **_agent("s2"))
+    assert list(_earlier(_review(world, k=0))) == [cand]
+
+
+def test_an_earlier_changed_real_whose_subject_is_gone_is_left_to_the_dangling_report(
+    world: World,
+) -> None:
+    """★ R-H-2: once a re-diff pairs the function with another (the anchor dangles), the same
+    history reads no earlier_changed_real — the dangling report holds it.
+
+    MUTATION (verified RED, ``1 failed``): read every anchor written, resolving or not -> RED."""
+    gone = _pair_anchor(DX, "00003000", "00003000")
+    world.judge(DX, gone, "changed_real", **_agent())
+    world.judge(DX, gone, "change_inconclusive", **_agent())
+    assert list(_earlier(_review(world, k=0))) == [gone]
+    world.atlas.execute(
+        "UPDATE function_alignment SET addr_b = '00003400' WHERE addr_a = '00003000'"
+    )
+    world.atlas.commit()
+    pv._clear_view_caches()
+    ru.DIFF_CACHE.clear()
+    r = _review(world, k=0)
+    assert gone in r.report["dangling_judgements"]
+    assert _earlier(r) == {}
+
+
+def test_an_earlier_changed_real_on_an_entry_no_longer_listed_is_not_read(world: World) -> None:
+    """An entry that is placed but no longer listed takes no write (a person could never settle
+    it), so an earlier changed_real on it does not hold the pair; it reads subject_unlisted.
+
+    MUTATION (verified RED, ``1 failed``): read every placed entry's subject (``subjects``) instead
+    of the listed ones -> RED."""
+    world.pair(DX, "00007000", "00007000", conf=0.5, sim=1.0)
+    anchor = _pair_anchor(DX, "00007000", "00007000")
+    assert anchor in {e["anchor_ref"] for e in world.view()["entries"]}
+    world.judge(DX, anchor, "changed_real", **_agent())
+    world.judge(DX, anchor, "change_inconclusive", **_agent())
+    assert anchor in _earlier(_review(world, k=0))
+    world.atlas.execute(
+        "UPDATE function_alignment SET alignment_confidence = 0.97, alignment_state = 'aligned' "
+        "WHERE addr_a = '00007000'"
+    )
+    world.atlas.commit()
+    pv._clear_view_caches()
+    ru.DIFF_CACHE.clear()
+    assert anchor not in {e["anchor_ref"] for e in world.view()["entries"]}
+    r = _review(world, k=0)
+    d = next(d for d in r.facts.diffs if d.diff_id == DX)
+    assert anchor in d.subjects  # it still resolves
+    assert _earlier(r) == {}

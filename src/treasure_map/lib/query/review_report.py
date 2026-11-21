@@ -552,7 +552,16 @@ _HANDOFF_LABELS: tuple[str, ...] = (
     HANDOFF_HYPOTHESES_TITLE,
     HANDOFF_DEVICE_TITLE,
     "status",
+    # an open item's block (handoff_open_chunk)
+    "open item",
+    "recorded by",
+    "recorded at",
+    "review state",
+    "alternative pairings (tmap facts)",
+    "earlier writes and deletes",
 )
+_OPEN_ALT = "alternative pairings (tmap facts)"
+_OPEN_HISTORY = "earlier writes and deletes"
 _CHANGE = "change (tmap facts)"
 _CHANGE_PROPOSED = "change (tmap facts, proposed pairing — alignment undetermined)"
 _SHAPE = "reachable shape (tmap facts)"
@@ -1338,12 +1347,13 @@ def handoff_report(
     return review.report
 
 
-def handoff_header(run_pair: str, n_findings: int, rep: dict[str, Any]) -> str:
+def handoff_header(run_pair: str, n_findings: int, rep: dict[str, Any], *, open_items: int) -> str:
     """The document's header line, served as its own first page by get_diff_handoff so the CLI file
     and the MCP pages are the same text. ``rep`` is the pair's report at the default k
     (``handoff_report``): the header counts its disposed subjects by verdict and, when the
     must-read set is not done, says the hand-off is a partial one (the MCP tool serves none then;
-    the command line writes it for a person)."""
+    the command line writes it for a person). ``open_items`` is how many change_inconclusive
+    blocks follow the findings (handoff_open_items)."""
     v = rep["verdicts"]["disposed"]
     n = sum(v.values())
     without = f" / {v['without_verdict']} without a verdict" if v["without_verdict"] else ""
@@ -1360,6 +1370,8 @@ def handoff_header(run_pair: str, n_findings: int, rep: dict[str, Any]) -> str:
         f"# Findings hand-off for {run_pair}\n\n"
         f"_{n_findings} changed_real finding(s). Each block carries tmap's facts and the "
         f"recorded judgment; the analysis is for a person to fill. {HANDOFF_BOUNDARY}_\n\n"
+        f"_{open_items} change_inconclusive judgement(s) listed as open items after the "
+        "findings._\n\n"
         f"_Of {n} disposed subjects: {v['changed_real']} changed_real / "
         f"{v['no_real_change']} no_real_change / {v['change_inconclusive']} "
         f"change_inconclusive{without}._\n\n"
@@ -1405,11 +1417,149 @@ def handoff_document(
     analysis: dict[str, dict[str, str]] | None = None,
 ) -> str:
     """The whole findings hand-off as one markdown document — the header (read with the pair's
-    report at the default k, ``handoff_report``) then every block in anchor order. The
-    concatenation of get_diff_handoff's pages is this same text (B-4); with ``analysis`` it is the
-    driver's document, the agent's texts under each block's placeholders."""
+    report at the default k, ``handoff_report``), every finding block in anchor order, then every
+    open item block (handoff_open_items) in anchor order. The concatenation of get_diff_handoff's
+    pages is this same text (B-4); with ``analysis`` it is the driver's document, the agent's texts
+    under each finding block's placeholders (an open item block has none)."""
     findings = handoff_findings(atlas, run_pair, file_staleness=file_staleness)
+    open_items = handoff_open_items(atlas, run_pair, file_staleness=file_staleness)
     rep = handoff_report(atlas, run_pair, file_staleness=file_staleness)
-    return handoff_header(run_pair, len(findings), rep) + "".join(
-        handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=analysis)
+    return (
+        handoff_header(run_pair, len(findings), rep, open_items=len(open_items))
+        + "".join(handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=analysis))
+        + "".join(handoff_open_blocks(atlas, run_pair, open_items))
     )
+
+
+# ── the open items: the change_inconclusive judgements, after the findings ─────────────────────
+
+
+def _json_obj(raw: Any) -> dict[str, Any]:
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _open_history(atlas: Any, anchor: str) -> list[dict[str, Any]]:
+    """Every write and delete overlay_history records on ``anchor`` but the one its current
+    judgement is (the last write), in order — a cleared round included: ``{history_id, at, event,
+    verdict, attributed_to}``, a delete's verdict the one it took away. A blind shadow is not a
+    write and is not listed."""
+    rows = atlas.execute(
+        "SELECT id, at, event, before, after, attributed_to FROM overlay_history "
+        "WHERE anchor_kind = 'diff_subject' AND anchor_ref = ? "
+        "AND event IN ('insert', 'update', 'delete') ORDER BY id",
+        (anchor,),
+    ).fetchall()
+    writes = [i for i, r in enumerate(rows) if r[2] in ("insert", "update")]
+    current = writes[-1] if writes else None
+    out = []
+    for i, r in enumerate(rows):
+        if i == current:
+            continue
+        side = _json_obj(r[3] if r[2] == "delete" else r[4])
+        out.append(
+            {
+                "history_id": r[0],
+                "at": r[1],
+                "event": r[2],
+                "verdict": side.get("verdict"),
+                "attributed_to": r[5],
+            }
+        )
+    return out
+
+
+def handoff_open_items(
+    atlas: Any,
+    run_pair: str,
+    *,
+    file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """The pair's change_inconclusive judgements — the subjects the review left open — ordered by
+    anchor_ref, each as list_diff_overlays reads it (review_state, basis) with its ``history``
+    (``_open_history``). Read like handoff_findings: only this pair's judgements, and only the
+    views they are read against."""
+    from treasure_map.lib.query import diff_annotations as da
+
+    res = da.list_diff_overlays(
+        atlas,
+        verdict="change_inconclusive",
+        run_id=run_pair,
+        progress=False,
+        file_staleness=file_staleness,
+    )
+    rows = [r for r in res.get("overlays", []) if r.get("run_id") == run_pair]
+    rows.sort(key=lambda r: str(r["anchor_ref"]))
+    for r in rows:
+        r["history"] = _open_history(atlas, str(r["anchor_ref"]))
+    return rows
+
+
+def _open_pairing_lines(atlas: Any, diff_id: str, anchor: str) -> list[str]:
+    """A function_pair open item's alternative pairings, as get_diff_patch_view(diff_id,
+    entry_id=anchor) gives them: each one's via, direction, target and evidence count. Nothing when
+    the entry has none."""
+    entry, why = _view_entry(atlas, diff_id, anchor)
+    if entry is None:
+        return [_cell(_OPEN_ALT, _unavailable(why))]
+    items = entry.get("alt_pairings") or []
+    if not items:
+        withheld = entry.get("alt_pairings_withheld")
+        return [_cell(_OPEN_ALT, _unavailable(f"withheld: {withheld}"))] if withheld else []
+    lines = [f"- {_OPEN_ALT}: {len(items)}"]
+    for i in items:
+        lines.append(
+            f"  - via {_val(i.get('via'))}, {_val(i.get('direction'))} "
+            f"{_inline(_val(i.get('target_addr')))}, evidence {_val(i.get('evidence_count'))}"
+        )
+    return lines
+
+
+def handoff_open_chunk(
+    atlas: Any, run_pair: str, item: dict[str, Any], *, cap: int | None = None
+) -> str:
+    """One open item's block: the change_inconclusive judgement as recorded (who, when, its review
+    state now, the rationale), a function pair's alternative pairings, and every earlier write and
+    delete on its anchor. No analysis placeholders and no status: it is listed for a person to
+    pick up, not handed off. Cut at ``cap`` (default HANDOFF_BLOCK_CAP) as a finding block is."""
+    anchor = str(item["anchor_ref"])
+    kind = item.get("subject_kind") or ""
+    diff_id = item.get("diff_id")
+    lines = [
+        f"## open item: `{handoff_anchor_text(anchor)}`",
+        "",
+        _cell("subject", kind or "unknown"),
+        _cell("recorded verdict", str(item.get("verdict") or "")),
+        _cell("recorded by", _val(item.get("attributed_to"))),
+        _cell("recorded at", _val(item.get("updated_at"))),
+        _cell("review state", _val(item.get("review_state"))),
+    ]
+    rationale = str(item.get("rationale") or "")
+    if rationale:
+        lines += _embedded("recorded rationale", rationale)
+    else:
+        lines.append(_cell("recorded rationale", "(none recorded)"))
+    if kind == "function_pair" and isinstance(diff_id, str):
+        lines += _open_pairing_lines(atlas, diff_id, anchor)
+    history = item.get("history") or []
+    if history:
+        lines.append(f"- {_OPEN_HISTORY}: {len(history)}")
+        for h in history:
+            lines.append(
+                f"  - {_val(h.get('at'))} {_val(h.get('event'))} {_val(h.get('verdict'))} "
+                f"({_val(h.get('attributed_to'))})"
+            )
+    else:
+        lines.append(_cell(_OPEN_HISTORY, "(none recorded)"))
+    lines.append("")
+    room = HANDOFF_BLOCK_CAP if cap is None else cap
+    lines = _cap_lines(lines, room, _read_more(kind, run_pair, diff_id, anchor))
+    return "\n".join(lines) + "\n"
+
+
+def handoff_open_blocks(atlas: Any, run_pair: str, items: list[dict[str, Any]]) -> list[str]:
+    """One block per open item, in the items' order."""
+    return [handoff_open_chunk(atlas, run_pair, i) for i in items]

@@ -232,3 +232,24 @@ def test_a_row_stored_with_an_older_kind_reads_back_and_the_column_has_no_check(
     ).fetchone()[0]
     col = next(c for c in ddl.split(",") if "verdict_basis" in c)
     assert "CHECK" not in col.upper(), col
+
+
+def test_an_mcp_clear_records_its_channel_and_session(
+    judged: tuple[World, str], tmp_path: Path
+) -> None:
+    """★ R-H-3: a delete through the MCP clear_overlay is recorded with channel ``mcp`` and the
+    server's session, as an MCP write is.
+
+    MUTATION (verified RED, ``1 failed``): call clear_overlay without the context -> channel
+    ``api``, no session -> RED."""
+    from treasure_map import mcp_app
+    from treasure_map.lib import tool_call_log as tcl
+
+    w, anchor = judged
+    w.judge(DX, anchor, "change_inconclusive")
+    log = tcl.ToolCallLog(tmp_path / "calls.jsonl", tcl.Session(id="clear-session"))
+    tools = mcp_app.make_tools(w.path, call_log=log)
+    out = tools["clear_overlay"](anchor_ref=anchor, anchor_kind="diff_subject")
+    assert out["cleared"] == 1, out
+    (row,) = [r for r in _history(w, anchor) if r["event"] == "delete"]
+    assert (row["channel"], row["session"]) == ("mcp", "clear-session")

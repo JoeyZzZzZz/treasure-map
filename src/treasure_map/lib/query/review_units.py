@@ -835,8 +835,10 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
       read something are also in ``read_in_part``. The caller marks it NEEDS_RECHECK; it does not
       open a blind audit. A write recorded with no read basis (an older one) never sets it.
     * ``disagreements`` (ALWAYS on) — a blind shadow that reads otherwise than the current judgement
-      (from history, even once the gate is off), or a judgement overwritten by another session with
-      another verdict; a person's write settles it."""
+      (from history, even once the gate is off), a judgement overwritten by another session with
+      another verdict, or a subject an earlier write not by a person read changed_real that now
+      reads otherwise or has no judgement (``_earlier_changed_real``); a person's write settles
+      it."""
     pair = dr.run_pair(facts.run_a, facts.run_b)
     current = {
         r[0]: {"verdict": r[1], "attributed_to": r[2]}
@@ -848,7 +850,7 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
     }
     history: dict[str, list[dict[str, Any]]] = {}
     for row in atlas.execute(
-        "SELECT id, anchor_ref, event, before, after, attributed_to, read_basis, session "
+        "SELECT id, anchor_ref, event, before, after, attributed_to, read_basis, session, at "
         "FROM overlay_history WHERE anchor_kind = 'diff_subject' AND run_id = ? ORDER BY id",
         (pair,),
     ):
@@ -861,6 +863,7 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
                 "attributed_to": row[5],
                 "read_basis": _json(row[6]),
                 "session": row[7],
+                "at": row[8],
             }
         )
     out = Audits(verdicts={a: str(r["verdict"]) for a, r in current.items()})
@@ -972,6 +975,60 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
             out.open.append(
                 Audit(audited, tuple(sources), wid, last["session"] if last else None, unit)
             )
+    out.disagreements += _earlier_changed_real(facts, current, history)
+    return out
+
+
+def _earlier_changed_real(
+    facts: PairFacts,
+    current: dict[str, dict[str, Any]],
+    history: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """The ``earlier_changed_real`` disagreements (always on): a subject that resolves now, whose
+    current judgement is not changed_real (or that has none left), although since its last write by
+    a person (from the start, with none) a write not by a person recorded changed_real — whether
+    that round was overwritten or cleared, by another session or by its own. Only ``human`` is a
+    person's write here: a ``human-via-agent`` write neither settles it nor stops counting. Every
+    anchor with a current judgement or a recorded write is read, not only the units' members (a
+    subject no unit holds is read too), as long as a person can write on it now — a listed entry or
+    a candidate row of one, a binary_presence subject, a changed file: one a write is refused on
+    (an entry no longer listed) could never be settled. A subject that no longer resolves is the
+    dangling report's, not read here."""
+    resolvable: set[str] = set()
+    for d in facts.diffs:
+        resolvable |= set(d.listed_anchors)
+    resolvable |= {m.anchor_ref for m in facts.presence_members}
+    resolvable |= {m.anchor_ref for m in facts.file_members}
+    written = {
+        a for a, hist in history.items() if any(h["event"] in ("insert", "update") for h in hist)
+    }
+    out: list[dict[str, Any]] = []
+    for anchor in sorted((set(current) | written) & resolvable):
+        row = current.get(anchor)
+        if row is not None and (row["attributed_to"] == HUMAN or row["verdict"] == "changed_real"):
+            continue
+        writes = [h for h in history.get(anchor, []) if h["event"] in ("insert", "update")]
+        since = max((i for i, h in enumerate(writes) if h["attributed_to"] == HUMAN), default=-1)
+        earlier = [
+            h
+            for h in writes[since + 1 :]
+            if h["after"].get("verdict") == "changed_real" and h["attributed_to"] != HUMAN
+        ]
+        if not earlier:
+            continue
+        last = earlier[-1]
+        out.append(
+            {
+                "anchor_ref": anchor,
+                "why": "earlier_changed_real",
+                "current": row["verdict"] if row is not None else None,
+                "earlier": {
+                    "history_id": last["id"],
+                    "at": last["at"],
+                    "attributed_to": last["attributed_to"],
+                },
+            }
+        )
     return out
 
 

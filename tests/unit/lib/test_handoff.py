@@ -1323,30 +1323,43 @@ def test_a_judgement_swapped_within_one_second_is_not_dropped(
     missing -> RED."""
     w = _wide_findings_world(tmp_path, monkeypatch, 2)
     a1, a2 = sorted(f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR))
+    # A person turns a finding change_inconclusive (an agent doing so reads earlier_changed_real
+    # and holds the hand-off): it is then an open item, not a finding.
     overlay.annotate_diff(
         w.atlas,
         diff_id=DX,
         anchor_ref=a2,
         verdict="change_inconclusive",
         rationale="not read yet",
-        ctx=overlay.WriteContext(channel="mcp", session="s"),
+        attributed_to="human",
+        ctx=overlay.WriteContext(channel="judge", session="s"),
     )
     _same_second(w)
     tools = mcp_app.make_tools(w.path)
     first = _pages_of(tools)
-    assert a1 in first and a2 not in first
+    assert _finding_heads(first) == [a1] and _open_heads(first) == [a2]
     overlay.annotate_diff(
         w.atlas,
         diff_id=DX,
         anchor_ref=a1,
         verdict="change_inconclusive",
         rationale="re-read",
-        ctx=overlay.WriteContext(channel="mcp", session="s"),
+        attributed_to="human",
+        ctx=overlay.WriteContext(channel="judge", session="s"),
     )
     _judge(w.atlas, DX, a2, "the real one")
     _same_second(w)
     second = _pages_of(tools)
-    assert a2 in second and a1 not in second
+    assert _finding_heads(second) == [a2] and _open_heads(second) == [a1]
+
+
+def _finding_heads(text: str) -> list[str]:
+    return [x[len("## `") : -1] for x in text.splitlines() if x.startswith("## `")]
+
+
+def _open_heads(text: str) -> list[str]:
+    head = "## open item: `"
+    return [x[len(head) : -1] for x in text.splitlines() if x.startswith(head)]
 
 
 def test_two_atlases_with_one_pair_name_are_cached_apart(
@@ -2730,3 +2743,120 @@ def test_the_skill_and_the_guide_say_a_report_is_the_handoff() -> None:
     assert _SKILL_HANDOFF_RULE in rules
     assert rules.index("- With several workers") < rules.index(_SKILL_HANDOFF_RULE)
     assert _GUIDE_HANDOFF_SENTENCE in mcp_app._AGENT_GUIDE
+
+
+# ── the open items: the change_inconclusive judgements, after the findings ──────────────────────
+
+
+def _human(w: World, anchor: str, verdict: str, rationale: str = "a person read it") -> None:
+    overlay.annotate_diff(
+        w.atlas,
+        diff_id=DX,
+        anchor_ref=anchor,
+        verdict=verdict,
+        rationale=rationale,
+        attributed_to="human",
+        ctx=overlay.WriteContext(channel="judge", session="p"),
+    )
+
+
+def _open_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[World, list[str]]:
+    """Five changed_real findings; then a person turns three of them change_inconclusive, the
+    first of those after the agent's changed_real was cleared (a deleted round in its history)."""
+    w = _wide_findings_world(tmp_path, monkeypatch, 5)
+    anchors = sorted(f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR))
+    overlay.clear_overlay(w.atlas, anchor_ref=anchors[0], anchor_kind="diff_subject")
+    for a in anchors[:3]:
+        _human(w, a, "change_inconclusive")
+    return w, anchors
+
+
+def test_the_change_inconclusive_judgements_follow_the_findings_as_open_items(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ R-H-1: with 2 changed_real and 3 change_inconclusive judgements the hand-off serves 2
+    finding blocks, then 3 open item blocks (``total_blocks`` = 1 + 2 + 3), the header says so, and
+    the pages concatenated are byte for byte the file the command line writes.
+
+    MUTATION (verified RED, ``1 failed``): count ``findings`` as ``total_blocks - 1`` again -> 5 ->
+    RED; leave the open blocks out of the MCP pages -> 3 blocks and the pages differ from the file
+    -> RED; leave them out of the command line's file -> the file differs from the pages -> RED."""
+    from click.testing import CliRunner
+
+    from tests.unit.test_tool_surface import _call
+    from treasure_map.cli import review_cli
+
+    w, anchors = _open_world(tmp_path, monkeypatch)
+    server = mcp_app.build_server(w.path)
+    first = _call(server, "get_diff_handoff", {"run_pair": PAIR, "offset": 0})
+    assert "error" not in first and "refused" not in first, first
+    assert (first["findings"], first["open_items"], first["total_blocks"]) == (2, 3, 6)
+    pages, off = [], 0
+    while off is not None:
+        r = _call(server, "get_diff_handoff", {"run_pair": PAIR, "offset": off})
+        pages.append(r["text"])
+        off = r["next_offset"]
+    text = "".join(pages)
+    assert "_3 change_inconclusive judgement(s) listed as open items after the findings._" in text
+    assert _finding_heads(text) == anchors[3:]
+    assert _open_heads(text) == anchors[:3]
+    assert text.index("## open item: ") > max(text.index(f"## `{a}`") for a in anchors[3:])
+    out_file = tmp_path / "handoff.md"
+    res = CliRunner().invoke(
+        review_cli.review,
+        ["report", PAIR, "--handoff", "-o", str(out_file), "--atlas", str(w.path)],
+    )
+    assert res.exit_code == 0, res.output
+    assert out_file.read_text(encoding="utf-8") == text
+    assert "2 findings, 3 open items" in res.output
+
+
+def test_an_open_items_history_holds_its_cleared_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ An open item's block lists every earlier write and delete on its anchor — the agent's
+    changed_real and the delete that cleared it — but not the write it is now; the judgement is
+    shown as recorded (who, when, its review state).
+
+    MUTATION (verified RED, ``1 failed``): read only insert / update events -> the delete is
+    missing -> RED; keep the current write in the history -> RED."""
+    w, anchors = _open_world(tmp_path, monkeypatch)
+    items = {i["anchor_ref"]: i for i in rr.handoff_open_items(w.atlas, PAIR)}
+    assert sorted(items) == anchors[:3]
+    hist = items[anchors[0]]["history"]
+    assert [(h["event"], h["verdict"], h["attributed_to"]) for h in hist] == [
+        ("insert", "changed_real", "agent-via-mcp"),
+        ("delete", "changed_real", "agent-via-mcp"),
+    ]
+    assert [(h["event"], h["verdict"]) for h in items[anchors[1]]["history"]] == [
+        ("insert", "changed_real")
+    ]
+    block = rr.handoff_open_chunk(w.atlas, PAIR, items[anchors[0]])
+    assert block.startswith(f"## open item: `{anchors[0]}`")
+    assert "- recorded by: human" in block
+    assert f"- review state: {items[anchors[0]]['review_state']}" in block
+    assert "- earlier writes and deletes: 2" in block
+    assert " delete changed_real (agent-via-mcp)" in block
+    assert rr.HANDOFF_HYPOTHESES_TITLE not in block  # nothing to write for it
+
+
+def test_the_digest_moves_when_an_open_item_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ findings_digest covers the open items too: a change_inconclusive judgement rewritten
+    (the findings unchanged) moves it, and the next pages carry the new text.
+
+    MUTATION (verified RED, ``1 failed``): digest the findings alone again -> the digest stays
+    and the cached blocks keep the old rationale -> RED."""
+    w, anchors = _open_world(tmp_path, monkeypatch)
+    _same_second(w)  # every updated_at one value, so only the rewrite below moves anything
+    tools = mcp_app.make_tools(w.path)
+    before = tools["get_diff_handoff"](PAIR, 0)["findings_digest"]
+    assert "a person read it" in _pages_of(tools)
+    findings = rr.handoff_findings(w.atlas, PAIR)
+    _human(w, anchors[1], "change_inconclusive", rationale="read it again, still open")
+    _same_second(w)
+    assert rr.handoff_findings(w.atlas, PAIR) == findings  # the findings read the same
+    after = tools["get_diff_handoff"](PAIR, 0)["findings_digest"]
+    assert after != before
+    assert "read it again, still open" in _pages_of(tools)
