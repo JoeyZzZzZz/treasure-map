@@ -187,13 +187,19 @@ def _parse_entry_id(entry_id: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+# The unit member kinds that are diff entries a group can name: a listed entry, and an alternative
+# entry (a pairing component's claim, lib/query/pairing_components; entry_id ``pair:<A>:<B>``).
+ENTRY_KINDS = frozenset({"entry", "alternative"})
+
+
 def members_from_units(units: list[Any]) -> list[MemberRef]:
-    """The must-read diff ENTRY members of a pair's units (each in exactly one unit), with the per
-    side addresses and the kind of the unit holding them (``callee_group`` for a callee group)."""
+    """The must-read diff ENTRY members of a pair's units (each in exactly one unit) — the listed
+    entries and the alternative ones — with the per side addresses and the kind of the unit holding
+    them (``callee_group`` for a callee group)."""
     out: list[MemberRef] = []
     for u in units:
         for m in u.members:
-            if m.kind != "entry" or not m.must_read or not m.entry_id:
+            if m.kind not in ENTRY_KINDS or not m.must_read or not m.entry_id:
                 continue
             addr_a, addr_b = _parse_entry_id(m.entry_id)
             out.append(MemberRef(m.stream, m.entry_id, m.anchor_ref, u.kind, addr_a, addr_b))

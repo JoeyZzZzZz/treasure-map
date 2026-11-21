@@ -311,6 +311,32 @@ def test_an_alternative_entry_reads_like_an_aligned_pair_without_the_alt_fields(
     assert {x["entry_id"] for x in page["entries"]} == {_pair_id(A1, B1), _pair_id(A2, B2)}
 
 
+def test_an_alternative_entry_its_own_twin_reads_gives_no_alt_fields(tmp_path: Path) -> None:
+    """★ rule 6: a twin claim (a1 and b2 one body) — the alternative entry (a1, b2) reads that same
+    twin on itself, and its page still carries none of alt_pairings / alt_pairing_count /
+    alt_pairing_sources.
+
+    MUTATION (verified RED, ``1 failed``): render the alt fields on an alternative entry too
+    (drop ``if not alternative`` in get_diff_patch_view's _render) -> RED."""
+    shared = [f'puts("shared step {i}")' for i in range(6)]
+    w = _world(tmp_path, 2, texts={A1: shared, B2: shared})
+    w.commit()
+    built = pv.build_diff_view(w.atlas, DIFF)
+    assert built is not None
+    readings = pv._pseudo_readings(w.atlas, built)
+    comps, alts = pc.corrections(w.atlas, built, readings)
+    (claim,) = comps[0].claims
+    assert ((claim.addr_a, claim.addr_b), claim.vias) == ((A1, B2), ("twin",))
+    (alt,) = [a for a in alts if a.entry_id == _pair_id(A1, B2)]
+    # The premise: the alternative entry reads a same-body pairing (onto itself) of its own.
+    found = pv._alt_readings(built, readings, alt)
+    assert found is not None and found[0], found
+    e = _drill(w, _pair_id(A1, B2))
+    assert e["alignment_state"] == "alternative"
+    for key in ("alt_pairings", "alt_pairing_count", "alt_pairing_sources"):
+        assert key not in e, key
+
+
 def test_every_row_of_an_alternative_entry_lands_r_proposed_pairing(tmp_path: Path) -> None:
     """★ rule 7: each row of an alternative entry lands R / proposed_pairing with no alignment
     confidence, and no ``unmapped_reason`` blind spot is counted for them; every candidate row of
@@ -475,6 +501,44 @@ def test_a_component_with_a_row_is_one_must_read_unit_and_its_superseded_entries
     assert u.component["superseded_reasons"] == {
         x: own[x] for x in (_pair_id(A1, B1), _pair_id(A2, B2)) if own[x]
     }
+
+
+def test_the_alternative_entries_of_a_must_read_component_join_their_dispatch_group(
+    tmp_path: Path,
+) -> None:
+    """★ The dispatch navigation groups a must-read component's alternative entries: a 2-cycle the
+    dispatch keys of one table make (both members superseded, so in no unit) is grouped by its two
+    alternative entries, each with its keys on both sides, and each handed out with its label.
+
+    MUTATION (verified RED, ``1 failed``): take ``entry`` members only in members_from_units
+    again -> the group holds no member -> RED; label ``entry`` members only in the hand-out
+    (mcp_app._member_json) -> RED."""
+    w = _cycle_with_rows(tmp_path)
+    # The dispatch tables are read by the diff's binary paths (the keys' rows are on /fx/libx).
+    w.atlas.execute("UPDATE diff_meta SET binary_path_a = '/fx/libx', binary_path_b = '/fx/libx'")
+    w.commit()
+    r = ru.review_pair(
+        w.atlas,
+        "runA",
+        "runB",
+        pair_staleness={"source_stale": False},
+        server_commit="c0",
+        navigation=True,
+    )
+    pd = r.navigation.dispatch
+    assert pd is not None
+    members = {eid: keys for g in pd.groups for eid, keys in g.members.items()}
+    assert members == {
+        _pair_id(A1, B2): {"a": [f"key_{A1}_{B2}"], "b": [f"key_{A1}_{B2}"]},
+        _pair_id(A2, B1): {"a": [f"key_{A2}_{B1}"], "b": [f"key_{A2}_{B1}"]},
+    }, members
+    # Handed out, each alternative member carries its dispatch label as a listed entry does.
+    got = mcp_app.make_tools(w.path)["start_diff_review"](run_pair=PAIR)
+    unit = got["next_unit"]
+    assert unit["kind"] == ru.PAIRING, unit
+    labels = {m["entry_id"]: m.get("dispatch") for m in unit["members"]}
+    assert set(labels) == {_pair_id(A1, B2), _pair_id(A2, B1)}, labels
+    assert all(labels.values()), labels
 
 
 def test_a_candidate_row_alone_makes_the_component_must_read(

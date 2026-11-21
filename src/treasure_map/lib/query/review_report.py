@@ -1547,9 +1547,10 @@ def handoff_open_chunk(
     atlas: Any, run_pair: str, item: dict[str, Any], *, cap: int | None = None
 ) -> str:
     """One open item's block: the change_inconclusive judgement as recorded (who, when, its review
-    state now, the rationale), a function pair's alternative pairings, and every earlier write and
-    delete on its anchor. No analysis placeholders and no status: it is listed for a person to
-    pick up, not handed off. Cut at ``cap`` (default HANDOFF_BLOCK_CAP) as a finding block is."""
+    state now, its basis as a finding block reads it, the rationale), a function pair's alternative
+    pairings, and every earlier write and delete on its anchor. No analysis placeholders and no
+    status: it is listed for a person to pick up, not handed off. Cut at ``cap`` (default
+    HANDOFF_BLOCK_CAP) as a finding block is."""
     anchor = str(item["anchor_ref"])
     kind = item.get("subject_kind") or ""
     diff_id = item.get("diff_id")
@@ -1561,6 +1562,8 @@ def handoff_open_chunk(
         _cell("recorded by", _val(item.get("attributed_to"))),
         _cell("recorded at", _val(item.get("updated_at"))),
         _cell("review state", _val(item.get("review_state"))),
+        # The same reading a finding block's basis line gives: a dangling judgement says so.
+        _cell("basis", _finding_basis_line(item)),
     ]
     rationale = str(item.get("rationale") or "")
     if rationale:

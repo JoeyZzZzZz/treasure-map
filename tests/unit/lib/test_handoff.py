@@ -2840,6 +2840,28 @@ def test_an_open_items_history_holds_its_cleared_round(
     assert rr.HANDOFF_HYPOTHESES_TITLE not in block  # nothing to write for it
 
 
+def test_a_dangling_open_item_says_so_in_its_basis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ An open item whose subject no longer resolves (re-paired after the judgement: dangling)
+    reads its basis as a finding block does — anchor_unresolved named, not a bare needs_recheck.
+
+    MUTATION (verified RED, ``1 failed``): leave the basis line out of the open block -> RED."""
+    w = World(tmp_path, monkeypatch)
+    w.pair(DX, "00003000", "00004000", conf=0.5, sim=0.7)
+    gone = _pair_anchor(DX, "00003000", "00004000")
+    _human(w, gone, "change_inconclusive")
+    w.atlas.execute("UPDATE function_alignment SET addr_b = '00004400' WHERE addr_a = '00003000'")
+    w.atlas.commit()
+    (item,) = rr.handoff_open_items(w.atlas, PAIR)
+    assert (item["anchor_ref"], item["review_state"]) == (gone, "needs_recheck"), item
+    block = rr.handoff_open_chunk(w.atlas, PAIR, item)
+    assert (
+        "- basis: MOVED since the judgment (anchor_unresolved — the subject no longer resolves "
+        "(pairing moved?))" in block
+    ), block
+
+
 def test_the_digest_moves_when_an_open_item_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

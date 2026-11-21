@@ -71,6 +71,7 @@ from treasure_map.lib.query import canonical_view as _canonical_view
 from treasure_map.lib.query import coverage_report as _coverage_report
 from treasure_map.lib.query import density as _density
 from treasure_map.lib.query import diff_review as _dr_mod
+from treasure_map.lib.query import dispatch_groups as _dg
 from treasure_map.lib.query import effective_float_filters as _effective_float_filters
 from treasure_map.lib.query import entry_words
 from treasure_map.lib.query import explain_candidate as _explain_candidate
@@ -2773,8 +2774,8 @@ def make_tools(
         ]
 
     def _member_json(m: _ru.Member, state: str | None, nav: Any = None) -> dict[str, Any]:
-        """One member; a must-read entry a dispatch group names carries its ``dispatch`` label
-        (read by lib/query/review_navigation, passed through as it is)."""
+        """One member; a must-read entry (listed or alternative) a dispatch group names carries
+        its ``dispatch`` label (read by lib/query/review_navigation, passed through as it is)."""
         out: dict[str, Any] = {"anchor_ref": m.anchor_ref, "kind": m.kind}
         if m.entry_id is not None:
             out["entry_id"] = m.entry_id
@@ -2787,7 +2788,7 @@ def make_tools(
         out["reasons"] = list(m.reasons)
         if state is not None:
             out["review_state"] = state
-        if nav is not None and m.kind == "entry" and m.must_read:
+        if nav is not None and m.kind in _dg.ENTRY_KINDS and m.must_read:
             label = nav.member_dispatch(m.stream, m.entry_id)
             if label:
                 out["dispatch"] = label
