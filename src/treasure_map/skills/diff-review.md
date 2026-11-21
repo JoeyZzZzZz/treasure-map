@@ -34,6 +34,10 @@ produces no payload: every judgment is yours.
   held back, read in full); a `changed_real` read in part still counts.
 - Do not judge from the summary alone. Read both sides of the code the material gives (or fetch
   it) before a verdict.
+- A `pairing_component` unit holds the alternative pairings an alternative-pairing claim proposes
+  for mis-paired entries. Read its alternative entries first and judge each on its own anchor; a
+  superseded entry needs no judgment; judge an end function (`ends`) on the entry it is in; in a
+  component with a conflict, judge every claim.
 - `must_read_complete` is the bar for "the must-read part is done"; `complete` also needs every
   second-tier entry. Report both as the server gives them.
 - By default only the must-read units are handed out: `next_unit` null then comes with

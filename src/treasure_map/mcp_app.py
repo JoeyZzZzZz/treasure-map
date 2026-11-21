@@ -668,7 +668,14 @@ _START_META_KEYS = (
     "toolchain_checked",
 )
 # The units handed out by the page: their member list is what the material on that page shows.
-_PAGED_KINDS = (_ru.S_BATCH, _ru.SECOND_TIER, _ru.GROUP, _ru.REDUCE, _ru.PRESENCE)
+_PAGED_KINDS = (
+    _ru.S_BATCH,
+    _ru.SECOND_TIER,
+    _ru.GROUP,
+    _ru.REDUCE,
+    _ru.PRESENCE,
+    _ru.PAIRING,
+)
 # A diff write made before anything of its subject was read: what that reads as, on its answer.
 _JUDGED_UNREAD = (
     "written before anything of its subject was read: it reads needs_recheck (not disposed) "
@@ -945,7 +952,9 @@ _AGENT_GUIDE = (
     + "A callee_group unit holds the entries that newly call one "
     "function (its code on both sides given once): judge each with group_ref=<its group_ref>, "
     "and the callee's own entry too; the reduce unit, handed out last, names what still lacks "
-    "it. A reduce owed holds must_read_complete false. Once must_read_complete is true, "
+    "it. A pairing_component unit holds the alternative pairings an alt claim proposes for "
+    "mis-paired entries: read and judge the alternative entries; superseded entries need no "
+    "judgement. A reduce owed holds must_read_complete false. Once must_read_complete is true, "
     "get_diff_handoff(run_pair) pages a standardized hand-off of the changed_real findings — one "
     "block each, tmap's facts and two placeholders for a person (refused before; tmap review "
     "report --handoff writes a partial one for a person); once complete, tmap review report "
@@ -2881,6 +2890,8 @@ def make_tools(
             }
         if u.kind == _ru.GROUP and u.group is not None:
             return _group_material(atlas, review, u, budget)
+        if u.kind == _ru.PAIRING and u.component is not None:
+            return _component_material(atlas, review, u, budget)
         if u.kind == _ru.REDUCE:
             return _reduce_material(review, u, budget)
         if u.kind in (_ru.S_BATCH, _ru.SECOND_TIER):
@@ -2941,6 +2952,66 @@ def make_tools(
                         entry[part] = {"withheld": "page_budget", "read_with": read_more}
             return out
         return {"error": f"no material for unit kind {u.kind!r}"}
+
+    def _component_material(
+        atlas: sqlite3.Connection, review: _ru.PairReview, u: _ru.Unit, budget: int
+    ) -> dict[str, Any]:
+        """A pairing component (lib/query/pairing_components): what it is — its claims, members,
+        superseded entries, ends and whether it holds a conflict — then its members as a batch's
+        are read (the alternative entries first, each with its pseudocode delta and inline hunk),
+        fitted to what the page leaves."""
+        c = u.component or {}
+        out: dict[str, Any] = {
+            "diff_id": u.stream,
+            "component": {
+                "component_id": c.get("component_id"),
+                "claims": list(c.get("claims") or []),
+                "members": [m.entry_id for m in u.members],
+                "superseded": list(c.get("superseded") or []),
+                "ends": list(c.get("ends") or []),
+                "conflict": bool(c.get("conflict")),
+            },
+            "how": (
+                "the alternative entries (alignment_state alternative) are the pairings the "
+                "claims propose: read each and judge it on its own anchor_ref; a superseded entry "
+                "needs no judgement (it stays listed); judge an end function on the entry it is "
+                "in; with a conflict, judge every claim. A promotion from an alternative entry is "
+                "refused."
+            ),
+        }
+        found = _member_entries(atlas, review, u, None)
+        if "error" in found:
+            return {"error": found["error"]}
+        claims = set(out["component"]["claims"])
+        entries = sorted(found["entries"], key=lambda e: e.get("entry_id") not in claims)
+        room = budget - len(json.dumps(out)) - 600
+        kept: list[dict[str, Any]] = []
+        used = 0
+        for e in entries:
+            size = len(json.dumps(e))
+            if used + size > room:
+                break
+            kept.append(e)
+            used += size
+        if not kept and entries:
+            kept = [_entry_within_budget(entries[0], 0, max(room, 0))]
+        out.update(
+            {
+                "entries": kept,
+                "entries_total": len(u.members),
+                "entries_truncated": len(kept) < len(entries) or bool(found["missing"]),
+                "read_one": (
+                    f"get_diff_patch_view(diff_id={json.dumps(u.stream)}, entry_id=<entry_id>)"
+                ),
+                "judge_with": f"annotate_diff_batch(diff_id={json.dumps(u.stream)}, ...)",
+            }
+        )
+        rows = _read_rows_hint(u.stream, kept)
+        if rows is not None:
+            out["read_rows"] = rows
+        if found["missing"]:
+            out["members_not_in_view"] = found["missing"]
+        return out
 
     def _side_code(run: str, function: str, binary: str | None, cap: int) -> dict[str, Any]:
         """One side's pseudocode of a function, cut at ``cap`` characters (with the call that reads

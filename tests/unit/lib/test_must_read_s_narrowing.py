@@ -335,11 +335,11 @@ def test_an_added_reason_keeps_the_reasons_order() -> None:
 
 
 def test_the_predicate_version_moved_and_with_it_every_unit_id() -> None:
-    """T-X3a / T-J7 (v4: the units read the facts' order, spec Y). MUTATION (verified RED):
-    PREDICATE_VERSION left at v3 -> RED."""
-    assert ru.PREDICATE_VERSION == "v4"
+    """T-X3a / T-J7 (v4: the units read the facts' order, spec Y; v5: the pairing components are
+    units of their own). MUTATION (verified RED): PREDICATE_VERSION left at v4 -> RED."""
+    assert ru.PREDICATE_VERSION == "v5"
     anchors = ["a", "b"]
-    for earlier in ("v2", "v3"):
+    for earlier in ("v2", "v3", "v4"):
         assert ru.unit_id(ru.S_BATCH, anchors, earlier) != ru.unit_id(ru.S_BATCH, anchors)
 
 

@@ -279,7 +279,9 @@ def _parse_ref(group_ref: str) -> tuple[str, str, str, str, str] | None:
     return head, key, side, fpv, recipe
 
 
-def _subject_side_refs(built: BuiltDiff, anchor_ref: str, side: str) -> tuple[set[str], bool]:
+def _subject_side_refs(
+    atlas: sqlite3.Connection, built: BuiltDiff, anchor_ref: str, side: str
+) -> tuple[set[str], bool]:
     """The evidence_refs the judged subject has on ``side``, and whether the anchor is a candidate.
     For an entry it is the entry's rows' refs on that side; for a candidate row it is that row's ref
     on that side."""
@@ -295,7 +297,7 @@ def _subject_side_refs(built: BuiltDiff, anchor_ref: str, side: str) -> tuple[se
         _gran, _cls, a_ref, b_ref = split
         ref = a_ref if side == "a" else b_ref
         return ({ref} if ref else set()), True
-    subjects = dr.subjects_of(built.placed, diff.run_a, diff.run_b, diff.binary or "")
+    subjects = dr.subjects_for(atlas, built, built.placed)
     subject = subjects.get(anchor_ref)
     if subject is None or subject.entry is None:
         return set(), False
@@ -350,9 +352,9 @@ def annotate_group_on(
         if cache is not None:
             cache[group_ref] = hit
     side, f2_key, calls, groups, members, snapshot = hit
-    relation = _relation(built, side, f2_key, members, calls, anchor_ref)
+    relation = _relation(atlas, built, side, f2_key, members, calls, anchor_ref)
     if relation is None:
-        shapes = _subject_shapes_listing(built, side_meta, side, calls, groups, anchor_ref)
+        shapes = _subject_shapes_listing(atlas, built, side_meta, side, calls, groups, anchor_ref)
         raise ConfigError(
             f"group {group_ref!r} is not about this entry: it holds no call of it, and the shape "
             f"is not one this subject has on side {side!r}. The shapes it does have on this side: "
@@ -445,6 +447,7 @@ def diff_id_of(side_meta: sss._Meta) -> str:
 
 
 def _relation(
+    atlas: sqlite3.Connection,
     built: BuiltDiff,
     side: str,
     f2_key: str,
@@ -454,7 +457,7 @@ def _relation(
 ) -> str | None:
     """How the group is about the judged subject: ``own_call`` when the group holds a call of it,
     ``same_shape`` when the shape is one the subject (a function-level candidate) has, else None."""
-    subject_refs, _is_candidate = _subject_side_refs(built, anchor_ref, side)
+    subject_refs, _is_candidate = _subject_side_refs(atlas, built, anchor_ref, side)
     if subject_refs & {c.ref for c in members if c.ref}:
         return "own_call"
     if f2_key in {c.key for c in calls if c.ref in subject_refs and c.unkeyed is None}:
@@ -463,6 +466,7 @@ def _relation(
 
 
 def _subject_shapes_listing(
+    atlas: sqlite3.Connection,
     built: BuiltDiff,
     meta: sss._Meta,
     side: str,
@@ -470,7 +474,7 @@ def _subject_shapes_listing(
     groups: dict[str, list[sss._Call]],
     anchor_ref: str,
 ) -> list[dict[str, Any]]:
-    subject_refs, _is_candidate = _subject_side_refs(built, anchor_ref, side)
+    subject_refs, _is_candidate = _subject_side_refs(atlas, built, anchor_ref, side)
     mine = [c for c in calls if c.ref in subject_refs and c.unkeyed is None]
     return sss._shape_keys(meta, side, mine, groups)
 

@@ -58,11 +58,12 @@ def entry_subjects(
     atlas: sqlite3.Connection, built: Any, meta: dict[str, Any]
 ) -> dict[str, dr.Subject]:
     """The subjects of a built diff's listed view by anchor_ref (its entries, and the candidate
-    rows of each) — built once per write call, a batch's items all read from it."""
+    rows of each) and its alternative entries (lib/query/pairing_components) — built once per
+    write call, a batch's items all read from it."""
     from treasure_map.lib.query.patch_view import listed_view
 
     entries = listed_view(atlas, built).entries
-    return dr.subjects_of(entries, meta["run_a_id"], meta["run_b_id"], meta["binary_a"])
+    return dr.WritableSubjects(atlas, built, entries)
 
 
 def entry_subject(

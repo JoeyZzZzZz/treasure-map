@@ -234,7 +234,7 @@ def entry_facts(e: _Entry) -> dict[str, Any]:
             key=json.dumps,
         )
         callsites = e.sink_callsite_counts
-        return {
+        facts = {
             "alignment_state": p.state,
             "similarity": p.similarity,
             "export_gap_a": p.export_gap_a,
@@ -257,6 +257,11 @@ def entry_facts(e: _Entry) -> dict[str, Any]:
             ),
             "alt_pairings": _alt_pairings(e),
         }
+        if p.state == "alternative":
+            # An alternative entry rests on its component (lib/query/pairing_components): any claim
+            # of it moving moves the component_id, and every judgement on its alternatives.
+            facts["pairing_correction"] = (e.pairing_correction or {}).get("component_id")
+        return facts
     assert e.unpaired is not None
     u = e.unpaired
     return {
@@ -313,6 +318,69 @@ def subjects_of(placed: list[_Entry], run_a: str, run_b: str, binary: str) -> di
                 "candidate", row_facts(v), e, v
             )
     return out
+
+
+def subjects_for(
+    atlas: Any,
+    built: Any,
+    entries: list[_Entry],
+    readings: Any = None,
+    *,
+    alternatives: tuple[_Entry, ...] | None = None,
+) -> dict[str, Subject]:
+    """``subjects_of(entries)`` of a built diff, and beside them each alternative entry's
+    function_pair subject (lib/query/pairing_components) — never a candidate subject of its rows:
+    a candidate is judged on its own entry's anchor. ``alternatives`` when the caller holds them;
+    else they are read (with ``readings``, the view's, when given). Empty for a diff that records
+    no binary."""
+    d = built.diff
+    if not d.binary:
+        return {}
+    out = subjects_of(entries, d.run_a, d.run_b, d.binary)
+    if alternatives is None:
+        from treasure_map.lib.query.pairing_components import corrections
+
+        alternatives = corrections(atlas, built, readings)[1]
+    for e in alternatives:
+        out[entry_anchor(e, d.run_a, d.run_b, d.binary)] = Subject(
+            "function_pair", entry_facts(e), e
+        )
+    return out
+
+
+class WritableSubjects(dict[str, Subject]):
+    """The subjects a write can land on in a built diff: the listed entries' and their candidate
+    rows' (``subjects_of``), read at once, and the alternative entries'
+    (lib/query/pairing_components), read only when an anchor names none of the listed ones —
+    reading them reads the diff's pseudocode, which a write on a listed entry never needs."""
+
+    def __init__(self, atlas: Any, built: Any, entries: list[_Entry]) -> None:
+        d = built.diff
+        super().__init__(subjects_of(entries, d.run_a, d.run_b, d.binary) if d.binary else {})
+        self._atlas, self._built = atlas, built
+        self._alternatives: tuple[_Entry, ...] | None = None
+
+    def alternatives(self) -> tuple[_Entry, ...]:
+        """The diff's alternative entries, read (and their subjects added) on the first call."""
+        if self._alternatives is None:
+            d = self._built.diff
+            if not d.binary:
+                self._alternatives = ()
+            else:
+                from treasure_map.lib.query.pairing_components import corrections
+
+                self._alternatives = corrections(self._atlas, self._built)[1]
+                for e in self._alternatives:
+                    self.setdefault(
+                        entry_anchor(e, d.run_a, d.run_b, d.binary),
+                        Subject("function_pair", entry_facts(e), e),
+                    )
+        return self._alternatives
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key not in self and self._alternatives is None and "#function_pair#" in key:
+            self.alternatives()
+        return super().get(key, default)
 
 
 def anchors_of(entries: list[_Entry], run_a: str, run_b: str, binary: str) -> set[str]:

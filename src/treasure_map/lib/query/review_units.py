@@ -22,6 +22,14 @@ states, made checkable, plus what it left out. An entry of a diff is must-read w
 * a bucket B entry of attention 0 or 1 whose subclass is ``sink_present_no_visible_delta`` or
   ``instruction_unmatched`` — ``aligned_b_sink``;
 * among the first ``k`` entries of its diff in the order its facts give (below) — ``top_k``.
+A pairing-correction component (lib/query/pairing_components: the alternative entries a claim
+proposes for mis-paired entries, and the entries they re-pair) is one unit of its own, cut before
+the callee groups: its alternative entries and its listed members that are not superseded. It is
+must-read when an alternative entry has a candidate row, or either of its functions calls a sink (a
+side that cannot be counted counts as calling one, a design-skipped micro-stub as not), or one of
+its listed members is must-read by the reasons above — and then every member carries
+``pairing_component`` beside its own reasons. A superseded entry is in no unit (its reasons go with
+its component's unit), and no component member is a callee group's.
 
 Besides the entries, every changed non-binary file of the pair is a must-read unit of its own, and
 so are the binaries one run of the pair holds alone (``binary_presence``): each function of such a
@@ -74,7 +82,7 @@ from treasure_map.lib.pattern import classes
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN, UNSEEN
 
-PREDICATE_VERSION = "v4"
+PREDICATE_VERSION = "v5"
 DEFAULT_K = 4
 MAX_K = 200
 # At most this many items in one annotate_diff_batch call.
@@ -104,12 +112,13 @@ REASONS = (
     "command_calls_fewer",
     "aligned_b_sink",
     "top_k",
+    "pairing_component",
     "binary_presence",
     "non_binary_file",
 )
 
 # Unit kinds.
-ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE = (
+ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE, PAIRING = (
     "entry",
     "s_batch",
     "binary_presence",
@@ -118,11 +127,12 @@ ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE = (
     "audit",
     "callee_group",
     "reduce",
+    "pairing_component",
 )
-UNIT_KINDS = (ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE)
-# Where a unit of a kind sorts among the units at the same place: a group first (its members read
-# together), an audit after the unit its member came from.
-_KIND_RANK = {GROUP: -1, AUDIT: 1}
+UNIT_KINDS = (ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE, PAIRING)
+# Where a unit of a kind sorts among the units at the same place: a group or a pairing component
+# first (its members read together), an audit after the unit its member came from.
+_KIND_RANK = {GROUP: -1, PAIRING: -1, AUDIT: 1}
 # How many disagreements the report lists (the count is always exact).
 DISAGREEMENTS_SHOWN = 20
 # The judgements an audit reads blind: why one is opened. ``unread_before_verdict`` is NOT here any
@@ -198,7 +208,8 @@ class Member:
     binary, or such a binary) or a changed file."""
 
     anchor_ref: str
-    kind: str  # "entry" | "binary_presence" | "non_binary_file"
+    # "entry" | "alternative" (a pairing component's) | "binary_presence" | "non_binary_file"
+    kind: str
     stream: str  # its diff_id, or PRESENCE_STREAM / FILE_STREAM
     position: int  # its place in its stream
     entry_id: str | None = None
@@ -224,6 +235,9 @@ class Unit:
     position: int  # its first member's place in its stream (the round it is handed out in)
     stream_index: int  # its stream's place among the streams
     group: dict[str, Any] | None = None  # a callee group unit's group (DiffFacts.groups)
+    # A pairing component unit's component: {component_id, claims, superseded, superseded_reasons
+    # (each superseded entry's own reasons, which this unit carries for it), ends, conflict}.
+    component: dict[str, Any] | None = None
 
     @property
     def order(self) -> tuple[int, int, int, str]:
@@ -315,9 +329,15 @@ class DiffFacts:
     # The diff's callee groups (lib/query/callee_groups): ``{callee_b, callee_a, name, ref,
     # members (entry ids), members_possibly_incomplete}``, every member a listed paired entry.
     groups: list[dict[str, Any]] = field(default_factory=list)
-    # The anchors of the listed entries and of their candidate rows: a judgement whose subject is
-    # in ``subjects`` but not here reads subject_unlisted (diff_review.unlisted_judgements).
+    # The anchors of the listed entries and of their candidate rows (and of the alternative
+    # entries): a judgement whose subject is in ``subjects`` but not here reads subject_unlisted
+    # (diff_review.unlisted_judgements).
     listed_anchors: frozenset[str] = frozenset()
+    # The pairing-correction components (lib/query/pairing_components): {component_id, claims (the
+    # alternative entries' ids), entries (the members, listed or not), superseded, ends, conflict,
+    # signal (an alternative entry has a row, or a function of one calls a sink), alternatives
+    # (their members)}. Their entries are no callee group's member.
+    components: list[dict[str, Any]] = field(default_factory=list)
 
 
 def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) -> DiffFacts | None:
@@ -354,13 +374,20 @@ def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) ->
         )
     subjects: dict[str, dr.Subject] = {}
     listed_anchors: frozenset[str] = frozenset()
+    components: list[dict[str, Any]] = []
     if d.binary and not listing.withheld:
-        full = dr.subjects_of(listing.built.placed, d.run_a, d.run_b, d.binary)
+        full = dr.subjects_for(
+            atlas, listing.built, listing.built.placed, alternatives=listing.alternatives
+        )
         # Facts only: a judgement is read against its subject's facts (diff_review.judge).
         subjects = {a: dr.Subject(s.kind, s.facts) for a, s in full.items()}
+        alt_anchors = {dr.entry_anchor(e, d.run_a, d.run_b, d.binary) for e in listing.alternatives}
         listed_anchors = frozenset(
             dr.anchors_of([o.entry for o in listing.entries], d.run_a, d.run_b, d.binary)
+            | alt_anchors
         )
+        components = _components(listing, d.run_a, d.run_b, d.binary)
+    in_component = {x for c in components for x in c["entries"]}
     groups: list[dict[str, Any]] = []
     if not listing.withheld:
         from treasure_map.lib.query.callee_groups import callee_groups
@@ -372,7 +399,9 @@ def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) ->
                 "callee_a": g.callee_a,
                 "name": g.callee_name,
                 "ref": g.ref,
-                "members": list(g.members),
+                # A pairing component's members (superseded ones included) are cut first: none
+                # of them is a group's member.
+                "members": [m for m in g.members if m not in in_component],
                 "members_possibly_incomplete": g.members_possibly_incomplete,
                 "members_a_side_unread": g.members_a_side_unread,
             }
@@ -401,7 +430,62 @@ def diff_facts(atlas: sqlite3.Connection, diff_id: str, diff_ok: bool = True) ->
         run_b=d.run_b,
         groups=groups,
         listed_anchors=listed_anchors,
+        components=components,
     )
+
+
+def _has_sink_call(bld: Any, side: str, addr: str) -> bool:
+    """Whether a function calls a sink by its call counts; one that cannot be counted counts as
+    calling one, except a design-skipped micro-stub (no text by design), which counts as none."""
+    unknown, counts = bld._callsite_side(side, addr)
+    if unknown == "skipped_micro":
+        return False
+    if unknown is not None:
+        return True
+    return any(v > 0 for v in counts.values())
+
+
+def _components(listing: Any, run_a: str, run_b: str, binary: str) -> list[dict[str, Any]]:
+    """The diff's pairing-correction components as its units read them (``DiffFacts.components``):
+    each alternative entry a member at the place of the component's first listed member."""
+    position = {o.entry.entry_id: o.position for o in listing.entries}
+    alts = {e.entry_id: e for e in listing.alternatives}
+    bld = listing.built.builder
+    out: list[dict[str, Any]] = []
+    for c in listing.components:
+        listed = [x for x in c.entries if x in position]
+        at = min((position[x] for x in listed), default=len(listing.entries))
+        members = [
+            Member(
+                anchor_ref=dr.pair_anchor(run_a, run_b, binary, cl.addr_a, cl.addr_b),
+                kind="alternative",
+                stream=listing.built.diff.diff_id,
+                position=at,
+                entry_id=cl.entry_id,
+                rows=len(alts[cl.entry_id].row_views) if cl.entry_id in alts else 0,
+            )
+            for cl in c.claims
+        ]
+        signal = any(m.rows for m in members) or (
+            bld is not None
+            and any(
+                _has_sink_call(bld, "a", cl.addr_a) or _has_sink_call(bld, "b", cl.addr_b)
+                for cl in c.claims
+            )
+        )
+        out.append(
+            {
+                "component_id": c.component_id,
+                "claims": [cl.entry_id for cl in c.claims],
+                "entries": list(c.entries),
+                "superseded": list(c.superseded),
+                "ends": [{"side": s, "addr": a} for s, a in c.ends],
+                "conflict": c.conflict,
+                "signal": bool(signal),
+                "alternatives": members,
+            }
+        )
+    return out
 
 
 # ── the pair ────────────────────────────────────────────────────────────────────────────────
@@ -543,6 +627,36 @@ def _assign_groups(d: DiffFacts, k: int) -> dict[str, tuple[dict[str, Any], list
     return out
 
 
+def _component_units(d: DiffFacts, k: int, add: Callable[..., None]) -> set[str | None]:
+    """Cut one unit per pairing component of the diff (``add(PAIRING, ...)``); return every entry
+    id the components hold, superseded ones included."""
+    by_id = {m.entry_id: _with_top_k(m, k) for m in d.entries}
+    held: set[str | None] = set()
+    for c in d.components:
+        listed = [by_id[x] for x in c["entries"] if x in by_id]
+        superseded = set(c["superseded"])
+        must = c["signal"] or any(m.must_read for m in listed)
+        members = [*c["alternatives"], *(m for m in listed if m.entry_id not in superseded)]
+        if must:
+            members = [_with_reason(m, "pairing_component") for m in members]
+        component = {
+            "component_id": c["component_id"],
+            "claims": list(c["claims"]),
+            "superseded": list(c["superseded"]),
+            "superseded_reasons": {
+                m.entry_id: list(m.reasons)
+                for m in listed
+                if m.entry_id in superseded and m.reasons
+            },
+            "ends": list(c["ends"]),
+            "conflict": c["conflict"],
+        }
+        if members:
+            add(PAIRING, members, must, None, component)
+        held |= set(c["entries"])
+    return held
+
+
 def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
     """Every unit of the pair, in the order they are handed out (``Unit.order``)."""
     units: list[Unit] = []
@@ -551,7 +665,11 @@ def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
     index = {s: i for i, s in enumerate(streams)}
 
     def add(
-        kind: str, members: list[Member], must_read: bool, group: dict[str, Any] | None = None
+        kind: str,
+        members: list[Member],
+        must_read: bool,
+        group: dict[str, Any] | None = None,
+        component: dict[str, Any] | None = None,
     ) -> None:
         first = min(members, key=lambda m: m.position)
         anchors = [m.anchor_ref for m in members]
@@ -567,6 +685,7 @@ def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
                 position=first.position,
                 stream_index=index[first.stream],
                 group=group,
+                component=component,
             )
         )
 
@@ -575,10 +694,12 @@ def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
             continue
         s_members: list[Member] = []
         second: dict[str, list[Member]] = {}
+        # The pairing components first (their members are no group's), then the callee groups.
+        in_component = _component_units(d, k, add)
         grouped = _assign_groups(d, k)
         for g, members in grouped.values():
             add(GROUP, members, True, g)
-        taken = {m.entry_id for _g, members in grouped.values() for m in members}
+        taken = in_component | {m.entry_id for _g, members in grouped.values() for m in members}
         for raw in d.entries:
             m = _with_top_k(raw, k)
             if m.entry_id in taken:
@@ -665,6 +786,9 @@ def read_progress(
         out.unlisted += dr.unlisted_judgements(judged, d.listed_anchors).values()
         for m in d.entries:
             out.states[m.anchor_ref] = dr.review_state(judged.get(m.anchor_ref))
+        for c in d.components:
+            for m in c["alternatives"]:
+                out.states[m.anchor_ref] = dr.review_state(judged.get(m.anchor_ref))
     stale = pair_staleness.get("source_stale")
     reason = pair_staleness.get("source_stale_reason")
     presence_judged = bp.presence_review(
@@ -1111,7 +1235,8 @@ def coverage_offer(
     second = [
         u
         for u in review.units
-        if u.kind == SECOND_TIER
+        if not u.must_read
+        and u.kind not in (AUDIT, REDUCE)
         and in_shard(u.unit_id, worker, workers)
         and not unit_disposed(u, states)
     ]
@@ -1135,7 +1260,7 @@ def coverage_offer(
             "why": (
                 "the listed entries the must-read predicate "
                 f"({PREDICATE_VERSION}, k={review.k}) did not select, cut into batches per diff "
-                "and bucket"
+                "and bucket, and the pairing components it did not select"
             ),
             "handed_out": sweep,
             "due_recheck": sum(

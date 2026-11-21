@@ -4,7 +4,8 @@
 rules of ``alt_pairings`` (lib/query/patch_view), and the same-body reading (``via="twin"``).
 
 Three sources, each read as its own fact beside the entry, never a re-pairing and never a choice
-between them:
+between them (the ones between two pair entries that stand make a pairing-correction component,
+lib/query/pairing_components, read beside the diff's pairs, which stay as they are):
 
 * ``string`` — the function's unique strings (each referenced from exactly one function on each
   side, the format-only ones left out) point to one function on the other side; published when at

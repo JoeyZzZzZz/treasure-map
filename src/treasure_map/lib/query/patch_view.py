@@ -76,6 +76,10 @@ TWO SIGNALS SIMILARITY IS BLIND TO (lib/query/sameness), read on the function-pa
   other than the diff puts them, by unique strings, a dispatch key or the same body found once
   elsewhere (lib/query/alt_pairings): counted on a page, read in full by ``entry_id``, in a fixed
   order, never chosen between; nothing is re-paired and no bucket, order or significance reads it.
+  An alternative pairing on its own still re-pairs nothing; the ones between two PAIR entries that
+  stand (lib/query/pairing_components) make a pairing-correction component, each read as an
+  alternative entry (``alignment_state`` ``alternative``) by ``entry_id`` or as a unit's members —
+  never listed, counted or ordered — with ``pairing_correction`` on it and on its members.
   ``sink_arg_constant_delta`` — a persisted candidate whose size constant moved (0x40 -> 0x3f),
   with the callee and from/to, direction-neutral. A changed size KIND is the weaker
   ``size_kind_shifted``.
@@ -229,6 +233,10 @@ _DIFF_WIDE = (
     "extraction_generation_mismatch",
 )
 _RUN_PAIR = ("binary_not_diffed", "shadowed_by_name_collision")
+# An alternative pairing read as a pair of its own (lib/query/pairing_components): its ``_Pair``
+# state, and the reason every row of it carries (its landing's subclass, in R).
+ALTERNATIVE = "alternative"
+PROPOSED_PAIRING = "proposed_pairing"
 _DIFFERENT_CALLEE = ("present_different_callee", "counterpart_different_callee")
 # Reasons a row keeps as its B subclass as they are.
 _B_AS_IS = (
@@ -447,6 +455,8 @@ def row_landing(
         return "persisted", None
     if reason in _DIFF_WIDE or reason in _RUN_PAIR:
         return "banner", f"diff_undetermined:{reason}"
+    if reason == PROPOSED_PAIRING:
+        return "R", PROPOSED_PAIRING
     if counterpart_call == "present_different_callee":
         if elsewhere is False:
             return "A", "matched_call_other_callee"
@@ -704,6 +714,15 @@ class _Pair:
     @property
     def aligned(self) -> bool:
         return self.state == "aligned"
+
+    @property
+    def kind(self) -> str:
+        """``aligned``, ``undetermined`` (BinDiff's undetermined pairing, which the view calls a
+        proposed reading) or ``alternative`` (an alternative pairing read as a pair of its own,
+        lib/query/pairing_components — never placed, never in a bucket)."""
+        if self.state == ALTERNATIVE:
+            return ALTERNATIVE
+        return "aligned" if self.aligned else "undetermined"
 
 
 @dataclass(frozen=True)
@@ -1321,6 +1340,9 @@ class _Entry:
     # they were read in a call depends on a cache, and a judgement's facts must not).
     alt_anchor: list[dict[str, Any]] = field(default_factory=list)
     alt_withheld: str | None = None
+    # Its pairing-correction component (lib/query/pairing_components), set per read on a member
+    # entry (the component's summary) and on an alternative entry (its detail); None on the rest.
+    pairing_correction: dict[str, Any] | None = None
 
     @property
     def shown_bucket(self) -> str:
@@ -2421,7 +2443,7 @@ def _anchored_differs(e: _Entry, u_state: str | None) -> bool:
     p = e.pair
     return (
         p is not None
-        and not p.aligned
+        and p.kind == "undetermined"
         and p.export_gap_a is None
         and p.export_gap_b is None
         and u_state == sameness.U_DIFFERS
@@ -2447,7 +2469,7 @@ def _anchored_micro_side(e: _Entry) -> bool:
     p = e.pair
     return (
         p is not None
-        and not p.aligned
+        and p.kind == "undetermined"
         and p.export_gap_a is None
         and p.export_gap_b is None
         and _anchor(p) is not None
@@ -3467,6 +3489,8 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
             "rows": e.row_views,
         }
     )
+    if e.pairing_correction is not None:
+        out["pairing_correction"] = e.pairing_correction
     return out
 
 
@@ -3793,6 +3817,9 @@ _TWIN_CACHE: _BoundedCache[tuple[str, ...], alt_pairings.TwinReadings] = _Bounde
 # An alternative pairing's text reading (its delta as counts and its line ratio), and a current
 # pairing's line ratio, per (the readings' key, addr_a, addr_b): read for one entry at a time.
 _ALT_TEXT_CACHE: _BoundedCache[tuple[str, ...], dict[str, Any]] = _BoundedCache(4096)
+# An alternative entry's text reading (lib/query/pairing_components), as an aligned pair's
+# (``_read_pair``), per (the readings' key, addr_a, addr_b).
+_ALTERNATIVE_READING_CACHE: _BoundedCache[tuple[str, ...], _Read] = _BoundedCache(4096)
 _ELSEWHERE_SAMPLE = 3  # addresses shown of a body found elsewhere
 
 
@@ -3808,16 +3835,20 @@ def _clear_view_caches() -> None:
     _B_MENTIONS_CACHE.clear()
     _TWIN_CACHE.clear()
     _ALT_TEXT_CACHE.clear()
+    _ALTERNATIVE_READING_CACHE.clear()
     _SIZE_FACT_CACHE.clear()
     _CANDIDATE_ENTRY_CACHE.clear()
     _ANCHOR_SIDE_CACHE.clear()
     _ENTRY_WORDS_IMAGE_CACHE.clear()
     _OVERLAY_CACHE.clear()
     _DIFFERS_CACHE.clear()
-    # S6's process-wide call-list cache (in a module that imports this one, so imported here).
+    # S6's process-wide call-list cache and the pairing components' (in modules that import this
+    # one, so imported here).
     from treasure_map.lib.query.diff_group_freshness import _clear_cache
+    from treasure_map.lib.query.pairing_components import clear_cache as _clear_pairing_cache
 
     _clear_cache()
+    _clear_pairing_cache()
 
 
 def _run_source(atlas: sqlite3.Connection, run_id: str) -> tuple[str | None, str | None]:
@@ -4030,9 +4061,39 @@ def _b_other_fn_mentions(
     return frozenset(mentioned)
 
 
+def _alternative_reads(readings: _Readings, pairs: list[_Pair]) -> _PairReads:
+    """Each alternative pair's text reading, read as an aligned pair's (``_read_pair``) and cached
+    on the readings' key; both sides' bodies are read once, and only when one is not cached."""
+    out: _PairReads = {}
+    missing: list[_Pair] = []
+    for p in pairs:
+        hit = _ALTERNATIVE_READING_CACHE.get((*readings.key, p.addr_a, p.addr_b))
+        if hit is None:
+            missing.append(p)
+        else:
+            out[(p.addr_a, p.addr_b)] = hit
+    if missing:
+        (pa, sha_a), (pb, sha_b) = readings.sources
+        ba = sameness.read_function_bodies(pa, sha_a)
+        bb = sameness.read_function_bodies(pb, sha_b)
+        ra = sameness.read_image_ranges(pa, sha_a)
+        rb = sameness.read_image_ranges(pb, sha_b)
+        for p in missing:
+            read = _read_pair(ba, bb, p, ra, rb)
+            _ALTERNATIVE_READING_CACHE[(*readings.key, p.addr_a, p.addr_b)] = read
+            out[(p.addr_a, p.addr_b)] = read
+    return out
+
+
 def _aligned_read(e: _Entry, readings: _Readings) -> _Read | None:
+    """An aligned pair's reading, or an alternative entry's (read the same way); None for any
+    other entry."""
     p = e.pair
-    if p is None or not p.aligned:
+    if p is None:
+        return None
+    if p.kind == ALTERNATIVE:
+        return _alternative_reads(readings, [p]).get((p.addr_a, p.addr_b), _UNREAD)
+    if not p.aligned:
         return None
     return readings.aligned.get((p.addr_a, p.addr_b), _UNREAD)
 
@@ -4049,9 +4110,10 @@ def _sameness_of(e: _Entry, readings: _Readings) -> str | None:
 
 
 def _proposed_of(e: _Entry, readings: _Readings) -> tuple[str, _Read] | None:
-    """(state, reading) of an undetermined pair's proposed reading; None for any other entry."""
+    """(state, reading) of an undetermined pair's proposed reading; None for any other entry (an
+    alternative entry's reading is its own, ``_aligned_read``)."""
     p = e.pair
-    if p is None or p.aligned:
+    if p is None or p.kind != "undetermined":
         return None
     read = readings.undetermined.get((p.addr_a, p.addr_b), _UNREAD)
     state = sameness.undetermined_pair_state(
@@ -4405,6 +4467,9 @@ def _delta_pair(e: _Entry, readings: _Readings) -> _Pair | None:
     p = e.pair
     if p is None:
         return None
+    if p.kind == ALTERNATIVE:
+        read = _aligned_read(e, readings)
+        return p if read is not None and read.matches is False else None
     reads = readings.aligned if p.aligned else readings.undetermined
     return p if reads.get((p.addr_a, p.addr_b), _UNREAD).matches is False else None
 
@@ -4604,7 +4669,9 @@ def _proposed_json(
 # A fact beside every placed entry (lib/query/alt_pairings): the published string / key readings
 # pointing elsewhere (``_Entry.alt_anchor``, from the build) and the same-body readings (from the
 # pseudocode readings), joined here, at render time. Never a re-pairing, never a choice between
-# them, never read by a bucket, an order, a significance or a must-read set. A listed page gives
+# them, never read by a bucket, an order or a significance; the ones between two pair entries that
+# stand make a pairing-correction component (lib/query/pairing_components), which the must-read
+# set reads as a unit of its own. A listed page gives
 # each entry its count and sources; unit material and a not-listed row give the readings without
 # their text and sink reading (``alt_delta_withheld`` says where that is); one entry read by
 # ``entry_id`` gives everything, each alternative pairing read as the current one is.
@@ -4723,6 +4790,66 @@ def _alt_pair(e: _Entry, item: dict[str, Any]) -> tuple[str, str]:
     )
 
 
+class _AltTexts:
+    """The text reading of a pairing that is not the diff's (an alternative one), or of a current
+    pairing's line ratio: per (the readings' key, ``alt`` / ``ratio``, addr_a, addr_b) in
+    ``_ALT_TEXT_CACHE``. ``want`` is each side's addresses to read in one pass on a miss."""
+
+    def __init__(self, built: BuiltDiff, readings: _Readings, want: dict[str, set[str]]) -> None:
+        self.built, self.readings, self.want = built, readings, want
+        self.texts: dict[str, dict[str, str | None] | None] = {}
+        self.ranges: dict[str, sameness.ImageRanges] = {}
+
+    def text_of(self, side: str, addr: str) -> str | None:
+        bld = self.built.builder
+        assert bld is not None
+        if side not in self.texts:
+            self.texts[side] = bld.sides[side].text_of(sorted(self.want[side] | {addr}))
+            path, sha = self.readings.sources[0 if side == "a" else 1]
+            self.ranges[side] = sameness.read_image_ranges(path, sha)
+        got = self.texts[side]
+        if got is not None and addr not in got:
+            got.update(bld.sides[side].text_of([addr]) or {})
+        return got.get(addr) if got is not None else None
+
+    def name_of(self, side: str, addr: str) -> str | None:
+        bld = self.built.builder
+        assert bld is not None
+        n = bld.sides[side].names.get(addr)
+        return n if n and not _is_synthetic_name(n, addr) else None
+
+    def reading(self, a: str, b: str, with_delta: bool) -> dict[str, Any] | None:
+        key = (*self.readings.key, "alt" if with_delta else "ratio", a, b)
+        hit = _ALT_TEXT_CACHE.get(key)
+        if hit is not None:
+            return hit
+        if not with_delta:  # a full reading holds the ratio too
+            full = _ALT_TEXT_CACHE.get((*self.readings.key, "alt", a, b))
+            if full is not None:
+                return full
+        ta, tb = self.text_of("a", a), self.text_of("b", b)
+        if not ta or not tb:
+            return None
+        ra, rb = self.ranges["a"], self.ranges["b"]
+        found: dict[str, Any] = {"ratio": round(sameness.delta_ratio(ta, tb, ra, rb, a, b), 3)}
+        if with_delta:
+            delta = sameness.pseudocode_delta(
+                ta, tb, ra, rb, a, b, self.name_of("a", a), self.name_of("b", b)
+            )
+            found["summary"] = _summary_delta(delta)
+        _ALT_TEXT_CACHE[key] = found
+        return found
+
+
+def _text_ratio(built: BuiltDiff, readings: _Readings, a: str, b: str) -> float | None:
+    """The line ratio of the pairing (``a``, ``b``) as the alternative pairings read it
+    (``_AltTexts``), or None when a side has no text to read."""
+    if built.builder is None:
+        return None
+    got = _AltTexts(built, readings, {"a": {a}, "b": {b}}).reading(a, b, False)
+    return got["ratio"] if got is not None else None
+
+
 def _alt_drill(
     built: BuiltDiff, readings: _Readings, e: _Entry, items: list[dict[str, Any]]
 ) -> None:
@@ -4738,39 +4865,7 @@ def _alt_drill(
     if e.pair is not None:
         want["a"].add(e.pair.addr_a)
         want["b"].add(e.pair.addr_b)
-    texts: dict[str, dict[str, str | None] | None] = {}
-    ranges: dict[str, sameness.ImageRanges] = {}
-
-    def text_of(side: str, addr: str) -> str | None:
-        if side not in texts:
-            texts[side] = bld.sides[side].text_of(sorted(want[side]))
-            path, sha = readings.sources[0 if side == "a" else 1]
-            ranges[side] = sameness.read_image_ranges(path, sha)
-        got = texts[side]
-        return got.get(addr) if got is not None else None
-
-    def name_of(side: str, addr: str) -> str | None:
-        n = bld.sides[side].names.get(addr)
-        return n if n and not _is_synthetic_name(n, addr) else None
-
-    def reading(a: str, b: str, with_delta: bool) -> dict[str, Any] | None:
-        key = (*readings.key, "alt" if with_delta else "ratio", a, b)
-        hit = _ALT_TEXT_CACHE.get(key)
-        if hit is not None:
-            return hit
-        ta, tb = text_of("a", a), text_of("b", b)
-        if not ta or not tb:
-            return None
-        found: dict[str, Any] = {
-            "ratio": round(sameness.delta_ratio(ta, tb, ranges["a"], ranges["b"], a, b), 3)
-        }
-        if with_delta:
-            delta = sameness.pseudocode_delta(
-                ta, tb, ranges["a"], ranges["b"], a, b, name_of("a", a), name_of("b", b)
-            )
-            found["summary"] = _summary_delta(delta)
-        _ALT_TEXT_CACHE[key] = found
-        return found
+    reading = _AltTexts(built, readings, want).reading
 
     current = None
     if e.pair is not None:
@@ -5694,15 +5789,21 @@ def anchored_differs_banner(states: dict[str, Any] | None) -> str | None:
     return " ".join(parts)
 
 
-def _resolve_entry(built: BuiltDiff, entry_id: str, entries: list[_Entry]) -> _Entry | str:
+def _resolve_entry(
+    built: BuiltDiff,
+    entry_id: str,
+    entries: list[_Entry],
+    alternatives: tuple[_Entry, ...] = (),
+) -> _Entry | str:
     """The listed entry ``entry_id`` names — by its entry_id, or by its anchor_ref — or why none.
-    ``entries`` is listed_view's (bucket S included).
+    ``entries`` is listed_view's (bucket S included); ``alternatives`` the diff's alternative
+    entries (lib/query/pairing_components), resolved by their entry_id or anchor_ref too.
 
     Read the way promote reads its entry (lib/query/diff_annotations), whose wording the refusals
     share: an anchor of another run pair or binary, or a candidate anchor, is refused by what it
     is. An entry that is placed but not listed is named as such, with where it is counted."""
     d = built.diff
-    for e in entries:
+    for e in (*entries, *alternatives):
         if e.entry_id == entry_id:
             return e
     if "#" in entry_id:
@@ -5732,7 +5833,7 @@ def _resolve_entry(built: BuiltDiff, entry_id: str, entries: list[_Entry]) -> _E
                 "entry_id takes an entry (its entry_id or anchor_ref), not a candidate anchor — a "
                 "candidate is read in its entry's rows"
             )
-        for e in entries:
+        for e in (*entries, *alternatives):
             if diff_review.entry_anchor(e, d.run_a, d.run_b, d.binary) == entry_id:
                 return e
     for e in built.placed:
@@ -5887,6 +5988,10 @@ class SignificanceListing:
     built: BuiltDiff
     withheld: bool
     entries: list[OrderedEntry]
+    # The pairing-correction components and their alternative entries, read with the same
+    # readings (lib/query/pairing_components); empty when withheld.
+    components: tuple[Any, ...] = ()
+    alternatives: tuple[_Entry, ...] = ()
 
 
 def view_staleness(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
@@ -5930,7 +6035,10 @@ def significance_listing(atlas: sqlite3.Connection, diff_id: str) -> Significanc
     _annotate_entries(built, readings)
     _attach_pair_evidence(atlas, built)
     shown = listed_view(atlas, built, readings)
-    review = ViewReview(atlas, built, shown)
+    from treasure_map.lib.query import pairing_components as _pc
+
+    components, alternatives = _pc.corrections(atlas, built, readings)
+    review = ViewReview(atlas, built, shown, alternatives)
     chosen = list(shown.entries)
     inputs = _order_inputs(chosen, readings, review, significant=True, hold_judged=False)
     ordered = _sort_with(chosen, "significance", None, inputs)
@@ -5948,6 +6056,8 @@ def significance_listing(atlas: sqlite3.Connection, diff_id: str) -> Significanc
             )
             for i, e in enumerate(ordered)
         ],
+        components,
+        alternatives,
     )
 
 
@@ -6129,8 +6239,13 @@ def get_diff_patch_view(
     _attach_pair_evidence(atlas, built)
     # The listed entries, bucket S included, decided from this view's own readings.
     shown = listed_view(atlas, built, readings)
+    # The pairing-correction components (their members marked) and their alternative entries:
+    # read by entry_id or as a unit's members, never listed, counted or ordered.
+    from treasure_map.lib.query import pairing_components as _pc
+
+    components, alternatives = _pc.corrections(atlas, built, readings)
     if entry_id is not None:
-        found = _resolve_entry(built, entry_id, shown.entries)
+        found = _resolve_entry(built, entry_id, shown.entries, alternatives)
         if isinstance(found, str):
             return {"diff_id": diff_id, "error": found}
         one = found
@@ -6189,7 +6304,7 @@ def get_diff_patch_view(
             and (not anchored_micro_side or _anchored_micro_side(e))
         ]
     )
-    review = ViewReview(atlas, built, shown)
+    review = ViewReview(atlas, built, shown, alternatives)
     unknown_filter = _unknown_filter_value(entries, subclass, blind_spot)
     # entry_words: a sink_patch page only (the listed entries' blocks, reduced to counts on a
     # summary page, and the whole diff's counts on every page); the other views carry neither.
@@ -6229,6 +6344,16 @@ def get_diff_patch_view(
         **({"entry_words_counts": words_view.counts} if words_view is not None else {}),
         "blind_spots": ledger,
         "overlay_coverage": overlay.coverage,
+        **(
+            {
+                "pairing_components": {
+                    "count": len(components),
+                    "claims": sum(len(c.claims) for c in components),
+                }
+            }
+            if components and view == "sink_patch"
+            else {}
+        ),
         # Set once the page's order is known (it follows that order); here to keep their place.
         "review_progress": None,
         "annotation": None,
@@ -6257,8 +6382,14 @@ def get_diff_patch_view(
         )
     summary = detail == "summary"
 
+    alternative_one = one is not None and one.pair is not None and one.pair.kind == ALTERNATIVE
+    # An alternative entry is no listed entry: a page of one is read over none of them.
+    in_scope = [] if alternative_one else chosen
+
     def _progress(positions: dict[str, int] | None = None) -> None:
-        envelope["review_progress"] = review.progress(chosen, filters, ledger, positions=positions)
+        envelope["review_progress"] = review.progress(
+            in_scope, filters, ledger, positions=positions
+        )
         envelope["annotation"] = review.annotation(positions=positions)
 
     if not_listed_page is not None:
@@ -6307,7 +6438,7 @@ def get_diff_patch_view(
         )
         return envelope
     envelope["guards_read_with"] = _guards_read_with(built.diff)
-    inputs = _order_inputs(chosen, readings, review, significant=effective == "significance")
+    inputs = _order_inputs(in_scope, readings, review, significant=effective == "significance")
     proposed, lens = inputs.proposed, inputs.lens
     swap_lift, lift_basis = inputs.swap_lift, inputs.lift_basis
     if effective == "significance":
@@ -6315,7 +6446,7 @@ def get_diff_patch_view(
         envelope["lens"]["sunk_with_body_size_differs"] = {
             "count": sum(
                 1
-                for e in chosen
+                for e in in_scope
                 if lens[e.entry_id][0] == ATTENTION_SINK
                 and _body_of(e, readings) == sameness.BODY_STRUCTURE_DIFFERS
             ),
@@ -6323,7 +6454,9 @@ def get_diff_patch_view(
         }
     read_first = inputs.read_first
     bands = review.bands() if band else None
-    if anchored_default:
+    if alternative_one:
+        ordered = list(chosen)  # a page of one, in no order
+    elif anchored_default:
         ordered = _anchored_order(chosen, read_first, bands)
     else:
         ordered = _sort_with(chosen, resolved, bands, inputs)
@@ -6331,9 +6464,11 @@ def get_diff_patch_view(
     _progress({e.entry_id: i for i, e in enumerate(ordered)})
     end = offset + limit
     if entry_ids is not None:
-        # In-process only (no tool passes it): the listed entries with these ids, in view order,
-        # rendered as a page would render them — a review unit's material reads its members so.
-        page = [e for e in ordered if e.entry_id in entry_ids]
+        # In-process only (no tool passes it): the alternative entries with these ids, then the
+        # listed ones in view order, rendered as a page would render them — a review unit's
+        # material reads its members so.
+        page = [e for e in alternatives if e.entry_id in entry_ids]
+        page += [e for e in ordered if e.entry_id in entry_ids]
         end = len(ordered)
     else:
         page = ordered[offset:end]
@@ -6354,7 +6489,9 @@ def get_diff_patch_view(
 
     def _render(e: _Entry) -> dict[str, Any]:
         out = review.entry_json(e, band)
-        out.update(_alt_fields(built, readings, e, alt_mode, ALT_READ_WITH_ENTRY_ID))
+        alternative = e.pair is not None and e.pair.kind == ALTERNATIVE
+        if not alternative:  # an alternative entry is itself the reading of one
+            out.update(_alt_fields(built, readings, e, alt_mode, ALT_READ_WITH_ENTRY_ID))
         # out["rows"] IS e.row_views (the entry's own list, which promote and the judgement basis
         # read whole): it is REPLACED by the window's new list, never cut or sorted in place, and a
         # row given guard_links / sink_axes is a copy (_rendered_rows).
@@ -6365,7 +6502,9 @@ def get_diff_patch_view(
         links: list[dict[str, Any] | None] | None = None
         if scan is not None:
             guard_fields, links = _entry_guards(e, scan, rows, page_axes["b"])
-        pairing = "proposed" if p is not None and not p.aligned else None
+        pairing = (
+            None if p is None or p.aligned else ("proposed" if p.kind != ALTERNATIVE else p.kind)
+        )
         out["rows"] = _rendered_rows(rows, links, pairing, page_axes if one is not None else None)
         out.update(window)
         if one is not None:
@@ -6436,7 +6575,11 @@ class ViewReview:
     caller holds it (read from its own readings); else it is asked for here."""
 
     def __init__(
-        self, atlas: sqlite3.Connection, built: BuiltDiff, listed: ListedView | None = None
+        self,
+        atlas: sqlite3.Connection,
+        built: BuiltDiff,
+        listed: ListedView | None = None,
+        alternatives: tuple[_Entry, ...] | None = None,
     ) -> None:
         d = built.diff
         self.built = built
@@ -6449,9 +6592,14 @@ class ViewReview:
         self.binary = d.binary
         self.withheld = built.withheld is not None
         rows = diff_review.read_judgements(atlas, d.run_a, d.run_b)
-        subjects = (
-            diff_review.subjects_of(built.placed, d.run_a, d.run_b, d.binary) if d.binary else {}
-        )
+        # The alternative entries (lib/query/pairing_components) are subjects a judgement can rest
+        # on, never items: they are not listed, counted or ordered.
+        if alternatives is None:
+            from treasure_map.lib.query.pairing_components import corrections
+
+            alternatives = corrections(atlas, built)[1] if d.binary else ()
+        self.alternatives = alternatives
+        subjects = diff_review.subjects_for(atlas, built, built.placed, alternatives=alternatives)
         # S6: a judgement may have recorded the same-shape group it leaned on. Re-derive it here,
         # where the build is in hand, and let judgements_for fold any move into needs_recheck. One
         # cache per review so several judgements on one group rebuild it once; the call list behind
@@ -6481,6 +6629,8 @@ class ViewReview:
         listed_anchors = (
             diff_review.anchors_of(entries, d.run_a, d.run_b, d.binary) if d.binary else set()
         )
+        # An alternative entry takes a write as a listed one does: never subject_unlisted.
+        listed_anchors |= {a for e in alternatives if (a := self.alternative_anchor(e))}
         self.unlisted = diff_review.unlisted_judgements(self.judged, listed_anchors)
         self.anchor: dict[str, str | None] = {
             e.entry_id: (
@@ -6507,8 +6657,42 @@ class ViewReview:
     def bands(self) -> dict[str, int]:
         return {k: diff_review.band_bias(i.state, i.verdict) for k, i in self.items.items()}
 
+    def alternative_anchor(self, e: _Entry) -> str | None:
+        d = self.built.diff
+        return diff_review.entry_anchor(e, d.run_a, d.run_b, d.binary) if d.binary else None
+
+    def claim_states(self, claims: list[str]) -> dict[str, str]:
+        """Each alternative entry's review state, by its entry_id (a claim of a component)."""
+        by_id = {e.entry_id: e for e in self.alternatives}
+        out: dict[str, str] = {}
+        for cid in claims:
+            e = by_id.get(cid)
+            anchor = self.alternative_anchor(e) if e is not None else None
+            out[cid] = diff_review.review_state(
+                self.judged.get(anchor) if anchor is not None else None
+            )
+        return out
+
     def entry_json(self, e: _Entry, band: bool) -> dict[str, Any]:
         out = _entry_json(e)
+        if e.pair is not None and e.pair.kind == ALTERNATIVE:
+            anchor = self.alternative_anchor(e)
+            out["anchor_ref"] = anchor
+            out["review_state"] = diff_review.review_state(
+                self.judged.get(anchor) if anchor is not None else None
+            )
+            out["pairing_correction"] = {
+                **(e.pairing_correction or {}),
+                "claim_review_states": self.claim_states(
+                    list((e.pairing_correction or {}).get("claims") or [])
+                ),
+            }
+            return out
+        if e.pairing_correction is not None:
+            out["pairing_correction"] = {
+                **e.pairing_correction,
+                "claim_review_states": self.claim_states(list(e.pairing_correction["claims"])),
+            }
         item = self.items[e.entry_id]
         if band:
             bias = diff_review.band_bias(item.state, item.verdict)

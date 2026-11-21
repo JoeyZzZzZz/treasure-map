@@ -559,9 +559,14 @@ _HANDOFF_LABELS: tuple[str, ...] = (
     "review state",
     "alternative pairings (tmap facts)",
     "earlier writes and deletes",
+    # an alternative entry's block, and an open item on a pairing component
+    "pairing (tmap facts)",
+    "pairing component (tmap facts)",
 )
 _OPEN_ALT = "alternative pairings (tmap facts)"
 _OPEN_HISTORY = "earlier writes and deletes"
+_PAIRING = "pairing (tmap facts)"
+_COMPONENT = "pairing component (tmap facts)"
 _CHANGE = "change (tmap facts)"
 _CHANGE_PROPOSED = "change (tmap facts, proposed pairing — alignment undetermined)"
 _SHAPE = "reachable shape (tmap facts)"
@@ -1005,7 +1010,17 @@ def _handoff_function_facts(
             _cell(_SIBLINGS, _unavailable(why)),
         ]
     if paired:
-        out = _change_lines(entry)
+        out = []
+        if entry.get("alignment_state") == "alternative":
+            pc = entry.get("pairing_correction") or {}
+            out.append(
+                _cell(
+                    _PAIRING,
+                    "alignment_state: alternative — a pairing an alternative-pairing claim "
+                    f"proposes (component {_val(pc.get('component_id'))}), not the diff's pairing",
+                )
+            )
+        out += _change_lines(entry)
         side, addr = "b", entry.get("addr_b") or entry.get("addr_a")
         if not entry.get("addr_b"):
             side = "a"
@@ -1499,12 +1514,22 @@ def handoff_open_items(
 
 
 def _open_pairing_lines(atlas: Any, diff_id: str, anchor: str) -> list[str]:
-    """A function_pair open item's alternative pairings, as get_diff_patch_view(diff_id,
-    entry_id=anchor) gives them: each one's via, direction, target and evidence count. Nothing when
-    the entry has none."""
+    """A function_pair open item's pairing facts, as get_diff_patch_view(diff_id, entry_id=anchor)
+    gives them: its pairing component and the review state of each claim when it is in one (or is
+    an alternative entry itself), else its alternative pairings — each one's via, direction, target
+    and evidence count. Nothing when the entry has none."""
     entry, why = _view_entry(atlas, diff_id, anchor)
     if entry is None:
         return [_cell(_OPEN_ALT, _unavailable(why))]
+    pc = entry.get("pairing_correction")
+    if isinstance(pc, dict):
+        # A member of a pairing component, or an alternative entry: the component and where each
+        # of its claims stands.
+        states = pc.get("claim_review_states") or {}
+        lines = [f"- {_COMPONENT}: {_val(pc.get('component_id'))}"]
+        for claim in pc.get("claims") or []:
+            lines.append(f"  - claim {_inline(claim)}: {_val(states.get(claim))}")
+        return lines
     items = entry.get("alt_pairings") or []
     if not items:
         withheld = entry.get("alt_pairings_withheld")

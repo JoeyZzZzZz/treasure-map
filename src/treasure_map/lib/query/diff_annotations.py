@@ -153,8 +153,9 @@ def capture_diff_basis_on(
     _check_anchor(anchor_ref, meta)
     _attach_pair_evidence(atlas, built)
     entries = listed_view(atlas, built).entries
-    subjects = dr.subjects_of(entries, meta["run_a_id"], meta["run_b_id"], meta["binary_a"])
-    subject = subjects.get(anchor_ref)
+    # The listed entries and the alternative entries (lib/query/pairing_components) take a write;
+    # an entry placed but not listed does not.
+    subject = dr.WritableSubjects(atlas, built, entries).get(anchor_ref)
     if subject is None:
         raise ConfigError(
             f"{anchor_ref!r} names nothing get_diff_patch_view lists for {diff_id!r} now — an "
@@ -223,14 +224,24 @@ def is_diff_anchor(
     counts as read whoever's entry it is). The precomputed lookups let a batch build them once."""
     from treasure_map.lib.query.diff_group_freshness import group_in_diff
 
-    run_a, run_b, binary = meta["run_a_id"], meta["run_b_id"], meta["binary_a"]
+    run_a, run_b = meta["run_a_id"], meta["run_b_id"]
     entries = listed_view(atlas, built).entries
     if subjects is None:
-        subjects = dr.subjects_of(entries, run_a, run_b, binary)
+        subjects = dr.WritableSubjects(atlas, built, entries)
     if entry_ids is None:
         entry_ids = {e.entry_id for e in entries}
     if row_refs is None:
-        row_refs = {ref for e in entries for r in e.rows for ref in (r.a_ref, r.b_ref) if ref}
+        row_refs = _row_refs(entries)
+    if (
+        isinstance(subjects, dr.WritableSubjects)
+        and item not in entry_ids
+        and item not in row_refs
+        and subjects.get(item) is None
+    ):
+        # Not a listed entry's: an alternative entry's id, anchor or row ref, read only now.
+        alternatives = subjects.alternatives()
+        entry_ids = {*entry_ids, *(e.entry_id for e in alternatives)}
+        row_refs = row_refs | _row_refs(list(alternatives))
     parts = dr.split_anchor(item, run_a, run_b)
     if parts is not None and subjects.get(item) is not None:
         return parts[0]  # function_pair / function_presence / candidate
@@ -274,11 +285,10 @@ def require_checked_anchor(
     and at least one anchor must resolve. ``field`` is the key name, for the message wording;
     ``anchor_ref`` (the judged subject) fills the copyable example a refusal for no resolving
     anchor ends with."""
-    run_a, run_b, binary = meta["run_a_id"], meta["run_b_id"], meta["binary_a"]
     entries = listed_view(atlas, built).entries
-    subjects = dr.subjects_of(entries, run_a, run_b, binary)
+    subjects = dr.WritableSubjects(atlas, built, entries)
     entry_ids = {e.entry_id for e in entries}
-    row_refs = {ref for e in entries for r in e.rows for ref in (r.a_ref, r.b_ref) if ref}
+    row_refs = _row_refs(entries)
     hits = 0
     for i, raw in enumerate(items):
         item = raw.strip()
@@ -407,18 +417,35 @@ def require_file_checked_anchor(
         raise ConfigError(_rule_for(field))
 
 
+def _alternatives(atlas: sqlite3.Connection, built: BuiltDiff) -> tuple[_Entry, ...]:
+    """The diff's alternative entries (lib/query/pairing_components)."""
+    from treasure_map.lib.query.pairing_components import corrections
+
+    return corrections(atlas, built)[1]
+
+
+def _row_refs(entries: list[_Entry]) -> set[str]:
+    return {ref for e in entries for r in e.rows for ref in (r.a_ref, r.b_ref) if ref}
+
+
 # ── promotion ──────────────────────────────────────────────────────────────────────────────
 
 
-def _entry(built: BuiltDiff, meta: dict[str, Any], entry_id: str, entries: list[_Entry]) -> _Entry:
+def _entry(
+    built: BuiltDiff,
+    meta: dict[str, Any],
+    entry_id: str,
+    entries: list[_Entry],
+    alternatives: tuple[_Entry, ...] = (),
+) -> _Entry:
     """The listed entry named by its entry_id, or by its anchor_ref. ``entries`` is listed_view's
-    (bucket S included)."""
+    (bucket S included); ``alternatives`` the alternative entries, named the same ways."""
     if entry_id.split("#", 2)[1:2] == ["non_binary"]:
         raise ConfigError(
             "promote carries a judgment onto a candidate of a function entry; a non-binary file "
             "has no candidate rows"
         )
-    by_id = {e.entry_id: e for e in entries}
+    by_id = {e.entry_id: e for e in (*entries, *alternatives)}
     if entry_id in by_id:
         return by_id[entry_id]
     if "#" in entry_id:
@@ -429,7 +456,7 @@ def _entry(built: BuiltDiff, meta: dict[str, Any], entry_id: str, entries: list[
                 "name the candidate with row_ref"
             )
         run_a, run_b, binary = meta["run_a_id"], meta["run_b_id"], meta["binary_a"]
-        for e in entries:
+        for e in (*entries, *alternatives):
             if dr.entry_anchor(e, run_a, run_b, binary) == entry_id:
                 return e
     raise ConfigError(f"{entry_id!r} is not an entry get_diff_patch_view lists for this diff now")
@@ -452,10 +479,11 @@ def check_promotion(
        (a P row whose function was not analysed — ``absent`` — says nothing about the candidate).
        Everything else is refused with its landing, subclass and presence_reason as the view
        states them. Every row of the entry that carries ``row_ref`` must pass.
-    2. WHETHER THE COUNTERPART IS DETERMINED — a pair that is ``alignment_undetermined``, or a
-       function with no counterpart whose presence is anything but
-       ``unmatched_analysis_complete`` (analysis incomplete, or the two inventories disagree), is
-       refused whatever its rows say.
+    2. WHETHER THE COUNTERPART IS DETERMINED — a pair that is ``alignment_undetermined``, an
+       alternative entry (a pairing an alternative-pairing claim proposes, lib/query/
+       pairing_components: resolved, never promoted), or a function with no counterpart whose
+       presence is anything but ``unmatched_analysis_complete`` (analysis incomplete, or the two
+       inventories disagree), is refused whatever its rows say.
     3. WHETHER THE DIFF IS CURRENT — ``source_stale`` must be false; true or null is refused unless
        ``allow_stale_source``, which is then recorded in the origin.
 
@@ -468,7 +496,22 @@ def check_promotion(
     """
     meta = _binary_diff(atlas, diff_id)
     built = _built(atlas, diff_id)
-    e = _entry(built, meta, entry_id, listed_view(atlas, built).entries)
+    entries = listed_view(atlas, built).entries
+    try:
+        e = _entry(built, meta, entry_id, entries)
+    except ConfigError:
+        # Not a listed entry: an alternative entry's id or anchor (read only now), or none.
+        e = _entry(built, meta, entry_id, entries, _alternatives(atlas, built))
+    if e.pair is not None and e.pair.kind == "alternative":
+        raise PromotionRefusedError(
+            f"{e.entry_id} is an alternative pairing (a pairing-correction claim, not the diff's "
+            "pairing): whether the two functions are counterparts is not established — judge it "
+            "on its anchor; its candidates are judged on their own entries",
+            {
+                "alignment_state": e.pair.state,
+                "pairing_correction": (e.pairing_correction or {}).get("component_id"),
+            },
+        )
     anchor = dr.entry_anchor(e, meta["run_a_id"], meta["run_b_id"], meta["binary_a"])
     carrying = [
         v for r, v in zip(e.rows, e.row_views, strict=True) if row_ref in (r.a_ref, r.b_ref)
