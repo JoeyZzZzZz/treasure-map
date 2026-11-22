@@ -3208,7 +3208,8 @@ def test_the_report_declares_the_two_named_attribution_and_entry_reach_gaps(
     """★ F-1 / F-2: the two fact-layer gaps this view cannot close are NAMED blind spots, declared
     with every report (``not_seen``, and the markdown's "Not seen by this view") rather than left
     for a reader to infer — a source whose provenance is lost to a local variable or an accessor,
-    and the entry reach of a CGI that dispatches on a path within a request object.
+    and the entry reach of a CGI nothing in the image names, which the entry probe can only see by
+    where the file is placed.
 
     MUTATION (verified RED, ``1 failed``): drop either entry from NOT_SEEN -> RED."""
     from treasure_map.lib.query import review_report as rr
@@ -3216,7 +3217,7 @@ def test_the_report_declares_the_two_named_attribution_and_entry_reach_gaps(
     w = World(tmp_path, monkeypatch)
     w.pair(DX, "00001000", "00001100")
     r = _review(w)
-    named = {"source_attribution_through_local_or_accessor", "entry_reach_of_object_path_dispatch"}
+    named = {"source_attribution_through_local_or_accessor", "entry_reach_of_cgi_named_nowhere"}
     assert named <= set(r.report["not_seen"]), r.report["not_seen"]
     section = rr.markdown(r).partition("## Not seen by this view")[2]
     for gap in sorted(named):

@@ -18,18 +18,29 @@ Hard rules (do not relax):
   NOT a safety verdict.
 - `entry_reach` lists the call sites found; "no site found" is reported as ``unknown``, never as
   "unreachable" (a binary may be invoked at runtime, via another binary's exec, or over IPC).
+  One site kind is an INFERENCE, not a reference: a CGI file placed inside a directory tree a
+  NAMED CGI is served from carries ``basis: "inferred"`` and the co-location it was inferred
+  from, so a reader can demote a sibling that is in fact dead. Every other site is a direct
+  textual/structural reference and carries no ``basis``.
 - `trace_boundary` states honestly where the structured trace stopped and why.
 
-Nothing here feeds recall, the review-ordering score, or the reachability grade — it is read-only
-evidence attached to the candidate for a later layer to consume.
+Nothing here GRADES recall, the review-ordering score, or reachability — it is read-only evidence
+attached to the candidate, and a later layer consumes it (the reachability dim is graded in the
+triage read layer, from the site kinds this module records). What the evidence says does bear on
+that grade: an entry site is what lifts a candidate's reachability out of ``unknown``, which moves
+it in the review ordering. So adding a site here is a ranking change by construction — which is
+why the inferred kind above states the inference in its own field instead of hiding inside a
+reference.
 """
 
 from __future__ import annotations
 
+import posixpath
 import re
 import sqlite3
 from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -634,6 +645,161 @@ def _ref_at_boundary(name: str, ep: str) -> bool:
     return re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", ep) is not None
 
 
+# The file extension a served CGI file is recognised by. Deliberately the only test for "this is
+# a CGI": a web server's handler map lives in its config, which the default hunt does not read, so
+# a mapping-based test is not computable here. Extension-only also keeps the helper files that sit
+# in a web directory (a shared library, an extensionless data file) out of the inference — they are
+# not request targets, and a wrong extension leaves the candidate at ``unknown``, never at a
+# claimed reachability.
+CGI_SUFFIX = ".cgi"
+
+# Rootfs-relative directories that must NEVER become a served root, by path and in full (a
+# descendant of one is fine: ``usr/www`` is a real web root, ``usr`` is not). An anchor misplaced
+# in one of these — a web asset naming a short binary name that also happens to be a system
+# binary's — would otherwise hand web reachability to every CGI in a system tree. The filesystem
+# root is in here as the empty string: a binary directly at the rootfs root roots the whole image.
+_NEVER_SERVED_ROOTS: frozenset[str] = frozenset(
+    {
+        "",
+        ".",
+        "bin",
+        "sbin",
+        "lib",
+        "lib32",
+        "lib64",
+        "libexec",
+        "etc",
+        "dev",
+        "proc",
+        "sys",
+        "tmp",
+        "var",
+        "run",
+        "opt",
+        "mnt",
+        "media",
+        "boot",
+        "home",
+        "root",
+        "srv",
+        "usr",
+        "usr/bin",
+        "usr/sbin",
+        "usr/lib",
+        "usr/lib32",
+        "usr/lib64",
+        "usr/libexec",
+        "usr/local",
+        "usr/local/bin",
+        "usr/local/sbin",
+        "usr/local/lib",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ServedRoot:
+    """A directory tree a NAMED CGI is served from: the evidence that lets a CGI file placed in it
+    be read as web-reachable without being named anywhere itself.
+
+    ``directory`` is spelled exactly as the binaries table spells it — an absolute host path in a
+    normal scan, and whatever that table holds otherwise, because it is what a membership test
+    compares; ``rel_directory`` is the same directory relative to the rootfs, and ``seed`` the
+    name of the named CGI it was derived from — the two that go into the inferred site's note, so
+    the reader sees WHICH co-location was inferred from and can disagree with it."""
+
+    directory: str
+    rel_directory: str
+    seed: str
+
+
+def _inventory_relative_paths(conn: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
+    """``sha256 -> rootfs-relative paths`` from the file inventory, for placing a binary inside the
+    image. Empty for an analysis.db without the inventory (every served root is then undecidable
+    and none is derived — see :func:`served_cgi_roots`)."""
+    try:
+        rows = conn.execute(
+            "SELECT sha256, path FROM file_inventory WHERE sha256 IS NOT NULL AND path IS NOT NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    out: dict[str, list[str]] = {}
+    for sha, path in rows:
+        out.setdefault(str(sha), []).append(str(path))
+    return {sha: tuple(sorted(paths)) for sha, paths in out.items()}
+
+
+def _rootfs_relative(binary_path: str, candidates: tuple[str, ...]) -> str | None:
+    """Where ``binary_path`` sits relative to the rootfs, chosen from the inventory paths that
+    share its content; None when none of them spells this file's path.
+
+    The binaries table records an absolute host path and the inventory a rootfs-relative one, so
+    the two are joined by content and confirmed by suffix. One content can live at several paths;
+    the longest suffix match is the most specific, and the name order breaks a tie so the choice
+    is the same on every re-hunt (the site this feeds is stored text an overlay judgement's basis
+    compares). A binaries table that spells the path rootfs-relative ITSELF has no suffix to
+    match, so an exact equality counts too — otherwise the inference would be silently off for
+    such a database rather than honestly unavailable."""
+    relative_table = not binary_path.startswith("/")
+    matches = [
+        r
+        for r in candidates
+        if binary_path.endswith("/" + r.lstrip("/"))
+        or (relative_table and r.lstrip("/") == binary_path)
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda r: (-len(r), r))[0]
+
+
+def served_cgi_roots(conn: sqlite3.Connection, index: EntryIndex) -> tuple[ServedRoot, ...]:
+    """The directory trees a NAMED CGI is served from, over EVERY binary in the image.
+
+    A global prescan, run once before any candidate is looked at: a single binary's own view
+    cannot see that a sibling CGI one directory up is named by a web asset, so this cannot be
+    computed inside :meth:`EntryIndex.sites_for`.
+
+    ★ Load-bearing limits on what may seed a root, each one a tree that must NOT be served:
+      * ONLY a real ``web_endpoint`` name match seeds (``index`` is the probe built for exactly
+        this question — it holds the web assets and nothing else, so a ``script_call`` or an
+        ``exec_edge`` reference cannot seed, and neither can an inferred site: this is one pass
+        with no feedback into its own input). A system directory holds hundreds of
+        script-launched binaries; seeded there, the inference would cover all of them.
+      * The web server's OWN directory is not a served root by virtue of being a web server's —
+        only the directory of a binary a web asset NAMES is, which is a request target.
+      * A system directory is refused outright (``_NEVER_SERVED_ROOTS``), as is a binary whose
+        place in the image cannot be established from the inventory: unplaceable means
+        unguardable, so it is dropped rather than trusted.
+    Nothing is invented when no root survives — the candidates stay ``unknown``."""
+    try:
+        bins = conn.execute("SELECT name, path, sha256 FROM current_binaries").fetchall()
+    except sqlite3.OperationalError:
+        return ()
+    inventory = _inventory_relative_paths(conn)
+    roots: dict[str, tuple[str, str]] = {}
+    for name, path, sha in ((r[0], r[1], r[2]) for r in bins):
+        if not path or not any(
+            s.get("kind") == "web_endpoint" for s in index.sites_for(name, path)
+        ):
+            continue
+        relative = _rootfs_relative(str(path), inventory.get(str(sha), ()))
+        if relative is None:
+            continue
+        rel_directory = posixpath.dirname(relative.lstrip("/"))
+        if rel_directory in _NEVER_SERVED_ROOTS:
+            continue
+        directory, seed = posixpath.dirname(str(path)), posixpath.basename(str(path))
+        kept = roots.get(directory)
+        # One root, one seed in the note, picked by name so two named CGIs in a directory do not
+        # make the stored site text depend on the row order.
+        if kept is None or seed < kept[1]:
+            roots[directory] = (rel_directory, seed)
+    return tuple(
+        ServedRoot(directory, rel_directory, seed)
+        for directory, (rel_directory, seed) in sorted(roots.items())
+    )
+
+
 class EntryIndex:
     """In-memory index of rootfs entry evidence (L0.5 ``script_calls`` + ``web_endpoints``).
 
@@ -647,6 +813,7 @@ class EntryIndex:
         ],
         web_endpoints: list[tuple[str | None, str | None, str | None, str | None, str | None]],
         exec_sites: dict[str, list[dict[str, Any]]] | None = None,
+        served_roots: tuple[ServedRoot, ...] = (),
     ) -> None:
         self._script_calls = script_calls
         self._web_endpoints = web_endpoints
@@ -655,6 +822,11 @@ class EntryIndex:
         # a table this index can read). Optional on purpose — an index built without it degrades to
         # exactly the previous behaviour instead of failing, so an older caller keeps working.
         self._exec_sites = exec_sites or {}
+        # The image-wide prescan (:func:`served_cgi_roots`), which no per-binary view can compute.
+        # Empty by default, and an index built without it behaves exactly as it did before the
+        # inference existed — the prescan is the ONLY producer, so a script or exec reference can
+        # never arrive here as a root.
+        self._served_roots = served_roots
 
     def sites_for(self, binary_name: str | None, binary_path: str | None) -> list[dict[str, Any]]:
         """Every entry site referencing the binary (all sites). Each script site carries the script
@@ -665,11 +837,20 @@ class EntryIndex:
         a rootfs script that invokes the binary, a web asset that names it, and another binary that
         launches it (an ``exec_edge`` site). All three are textual/structural references, and none
         of them is proof that input arrives — the caller must not collapse them into a verdict.
+
+        A fourth kind is an INFERENCE from placement, not a reference: a CGI file inside a
+        directory tree a named CGI is served from (:func:`served_cgi_roots`). It is offered only to
+        a binary no web asset names, carries ``basis: "inferred"`` with the co-location it rests
+        on, and carries no endpoint — there is no request for it to quote. The reachability grade
+        it produces is the same one a named site produces (that is the point: a request-reachable
+        CGI should not sort below an unreachable one), so the distinction lives in the site, and a
+        reader who finds the sibling dead demotes it from there.
         """
         names = {n for n in (binary_name, Path(binary_path).name if binary_path else None) if n}
         if not names:
             return []
         sites: list[dict[str, Any]] = []
+        web_named = False
         for script, command, line, args_pattern, via, via_line in self._script_calls:
             cmd = command or ""
             # References the binary when the command token is, or ends in, the binary name
@@ -694,6 +875,7 @@ class EntryIndex:
             # Path/word-boundary match, NOT bare substring: a short binary name ("rc") must sit on
             # a segment boundary of the endpoint, so per(rc)ent does not spuriously attach.
             if any(_ref_at_boundary(n, ep) for n in names):
+                web_named = True
                 sites.append(
                     {
                         "kind": "web_endpoint",
@@ -712,7 +894,33 @@ class EntryIndex:
         for key in (binary_path, *sorted(names)):
             if key:
                 sites.extend(self._exec_sites.get(key, ()))
+        # ★ The inference goes LAST, after every direct reference, and only to a binary no web
+        # asset names: a named CGI keeps exactly the site list it had, so the one place the two
+        # can be told apart stays clean.
+        inferred = None if web_named else self._served_site(binary_path)
+        if inferred is not None:
+            sites.append(inferred)
         return sites
+
+    def _served_site(self, binary_path: str | None) -> dict[str, Any] | None:
+        """The inferred ``web_endpoint`` site for a CGI file placed in a served tree; None when
+        the binary is not a CGI file, sits in no served tree, or has no recorded path (a tree is a
+        statement about placement, and an unplaced file has none)."""
+        if not binary_path or not binary_path.endswith(CGI_SUFFIX):
+            return None
+        under = [r for r in self._served_roots if binary_path.startswith(r.directory + "/")]
+        if not under:
+            return None
+        # The most specific tree the file sits in, so the note names the nearest served directory;
+        # the path order breaks a tie, keeping the stored text the same on every re-hunt.
+        root = sorted(under, key=lambda r: (-len(r.directory), r.directory))[0]
+        return {
+            "kind": "web_endpoint",
+            "basis": "inferred",
+            "note": (
+                f"co-located with proven CGI {root.seed} under served root {root.rel_directory}"
+            ),
+        }
 
 
 def load_entry_index(
@@ -723,7 +931,12 @@ def load_entry_index(
 
     ``exec_sites`` comes from a different source than the two tables here — it is computed during
     the hunt from the call provenance, keyed by the binary being launched. Omitting it degrades to
-    the rootfs-only index rather than failing, so the two sources stay independent."""
+    the rootfs-only index rather than failing, so the two sources stay independent.
+
+    The served-root prescan runs here, on this same connection and before the index any candidate
+    is read with exists: it needs every binary at once, which is exactly what this one-per-
+    analysis.db load has in front of it. It is seeded from a PROBE index holding the web assets
+    alone, so only a real endpoint name match can produce a root (see :func:`served_cgi_roots`)."""
     # ★ An older analysis.db has no via / via_line columns, and this read is read-only so no
     # migration adds them. Asking for them there would raise, and the except below would turn
     # every script entry into "none found" — so the columns are asked for only when present.
@@ -748,8 +961,11 @@ def load_entry_index(
         ).fetchall()
     except sqlite3.OperationalError:
         we = []
+    script_calls = [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in sc]
+    web_endpoints = [(r[0], r[1], r[2], r[3], r[4]) for r in we]
     return EntryIndex(
-        [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in sc],
-        [(r[0], r[1], r[2], r[3], r[4]) for r in we],
+        script_calls,
+        web_endpoints,
         exec_sites=exec_sites,
+        served_roots=served_cgi_roots(conn, EntryIndex([], web_endpoints)),
     )

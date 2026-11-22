@@ -214,10 +214,12 @@ NOT_SEEN = (
     # from. ``multi_hop`` is the SINK side of this (a sink two calls away); the source side is
     # its own gap.
     "source_attribution_through_local_or_accessor",
-    # An entry probe recognizes a CGI that dispatches on a path within a request object by none of
-    # its mechanisms, so every candidate of such a binary reads reachability unknown — never
-    # "not reached".
-    "entry_reach_of_object_path_dispatch",
+    # A CGI reached by a direct path request, which no rootfs script invokes, no binary execs, and
+    # no web asset names (a front end that builds the URL rather than writing the file name leaves
+    # nothing to match). The entry probe then sees it by PLACEMENT only — inside a directory tree
+    # some NAMED CGI is served from — and in an image where nothing is named, not at all: every
+    # candidate of such a binary reads reachability unknown, never "not reached".
+    "entry_reach_of_cgi_named_nowhere",
 )
 
 
