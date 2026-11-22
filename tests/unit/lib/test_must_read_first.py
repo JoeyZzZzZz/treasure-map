@@ -26,6 +26,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
     PAIR,
     World,
     _clear_view_caches,
+    landed_refs,
 )
 from tests.unit.lib.test_review_units import _build_world, _judge_args, _review, _server_call
 from treasure_map import mcp_app
@@ -76,7 +77,11 @@ def _mixed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, failed: bool = Fa
 
 def _judge_unit(w: World, u: ru.Unit) -> None:
     for m in u.members:
-        w.judge(m.stream, m.anchor_ref, "changed_real")
+        # A changed_real cites the rows its change landed on, else the gate holds it (E-1).
+        basis = None
+        if refs := landed_refs(w.atlas, m.stream, m.anchor_ref):
+            basis = {"evidence": [m.anchor_ref, *refs]}
+        w.judge(m.stream, m.anchor_ref, "changed_real", verdict_basis=basis)
 
 
 def _loop(w: World, *, sweep: bool, k: int = 0) -> list[ru.Unit]:
@@ -235,7 +240,7 @@ def test_a_failed_diff_does_not_keep_the_review_from_stopping(
             break
         assert nu["kind"] != ru.SECOND_TIER, nu
         for m in nu["members"]:
-            answer = _server_call(server, "annotate_diff", _judge_args(m, nu["unit_id"]))
+            answer = _server_call(server, "annotate_diff", _judge_args(m, nu["unit_id"], w.atlas))
             assert answer.get("written") is True, answer
         nu = answer.get("next_unit")
     assert nu is None and "coverage_offer" in answer, answer
@@ -265,7 +270,7 @@ def test_every_hand_out_point_stops_and_sweep_carries_on_through_a_write(
     while nu is not None:
         assert nu["kind"] != ru.SECOND_TIER and nu["must_read"] is True, nu
         for m in nu["members"]:
-            answer = _server_call(server, "annotate_diff", _judge_args(m, nu["unit_id"]))
+            answer = _server_call(server, "annotate_diff", _judge_args(m, nu["unit_id"], w.atlas))
         nu = answer.get("next_unit")
     assert answer["next_unit"] is None
     # exactly these keys: no separate "other direction unread" count (that is basis_incomplete)
@@ -277,7 +282,7 @@ def test_every_hand_out_point_stops_and_sweep_carries_on_through_a_write(
     assert nu is not None and nu["kind"] == ru.SECOND_TIER, swept
     first = nu["unit_id"]
     for m in nu["members"]:
-        answer = _server_call(server, "annotate_diff", _judge_args(m, first))
+        answer = _server_call(server, "annotate_diff", _judge_args(m, first, w.atlas))
     nxt = answer.get("next_unit")
     assert nxt is not None and nxt["kind"] == ru.SECOND_TIER and nxt["unit_id"] != first, answer
     assert answer.get("sweep") == {"on": True, "inferred": True}
@@ -321,7 +326,7 @@ def test_without_a_log_a_write_hands_on_the_default_and_says_why(
     tools = mcp_app.make_tools(w.path)  # no call log
     nu = tools["start_diff_review"](run_pair=PAIR, k=0, sweep=True)["next_unit"]
     assert nu["kind"] == ru.ENTRY or nu["must_read"] is True
-    got = tools["annotate_diff"](**_judge_args(nu["members"][0], nu["unit_id"]))
+    got = tools["annotate_diff"](**_judge_args(nu["members"][0], nu["unit_id"], w.atlas))
     assert got.get("sweep", {}).get("on") is False and "no tool-call log" in got["sweep"]["why"]
 
 

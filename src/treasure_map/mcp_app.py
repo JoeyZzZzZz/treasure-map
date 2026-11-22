@@ -6183,6 +6183,32 @@ def make_tools(
             )
         return out
 
+    def _entry_citations(
+        view: dict[str, Any], anchor_ref: str, verdict: str, basis: Any
+    ) -> dict[str, Any]:
+        """A changed_real's answer on a function_pair entry: how far it cites the rows the change
+        LANDED on (the gate's shape, ``review_units.entry_citation_gap``), and — when it cites
+        fewer than it owes — which rows are missing, so the next write can name them. Without
+        this the gate would bounce a write with nothing to act on."""
+        entry_id = _entry_id_of(anchor_ref)
+        built = view.get("built") if isinstance(view, dict) else None
+        if verdict != "changed_real" or built is None or entry_id is None:
+            return {}
+        entry = next((e for e in built.placed if e.entry_id == entry_id), None)
+        if entry is None:
+            return {}
+        gap = _ru.entry_citation_gap(entry, basis)
+        if gap is None:
+            return {}
+        out: dict[str, Any] = {"row_citations": gap}
+        if gap["cited"] < gap["owed"]:
+            out["row_citations_short"] = (
+                f"cites {gap['cited']} of the {gap['owed']} rows this entry's change landed on "
+                "(a row whose landing is not persisted): it reads needs_recheck (not disposed) "
+                "until judged again with evidence naming them — missing_sample lists some"
+            )
+        return out
+
     def _write_hints_pass() -> Any:
         """One write call's pass over its same-shape groups (lib/query/write_hints)."""
         return _wh.SameShapePass(
@@ -6447,6 +6473,8 @@ def make_tools(
                 and _dr_mod.is_binary_presence_anchor(anchor_ref)
             ):
                 result.update(_presence_citations(atlas, run_pair, anchor_ref, given or None))
+            if not shadow and _entry_id_of(anchor_ref) is not None:
+                result.update(_entry_citations(view, anchor_ref, verdict, given or None))
             # Read when written, before the answer's size is taken: the next unit's material is fit
             # in what this leaves.
             hints_pass = _write_hints_pass()

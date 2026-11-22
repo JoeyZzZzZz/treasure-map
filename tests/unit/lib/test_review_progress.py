@@ -30,6 +30,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
     PAIR,
     World,
     _clear_view_caches,
+    landed_refs,
 )
 from tests.unit.lib.test_must_read_first import FAILED_DIFF, _mixed
 from tests.unit.lib.test_review_units import (
@@ -92,12 +93,22 @@ def _session_lines(w: World, server: Any) -> list[dict[str, Any]]:
     return [ln for ln in lines if ln.get("session") == server._call_log.session.id]
 
 
-def _batch(server: Any, nu: dict[str, Any]) -> dict[str, Any]:
+def _batch(server: Any, nu: dict[str, Any], atlas: Any) -> dict[str, Any]:
     """Judge every member of the unit ``nu`` in one batch write naming it."""
     diffs = {_diff_of(m["anchor_ref"]) for m in nu["members"]}
     assert len(diffs) == 1, diffs  # the precondition: one diff's members
     items = [
-        {"anchor_ref": m["anchor_ref"], "verdict": "changed_real", "rationale": "r"}
+        {
+            "anchor_ref": m["anchor_ref"],
+            "verdict": "changed_real",
+            "rationale": "r",
+            # cite the rows the change landed on, else the gate holds it (E-1)
+            **(
+                {"evidence": [m["anchor_ref"], *refs]}
+                if (refs := landed_refs(atlas, _diff_of(m["anchor_ref"]), m["anchor_ref"]))
+                else {}
+            ),
+        }
         for m in nu["members"]
     ]
     out = _server_call(
@@ -109,14 +120,14 @@ def _batch(server: Any, nu: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _must_read_loop(server: Any, *, k: int = 0, **extra: Any) -> dict[str, Any]:
+def _must_read_loop(server: Any, atlas: Any, *, k: int = 0, **extra: Any) -> dict[str, Any]:
     """Judge every unit handed out until none is: the last write's answer."""
     answer = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": k, **extra})
     nu = answer["next_unit"]
     for _ in range(40):
         if nu is None:
             return answer
-        answer = _batch(server, nu)
+        answer = _batch(server, nu, atlas)
         nu = answer["next_unit"]
     raise AssertionError("the loop did not end")
 
@@ -146,7 +157,7 @@ def test_this_session_counts_what_was_handed_before_this_answer(
     nu = head["next_unit"]
     for _ in range(2):
         expected.append(sum(ln["response_bytes"] for ln in _session_lines(w, server)))
-        out = _batch(server, nu)
+        out = _batch(server, nu, w.atlas)
         seen.append(out["progress"]["this_session"])
         nu = out["next_unit"]
         assert nu is not None
@@ -164,12 +175,16 @@ def test_a_second_session_on_the_same_log_counts_its_own(
     bytes and unit counted -> RED."""
     w = _build_world(tmp_path, monkeypatch)
     first = mcp_app.build_server(w.path)
-    _batch(first, _server_call(first, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"])
+    _batch(
+        first,
+        _server_call(first, "start_diff_review", {"run_pair": PAIR, "k": 0})["next_unit"],
+        w.atlas,
+    )
     assert _session_lines(w, first)  # the precondition: the first session's lines are there
     second = mcp_app.build_server(w.path)
     got = _server_call(second, "start_diff_review", {"run_pair": PAIR, "k": 0})
     assert got["progress"]["this_session"] == {"units_handed": 0, "response_bytes": 0}
-    nxt = _batch(second, got["next_unit"])
+    nxt = _batch(second, got["next_unit"], w.atlas)
     mine = _session_lines(w, second)
     assert nxt["progress"]["this_session"] == {
         "units_handed": 1,
@@ -186,7 +201,7 @@ def test_without_a_log_this_session_is_unknown_and_the_rest_is_given(
     tools = mcp_app.make_tools(w.path)  # no call log
     head = tools["start_diff_review"](run_pair=PAIR, k=0)
     nu = head["next_unit"]
-    out = tools["annotate_diff"](**_judge_args(nu["members"][0], nu["unit_id"]))
+    out = tools["annotate_diff"](**_judge_args(nu["members"][0], nu["unit_id"], w.atlas))
     for p in (head["progress"], out["progress"]):
         assert p["this_session"] is None
         assert p["this_session_unavailable"] == "no tool-call log for this session"
@@ -216,7 +231,9 @@ def test_what_is_left_is_the_must_read_part(
         "members": mr["members"] - mr["members_disposed"],
     }
     nu = head["next_unit"]
-    out = _server_call(server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"]))
+    out = _server_call(
+        server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"], w.atlas)
+    )
     assert out["progress"]["must_read_left"]["members"] == before["members"] - 1
     rep = _review(w, k=0).report["must_read"]
     assert out["progress"]["must_read_left"]["members"] == rep["members"] - rep["members_disposed"]
@@ -276,7 +293,7 @@ def test_every_cause_of_an_incomplete_must_read_part_is_shown(
     w.atlas.commit()
     server = mcp_app.build_server(w.path)
     if cause != "must_read_left":
-        _must_read_loop(server)
+        _must_read_loop(server, w.atlas)
     anchor = next(m.anchor_ref for u in _review(w, k=0).units if u.must_read for m in u.members)
     if cause == "disagreements":
         other = overlay.WriteContext(channel="mcp", session="another session")
@@ -315,7 +332,7 @@ def test_every_stop_carries_progress(tmp_path: Path, monkeypatch: pytest.MonkeyP
     _after_unit_write's after its ``if nxt is None`` return -> RED."""
     w = _mixed(tmp_path, monkeypatch)
     server = mcp_app.build_server(w.path)
-    last = _must_read_loop(server)
+    last = _must_read_loop(server, w.atlas)
     head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
     for answer in (last, head):
         assert answer["next_unit"] is None
@@ -347,14 +364,19 @@ def test_the_material_is_fitted_beside_progress(
     server = mcp_app.build_server(w.path)
     first = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 1})
     e1 = first["next_unit"]  # one entry; the 59 others are one second-tier batch
-    one = _server_call(server, "annotate_diff", _judge_args(e1["members"][0], e1["unit_id"]))
+    one = _server_call(
+        server, "annotate_diff", _judge_args(e1["members"][0], e1["unit_id"], w.atlas)
+    )
     start = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 1})
     nu = start["next_unit"]
-    item = {
-        "anchor_ref": nu["members"][0]["anchor_ref"],
+    one_anchor = nu["members"][0]["anchor_ref"]
+    item: dict[str, Any] = {
+        "anchor_ref": one_anchor,
         "verdict": "changed_real",
         "rationale": "r",
     }
+    if refs := landed_refs(w.atlas, _diff_of(one_anchor), one_anchor):
+        item["evidence"] = [one_anchor, *refs]
     batch = _server_call(
         server,
         "annotate_diff_batch",
@@ -395,7 +417,10 @@ def _shard_done_elsewhere_owed(w: World, workers: int) -> int:
     worker = next(i for i, us in holders.items() if us and len(us) < len(units))
     for u in holders[worker]:
         for m in u.members:
-            w.judge(m.stream, m.anchor_ref, "changed_real")
+            basis = None
+            if refs := landed_refs(w.atlas, m.stream, m.anchor_ref):
+                basis = {"evidence": [m.anchor_ref, *refs]}
+            w.judge(m.stream, m.anchor_ref, "changed_real", verdict_basis=basis)
     return worker
 
 
@@ -426,7 +451,9 @@ def test_in_a_shard_progress_says_its_counts_are_the_pairs(
     swept = _server_call(server, "start_diff_review", {**args, "sweep": True})
     nu = swept["next_unit"]
     assert nu is not None and nu["kind"] == ru.SECOND_TIER
-    out = _server_call(server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"]))
+    out = _server_call(
+        server, "annotate_diff", _judge_args(nu["members"][0], nu["unit_id"], w.atlas)
+    )
     assert out.get("shard", {}).get("inferred") is True  # the precondition
     assert (out["progress"].get("scope"), out["progress"].get("pair_wide")) == ("shard", PAIR_WIDE)
     whole = _server_call(
@@ -501,7 +528,7 @@ def test_progress_carries_no_reachability_or_verdict_word(
     w.atlas.commit()
     server = mcp_app.build_server(w.path)
     blocks = [_server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})["progress"]]
-    blocks.append(_must_read_loop(server)["progress"])
+    blocks.append(_must_read_loop(server, w.atlas)["progress"])
     blocks.append(mcp_app.make_tools(w.path)["start_diff_review"](run_pair=PAIR, k=0)["progress"])
     words = [t for b in blocks for t in _words(b, [])]
     assert "still" in words and "pair" in words  # the scan read the block
@@ -525,7 +552,7 @@ def test_every_progress_field_the_skill_names_is_in_the_answer(
     server = mcp_app.build_server(w.path)
     head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
     assert head["next_unit"] is not None
-    stop = _must_read_loop(server)
+    stop = _must_read_loop(server, w.atlas)
     for answer in (head, stop):
         assert named <= set(answer["progress"]), sorted(named - set(answer["progress"]))
 
@@ -541,7 +568,7 @@ def test_a_fresh_session_continues_with_the_next_unit_not_disposed(
     a = mcp_app.build_server(w.path)
     head = _server_call(a, "start_diff_review", {"run_pair": PAIR, "k": 0})
     u1 = head["next_unit"]
-    stopped = _batch(a, u1)
+    stopped = _batch(a, u1, w.atlas)
     assert stopped["progress"]["resume_with"] == f'start_diff_review(run_pair="{PAIR}", k=0)'
     b = mcp_app.build_server(w.path)
     got = _server_call(b, "start_diff_review", {"run_pair": PAIR, "k": 0})

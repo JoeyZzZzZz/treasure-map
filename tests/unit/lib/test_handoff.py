@@ -14,7 +14,13 @@ from typing import Any
 import pytest
 
 from tests.unit.lib import test_same_shape_siblings as sst
-from tests.unit.lib.test_diff_review import DX, World, _pair_anchor, a_row  # noqa: F401
+from tests.unit.lib.test_diff_review import (  # noqa: F401
+    DX,
+    World,
+    _pair_anchor,
+    a_row,
+    landed_refs,
+)
 from tests.unit.lib.test_file_diff import FW, SECRET_VALUE
 from treasure_map import mcp_app, version
 from treasure_map.lib import overlay
@@ -76,7 +82,10 @@ def _judge_changed_real(w: World, anchor: str) -> None:
         anchor_ref=anchor,
         verdict="changed_real",
         rationale="looked at both sides",
-        verdict_basis={"change_kind": ["sink_replaced"], "evidence": [anchor]},
+        verdict_basis={
+            "change_kind": ["sink_replaced"],
+            "evidence": [anchor, *landed_refs(w.atlas, DX, anchor)],
+        },
         ctx=overlay.WriteContext(channel="mcp", session="s"),
     )
 
@@ -215,7 +224,10 @@ def _wide_findings_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int
             anchor_ref=anchor,
             verdict="changed_real",
             rationale="r",
-            verdict_basis={"change_kind": ["restructured"], "evidence": [anchor]},
+            verdict_basis={
+                "change_kind": ["restructured"],
+                "evidence": [anchor, *landed_refs(w.atlas, DX, anchor)],
+            },
             ctx=overlay.WriteContext(channel="mcp", session="s"),
         )
     return w
@@ -288,7 +300,10 @@ def test_findings_digest_changes_when_a_judgment_is_written(
         anchor_ref=anchor,
         verdict="changed_real",
         rationale="r",
-        verdict_basis={"change_kind": ["restructured"], "evidence": [anchor]},
+        verdict_basis={
+            "change_kind": ["restructured"],
+            "evidence": [anchor, *landed_refs(w.atlas, DX, anchor)],
+        },
         ctx=overlay.WriteContext(channel="mcp", session="s2"),
     )
     second = _server_call_on(w.path, "get_diff_handoff", {"run_pair": PAIR})["findings_digest"]
@@ -611,7 +626,14 @@ def _judge(
         anchor_ref=anchor,
         verdict="changed_real",
         rationale=rationale,
-        verdict_basis={"change_kind": ["restructured"]},
+        verdict_basis={
+            "change_kind": ["restructured"],
+            **(
+                {"evidence": [anchor, *refs]}
+                if diff_id and (refs := landed_refs(atlas, diff_id, anchor))
+                else {}
+            ),
+        },
         ctx=overlay.WriteContext(channel="mcp", session="s"),
     )
 

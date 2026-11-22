@@ -2118,3 +2118,32 @@ def test_a_candidate_row_judgement_on_a_listed_entry_is_not_unlisted(world: Worl
     assert cand in rows, sorted(rows)
     assert rows[cand]["review_state"] != dr.SUBJECT_UNLISTED, rows[cand]
     assert got["review_progress"]["judged_not_listed"]["count"] == 0
+
+
+def landed_refs(atlas: Any, diff_id: str, anchor: str) -> list[str]:
+    """The refs of the rows an entry's change LANDED on — what a changed_real on a must-read entry
+    has to cite to count as disposed (review_units ``entry_citations_short``). Empty when the entry
+    has no such row, which owes no citation."""
+    from treasure_map.lib.query import review_units as ru
+
+    parts = anchor.split("#", 2)
+    if len(parts) != 3 or parts[1] != "function_pair":
+        return []  # only a function_pair entry has rows of this shape
+    bits = parts[2].rsplit("::", 2)
+    if len(bits) != 3:
+        return []
+    entry_id = f"pair:{bits[1]}:{bits[2]}"
+    built = pv.build_diff_view(atlas, diff_id)
+    if built is None:
+        return []
+    e = next((x for x in built.placed if x.entry_id == entry_id), None)
+    if e is None:
+        return []
+    gap = ru.entry_citation_gap(e, None)
+    if gap is None:
+        return []
+    return [
+        ref
+        for r, v in zip(e.rows, e.row_views, strict=True)
+        if v["landing"] != "persisted" and (ref := r.a_ref or r.b_ref)
+    ][: ru.MAX_CITED]

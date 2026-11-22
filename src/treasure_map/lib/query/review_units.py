@@ -35,7 +35,12 @@ Besides the entries, every changed non-binary file of the pair is a must-read un
 so are the binaries one run of the pair holds alone (``binary_presence``): each function of such a
 binary holding a candidate is a must-read member (a binary holding none is one member on its own
 anchor), handed out per binary in batches. Such a member is disposed only when its judgement, of
-whatever verdict, cites every candidate of its subject (``presence_citations_short``). Every
+whatever verdict, cites every candidate of its subject (``presence_citations_short``). A
+``changed_real`` on a must-read function_pair entry is held to the same shape: it is disposed only
+when its ``checked`` / ``evidence`` cite every row of the entry that LANDED somewhere — every row
+whose ``landing`` is not ``persisted``, which is the rows the change is visible at — up to
+``MAX_CITED`` of them (``entry_citations_short``); an entry all of whose rows are ``persisted``
+owes no citation (a function-level change lands on no candidate row, which is legitimate). Every
 candidate row of a must-read entry is read with it: its unit's material carries up to a page of
 its rows (an entry alone, or each entry of a batch or group), the rest read on by entry_id and
 rows_offset; a member whose rows were not all delivered is not read whole by the material. A
@@ -91,6 +96,11 @@ BATCH_MAX = 200
 # material shows (an entry's scan runs ~2 KB, ~3.5 KB at the 90th percentile), so a unit is read
 # and judged from the page it is handed out on.
 BATCH_UNIT_MAX = 16
+
+# At most this many of an entry's landed rows a changed_real must cite (``entry_citations_short``).
+# An entry with more owes 20; the rest are counted in the hand-off, never required — an outlier
+# entry (the live maximum is in the hundreds) would otherwise owe a citation list nothing reads.
+MAX_CITED = 20
 
 # The sinks whose fewer calls on the B side make an aligned pair must-read: the command class (the
 # exec-path variant among it) and the argv-array runner the hunt does not recall.
@@ -199,6 +209,15 @@ NOT_SEEN = (
     "kernel_modules_information_only",
     "cross_binary_sink_chain",
     "indirect_calls_via_dispatch_tables",
+    # A field value read into a local variable first, or fetched through an accessor, loses its
+    # parameter provenance: the candidate's source reads unknown rather than the field it came
+    # from. ``multi_hop`` is the SINK side of this (a sink two calls away); the source side is
+    # its own gap.
+    "source_attribution_through_local_or_accessor",
+    # An entry probe recognizes a CGI that dispatches on a path within a request object by none of
+    # its mechanisms, so every candidate of such a binary reads reachability unknown — never
+    # "not reached".
+    "entry_reach_of_object_path_dispatch",
 )
 
 
@@ -849,6 +868,87 @@ def presence_citations_short(
     return out
 
 
+# ── the function_pair entries: whether a changed_real cites the rows it landed on ────────────
+
+
+def entry_citation_gap(e: Any, verdict_basis: Any) -> dict[str, Any] | None:
+    """How far a judgement's ``checked`` / ``evidence`` cite the rows of entry ``e`` that LANDED —
+    the rows whose ``landing`` is not ``persisted`` — or None when it has none of them (nothing is
+    owed: the change lands on no candidate row).
+
+    A row is cited by either of its refs (``a_ref`` / ``b_ref``), the two spellings a row_ref takes.
+    ``owed`` is what the gate requires: every landed row, capped at ``MAX_CITED``; ``uncited`` is
+    how many landed rows carry no citation whatever the cap, which the hand-off states."""
+    from treasure_map.lib.query import binary_presence as bp  # noqa: PLC0415
+
+    landed = [r for r, v in zip(e.rows, e.row_views, strict=True) if v["landing"] != "persisted"]
+    if not landed:
+        return None
+    cited = bp.cited_refs(verdict_basis)
+    hit = [r for r in landed if r.a_ref in cited or r.b_ref in cited]
+    missing = [ref for r in landed if r not in hit and (ref := r.a_ref or r.b_ref)]
+    return {
+        "required": len(landed),
+        "cited": len(hit),
+        "owed": min(len(landed), MAX_CITED),
+        "uncited": len(landed) - len(hit),
+        "missing_sample": missing[:5],
+    }
+
+
+def entry_citations_short(
+    atlas: sqlite3.Connection, facts: PairFacts, states: dict[str, str]
+) -> dict[str, dict[str, Any]]:
+    """The disposed ``changed_real`` judgements on must-read function_pair entries whose
+    ``checked`` / ``evidence`` do not cite the rows the change landed on — anchor -> what is
+    missing (``entry_citation_gap``).
+
+    Read against the LIVE view, the way ``presence_citations_short`` reads the live presence: an
+    entry the current view no longer lists under the judged id (re-paired since) is not read here
+    — its basis has already moved, and the gate never re-states that."""
+    from treasure_map.lib.query import patch_view as pv
+
+    out: dict[str, dict[str, Any]] = {}
+    pair = dr.run_pair(facts.run_a, facts.run_b)
+    rows = {
+        r[0]: r[2]
+        for r in atlas.execute(
+            "SELECT anchor_ref, verdict, verdict_basis FROM overlay "
+            "WHERE anchor_kind = 'diff_subject' AND run_id = ? AND verdict = 'changed_real'",
+            (pair,),
+        )
+    }
+    if not rows:
+        return out
+    want: dict[str, dict[str, str]] = {}
+    for d in facts.diffs:
+        for m in d.entries:
+            if (
+                m.kind == "entry"
+                and m.must_read
+                and m.entry_id is not None
+                # function_pair only: a function_presence subject has no row list of this shape,
+                # and a binary_presence one is already held to the stricter candidate gate.
+                and m.entry_id.startswith("pair:")
+                and m.anchor_ref in rows
+                and disposed(states.get(m.anchor_ref))
+            ):
+                want.setdefault(d.diff_id, {})[m.entry_id] = m.anchor_ref
+    for diff_id, by_entry in want.items():
+        built = pv.build_diff_view(atlas, diff_id)
+        if built is None:
+            continue
+        placed = {e.entry_id: e for e in built.placed}
+        for entry_id, anchor in by_entry.items():
+            e = placed.get(entry_id)
+            if e is None:
+                continue
+            gap = entry_citation_gap(e, rows[anchor])
+            if gap is not None and gap["cited"] < gap["owed"]:
+                out[anchor] = gap
+    return out
+
+
 # ── reduce: every callee group's members read as one group ──────────────────────────────────
 
 
@@ -1374,6 +1474,7 @@ def report(
     server_commit: str | None,
     audits: Audits | None = None,
     presence_short: dict[str, dict[str, Any]] | None = None,
+    entry_short: dict[str, dict[str, Any]] | None = None,
     reduce_owed: list[Member] | None = None,
 ) -> dict[str, Any]:
     """The pair's report: the must-read set by unit kind and by reason, how much of it and of every
@@ -1382,6 +1483,7 @@ def report(
     states = progress.states
     audits = audits or Audits()
     presence_short = presence_short or {}
+    entry_short = entry_short or {}
     reduce_owed = reduce_owed or []
     # An audit re-reads a subject and a reduce re-judges one: neither is a subject of its own.
     subjects = [u for u in units if u.kind not in (AUDIT, REDUCE)]
@@ -1475,6 +1577,8 @@ def report(
         f"disagreements {len(audits.disagreements)}; "
         f"{'reduce done' if not reduce_owed else f'reduce owed {len(reduce_owed)}'}; "
         f"presence citations short {len(presence_short)}; "
+        f"entry citations short {len(entry_short)} "
+        f"(landed rows uncited {sum(int(g['uncited']) for g in entry_short.values())}); "
         f"basis incomplete {basis_incomplete['count']}; "
         f"dangling {dangling['count']} (changed_real {dangling['changed_real']['count']}); "
         f"not listed {not_listed['count']}; "
@@ -1528,6 +1632,10 @@ def report(
             "settled_by": "a judgement written by a person (tmap review judge / audit --apply)",
         },
         "presence_citations_short": presence_short,
+        # The changed_real judgements that do not cite the rows they landed on, and how many
+        # landed rows carry no citation at all (an over-cap entry owes MAX_CITED of them).
+        "entry_citations_short": entry_short,
+        "entry_citations_uncited": sum(int(g["uncited"]) for g in entry_short.values()),
         "groups": {
             "units": len(group_units),
             "members": sum(len(u.members) for u in group_units),
@@ -1701,6 +1809,10 @@ def review_pair(
     for anchor in short:
         # Judged without citing every candidate of its subject: read again, not disposed.
         progress.states[anchor] = NEEDS_RECHECK
+    entry_short = entry_citations_short(atlas, facts, progress.states)
+    for anchor in entry_short:
+        # A changed_real that does not cite the rows it landed on: read again, not disposed.
+        progress.states[anchor] = NEEDS_RECHECK
     audits = read_audits(atlas, facts, units)
     for anchor in audits.needs_recheck:
         # Judged before anything of the subject was read (A-2(2)): re-read, not disposed. Always
@@ -1742,6 +1854,7 @@ def review_pair(
         server_commit=server_commit,
         audits=audits,
         presence_short=short,
+        entry_short=entry_short,
         reduce_owed=owed,
     )
     nav = None

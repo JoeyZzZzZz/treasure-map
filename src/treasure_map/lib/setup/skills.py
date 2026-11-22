@@ -76,6 +76,7 @@ LEGACY_SHA256 = frozenset(
         "351855eca316cf1db091802addc170feddd818b86cff8fd73c5859ad9712eec1",  # 5,107 bytes
         "50d0557f8e7a285e94f28dea60789baaaf03471f0064688aa7cc94f1d841de7b",  # 5,138 bytes
         "57ae11087c5001cd1236a5500f5d577c618a6554296c406fc45de89d168e0feb",  # 6,022 bytes
+        "229732beac7de9d4bf4bec8217dda0b606e0efb388ace31ac366fe63cbbb78e5",  # 6,362 bytes
     }
 )
 

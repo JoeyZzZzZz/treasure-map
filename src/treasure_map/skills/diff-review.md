@@ -34,6 +34,11 @@ produces no payload: every judgment is yours.
   held back, read in full); a `changed_real` read in part still counts.
 - Do not judge from the summary alone. Read both sides of the code the material gives (or fetch
   it) before a verdict.
+- A `changed_real` on a must-read function_pair entry has to CITE the rows the change landed on:
+  `evidence` names each row whose `landing` is not `persisted`, by that row's `a_ref` or `b_ref`,
+  up to 20 of them. Citing fewer reads `needs_recheck`; `coverage_statement` counts the rest under
+  `entry citations short`. An entry whose rows are all `persisted` owes no row citation — a
+  change in the function body that lands on no candidate is legitimate.
 - A `pairing_component` unit holds the alternative pairings an alternative-pairing claim proposes
   for mis-paired entries. Read its alternative entries first and judge each on its own anchor; a
   superseded entry needs no judgment; judge an end function (`ends`) on the entry it is in; in a

@@ -36,6 +36,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
     _pair_anchor,
     _ref,
     _row,
+    landed_refs,
 )
 from tests.unit.lib.test_review_units import _build_world, _diff_of, _review
 from treasure_map import mcp_app
@@ -134,6 +135,11 @@ class Sess:
         }
         if verdict == "no_real_change":
             args.update(checked=[anchor], why_unchanged="the same call")
+        if verdict == "changed_real":
+            # cite the rows the change landed on, else the citation gate holds it (E-1)
+            refs = landed_refs(self.w.atlas, _diff_of(anchor), anchor)
+            if refs:
+                args["evidence"] = [anchor, *refs]
         if unit_id is not None:
             args["unit_id"] = unit_id
         got: dict[str, Any] = self.tools["annotate_diff"](**args)
@@ -333,11 +339,14 @@ def _judge_must(
         for m in u.members:
             if m.anchor_ref in skip:
                 continue
-            basis = (
-                {"checked": [m.anchor_ref], "why_unchanged": "same"}
-                if verdict == "no_real_change"
-                else None
-            )
+            basis: dict[str, Any] | None = None
+            if verdict == "no_real_change":
+                basis = {"checked": [m.anchor_ref], "why_unchanged": "same"}
+            elif verdict == "changed_real":
+                # cite the rows the change landed on, else the citation gate holds it (E-1)
+                refs = landed_refs(w.atlas, _diff_of(m.anchor_ref), m.anchor_ref)
+                if refs:
+                    basis = {"evidence": [m.anchor_ref, *refs]}
             w.judge(_diff_of(m.anchor_ref), m.anchor_ref, verdict, verdict_basis=basis)
     ru.DIFF_CACHE.clear()
 
@@ -369,7 +378,12 @@ def test_c2_the_dispositions_are_the_pairs_own(gw: World) -> None:
 
     MUTATION (verified RED, 1 failed): read the judgements of every pair (drop ``AND run_id = ?``
     from read_audits' current rows) -> recorded doubles -> RED."""
-    gw.judge(DX, A1, "changed_real")
+    gw.judge(
+        DX,
+        A1,
+        "changed_real",
+        verdict_basis={"evidence": [A1, *landed_refs(gw.atlas, DX, A1)]},
+    )
     gw.judge(DX, A3, "no_real_change", verdict_basis={"checked": [A3], "why_unchanged": "s"})
     assert _copy_judgements_to(gw, "runA::runC") == 2  # the other pair's judgements
     rep = _review(gw, k=4).report
@@ -501,7 +515,12 @@ def test_b3_the_command_line_writes_a_partial_file_before_and_the_mcp_text_after
     from treasure_map.version import UNKNOWN_VERSION
 
     monkeypatch.setattr(version, "installed_commit", lambda: UNKNOWN_VERSION)
-    gw.judge(DX, A1, "changed_real")
+    gw.judge(
+        DX,
+        A1,
+        "changed_real",
+        verdict_basis={"evidence": [A1, *landed_refs(gw.atlas, DX, A1)]},
+    )
     out = gw.tmp / "h.md"
     res = _cli_handoff(gw, out)
     assert res.exit_code == 0, res.output
