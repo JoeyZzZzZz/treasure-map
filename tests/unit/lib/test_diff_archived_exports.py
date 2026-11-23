@@ -15,7 +15,6 @@ import gzip
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -54,27 +53,28 @@ def test_compute_decompresses_the_two_archives_and_runs_only_bindiff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """★ The compute step hands BinDiff the two archived exports, decompressed, and reads their
-    reports; it never starts an export of its own.
+    reports; it never starts an export of its own — the shipped driver holds no way to.
 
-    MUTATION (verified RED): export the binary again instead of reading the archive -> RED."""
+    MUTATION (verified RED): read the binary and export it again instead of the archive -> the
+    decompressed-archive bytes never reach BinDiff -> RED; put an export runner back into the
+    driver (what such a step would call) -> the last assertion goes RED."""
     a = _real_archive(tmp_path / "a", "a" * 64, b"export A")
     b = _real_archive(tmp_path / "b", "b" * 64, b"export B")
     seen: dict[str, bytes] = {}
-
-    def no_export(*_a: Any, **_k: Any) -> Path:
-        raise AssertionError("a diff must not export a binary itself")
 
     def bindiff(ea: Path, eb: Path, out: Path, timeout: int) -> Path:
         seen["a"], seen["b"] = ea.read_bytes(), eb.read_bytes()
         return out / "x.BinDiff"
 
-    monkeypatch.setattr(driver, "_run_binexport", no_export)
     monkeypatch.setattr(driver, "_run_bindiff", bindiff)
     td = tmp_path / "td"
     td.mkdir()
     art = driver.compute_diff(a, b, td, Config())
     assert seen == {"a": b"export A", "b": b"export B"}
     assert art.report_a is not None and art.report_a.builder == "fallback"
+    # the standalone export lives with the fixture builder (tests/fixtures/layer0/binexport.py),
+    # which is not part of the package: a diff has nothing to export with.
+    assert not hasattr(driver, "_run_binexport")
 
 
 def test_an_archive_that_does_not_decompress_fails_the_diff_by_its_own_reason(

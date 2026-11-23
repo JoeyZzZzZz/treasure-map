@@ -31,7 +31,7 @@ for side in before after; do
     strip --strip-all "$WORK/shapes_$side.so"
 done
 
-# This imports tmap's own driver, so it needs tmap's dependencies — prefer the repo venv.
+# This imports tmap's own diff driver, so it needs tmap's dependencies — prefer the repo venv.
 PY_BIN="${PYTHON:-}"
 if [ -z "$PY_BIN" ] && [ -x "$REPO/.venv/bin/python" ]; then
     PY_BIN="$REPO/.venv/bin/python"
@@ -46,8 +46,10 @@ from pathlib import Path
 
 repo, work, out = (Path(a) for a in sys.argv[1:4])
 sys.path.insert(0, str(repo / "src"))
+sys.path.insert(0, str(repo))  # for tests.fixtures.layer0, where the standalone export lives
+from tests.fixtures.layer0.binexport import _run_binexport
 from treasure_map.lib.config.config import Config
-from treasure_map.lib.diff.driver import _run_binexport, _run_bindiff
+from treasure_map.lib.diff.driver import _run_bindiff
 
 cfg = Config()
 with tempfile.TemporaryDirectory(prefix="tm_fixture_") as td:

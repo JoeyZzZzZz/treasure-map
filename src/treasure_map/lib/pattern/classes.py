@@ -523,36 +523,23 @@ def all_path_calls_literal(
     return all(a is not None and bool(_FMT_LITERAL_RE.match(a)) for call in path_args for a in call)
 
 
-def path_arg_ident(
-    pseudocode: str,
-    sink_name: str,
-    stub_names: Mapping[int, str] | None = None,
-    occurrence: int | None = None,
-) -> str | None:
-    """Leading identifier of a non-literal PATH argument of ``sink_name`` (the value whose
-    controllability matters); the flow-evidence layer classifies that identifier's source kind.
-
-    ``occurrence`` selects WHICH call to read, for the same reason it does on the format axis: a
-    candidate anchored at the Nth call must be judged on the Nth call's path. A function that opens
-    a fixed "/etc/…" at one call and a caller-supplied name at the next would otherwise hand BOTH
-    rows the variable — including the row whose own path is a constant.
-
-    ``occurrence=None`` keeps the function-level reading (first non-literal across all calls) for
-    callers that hold no callsite.
-    """
-    ref = path_arg_ref(pseudocode, sink_name, stub_names, occurrence)
-    return ref.root if ref is not None else None
-
-
 def path_arg_ref(
     pseudocode: str,
     sink_name: str,
     stub_names: Mapping[int, str] | None = None,
     occurrence: int | None = None,
 ) -> ArgRef | None:
-    """The path argument ``path_arg_ident`` reads, as an ``ArgRef``: the first non-literal path
-    argument that has a root (else the first non-literal one); a ``literal`` one when every
-    readable path argument is a literal; None when none could be read."""
+    """A PATH argument of ``sink_name``, read as an ``ArgRef``: the first non-literal path argument
+    that has a root (else the first non-literal one); a ``literal`` one when every readable path
+    argument is a literal; None when none could be read. Its root is the value whose
+    controllability matters, and the flow-evidence layer classifies that root's source kind.
+
+    ``occurrence`` selects WHICH call to read, for the same reason it does on the format axis: a
+    candidate anchored at the Nth call must be judged on the Nth call's path. A function that opens
+    a fixed "/etc/…" at one call and a caller-supplied name at the next would otherwise hand BOTH
+    rows the variable — including the row whose own path is a constant. ``occurrence=None`` keeps
+    the function-level reading (first non-literal across all calls) for callers that hold no
+    callsite."""
     calls = _iter_path_args(pseudocode, sink_name, stub_names)
     if occurrence is not None:
         if occurrence < 0 or occurrence >= len(calls):
@@ -731,12 +718,6 @@ def is_type_word(name: str) -> bool:
     )
 
 
-# The forms an argument takes. ``literal`` a constant (string, character, number, NULL);
-# ``var`` one variable; ``addr_of`` ``&var``; ``cast`` ``(T)var``; ``arith`` an expression whose
-# first non-constant operand gives the root; ``load`` a value read through a pointer, an index or a
-# field (``*p``, ``p[7]``, ``p->len``); ``call`` a call's return; ``const_addr`` a number cast to a
-# pointer; ``none`` nothing a variable could be read from.
-ARG_FORMS = ("literal", "var", "addr_of", "cast", "arith", "load", "call", "const_addr", "none")
 # The forms in which the root IS the value passed: only these may support a reading that makes a
 # candidate look safer (the value is a constant, a number, a checked character set).
 SAFE_FORMS = frozenset({"var", "addr_of", "cast"})
@@ -746,12 +727,16 @@ SAFE_FORMS = frozenset({"var", "addr_of", "cast"})
 class ArgRef:
     """One call argument, read.
 
-    ``form`` is one of ``ARG_FORMS``. ``root`` the variable the value is read from (for a load its
-    base pointer; for an expression its first non-constant operand's), None for a literal, a
-    constant address or nothing. ``lead`` the kind of that first operand (``var`` / ``load`` /
-    ``call``); when it is ``load``, ``path`` is the whole access expression (outer cast removed,
-    whitespace collapsed) — the thing a bound has to name, since a bound on ``p[0x14]`` is not a
-    bound on ``p[7]``. ``cast_type`` the outermost cast's type text."""
+    ``form`` is one of: ``literal`` a constant (string, character, number, NULL); ``var`` one
+    variable; ``addr_of`` ``&var``; ``cast`` ``(T)var``; ``arith`` an expression whose first
+    non-constant operand gives the root; ``load`` a value read through a pointer, an index or a
+    field (``*p``, ``p[7]``, ``p->len``); ``call`` a call's return; ``const_addr`` a number cast to
+    a pointer; ``none`` nothing a variable could be read from. ``root`` the variable the value is
+    read from (for a load its base pointer; for an expression its first non-constant operand's),
+    None for a literal, a constant address or nothing. ``lead`` the kind of that first operand
+    (``var`` / ``load`` / ``call``); when it is ``load``, ``path`` is the whole access expression
+    (outer cast removed, whitespace collapsed) — the thing a bound has to name, since a bound on
+    ``p[0x14]`` is not a bound on ``p[7]``. ``cast_type`` the outermost cast's type text."""
 
     form: str
     root: str | None = None

@@ -40,6 +40,7 @@ from treasure_map.lib.analyze.stub_resolve import (
     serialize_stub_table,
     stub_table_marker,
 )
+from treasure_map.lib.binexport_archive import SCAN_FAILED_PREFIX
 from treasure_map.lib.config.config import GhidraConfig
 from treasure_map.lib.errors import GhidraNotFoundError
 
@@ -1120,7 +1121,7 @@ class GhidraRunner:
                 return r2
 
         failed_reason = "import_failed" if import_failed else last.reason
-        export_status = f"scan_failed:{failed_reason or 'unknown'}"
+        export_status = f"{SCAN_FAILED_PREFIX}{failed_reason or 'unknown'}"
         # Said where a person sees it: the reason, the end of Ghidra's stderr and its log.
         logger.warning(
             "ghidra: %s failed (%s)%s%s",
@@ -1315,7 +1316,7 @@ class GhidraRunner:
         success = analysis_status in _SUCCESS_STATUSES
         if not success and reason is not None:
             # The export of a session whose extraction failed is never kept, whatever was written.
-            export_status = f"scan_failed:{reason}"
+            export_status = f"{SCAN_FAILED_PREFIX}{reason}"
         degrade_reason: str | None = None
         all_timeouts: int | None = None
         large_timeouts: int | None = None

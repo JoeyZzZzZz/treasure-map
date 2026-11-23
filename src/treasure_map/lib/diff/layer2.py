@@ -73,22 +73,6 @@ DECLARED_DELTA_DIMENSIONS: tuple[DimensionSpec, ...] = (
 )
 
 
-def _uncovered_triage_dimension(
-    triage_dimensions: frozenset[str], declared: frozenset[str]
-) -> str | None:
-    """The first triage dimension NOT covered by the declared layer-2 set, or None when all are
-    covered. A triage dimension is covered when it appears verbatim OR when a declared sub-dimension
-    prefixes it (``name.``) -- reachability is one triage dimension but two layer-2 sub-dimensions.
-    A triage dimension absent from the layer-2 universe is invisible to a consumer (no capability
-    row, no view row), so this is the mechanical check that a new triage dimension is never left to
-    vanish by absence -- the exact gap-by-absence this layer exists to kill."""
-    for name in sorted(triage_dimensions):
-        if name in declared or any(d.startswith(f"{name}.") for d in declared):
-            continue
-        return name
-    return None
-
-
 # subjects whose function-anchor alignment is low-confidence: the layer-0 state that means "aligned,
 # but do not trust the pairing" (mirrors function_alignment.alignment_state).
 _LOW_CONF_STATE = "alignment_undetermined"
@@ -601,10 +585,6 @@ def _capability_asymmetry(
 _DELTA_HANDLERS: dict[str, Callable[..., list[DimensionDeltaRow]]] = {
     "reachability.string_keyed_edge": _string_keyed_edge_delta,
 }
-
-
-def declared_delta_dimension_names() -> frozenset[str]:
-    return frozenset(d.name for d in DECLARED_DELTA_DIMENSIONS)
 
 
 @dataclass(frozen=True)

@@ -24,14 +24,31 @@ from treasure_map.lib.atlas.writer import (
 )
 from treasure_map.lib.diff import layer2
 from treasure_map.lib.diff.layer0 import norm_hex
-from treasure_map.lib.diff.layer2 import (
-    DECLARED_DELTA_DIMENSIONS,
-    declared_delta_dimension_names,
-    run_layer2_delta,
-)
+from treasure_map.lib.diff.layer2 import DECLARED_DELTA_DIMENSIONS, run_layer2_delta
 from treasure_map.lib.query.triage import _CANONICAL_DIMENSION_NAMES  # the authoritative universe
 
 _SKE = "reachability.string_keyed_edge"
+
+
+def _declared_names() -> frozenset[str]:
+    """The names the layer-2 universe declares."""
+    return frozenset(d.name for d in DECLARED_DELTA_DIMENSIONS)
+
+
+def _uncovered(triage_dimensions: frozenset[str], declared: frozenset[str]) -> str | None:
+    """The first triage dimension NOT covered by ``declared``, or None when all are covered. A
+    triage dimension is covered when it appears verbatim OR when a declared sub-dimension prefixes
+    it (``name.``) — reachability is one triage dimension but two layer-2 sub-dimensions. A triage
+    dimension absent from the universe is invisible to a consumer (no capability row, no view row),
+    which is the gap-by-absence this layer exists to kill.
+
+    The rule lives here because nothing in the shipped code applies it: what it guards is the
+    declaration table and the capability rows written from it, and these tests are that check."""
+    for name in sorted(triage_dimensions):
+        if name in declared or any(d.startswith(f"{name}.") for d in declared):
+            continue
+        return name
+    return None
 
 
 def _edge(
@@ -691,7 +708,7 @@ def test_declared_dimensions_and_handlers_are_bidirectional() -> None:
     handlers = set(layer2._DELTA_HANDLERS)
     supported = {d.name for d in DECLARED_DELTA_DIMENSIONS if d.delta_supported}
     assert handlers == supported
-    assert handlers <= declared_delta_dimension_names()
+    assert handlers <= _declared_names()
 
 
 def test_union_view_shows_full_universe_base_table_has_no_placeholder(tmp_path: Path) -> None:
@@ -801,10 +818,9 @@ def test_all_eight_triage_dimensions_are_visible(tmp_path: Path) -> None:
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
     run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
-    dims = set(_capstate(con, "d"))
-    for name in _CANONICAL_DIMENSION_NAMES:
-        covered = name in dims or any(d.startswith(f"{name}.") for d in dims)
-        assert covered, f"triage dimension {name!r} is invisible in the layer-2 universe"
+    dims = frozenset(_capstate(con, "d"))
+    missing = _uncovered(_CANONICAL_DIMENSION_NAMES, dims)
+    assert missing is None, f"triage dimension {missing!r} is invisible in the layer-2 universe"
     cs = _capstate(con, "d")
     assert cs["writer"] == ("present", "present", 0)  # visible, delta_supported=0
     assert cs["completeness"] == ("present", "present", 0)
@@ -851,17 +867,13 @@ def test_writer_completeness_appear_in_view_as_delta_not_implemented(tmp_path: P
 
 def test_coverage_guard_has_teeth(tmp_path: Path) -> None:
     # ★ reverse-validation: the real set covers every CANONICAL triage dim (all 8, incl. source);
-    # dropping ANY declared entry's coverage makes _uncovered_triage_dimension return the
-    # now-uncovered name (goes red). Anchored on _CANONICAL_DIMENSION_NAMES so `source` is checked.
-    declared = declared_delta_dimension_names()
-    assert (
-        layer2._uncovered_triage_dimension(_CANONICAL_DIMENSION_NAMES, declared) is None
-    )  # forward: covered
+    # dropping ANY declared entry's coverage makes the coverage rule report the now-uncovered name
+    # (goes red). Anchored on _CANONICAL_DIMENSION_NAMES so `source` is checked.
+    declared = _declared_names()
+    assert _uncovered(_CANONICAL_DIMENSION_NAMES, declared) is None  # forward: covered
     for name in _CANONICAL_DIMENSION_NAMES:
         reduced = frozenset(d for d in declared if d != name and not d.startswith(f"{name}."))
-        assert (
-            layer2._uncovered_triage_dimension(_CANONICAL_DIMENSION_NAMES, reduced) is not None
-        ), name
+        assert _uncovered(_CANONICAL_DIMENSION_NAMES, reduced) is not None, name
 
 
 def test_uncovered_guard_prefix_requires_the_dot(tmp_path: Path) -> None:
@@ -870,15 +882,12 @@ def test_uncovered_guard_prefix_requires_the_dot(tmp_path: Path) -> None:
     # None -> `source` reads as covered while absent. Anchor: source uncovered, only
     # source_writability declared -> the guard MUST report 'source'. If the dot were dropped this
     # goes green (wrongly), so this is the load-bearing test for that judgement.
-    assert (
-        layer2._uncovered_triage_dimension(frozenset({"source"}), frozenset({"source_writability"}))
-        == "source"
-    )
+    assert _uncovered(frozenset({"source"}), frozenset({"source_writability"})) == "source"
 
 
 def test_no_declared_dimension_is_a_phantom_top_level(tmp_path: Path) -> None:
     # reverse spelling guard: every declared top-level name (before '.') is a real triage dimension.
-    for d in declared_delta_dimension_names():
+    for d in _declared_names():
         top = d.split(".", 1)[0]
         assert top in _CANONICAL_DIMENSION_NAMES, (
             f"declared {d!r} points at non-existent triage dim {top!r}"

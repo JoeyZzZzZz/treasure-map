@@ -141,7 +141,7 @@ def test_load_config_absent_env_file_returns_valid_config(
 ) -> None:
     monkeypatch.setenv("TM_ENV_FILE", str(tmp_path / "nonexistent.env"))
     cfg = load_config()
-    assert cfg.log_level == "INFO"
+    assert cfg.ghidra.headless_timeout_seconds == 600
 
 
 # ── AtlasConfig ───────────────────────────────────────────────────────────────

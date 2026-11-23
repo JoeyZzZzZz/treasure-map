@@ -1,7 +1,13 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""A timed-out or interrupted BinExport subprocess takes its whole process group — the orphaned-JVM
-leak — and it does so AT ONCE, not by waiting the orphan out."""
+"""A timed-out or interrupted toolchain subprocess takes its whole process group — the orphaned-tool
+leak — and it does so AT ONCE, not by waiting the orphan out.
+
+The live path is BinDiff: a diff reads the exports the scans archived and runs only the ``bindiff``
+CLI, so the group kill is driven here through ``_run_bindiff`` itself (with a fake ``bindiff`` on
+PATH that backgrounds a child and waits for it, the launcher->tool shape). The standalone export
+the fixture builder keeps goes through the same wrapper; its argv is checked at the end.
+"""
 
 from __future__ import annotations
 
@@ -28,8 +34,21 @@ def _fresh_sweep_state() -> Iterator[None]:
 
 
 def _sleeper(marker: str) -> list[str]:
-    """A shell that backgrounds a 60s child and waits for it: the wrapper->JVM shape."""
+    """A shell that backgrounds a 60s child and waits for it: the launcher->tool shape."""
     return ["sh", "-c", f'python3 -c "import time; time.sleep(60)  # {marker}" & wait']
+
+
+def _fake_bindiff(tmp_path: Path, marker: str, seconds: int = 60) -> Path:
+    """A ``bindiff`` that backgrounds a long child and waits for it, as the real launcher does.
+
+    Only a GROUP kill ends the child: reaping the script itself leaves the grandchild running."""
+    path = tmp_path / "bin" / "bindiff"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'#!/bin/sh\npython3 -c "import time; time.sleep({seconds})  # {marker}" &\nwait\n'
+    )
+    path.chmod(0o755)
+    return path
 
 
 def _reap(marker: str) -> list[str]:
@@ -44,27 +63,32 @@ def _reap(marker: str) -> list[str]:
     return pids
 
 
-def test_a_timeout_kills_the_whole_group_at_once_not_just_the_wrapper() -> None:
-    """A shell that backgrounds a long child and waits (the analyzeHeadless->JVM shape): run's own
-    timeout reaps the shell and leaves the child; _run_killable kills the whole group, and does it
-    at once rather than letting communicate() block until the orphan exits on its own.
+def test_a_bindiff_timeout_kills_the_whole_group_at_once_not_just_the_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real BinDiff step, run out of time: a launcher that backgrounds the tool and waits for
+    it (what ``bindiff`` is) outlives ``subprocess.run``'s own timeout as an orphan; the group kill
+    ends the whole group, and ends it at once rather than letting communicate() block until the
+    orphan exits on its own.
 
     The child sleeps 60s; the group kill must end this in a couple of seconds. The elapsed bound is
-    what gives the test teeth the old version lacked: a version that dropped the killpg but kept
-    communicate() stayed GREEN because, by the time communicate() returned (~60s later), the orphan
-    had finished and pgrep found nothing. Here that version blows the time bound instead.
+    what gives the test teeth: a version that dropped the killpg but kept communicate() would stay
+    GREEN because, by the time communicate() returned (~60s later), the orphan had finished and
+    pgrep found nothing. Here that version blows the time bound instead.
 
     MUTATIONS (each must go RED):
-      * ``subprocess.run(..., timeout=)`` or ``os.kill(proc.pid, ...)`` (only the wrapper) ->
-        the child survives -> the pgrep assertion fails.
-      * drop the killpg and only re-raise -> communicate() waits ~60s -> the elapsed bound fails.
+      * ``_run_bindiff`` back to ``subprocess.run(..., timeout=)`` -> the child survives -> the
+        pgrep assertion fails.
+      * drop the killpg in _run_killable and only re-raise -> communicate() waits ~60s -> the
+        elapsed bound fails.
       * drop ``start_new_session=True`` -> killpg targets a non-group-leader -> child survives."""
     marker = "tmap_test_sleeper_rk1"
-    script = f'python3 -c "import time; time.sleep(60)  # {marker}" & wait'
+    monkeypatch.setattr(driver, "_find_bindiff", lambda: _fake_bindiff(tmp_path, marker))
     start = time.monotonic()
-    with pytest.raises(subprocess.TimeoutExpired):
-        _run_killable(["sh", "-c", script], dict(os.environ), 1)
+    with pytest.raises(driver.DiffToolchainError) as ei:
+        driver._run_bindiff(tmp_path / "a.BinExport", tmp_path / "b.BinExport", tmp_path, 1)
     elapsed = time.monotonic() - start
+    assert ei.value.kind == driver.FAIL_TIMEOUT  # the timeout still maps to its own bucket
     time.sleep(0.5)  # let SIGKILL propagate before we look
     leaked = _reap(marker)
     assert leaked == [], f"orphaned child survived the group kill: {leaked}"
@@ -84,7 +108,7 @@ def test_run_killable_registers_its_group_only_while_running() -> None:
 
 def test_kill_running_groups_reaps_a_registered_group() -> None:
     """``_kill_running_groups`` SIGKILLs every registered group — the main-thread path that takes
-    the in-flight JVMs down when a full sweep is interrupted, without waiting each one out.
+    the in-flight tools down when a full sweep is interrupted, without waiting each one out.
 
     MUTATION (RED): make ``_kill_running_groups`` a no-op (or ``os.kill`` instead of ``os.killpg``)
     -> the detached child outlives the call -> the time-bounded pgrep assertion fails."""
@@ -115,14 +139,18 @@ def test_kill_running_groups_reaps_a_registered_group() -> None:
             pass
 
 
-def test_an_interrupt_during_the_export_kills_the_whole_group() -> None:
-    """Ctrl-C (or a SIGTERM/SIGHUP the CLI turns into one) arriving while the export runs must take
-    the whole group down before it propagates, not just leave the export's process group running.
+def test_an_interrupt_during_the_bindiff_kills_the_whole_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C (or a SIGTERM/SIGHUP the CLI turns into one) arriving while BinDiff runs must take
+    the whole group down before it propagates, not just leave the tool's process group running.
     The interrupt is delivered to this (the calling) thread mid-communicate, as a real one is.
 
-    MUTATION: catch only TimeoutExpired in _run_killable -> the KeyboardInterrupt passes straight
-    through, the child survives -> the pgrep assertion fails (RED)."""
+    MUTATIONS (each must go RED): ``_run_bindiff`` back to ``subprocess.run`` -> the child survives
+    the interrupt; catch only TimeoutExpired in _run_killable -> the KeyboardInterrupt passes
+    straight through and the child survives -> the pgrep assertion fails."""
     marker = "tmap_test_sleeper_rk3"
+    monkeypatch.setattr(driver, "_find_bindiff", lambda: _fake_bindiff(tmp_path, marker))
 
     def _interrupt(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
@@ -132,26 +160,26 @@ def test_an_interrupt_during_the_export_kills_the_whole_group() -> None:
         signal.setitimer(signal.ITIMER_REAL, 0.5)
         start = time.monotonic()
         with pytest.raises(KeyboardInterrupt):
-            _run_killable(_sleeper(marker), dict(os.environ), 60)
+            driver._run_bindiff(tmp_path / "a.BinExport", tmp_path / "b.BinExport", tmp_path, 60)
         elapsed = time.monotonic() - start
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
     time.sleep(0.5)
     leaked = _reap(marker)
-    assert leaked == [], f"the interrupted export's group survived: {leaked}"
+    assert leaked == [], f"the interrupted tool's group survived: {leaked}"
     assert elapsed < 15
 
 
-def test_a_running_export_is_registered_and_a_sweep_kill_reaps_it() -> None:
+def test_a_running_step_is_registered_and_a_sweep_kill_reaps_it() -> None:
     """End to end with the real pieces: while _run_killable runs on a worker thread its group is in
     the registry, and the real _kill_running_groups (what an interrupted sweep calls on the main
     thread) ends it at once, so the worker returns in seconds rather than at the child's 60s.
 
-    MUTATION: drop the ``_register_pgid`` call -> the registry stays empty while the export runs
+    MUTATION: drop the ``_register_pgid`` call -> the registry stays empty while the step runs
     -> the "registered while running" assertion fails (RED).
     MUTATION: drop ``_SWEEP_CANCELLED.set()`` in ``_kill_running_groups`` -> the kill no longer
-    latches the cancel flag, so the post-kill ``_run_killable`` starts an export instead of
+    latches the cancel flag, so the post-kill ``_run_killable`` starts a subprocess instead of
     refusing -> the ``_SweepCancelledError`` assertion fails (RED)."""
     marker = "tmap_test_sleeper_rk4"
     before = set(driver._RUNNING_PGIDS)
@@ -170,29 +198,30 @@ def test_a_running_export_is_registered_and_a_sweep_kill_reaps_it() -> None:
         while time.monotonic() < deadline and not (set(driver._RUNNING_PGIDS) - before):
             time.sleep(0.05)
         registered = set(driver._RUNNING_PGIDS) - before
-        assert registered, "the running export's group was not in the registry"
+        assert registered, "the running step's group was not in the registry"
         start = time.monotonic()
         _kill_running_groups()
         th.join(timeout=15)
-        assert not th.is_alive(), "the worker was still waiting on its export after the kill"
+        assert not th.is_alive(), "the worker was still waiting on its subprocess after the kill"
         assert time.monotonic() - start < 15
         time.sleep(0.3)
         assert _reap(marker) == []
         assert set(driver._RUNNING_PGIDS) == before  # and it unregistered on the way out
         # the same kill latched the cancel flag: a worker that had NOT yet reached its Popen now
         # refuses to start one (the start-after-kill guard), so an interrupted sweep spawns no new
-        # JVM after the kill. ``["true"]`` would otherwise run and return cleanly.
+        # tool after the kill. ``["true"]`` would otherwise run and return cleanly.
         with pytest.raises(driver._SweepCancelledError):
             _run_killable(["true"], dict(os.environ), 30)
     finally:
         _reap(marker)
 
 
-def test_an_interrupted_sweep_starts_no_new_export(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Once the sweep was interrupted, a worker that had not yet started its export (side b after
-    side a) must not start one: a JVM started after the kill would keep the shutdown waiting.
+def test_an_interrupted_sweep_starts_no_new_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once the sweep was interrupted, a worker that had not yet started its subprocess (the next
+    binary's BinDiff) must not start one: a tool started after the kill would keep the shutdown
+    waiting.
 
-    MUTATION: drop the check before Popen -> the export is started -> RED."""
+    MUTATION: drop the check before Popen -> the subprocess is started -> RED."""
     started: list[list[str]] = []
     real_popen = subprocess.Popen
 
@@ -204,17 +233,18 @@ def test_an_interrupted_sweep_starts_no_new_export(monkeypatch: pytest.MonkeyPat
     driver._SWEEP_CANCELLED.set()
     with pytest.raises(driver._SweepCancelledError):
         _run_killable(["true"], dict(os.environ), 30)
-    assert started == [], "an export was started after the sweep was interrupted"
+    assert started == [], "a subprocess was started after the sweep was interrupted"
 
 
-def test_a_kill_that_lands_as_the_export_starts_still_reaps_it(
+def test_a_kill_that_lands_as_the_step_starts_still_reaps_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The kill can run between the pre-start check and the registration, so it never sees the new
-    group. The check right after registering catches that: the export is stopped at once.
+    group. The check right after registering catches that: the subprocess is stopped at once.
 
-    MUTATION: drop the check after ``_register_pgid`` -> the export runs until its own 20s timeout
-    and stops with TimeoutExpired instead -> the "stopped as cancelled" assertion fails (RED)."""
+    MUTATION: drop the check after ``_register_pgid`` -> the subprocess runs until its own 20s
+    timeout and stops with TimeoutExpired instead -> the "stopped as cancelled" assertion fails
+    (RED)."""
     marker = "tmap_test_sleeper_rk5"
     real_register = driver._register_pgid
 
@@ -233,24 +263,25 @@ def test_a_kill_that_lands_as_the_export_starts_still_reaps_it(
     time.sleep(0.3)
     leaked = _reap(marker)
     assert isinstance(stopped_by, driver._SweepCancelledError), (
-        f"the export was not stopped as cancelled (got {stopped_by!r} after {elapsed:.1f}s)"
+        f"the subprocess was not stopped as cancelled (got {stopped_by!r} after {elapsed:.1f}s)"
     )
-    assert leaked == [], f"the export started during the kill survived: {leaked}"
+    assert leaked == [], f"the subprocess started during the kill survived: {leaked}"
     assert elapsed < 15
 
 
 def test_the_standalone_export_names_its_language_and_starts_in_its_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """★ The standalone BinExport run imports the binary under the language the scan detects
-    (-processor), and starts from its own project directory, so a same-named script in the current
-    directory is never run.
+    """★ The standalone BinExport run (the fixture builder's, not a diff's) imports the binary
+    under the language the scan detects (-processor), and starts from its own project directory, so
+    a same-named script in the current directory is never run.
 
     MUTATION (verified RED): leave -processor out -> RED; start in the current directory -> RED."""
     import subprocess
 
+    from tests.fixtures.layer0.binexport import _run_binexport
     from treasure_map.lib.config.config import Config
-    from treasure_map.lib.diff.driver import DiffToolchainError, _run_binexport
+    from treasure_map.lib.diff.driver import DiffToolchainError
 
     seen: dict[str, object] = {}
 
@@ -281,8 +312,9 @@ def test_an_architecture_ghidra_has_no_language_for_is_not_passed_as_one(
     MUTATION (verified RED, 1 failed): pass any detected arch as -processor again."""
     import subprocess
 
+    from tests.fixtures.layer0.binexport import _run_binexport
     from treasure_map.lib.config.config import Config
-    from treasure_map.lib.diff.driver import DiffToolchainError, _run_binexport
+    from treasure_map.lib.diff.driver import DiffToolchainError
 
     seen: dict[str, object] = {}
 

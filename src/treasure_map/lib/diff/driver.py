@@ -6,8 +6,8 @@
 ``scan`` drives Ghidra internally so the user never touches an intermediate ``.BinExport`` /
 ``.BinDiff``:
 
-    preflight (cheap, fail-fast)  ->  BinExport x2  ->  BinDiff CLI  ->  .BinDiff (temp)
-      ->  layer0 parse (alignment facts)  ->  layer2 delta (dimension projection)
+    preflight (cheap, fail-fast)  ->  the two scans' archived exports  ->  BinDiff CLI
+      ->  .BinDiff (temp)  ->  layer0 parse (alignment facts)  ->  layer2 delta (projection)
 
 Preflight runs the five cheap checks BEFORE any heavy work so a missing run / missing analysis.db /
 version skew / unlocatable binary / missing toolchain fails FAST with an actionable message instead
@@ -15,12 +15,13 @@ of crashing deep inside an IO/subprocess call. It reuses layer0's run-resolution
 helpers (one source of truth) and NEVER judges — it only gates and drives; the map projection is
 layer2's job.
 
-BOUNDARY — the external-tool orchestration (Ghidra headless + the BinExport plugin + the BinDiff
-CLI) is real-machine engineering that CANNOT run in CI (no Ghidra / BinExport / BinDiff here). The
-preflight is fully unit-tested; the export/diff subprocess steps are exercised by the maintainer's
-end-to-end smoke on a pinned toolchain (Ghidra 11.4.3 + BinDiff 8 + the prebuilt BinExport). Their
-command lines are isolated in ``_run_binexport`` / ``_run_bindiff`` so a toolchain revision touches
-only those two functions.
+BOUNDARY — running the external tool (the BinDiff CLI, over the exports the two scans archived) is
+real-machine engineering that CANNOT run in CI (no BinDiff here). The preflight is fully
+unit-tested; the BinDiff subprocess step is exercised by the maintainer's end-to-end smoke on a
+pinned toolchain (BinDiff 8, over exports made by Ghidra 11.4.3 + the prebuilt BinExport). Its
+command line is isolated in ``_run_bindiff`` so a toolchain revision touches only that function. A
+diff starts no export of its own; the standalone export this module used to hold is now
+``tests/fixtures/layer0/binexport.py``, which only the fixture builder runs.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from treasure_map.lib.atlas.models import DiffMetaRow
 from treasure_map.lib.atlas.writer import add_diff_meta, delete_diff
 from treasure_map.lib.binary_id import BinaryRow, resolve_binary_in_db
 from treasure_map.lib.binexport_archive import (
+    SCAN_FAILED_PREFIX,
     USABLE_STATUSES,
     StoredExport,
     archive_files,
@@ -79,7 +81,6 @@ from treasure_map.lib.diff.export_report import (
     ExportReport,
     ExportReportError,
     read_export_report,
-    report_path,
 )
 from treasure_map.lib.diff.layer0 import (
     _confirmed_same_version,
@@ -92,7 +93,6 @@ from treasure_map.lib.diff.layer0 import (
 )
 from treasure_map.lib.diff.layer2 import run_layer2_delta
 from treasure_map.lib.errors import ConfigError, TreasureMapError
-from treasure_map.lib.export_stamp import EXPORT_SCRIPT, EXPORT_SCRIPT_DIR, FALLBACK_BUILDER
 from treasure_map.lib.machine import clamp_parallelism_to_memory
 from treasure_map.lib.query.runs import run_staleness
 from treasure_map.lib.query.sink_overlay import persist_sink_overlay, read_sink_overlay_baseline
@@ -104,18 +104,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from treasure_map.lib.atlas.models import RunRow
     from treasure_map.lib.config.config import Config
-
-# tmap's OWN headless BinExport script and the modified builder it falls back to (lib/export_stamp).
-# A scan runs it in its own session and archives the export; a diff reads that archive. The
-# standalone export below (_run_binexport) is kept for smoke tests and emergencies only.
-_SCRIPT_DIR = EXPORT_SCRIPT_DIR
-_BINEXPORT_SCRIPT = EXPORT_SCRIPT
-_FALLBACK_BUILDER = FALLBACK_BUILDER
-
-# BinExport JVM heap for a standalone export (_run_binexport). A conservative fixed ceiling, not
-# the per-binary adaptive_heap_mb ladder a scan uses: its peak-heap demand is unmeasured, and 4096
-# never runs out of memory mid-export.
-_DIFF_BINEXPORT_HEAP_MB = 4096
 
 # The memory one diff's compute is budgeted at for the RUNTIME parallelism clamp: a BinDiff process
 # and the two exports it holds (a diff runs no JVM). A CLAMP UNIT, not a cap:
@@ -573,20 +561,6 @@ def _find_bindiff() -> Path | None:
     return Path(found) if found else None
 
 
-def _binexport_present(headless: Path) -> bool:
-    """Is exactly one BinExport extension loaded by the discovered Ghidra?
-
-    ``analyzeHeadless`` lives at ``<ghidra_home>/support/analyzeHeadless``, so the home is the
-    resolved file's parent's parent. Where Ghidra loads the extension from is answered by the same
-    locator the toolchain stamp reads (lib.diff.toolchain): the install's own Extensions directory
-    and the user settings directory. Two loaded copies, or a settings directory that cannot be
-    determined, both read as 'not confirmed present', so the caller reports it missing rather than
-    silently proceeding; ``tmap doctor`` shows where it looked."""
-    home = headless.resolve().parent.parent
-    dirs = _toolchain.binexport_dirs(home)
-    return dirs is not None and len(dirs) == 1
-
-
 def _check_toolchain(config: Config) -> None:
     """HARD check 5: the ``bindiff`` CLI must be available. A diff reads the exports the scans
     archived and runs only BinDiff on them; Ghidra and the BinExport extension are the SCAN's
@@ -632,7 +606,7 @@ def _export_remedy(status: str, run_id: str, binary: str) -> str:
             "the export ran past its budget; raise ghidra.headless_timeout_seconds and "
             f"`tmap rescan {run_id}` (a rescan at the same budget is not re-run)."
         )
-    if status.startswith("scan_failed:"):
+    if status.startswith(SCAN_FAILED_PREFIX):
         return f"the binary's extraction failed; see `tmap runs` for {run_id}."
     return (
         "the export failed the same way it would again under this tmap and BinExport; it is "
@@ -802,10 +776,10 @@ def _tail(raw: bytes | None, n: int) -> str:
     return raw.decode("utf-8", "replace")[-n:] if raw else ""
 
 
-# Process groups of BinExport subprocesses that are running right now, so a sweep interrupted
-# from the main thread can take them all down at once instead of waiting each one out to its own
-# timeout. A worker thread adds its group while it runs and removes it when it returns; the lock
-# guards the set because the parallel full diff runs several at a time.
+# Process groups of the toolchain subprocesses (BinDiff) that are running right now, so a sweep
+# interrupted from the main thread can take them all down at once instead of waiting each one out
+# to its own timeout. A worker thread adds its group while it runs and removes it when it returns;
+# the lock guards the set because the parallel full diff runs several at a time.
 _RUNNING_PGIDS: set[int] = set()
 _RUNNING_PGIDS_LOCK = threading.Lock()
 # Set when the sweep is interrupted. A worker that had not yet started its BinDiff when the running
@@ -830,8 +804,9 @@ def _unregister_pgid(pgid: int) -> None:
 
 def _kill_running_groups() -> None:
     """SIGKILL every toolchain (BinDiff) process group still running. Called when the sweep is
-    interrupted: the JVMs die at once, instead of each being waited on until it hits its timeout."""
-    _SWEEP_CANCELLED.set()  # first: a worker about to start a JVM now refuses to
+    interrupted: the running processes die at once, instead of each being waited on until it hits
+    its own timeout."""
+    _SWEEP_CANCELLED.set()  # first: a worker about to start one now refuses to
     with _RUNNING_PGIDS_LOCK:
         pgids = list(_RUNNING_PGIDS)
     for pgid in pgids:
@@ -846,15 +821,19 @@ def _run_killable(
 ) -> subprocess.CompletedProcess[bytes]:
     """Run ``cmd`` in its OWN process group and, on timeout OR interrupt, kill the whole group.
 
-    analyzeHeadless is a shell wrapper that starts the JVM WITHOUT exec, so ``subprocess.run``'s
-    timeout kills only the wrapper and leaves a 4GB-heap JVM orphaned — the same leak the scan
-    runner already guards against. A new session makes the child a group leader; SIGKILL to the
-    group (-pid) takes the JVM with it. The group is registered while it runs so an interrupt
-    reaching another thread can reap it too (see ``_kill_running_groups``). Returns a
-    CompletedProcess so the callers that read stdout / stderr / returncode are unchanged;
-    re-raises whatever stopped it (TimeoutExpired, KeyboardInterrupt, …) after the kill."""
+    ``subprocess.run``'s timeout kills only the process it started. A toolchain step that does its
+    real work in a child of its own — analyzeHeadless starts the JVM WITHOUT exec — leaves that
+    child behind, the same leak the scan runner already guards against, and the shape of an
+    external tool is not something to assume from here. A new session makes the child a group
+    leader; SIGKILL to the group (-pid) takes whatever it started with it. The group is registered
+    while it runs so an interrupt reaching another thread can reap it too (see
+    ``_kill_running_groups``). Returns a CompletedProcess so the callers that read stdout / stderr
+    / returncode are unchanged; re-raises whatever stopped it (TimeoutExpired, KeyboardInterrupt,
+    …) after the kill."""
     if _SWEEP_CANCELLED.is_set():
-        raise _SweepCancelledError("the diff sweep was interrupted; not starting another export")
+        raise _SweepCancelledError(
+            "the diff sweep was interrupted; not starting another toolchain step"
+        )
     proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
         cmd,
         env=env,
@@ -866,11 +845,13 @@ def _run_killable(
     _register_pgid(proc.pid)  # pid == pgid (session leader)
     try:
         if _SWEEP_CANCELLED.is_set():  # the kill ran between the check above and the register
-            raise _SweepCancelledError("the diff sweep was interrupted while this export started")
+            raise _SweepCancelledError(
+                "the diff sweep was interrupted while this toolchain step started"
+            )
         out, err = proc.communicate(timeout=timeout)
     except BaseException:
-        # A timeout, or an interrupt delivered to this thread: take the JVM group down before
-        # propagating, so no 4GB-heap orphan survives this subprocess.
+        # A timeout, or an interrupt delivered to this thread: take the whole group down before
+        # propagating, so nothing the step started survives it.
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
@@ -903,99 +884,6 @@ def _diag(
         if log:
             parts.append(f"log(tail):\n{log}")
     return "\n".join(parts)
-
-
-def _run_binexport(so_path: Path, config: Config, out_dir: Path, side: str, timeout_s: int) -> Path:
-    """Export one ``.so`` to a ``.BinExport`` via Ghidra headless + tmap's own export script.
-
-    REAL-MACHINE PATH — requires Ghidra 11.4.3 + the BinExport extension (for its classes); not
-    runnable in CI. Uses tmap's own non-interactive ``ExportBinExport.java`` (NOT the extension's
-    interactive ``BinExport.java``, which ignores the output-path argument and lets analyzeHeadless
-    exit 0 with no file). The argv here is the one adjustment point if the export entry changes."""
-    from treasure_map.lib.analyze.elf_inventory import detect_arch
-    from treasure_map.lib.analyze.ghidra_runner import find_headless
-
-    headless = find_headless(config.ghidra)
-    export_path = out_dir / f"{side}.BinExport"
-    log_path = out_dir / f"{side}.ghidra.log"
-    # The language the scan imports the binary under, named here too: left to Ghidra's own guess,
-    # a MIPS binary could be read in another variant than the scan's, and its export with it.
-    arch = detect_arch(so_path)
-    # An architecture detect_arch does not support comes back as an ``UNKNOWN_…`` label, which is
-    # no Ghidra language: Ghidra is left to its own guess rather than handed a name it rejects.
-    processor = ["-processor", arch] if arch and not arch.startswith("UNKNOWN_") else []
-    with tempfile.TemporaryDirectory(prefix="tm_binexport_proj_") as proj:
-        cmd = [
-            str(headless),
-            proj,
-            "Proj",
-            *processor,
-            "-import",
-            str(so_path),
-            "-postScript",
-            _BINEXPORT_SCRIPT,
-            str(export_path),
-            str(report_path(export_path)),
-            "-scriptPath",
-            str(_SCRIPT_DIR),
-            "-deleteProject",
-            "-log",
-            str(log_path),
-            "-analysisTimeoutPerFile",
-            str(timeout_s),
-        ]
-        env = {**os.environ, "JAVA_TOOL_OPTIONS": f"-Xmx{_DIFF_BINEXPORT_HEAP_MB}m"}
-        try:
-            # Started from the project directory: analyzeHeadless resolves a bare script name
-            # against the directory it starts in first, so a same-named file there would run.
-            proc = _run_killable(cmd, env, timeout_s + 120, cwd=proj)
-        except subprocess.TimeoutExpired as exc:
-            raise DiffToolchainError(
-                f"BinExport timed out for side {side} ({so_path.name})", kind=FAIL_TIMEOUT
-            ) from exc
-    if proc.returncode != 0:
-        raise DiffToolchainError(
-            f"BinExport subprocess failed (side {side}, {so_path.name}, rc={proc.returncode})\n"
-            + _diag(cmd, proc, log_path),
-            kind=FAIL_BINEXPORT_CRASH,
-        )
-    if _analysis_timed_out(proc, log_path):
-        # Checked before the files: an export written after the analysis stopped is complete as a
-        # file and still describes a half-analysed program, and when no export was written the
-        # timeout says more about why.
-        raise DiffToolchainError(
-            f"Ghidra's analysis of side {side} ({so_path.name}) ran past -analysisTimeoutPerFile "
-            f"({timeout_s}s): the export would describe a program it did not finish analysing\n"
-            + _diag(cmd, proc, log_path),
-            kind=FAIL_TIMEOUT,
-        )
-    if not export_path.exists() or not report_path(export_path).is_file():
-        raise DiffToolchainError(
-            f"BinExport produced no file for side {side} ({so_path.name}) although the process "
-            "exited 0 — the postScript did not run to completion (analyzeHeadless returns 0 even "
-            f"when a postScript aborts). Expected: {export_path} and its report\n"
-            + _diag(cmd, proc, log_path),
-            kind=FAIL_BINEXPORT_NO_FILE,
-        )
-    return export_path
-
-
-# The line analyzeHeadless reports when -analysisTimeoutPerFile stops the analysis. It then still
-# runs the post-script and exits 0, so this line is the only sign. Ghidra's own wording only: a
-# library or flag with "timeout" in its name must not match.
-_ANALYSIS_TIMED_OUT = re.compile(rb"REPORT: Analysis timed out at \d+ seconds")
-
-
-def _analysis_timed_out(proc: subprocess.CompletedProcess[bytes], log_path: Path) -> bool:
-    """Whether Ghidra reported its analysis timed out, on stdout or in its -log file. Both are
-    read: the console always has it, but either can be missing (a log that was never written, an
-    output that was not captured), and one missing must not pass the check silently."""
-    if _ANALYSIS_TIMED_OUT.search(proc.stdout or b""):
-        return True
-    try:
-        return bool(_ANALYSIS_TIMED_OUT.search(log_path.read_bytes()))
-    except OSError:
-        return False
 
 
 def _run_bindiff(export_a: Path, export_b: Path, out_dir: Path, timeout_s: int) -> Path:
@@ -2016,7 +1904,7 @@ def run_full_diff(
                 on_outcome(done, total, oc)
         except KeyboardInterrupt:
             # Ctrl-C (or SIGTERM/SIGHUP, which the CLI turns into this): stop the sweep NOW. First
-            # kill every in-flight BinDiff group so the JVMs die at once — without this the
+            # kill every in-flight BinDiff group so they all die at once — without this the
             # already-running subprocesses (<= workers) would each run to its own timeout while
             # shutdown(wait=True) waits them out. Then discard the current in-flight (uncommitted)
             # persist — every COMPLETED binary already committed its own transaction, so a rollback

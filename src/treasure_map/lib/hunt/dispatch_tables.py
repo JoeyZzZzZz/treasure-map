@@ -107,7 +107,6 @@ CODE_TWO_INDEX = "code_two_index"
 CODE_HELPER = "code_helper"
 DATA_TERMINATOR = "data_terminator"
 UNDETERMINED = "undetermined"
-PAIRING_BASES = (CODE_TWO_INDEX, CODE_HELPER, DATA_TERMINATOR, UNDETERMINED)
 # column_evidence: what shows that a determined column is a column the table dispatches to.
 EVIDENCE_CODE = "code"  # the reading code calls it
 EVIDENCE_STRUCT = "struct"  # the record has this single handler column
@@ -607,7 +606,6 @@ class _Reading:
     rotations: list[int]
     keys: list[int]
     terminated: bool = False
-    tail_sentinel: bool = False
 
 
 @dataclass
@@ -866,7 +864,6 @@ def _terminate(w: _Words, s: int, r: _Reading) -> None:
     nk = last + s
     if nk in w.key and all(w.zero(nk + o) for o in r.offsets):
         last = nk
-        r.tail_sentinel = True
     for t in r.rotations:
         lo = last + s + (t + 1 - s)
         hi = lo + s

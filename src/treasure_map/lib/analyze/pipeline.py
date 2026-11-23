@@ -58,6 +58,7 @@ from treasure_map.lib.analyze.non_binary.orchestrator import NonBinaryStats, run
 from treasure_map.lib.analyze.symlinks import SymlinkCollector, write_symlinks
 from treasure_map.lib.analyze.xrefs import XrefStats, build_xrefs
 from treasure_map.lib.binexport_archive import (
+    SCAN_FAILED_PREFIX,
     USABLE_STATUSES,
     archive_dir,
     remove_other_archives,
@@ -497,7 +498,7 @@ def run_analyze(
                             res.reason,
                             res.timeout_budget,
                             pass_version,
-                            res.export_status or f"scan_failed:{res.reason or 'unknown'}",
+                            res.export_status or f"{SCAN_FAILED_PREFIX}{res.reason or 'unknown'}",
                             _export_meta(export_ctx, res, None),
                             # the architecture this attempt ran under (see db_ingest step 1e)
                             rec.arch,

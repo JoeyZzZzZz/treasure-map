@@ -34,7 +34,7 @@ from treasure_map.lib.pattern.classes import (
     all_path_calls_literal,
     call_offsets,
     format_string_ident,
-    path_arg_ident,
+    path_arg_ref,
     sink_callsites,
 )
 from treasure_map.lib.pattern.fingerprint import FINGERPRINT_ALGO_VERSION
@@ -45,6 +45,14 @@ from treasure_map.lib.storage.connection import open_db
 from ..boundary_words import listed_words_in
 
 _PATTERN_PKG = Path(__file__).resolve().parents[3] / "src" / "treasure_map" / "lib" / "pattern"
+
+
+def _path_ident(*args: object, **kw: object) -> str | None:
+    """The leading identifier of the PATH argument ``path_arg_ref`` reads — its ``root``, which is
+    what the flow-evidence layer classifies. Production reads the ref; these tests assert on the
+    identifier, so they go through the same reader."""
+    ref = path_arg_ref(*args, **kw)  # type: ignore[arg-type]
+    return ref.root if ref is not None else None
 
 
 def _make_db(tmp_path: Path, binaries: list[dict[str, object]]) -> Path:
@@ -366,10 +374,10 @@ def test_path_helpers_literal_ident_and_position() -> None:
     # blindly reading arg0 (the dirfd) would misjudge it.
     assert all_path_calls_literal('openat(AT_FDCWD, "/etc/x", 0);', "openat") is True
     assert all_path_calls_literal("openat(AT_FDCWD, p, 0);", "openat") is False
-    # path_arg_ident: leading identifier of the first NON-literal path arg (per-sink position).
-    assert path_arg_ident('fopen(p, "r");', "fopen") == "p"
-    assert path_arg_ident('fopen("/tmp/x", "r");', "fopen") is None
-    assert path_arg_ident("openat(AT_FDCWD, buf, 0);", "openat") == "buf"
+    # path_arg_ref: leading identifier of the first NON-literal path arg (per-sink position).
+    assert _path_ident('fopen(p, "r");', "fopen") == "p"
+    assert _path_ident('fopen("/tmp/x", "r");', "fopen") is None
+    assert _path_ident("openat(AT_FDCWD, buf, 0);", "openat") == "buf"
 
 
 def test_path_sink_set_disjoint_from_other_classes() -> None:
@@ -1325,14 +1333,14 @@ def test_the_danger_axis_identifiers_come_from_the_stub_call_too() -> None:
     would carry no identifier to trace; with it they name the variable the stub call passes.
 
     MUTATION (measured: 1 failed each, this test alone): drop the stub_names forward in
-    format_string_ident, or in path_arg_ident -> that reader returns None while a variable really
+    format_string_ident, or in path_arg_ref -> that reader returns None while a variable really
     is reaching the sink. Both were measured separately; each fails only this guard."""
     fmt_body = 'printf("ready\\n"); FUN_0041eae8(user);'
     assert format_string_ident(fmt_body, "printf") is None
     assert format_string_ident(fmt_body, "printf", {0x41EAE8: "printf"}) == "user"
     path_body = 'fopen("/etc/svc.conf", "r"); FUN_0041eb38(chosen, "w");'
-    assert path_arg_ident(path_body, "fopen") is None
-    assert path_arg_ident(path_body, "fopen", {0x41EB38: "fopen"}) == "chosen"
+    assert _path_ident(path_body, "fopen") is None
+    assert _path_ident(path_body, "fopen", {0x41EB38: "fopen"}) == "chosen"
 
 
 # ── sink-alias completion: same-signature aliases of covered sinks are recalled ─────────
@@ -1399,19 +1407,19 @@ def test_path_alias_arg_is_read_at_its_own_position_not_a_neighbour() -> None:
     The path arg (arg0 for fopen64, arg1 for openat64 after the dirfd) must be the one read.
 
     MUTATION (must go RED): read arg0 for openat64 (the dirfd), or drop fopen64 from PATH_SINK_ARG
-    so it takes no position -> path_arg_ident returns None on a variable path."""
+    so it takes no position -> the path reader returns None on a variable path."""
     # fopen64: the mode literal at arg1 must NOT wash a variable path at arg0 into 'constant'.
-    assert path_arg_ident('fopen64(chosen, "r");', "fopen64") == "chosen"
-    assert path_arg_ident('fopen64("/etc/x", "r");', "fopen64") is None
+    assert _path_ident('fopen64(chosen, "r");', "fopen64") == "chosen"
+    assert _path_ident('fopen64("/etc/x", "r");', "fopen64") is None
     assert all_path_calls_literal('fopen64(chosen, "r");', "fopen64") is False
     assert all_path_calls_literal('fopen64("/etc/x", "r");', "fopen64") is True
     # openat64: the path is arg1; arg0 is the dirfd and must not be read as the path.
-    assert path_arg_ident("openat64(AT_FDCWD, chosen, 0);", "openat64") == "chosen"
+    assert _path_ident("openat64(AT_FDCWD, chosen, 0);", "openat64") == "chosen"
     assert all_path_calls_literal("openat64(AT_FDCWD, chosen, 0);", "openat64") is False
     assert all_path_calls_literal('openat64(AT_FDCWD, "/etc/x", 0);', "openat64") is True
     # creat / truncate64: path at arg0.
-    assert path_arg_ident("creat(chosen, 0644);", "creat") == "chosen"
-    assert path_arg_ident("truncate64(chosen, 0);", "truncate64") == "chosen"
+    assert _path_ident("creat(chosen, 0644);", "creat") == "chosen"
+    assert _path_ident("truncate64(chosen, 0);", "truncate64") == "chosen"
 
 
 def test_alias_names_do_not_cross_match_by_substring() -> None:
@@ -1748,11 +1756,11 @@ def test_rename_is_constant_only_when_both_paths_are() -> None:
     """rename("/tmp/x", param_1) moves a fixed file to wherever the caller says.
 
     MUTATION: read only the source path of rename / renameat -> RED."""
-    from treasure_map.lib.pattern.classes import all_path_calls_literal, path_arg_ident
+    from treasure_map.lib.pattern.classes import all_path_calls_literal
 
     pc = 'void f(char *param_1){ rename("/tmp/x", param_1); }'
     assert not all_path_calls_literal(pc, "rename")
-    assert path_arg_ident(pc, "rename", occurrence=0) == "param_1"
+    assert _path_ident(pc, "rename", occurrence=0) == "param_1"
     pc_at = 'void f(char *param_1){ renameat(0, "/tmp/x", 0, param_1); }'
     assert not all_path_calls_literal(pc_at, "renameat")
     assert all_path_calls_literal('void f(void){ rename("/tmp/a", "/tmp/b"); }', "rename")

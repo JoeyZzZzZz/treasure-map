@@ -4,9 +4,10 @@
 
 Ghidra 11.4 loads extensions from its own ``Ghidra/Extensions`` and from the user settings
 directory (``$XDG_CONFIG_HOME`` or ``~/.config`` / ``~/Library``, then ``[<user>-]ghidra/
-ghidra_<version>_<release>``) — NOT from the old ``~/.ghidra/.ghidra_<version>`` one. The diff's
-preflight (driver._binexport_present) and the toolchain stamp read the same locator, and the
-stamp carries a digest of the jars so two builds of one version stamp apart."""
+ghidra_<version>_<release>``) — NOT from the old ``~/.ghidra/.ghidra_<version>`` one. The fixture
+builder's presence check (tests/fixtures/layer0/binexport._binexport_present) and the toolchain
+stamp read the same locator, and the stamp carries a digest of the jars so two builds of one
+version stamp apart. A diff reads the exports the scans archived and loads no extension itself."""
 
 from __future__ import annotations
 
@@ -14,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.fixtures.layer0 import binexport as fixture_export
 from treasure_map.lib.config.config import Config, GhidraConfig, GhidraLocalConfig
-from treasure_map.lib.diff import driver
 from treasure_map.lib.diff import toolchain as tc
 
 from .setup import fakes
@@ -104,26 +105,26 @@ def test_two_loaded_copies_are_not_a_version(
     tmp_path: Path, ghidra: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Install dir AND settings dir both carry one: Ghidra may load either, so no stamp is given
-    and the diff preflight does not call it present.
+    and the presence check does not call it present.
 
     MUTATION: take the first copy found -> RED."""
     home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     fakes.make_binexport(ghidra / "Ghidra" / "Extensions" / "BinExport")
     assert tc._binexport_version(ghidra) is not None
-    assert driver._binexport_present(ghidra / "support" / "analyzeHeadless") is True
+    assert fixture_export._binexport_present(ghidra / "support" / "analyzeHeadless") is True
     fakes.make_binexport(
         home / ".config" / "ghidra" / "ghidra_11.4.3_PUBLIC" / "Extensions" / "BinExport"
     )
     assert tc._binexport_version(ghidra) is None
-    assert driver._binexport_present(ghidra / "support" / "analyzeHeadless") is False
+    assert fixture_export._binexport_present(ghidra / "support" / "analyzeHeadless") is False
 
 
 def test_a_symlinked_launcher_reads_the_same_as_the_stamp(
     tmp_path: Path, ghidra: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``analyzeHeadless`` reached through a symlink (a PATH shim) resolves to the install, for
-    the preflight exactly as for detect_toolchain.
+    the presence check exactly as for detect_toolchain.
 
     MUTATION: drop ``.resolve()`` from _binexport_present -> the shim's grandparent has no
     Extensions -> False while the stamp says present -> RED."""
@@ -139,7 +140,7 @@ def test_a_symlinked_launcher_reads_the_same_as_the_stamp(
     cfg = Config(ghidra=GhidraConfig(local=GhidraLocalConfig(home=ghidra)))
     found = _REAL_DETECT(cfg)
     assert found is not None and found.binexport.startswith("11.4.3+lib:")
-    assert driver._binexport_present(shim) is True
+    assert fixture_export._binexport_present(shim) is True
 
 
 def test_the_stamp_follows_the_jars(

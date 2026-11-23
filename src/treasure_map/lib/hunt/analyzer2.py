@@ -667,19 +667,6 @@ _WRAPPER_AXIS_LABELS: dict[str, tuple[str, str]] = {
 }
 
 
-def _wrapper_sink_arg(
-    pseudocode: str,
-    wrapper_name: str,
-    fmt_index: int | None,
-    stub_names: Mapping[int, str] | None = None,
-    occurrence: int | None = None,
-) -> str | None:
-    """The variable feeding the wrapper's dangerous argument: the root of ``_wrapper_sink_arg_ref``
-    (None for a literal, a constant address, or an argument that could not be read)."""
-    ref = _wrapper_sink_arg_ref(pseudocode, wrapper_name, fmt_index, stub_names, occurrence)
-    return ref.root if ref is not None else None
-
-
 def _wrapper_sink_arg_ref(
     pseudocode: str,
     wrapper_name: str,

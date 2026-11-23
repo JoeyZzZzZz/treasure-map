@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import logging
 import os
-from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypeGuard
 
@@ -28,12 +27,6 @@ class AtlasConfig(BaseModel):
         return Path(os.path.expanduser(str(v)))
 
 
-class GhidraMode(StrEnum):
-    LOCAL = "local"  # the only implemented mode
-    DOCKER = "docker"  # accepted by the schema, not implemented
-    REMOTE = "remote"  # accepted by the schema, not implemented
-
-
 class GhidraLocalConfig(BaseModel):
     home: Path | None = None  # None = use discovery mechanism (see ghidra_runner.py)
 
@@ -45,19 +38,7 @@ class GhidraLocalConfig(BaseModel):
         return Path(os.path.expanduser(str(v)))
 
 
-class GhidraDockerConfig(BaseModel):
-    # No default image: the docker mode is not implemented yet, and the previous default named a
-    # tag that does not exist. A wrong default is worse than none — it would fail at pull time with
-    # a confusing "manifest unknown" instead of an honest "you have not configured an image".
-    image: str = ""
-
-
-class GhidraRemoteConfig(BaseModel):
-    endpoint: str = "http://localhost:8080"
-
-
 class GhidraConfig(BaseModel):
-    mode: GhidraMode = GhidraMode.LOCAL  # not read; accepted so an older config.yaml still loads
     headless_timeout_seconds: int = 600
     max_parallel_jvms: int = 4
     # Keep each binary's raw extractor output (``*_ghidra.json`` / ``*.stubs.tsv``) after it is
@@ -65,8 +46,6 @@ class GhidraConfig(BaseModel):
     # scan deletes it. It does not change what is ingested — never a content stamp.
     keep_raw_output: bool = False
     local: GhidraLocalConfig = Field(default_factory=GhidraLocalConfig)
-    docker: GhidraDockerConfig = Field(default_factory=GhidraDockerConfig)
-    remote: GhidraRemoteConfig = Field(default_factory=GhidraRemoteConfig)
 
 
 class ToolchainConfig(BaseModel):
@@ -92,7 +71,6 @@ class Config(BaseModel):
         default_factory=lambda: Path.home() / ".treasure-map" / "workspaces"
     )
     atlas: AtlasConfig = Field(default_factory=AtlasConfig)
-    log_level: str = "INFO"  # not read; accepted so an older config.yaml still loads
     # L0 xref fold threshold (edge contribution = callers × exporters). A high-fan-out symbol
     # above this is folded into the xref_folded_symbols ledger instead of exploding the xrefs table.
     # Keep in sync with xrefs.DEFAULT_FOLD_EDGE_THRESHOLD (a unit test asserts equality). Tune down

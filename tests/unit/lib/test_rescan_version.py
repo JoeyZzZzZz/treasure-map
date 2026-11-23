@@ -206,7 +206,6 @@ def _is_docstring(stmt: ast.stmt) -> bool:
 # scan stamp. Paired with the content-marked leaves, this must cover EVERY leaf of Config — a new
 # setting is then forced to declare which side it is on rather than defaulting to invisible.
 NON_CONTENT_CONFIG: dict[str, str] = {
-    "ghidra.mode": "not read; only local mode is implemented",
     "ghidra.headless_timeout_seconds": (
         "decides which binaries time out; a changed budget re-tries timed-out binaries on rescan "
         "and the per-binary extraction may change, which is surfaced by the per-binary "
@@ -215,13 +214,10 @@ NON_CONTENT_CONFIG: dict[str, str] = {
     "ghidra.max_parallel_jvms": "how many JVMs run in parallel; does not change what is stored",
     "ghidra.keep_raw_output": "keeps raw extractor output on disk for debugging; not ingested",
     "ghidra.local.home": "where Ghidra is installed; its version is recorded separately",
-    "ghidra.docker.image": "unimplemented docker mode",
-    "ghidra.remote.endpoint": "unimplemented remote mode",
     "toolchain.java_home": "where the JDK is; does not change what is stored",
     "toolchain.bindiff": "where BinDiff is; a diff-time tool, not a scan input",
     "workspace_dir": "where workspaces live on disk",
     "atlas.db_path": "where the atlas lives on disk",
-    "log_level": "not read; logging verbosity",
 }
 
 

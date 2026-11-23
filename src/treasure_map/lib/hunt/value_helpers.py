@@ -94,8 +94,9 @@ from treasure_map.lib.reachability.taint import _seed_sets
 _WRITERS: frozenset[str] = REGISTRY.writers
 # One-layer value-preserving copies: a source call wrapped in one of these still hands on the value.
 _COPY_CALLS: frozenset[str] = frozenset({"strdup", "strndup"})
-# The forms in which an expression IS the value it reads (classes.ARG_FORMS): a variable, a cast of
-# one, a read through it, its address. Arithmetic / a comparison / any other call is something else.
+# The forms in which an expression IS the value it reads (of the forms classes.arg_ref returns):
+# a variable, a cast of one, a read through it, its address. Arithmetic / a comparison / any other
+# call is something else.
 _VALUE_FORMS: frozenset[str] = frozenset({"var", "cast", "load", "addr_of"})
 # Comparison-family calls: their result is a verdict about the value, not the value.
 _COMPARE_CALLS: frozenset[str] = frozenset(
@@ -107,7 +108,6 @@ _COMPARE_OPS = ("==", "!=", "<=", ">=", "&&", "||", "<", ">")
 
 _PARAM_RE = re.compile(r"^param_(\d+)$")
 _STRING_LIT_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
-_FUN_NAME_RE = re.compile(r"^FUN_[0-9a-fA-F]+$")
 _LEAD_CALL_RE = re.compile(r"^([A-Za-z_]\w*)\s*\((.*)\)\s*$", re.DOTALL)
 _CAST_RE = re.compile(r"^\s*\((?:unsigned |signed |const )?\w[\w\s]*\**\s*\)\s*")
 _RETURN_PREFIXES = ("param_", "__dest", "pcVar", "puVar", "pvVar")
@@ -379,10 +379,6 @@ def helper_slots(pseudocode: str, source_names: Iterable[str] = SOURCE) -> froze
 
 
 # ── the population gate (M3), then criterion A ──────────────────────────────────────────────────
-
-
-def _is_fun_addr_name(name: str | None) -> bool:
-    return bool(name) and _FUN_NAME_RE.match(name or "") is not None
 
 
 def _return_type_is_bare_void(pseudocode: str) -> bool:

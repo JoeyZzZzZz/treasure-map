@@ -20,7 +20,7 @@ from treasure_map.lib.machine import (
     PER_JVM_MB,
     clamp_parallelism_to_memory,
     derive_parallelism,
-    mem_total_mb,
+    mem_total,
     physical_cores,
 )
 
@@ -72,13 +72,15 @@ def test_physical_cores_missing_file_falls_back(
 # ── memory probe ───────────────────────────────────────────────────────────────────────
 
 
-def test_mem_total_mb(tmp_path: Path) -> None:
+def test_mem_total(tmp_path: Path) -> None:
     path = _write(tmp_path, "meminfo", "MemTotal:       10183640 kB\nMemAvailable:  1347584 kB\n")
-    assert mem_total_mb(path) == 10183640 // 1024  # kB -> MB
+    probe = mem_total(path)
+    assert (probe.mb, probe.method) == (10183640 // 1024, "meminfo")  # kB -> MB
 
 
-def test_mem_total_mb_unreadable_is_conservative(tmp_path: Path) -> None:
-    assert mem_total_mb(str(tmp_path / "nope")) == 4096
+def test_mem_total_unreadable_is_conservative(tmp_path: Path) -> None:
+    probe = mem_total(str(tmp_path / "nope"))
+    assert (probe.mb, probe.method) == (4096, "unknown, assumed")
 
 
 # ── derive parallelism: min(cpu, mem) + the OOM invariant ───────────────────────────────

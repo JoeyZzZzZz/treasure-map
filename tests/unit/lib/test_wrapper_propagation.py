@@ -337,15 +337,16 @@ def test_calls_are_counted_with_the_stub_table_the_readers_use() -> None:
 
     MUTATION (verified RED): count calls without ``stub_names`` in ``_axis_candidates`` -> one
     candidate, and occurrence 1 then reads a call that does not exist."""
-    from treasure_map.lib.hunt.analyzer2 import _wrapper_sink_arg
+    from treasure_map.lib.hunt.analyzer2 import _wrapper_sink_arg_ref
 
     pc = "void f(void){ FUN_00012340(first); do_cmd(second); }"
     caller = _fn(9, "f", pc, ["do_cmd"])
     stubs = {0x12340: "do_cmd"}
     cands = find_wrapper_propagated_candidates([_WRAPPER, caller], {1: stubs})
     assert [c.occurrence for c in cands] == [0, 1]
-    read = [_wrapper_sink_arg(pc, "do_cmd", None, stubs, c.occurrence) for c in cands]
-    assert read == ["first", "second"]
+    # the reader production uses: the argument as an ArgRef, whose root is the variable feeding it
+    refs = [_wrapper_sink_arg_ref(pc, "do_cmd", None, stubs, c.occurrence) for c in cands]
+    assert [r.root if r is not None else None for r in refs] == ["first", "second"]
 
 
 def test_a_fmt_wrapper_whose_sink_call_is_stub_rendered_is_found_with_the_stub_table() -> None:

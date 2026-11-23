@@ -108,10 +108,6 @@ _EXCLUDED: dict[str, str] = {
     "lib.analyze.ghidra_runner:find_headless": (
         "where Ghidra is installed (its version is recorded)"
     ),
-    "lib.analyze.elf_inventory:detect_arch": (
-        "the language the standalone export (_run_binexport, kept for fixture builds and smoke "
-        "tests) imports under; a stored diff reads the scan's archived exports"
-    ),
     "lib.analyze.ghidra_runner:current_pass_version": (
         "the running extraction pass, compared for the preflight refusal; the binary's own pass "
         "is the extraction stamp"
@@ -132,11 +128,6 @@ _EXCLUDED: dict[str, str] = {
         "written"
     ),
     "version:installed_commit": "the installed build, compared for the run currency refusal",
-    "lib.export_stamp": (
-        "the standalone export's script names and location (_run_binexport, kept for smoke tests); "
-        "the scripts each side's export was made by are recorded with its archive and compared "
-        "per side, never read from here"
-    ),
 }
 
 

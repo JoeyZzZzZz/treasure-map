@@ -164,11 +164,6 @@ def mem_total(meminfo_path: str = _MEMINFO) -> MemProbe:
     return MemProbe(4096, "unknown, assumed")
 
 
-def mem_total_mb(meminfo_path: str = _MEMINFO) -> int:
-    """``mem_total(...).mb``."""
-    return mem_total(meminfo_path).mb
-
-
 def mem_available_mb(meminfo_path: str = _MEMINFO) -> int | None:
     """MemAvailable in MB right now, or None if it cannot be read (then no runtime clamp runs)."""
     try:

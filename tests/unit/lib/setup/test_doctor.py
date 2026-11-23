@@ -187,7 +187,7 @@ def test_the_config_check() -> None:
     assert _config_check(_inputs(Path.home())).state == "missing"
     (tm / "config.yaml").write_text("ghidra: [unclosed\n")
     assert _config_check(_inputs(Path.home())).state == "wrong"
-    (tm / "config.yaml").write_text("log_level: INFO\n")
+    (tm / "config.yaml").write_text("ghidra:\n  headless_timeout_seconds: 600\n")
     assert _config_check(_inputs(Path.home())).state == "ok"
 
 

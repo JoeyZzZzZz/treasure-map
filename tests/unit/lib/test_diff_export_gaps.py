@@ -2,11 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Toolchain failure buckets, and the functions an export could not hold as they are.
 
-Covers the driver's structured failure kinds (each set where a step fails, never read back out of a
-message that also carries argv and paths), the report a BinExport run leaves beside its file, and
-how layer 0, layer 2 and the sink overlay treat the functions that report lists: undetermined,
-never aligned, unmatched-complete, changed, unchanged or persisted. The Java side (the flow-graph
-repair and the fallback builder) runs only against a real Ghidra and is not exercised here.
+Covers the structured failure kinds (each set where a step fails, never read back out of a message
+that also carries argv and paths), the report a BinExport run leaves beside its file, and how
+layer 0, layer 2 and the sink overlay treat the functions that report lists: undetermined, never
+aligned, unmatched-complete, changed, unchanged or persisted. A diff itself runs only BinDiff; the
+export side is driven here through the standalone export the fixture builder keeps
+(tests/fixtures/layer0/binexport.py), which raises the same failure kinds a stored diff records.
+The Java side (the flow-graph repair and the fallback builder) runs only against a real Ghidra and
+is not exercised here.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from tests.fixtures.layer0 import binexport as fixture_export
 from tests.unit.lib.binexport_seed import archive_exports
 from treasure_map.lib.analyze import ghidra_runner
 from treasure_map.lib.atlas.connection import open_atlas
@@ -101,7 +105,7 @@ def test_an_export_that_wrote_nothing_is_no_file_whatever_its_argv_says(
     monkeypatch.setattr(subprocess, "run", _fake_run(seen))
     so_path = _export(tmp_path, "libnetfilter_cttimeout.so.1")
     with pytest.raises(DiffToolchainError) as ei:
-        driver._run_binexport(so_path, Config(), tmp_path, "a", 300)
+        fixture_export._run_binexport(so_path, Config(), tmp_path, "a", 300)
     assert "-analysisTimeoutPerFile" in seen[0] and "timeout" in str(ei.value)
     assert driver._classify_failure_reason(ei.value) == driver.FAIL_BINEXPORT_NO_FILE
 
@@ -113,7 +117,7 @@ def test_an_export_without_its_report_is_no_file(
     seen: list[list[str]] = []
     monkeypatch.setattr(subprocess, "run", _fake_run(seen, writes=(tmp_path / "a.BinExport",)))
     with pytest.raises(DiffToolchainError) as ei:
-        driver._run_binexport(_export(tmp_path), Config(), tmp_path, "a", 300)
+        fixture_export._run_binexport(_export(tmp_path), Config(), tmp_path, "a", 300)
     assert ei.value.kind == driver.FAIL_BINEXPORT_NO_FILE
     # the report path is handed to the script right after the export path
     i = seen[0].index(str(tmp_path / "a.BinExport"))
@@ -130,7 +134,7 @@ def test_a_step_that_ran_out_of_time_is_a_timeout(
     monkeypatch.setattr(subprocess, "run", _fake_run(seen, raises=expired))
     with pytest.raises(DiffToolchainError) as ei:
         if step == "binexport":
-            driver._run_binexport(_export(tmp_path), Config(), tmp_path, "a", 300)
+            fixture_export._run_binexport(_export(tmp_path), Config(), tmp_path, "a", 300)
         else:
             driver._run_bindiff(tmp_path / "a.BinExport", tmp_path / "b.BinExport", tmp_path, 300)
     assert driver._classify_failure_reason(ei.value) == driver.FAIL_TIMEOUT
@@ -143,7 +147,7 @@ def test_a_crashed_export_of_a_library_named_for_timeouts_is_a_crash(
     seen: list[list[str]] = []
     monkeypatch.setattr(subprocess, "run", _fake_run(seen, rc=1, stdout=b"analysis timeout"))
     with pytest.raises(DiffToolchainError) as ei:
-        driver._run_binexport(
+        fixture_export._run_binexport(
             _export(tmp_path, "libnetfilter_cttimeout.so.1"), Config(), tmp_path, "a", 300
         )
     assert driver._classify_failure_reason(ei.value) == driver.FAIL_BINEXPORT_CRASH
@@ -178,7 +182,7 @@ def test_an_export_of_an_analysis_that_timed_out_is_a_timeout(
         _fake_run(seen, stdout=stdout, writes=_complete_export(tmp_path), files=files),
     )
     with pytest.raises(DiffToolchainError) as ei:
-        driver._run_binexport(_export(tmp_path), Config(), tmp_path, "a", 10)
+        fixture_export._run_binexport(_export(tmp_path), Config(), tmp_path, "a", 10)
     assert ei.value.kind == driver.FAIL_TIMEOUT
     assert "analysis" in str(ei.value).lower()
 
@@ -197,7 +201,10 @@ def test_an_analysis_that_finished_is_not_a_timeout_whatever_it_is_named(
         subprocess, "run", _fake_run(seen, stdout=stdout, writes=_complete_export(tmp_path))
     )
     so_path = _export(tmp_path, "libnetfilter_cttimeout.so.1")
-    assert driver._run_binexport(so_path, Config(), tmp_path, "a", 300) == tmp_path / "a.BinExport"
+    assert (
+        fixture_export._run_binexport(so_path, Config(), tmp_path, "a", 300)
+        == tmp_path / "a.BinExport"
+    )
     assert "-analysisTimeoutPerFile" in seen[0]
 
 
@@ -211,7 +218,7 @@ def test_a_timed_out_analysis_without_an_export_is_still_a_timeout(
     seen: list[list[str]] = []
     monkeypatch.setattr(subprocess, "run", _fake_run(seen, stdout=_TIMED_OUT))
     with pytest.raises(DiffToolchainError) as ei:
-        driver._run_binexport(_export(tmp_path), Config(), tmp_path, "a", 10)
+        fixture_export._run_binexport(_export(tmp_path), Config(), tmp_path, "a", 10)
     assert ei.value.kind == driver.FAIL_TIMEOUT
 
 

@@ -17,7 +17,3 @@ class WorkspaceError(TreasureMapError):
 
 class GhidraNotFoundError(TreasureMapError):
     """Ghidra installation not found."""
-
-
-class InvalidFirmwareError(TreasureMapError):
-    """Firmware path does not point to a valid filesystem root."""

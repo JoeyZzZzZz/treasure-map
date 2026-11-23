@@ -1,12 +1,14 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
 """diff full-run parallelism: the preflight/compute/persist split, parallel compute + serial write,
-and the JVM-heap policy (scan keeps its per-binary ladder; diff holds a conservative fixed ceiling).
+and the JVM-heap policy (scan keeps its per-binary ladder; the standalone export the fixture builder
+keeps holds a conservative fixed ceiling; a diff itself starts no JVM).
 
 Hermetic: the external toolchain never runs. compute is stubbed to control success/failure and to
 record which thread it ran on; persist is stubbed the same way so the "writes are serial on the main
 thread" invariant is observable. preflight is stubbed with dummy .so files so the serial pre-phase
-resolves without a real located binary / toolchain.
+resolves without a real located binary / toolchain. The one exception is the interrupt test at the
+end, which runs a fake ``bindiff`` as a real subprocess — that is the whole point of it.
 """
 
 from __future__ import annotations
@@ -14,11 +16,14 @@ from __future__ import annotations
 import inspect
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from tests.fixtures.layer0 import binexport as fixture_export
 from tests.unit.lib.binexport_seed import stored_export
+from tests.unit.lib.test_run_killable import _fake_bindiff, _reap
 from treasure_map.lib.analyze.ghidra_runner import adaptive_heap_mb
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.writer import begin_run
@@ -116,11 +121,12 @@ def test_scan_still_uses_per_binary_adaptive_heap() -> None:
     )  # the small-lib rung is still 512, not a big value
 
 
-def test_diff_heap_stays_conservative_pending_measurement() -> None:
-    # ★ diff's BinExport heap stays a fixed 4096 (NOT the ladder) until a peak-heap measurement on
-    # the largest diffed binary confirms a smaller value is safe (spec: "never OOM mid-sweep").
-    assert driver._DIFF_BINEXPORT_HEAP_MB == 4096
-    src = inspect.getsource(driver._run_binexport)
+def test_the_standalone_export_heap_stays_conservative_pending_measurement() -> None:
+    # ★ The standalone export the fixture builder keeps holds a fixed 4096 heap (NOT the ladder)
+    # until a peak-heap measurement on the largest binary confirms a smaller value is safe
+    # (spec: "never OOM mid-export"). A diff itself starts no JVM.
+    assert fixture_export._DIFF_BINEXPORT_HEAP_MB == 4096
+    src = inspect.getsource(fixture_export._run_binexport)
     assert "_DIFF_BINEXPORT_HEAP_MB" in src  # the fixed ceiling, wired via the named marker
     assert "adaptive_heap_mb" not in src  # NOT ladder-ized yet (the pending downsize)
 
@@ -421,11 +427,11 @@ def test_ctrl_c_cancels_queue_keeps_completed_marks_cancelled(
     assert len(ran) == 1 and len(cancelled) == 2  # 1 completed, 2 queued -> cancelled (not drained)
 
 
-def test_ctrl_c_kills_the_in_flight_binexport_groups(
+def test_ctrl_c_kills_the_in_flight_bindiff_groups(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # ★ Ctrl-C mid-sweep must reap the running BinExport groups AT ONCE (so their 4GB-heap JVMs do
-    # not linger while shutdown(wait=True) waits each out to its own timeout), before the rollback.
+    # ★ Ctrl-C mid-sweep must reap the running BinDiff groups AT ONCE (so they do not linger while
+    # shutdown(wait=True) waits each out to its own timeout), before the rollback.
     # Reverse: dropping the _kill_running_groups() call in the handler leaves `killed` False.
     atlas_path = _seed(tmp_path, {"a": "1", "b": "2"}, {"a": "1x", "b": "2x"})
     monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
@@ -451,6 +457,66 @@ def test_ctrl_c_kills_the_in_flight_binexport_groups(
     con.close()
     assert fsum.cancelled is True
     assert killed["n"] == 1  # the interrupt handler took the in-flight groups down
+
+
+def test_ctrl_c_with_a_real_bindiff_in_flight_returns_at_once_and_leaves_nothing_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The whole interrupt path with the real pieces: a REAL subprocess (a fake ``bindiff`` that
+    backgrounds a 30s child, the launcher->tool shape) running on a real worker thread, interrupted
+    on the main thread. run_full_diff must come back at once — not at the tool's own timeout — and
+    leave no process of the group behind.
+
+    This is what the stubbed-out kill tests above cannot show: there, ``_kill_running_groups`` is
+    either faked or has an empty registry.
+
+    MUTATIONS (each must go RED): ``_run_bindiff`` back to ``subprocess.run`` -> its group is never
+    registered, the kill reaps nothing and ``pool.shutdown(wait=True)`` waits the 30s child out ->
+    both the time bound and the leak assertion fail; drop ``_kill_running_groups()`` from the
+    KeyboardInterrupt handler -> the same.
+    """
+    marker = "tmap_test_sweep_bindiff"
+    atlas_path = _seed(tmp_path, {"a": "1"}, {"a": "1x"})
+    monkeypatch.setattr(driver, "_check_toolchain", lambda config: None)
+    monkeypatch.setattr(driver, "preflight", _fake_preflight(tmp_path))
+    monkeypatch.setattr(driver, "_find_bindiff", lambda: _fake_bindiff(tmp_path, marker, 30))
+    monkeypatch.setattr(driver, "_persist_success", _ok_persist)
+
+    def _compute_through_bindiff(export_a, export_b, td, config):  # type: ignore[no-untyped-def]
+        # the real step, on the worker thread: its own process group, registered while it runs
+        return driver._run_bindiff(td / "a.BinExport", td / "b.BinExport", td, 600)
+
+    monkeypatch.setattr(driver, "compute_diff", _compute_through_bindiff)
+
+    interrupted_at: dict[str, float] = {}
+
+    def _interrupt_once_it_runs(fut_map):  # type: ignore[no-untyped-def]
+        # wait for the worker's group to be registered, then interrupt the main thread as Ctrl-C
+        # does; this generator yields nothing, so no outcome is persisted.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not driver._RUNNING_PGIDS:
+            time.sleep(0.05)
+        assert driver._RUNNING_PGIDS, "the worker's BinDiff group never reached the registry"
+        interrupted_at["t"] = time.monotonic()
+        raise KeyboardInterrupt
+        yield  # pragma: no cover -- unreachable; makes this a generator
+
+    monkeypatch.setattr(driver, "as_completed", _interrupt_once_it_runs)
+
+    con = open_atlas(atlas_path)
+    try:
+        fsum = driver.run_full_diff(con, "run_a", "run_b", config=_cfg())
+    finally:
+        con.close()
+    returned_after = time.monotonic() - interrupted_at["t"]
+    time.sleep(0.5)  # let SIGKILL reach the grandchild before looking
+    leaked = _reap(marker)
+    assert fsum.cancelled is True
+    assert leaked == [], f"a BinDiff of the interrupted sweep survived: {leaked}"
+    assert returned_after < 3, (
+        f"run_full_diff returned {returned_after:.1f}s after the interrupt -> the in-flight "
+        "BinDiff was waited out instead of killed"
+    )
 
 
 def test_sqlite_error_in_persist_does_not_abort_the_sweep(

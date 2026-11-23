@@ -6,17 +6,13 @@ import fcntl
 import logging
 import os
 import sqlite3
-from collections.abc import Callable
 from pathlib import Path
-from typing import IO, Any
+from typing import IO
 
 from treasure_map.lib.errors import WorkspaceError
 from treasure_map.lib.ro_db import ro_connect
 
 logger = logging.getLogger(__name__)
-
-# Kept for callers that type a scan/diff progress callback; the Workspace no longer fires one.
-ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
 class Workspace:

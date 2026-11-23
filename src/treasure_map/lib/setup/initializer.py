@@ -28,7 +28,8 @@ from treasure_map.lib.setup.tmap_files import ENV_TEXT, config_text
 logger = logging.getLogger(__name__)
 
 # Default config matching config.example.yaml; stores env var names, never values. Only keys tmap
-# reads are written (an older init's ghidra.mode and log_level still load; nothing reads them).
+# reads are written; a config an older init wrote (ghidra.mode, log_level) still loads, because an
+# unknown key is ignored rather than refused.
 # max_parallel_jvms is deliberately ABSENT here: _configure_parallelism probes the machine at init
 # and writes the derived value (a hardcoded default would mask a wrong-sized pool). If it were ever
 # missing from config.yaml, config.py's GhidraConfig default (4) is the safety fallback.
