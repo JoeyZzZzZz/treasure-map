@@ -669,7 +669,7 @@ def test_the_keyed_lookup_fixtures_are_blocked_by_the_measured_rule_alone() -> N
     nothing), and for the writer a bare-void return and no callsite taking its return."""
     from treasure_map.lib.hunt.value_helpers import (
         _body_shape_ok,
-        _return_taken_call_keys,
+        _callsite_keys,
         _return_type_is_bare_void,
         _source_calls,
     )
@@ -680,5 +680,67 @@ def test_the_keyed_lookup_fixtures_are_blocked_by_the_measured_rule_alone() -> N
     assert _source_calls(_ONE_HOP_GETTER, set(SOURCE)) == set()
     assert _return_type_is_bare_void(_SELF_PARSING_WRITER) is True
     assert _body_shape_ok(_SELF_PARSING_WRITER) is False
-    keys = _return_taken_call_keys([_fn(2, "keyed", _KEYED_CALLS)])
-    assert keys.get("FUN_00003000", set()) == set()  # no callsite takes the return
+    taken, _every = _callsite_keys([_fn(2, "keyed", _KEYED_CALLS)])
+    assert taken.get("FUN_00003000", set()) == set()  # no callsite takes the return
+
+
+def test_callsite_keys_merges_the_two_passes_without_changing_either_table() -> None:
+    """``_callsite_keys`` computes the return-taken table and the every-callsite table in one walk.
+    Each must equal the pre-merge two-pass computation (kept here as the reference), ignoring empty
+    entries the old defaultdict created incidentally — those are absent-equivalent for every reader.
+
+    MUTATION (verified RED): gate the every-table on ``is_taken`` too -> a writer whose return is
+    never taken loses its keys; drop the ``if is_taken`` guard on the taken-table -> a non-taken
+    callsite's literals leak into gate 3."""
+    from collections import defaultdict
+
+    from treasure_map.lib.hunt.value_helpers import (
+        _FUN_CALL_RE,
+        _RETURN_TAKEN_RE,
+        _STRING_LIT_RE,
+        _callsite_keys,
+        _CallsiteKeys,
+    )
+    from treasure_map.lib.pattern.classes import call_args_at, call_offsets
+
+    def ref_taken(funcs: list[FuncRow]) -> dict[str, set[str]]:
+        keys: dict[str, set[str]] = defaultdict(set)
+        for f in funcs:
+            pc = f.pseudocode or ""
+            for name in {m.group(1) for m in _FUN_CALL_RE.finditer(pc)}:
+                for off in call_offsets(pc, name):
+                    start = off
+                    while start > 0 and pc[start - 1].isspace():
+                        start -= 1
+                    start -= len(name)
+                    if not _RETURN_TAKEN_RE.search(pc[max(0, start - 120) : start]):
+                        continue
+                    for a in call_args_at(pc, off) or []:
+                        keys[name].update(_STRING_LIT_RE.findall(a))
+        return {k: v for k, v in keys.items() if v}
+
+    def ref_every(funcs: list[FuncRow]) -> dict[str, _CallsiteKeys]:
+        keys: dict[str, set[str]] = defaultdict(set)
+        positions: dict[str, set[int]] = defaultdict(set)
+        for f in funcs:
+            pc = f.pseudocode or ""
+            for name in {m.group(1) for m in _FUN_CALL_RE.finditer(pc)}:
+                for off in call_offsets(pc, name):
+                    for pos, a in enumerate(call_args_at(pc, off) or []):
+                        if _STRING_LIT_RE.findall(a):
+                            keys[name].update(_STRING_LIT_RE.findall(a))
+                            positions[name].add(pos)
+        return {n: _CallsiteKeys(frozenset(k), frozenset(positions[n])) for n, k in keys.items()}
+
+    # a binary with a return-taken getter, an out-param writer whose return is never taken, and a
+    # FUN call with no literal args (the empty-entry case the old taken-table created)
+    caller = (
+        "void h(char *param_1){ char a[64]; char b[64]; int *q; "
+        'q = FUN_00001000("wan"); q = FUN_00001000("lan"); '  # return taken, two keys
+        'FUN_00003000(param_1,"ssid=",a); FUN_00003000(param_1,"passwd=",b); '  # never taken
+        "q = FUN_00002000(param_1); }"  # return taken, no literal args -> no key
+    )
+    funcs = [_fn(1, "h", caller)]
+    taken, every = _callsite_keys(funcs)
+    assert {k: v for k, v in taken.items() if v} == ref_taken(funcs)
+    assert {k: v for k, v in every.items()} == ref_every(funcs)

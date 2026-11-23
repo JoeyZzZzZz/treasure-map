@@ -11,6 +11,7 @@ name it is made with). No entry names a firmware, a product or a device.
 
 from __future__ import annotations
 
+import bisect
 import functools
 import re
 from collections.abc import Iterable, Mapping
@@ -1056,7 +1057,13 @@ def _is_phantom_offset(paren_off: int, decl_end: int, spans: tuple[tuple[int, in
     this rule is off), or with its paren inside a string/char literal span. See ``call_offsets``."""
     if decl_end != -1 and paren_off < decl_end:
         return True
-    return any(lo < paren_off <= hi for lo, hi in spans)
+    # ``spans`` is ascending and non-overlapping (``_literal_spans``), so at most one span can
+    # hold ``paren_off`` — the last one whose open index is before it. Binary-search for it rather
+    # than scanning: a hot body runs this ~8e8 times. ``bisect_left(spans, (paren_off,))`` lands at
+    # the first span whose open index is >= paren_off, so the span before it (if any) is the only
+    # candidate; ``lo < paren_off`` then holds by construction and only ``paren_off <= hi`` is left.
+    i = bisect.bisect_left(spans, (paren_off,)) - 1
+    return i >= 0 and paren_off <= spans[i][1]
 
 
 # ── Call locations: one authority on "where are the calls to NAME" ──────────────────────────────

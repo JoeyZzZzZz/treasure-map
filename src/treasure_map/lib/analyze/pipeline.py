@@ -51,6 +51,7 @@ from treasure_map.lib.analyze.ghidra_runner import (
     GhidraRunner,
     _write_owner,
     export_paths,
+    ingested_paths,
     unfinished_decompiles,
 )
 from treasure_map.lib.analyze.non_binary.orchestrator import NonBinaryStats, run_all_ingesters
@@ -539,6 +540,7 @@ def run_analyze(
                 remove_other_archives(export_ctx.archive_dir, rec.sha256, keep)
                 _drop_raw_export(rec)
                 if stored:
+                    _drop_ingested(rec)  # ingested once; nothing reads it again
                     _record_decompile_rerun(rec, res)
                 return one
 
@@ -563,6 +565,15 @@ def run_analyze(
 
             def _drop_raw_export(rec: ElfRecord) -> None:
                 for path in export_paths(ghidra_output_dir, rec.path, rec.sha256[:8]):
+                    path.unlink(missing_ok=True)
+                    path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+
+            def _drop_ingested(rec: ElfRecord) -> None:
+                """The raw extractor output a stored extraction leaves behind: nothing reads it
+                again, so remove it unless ``keep_raw_output`` asked to keep it for debugging."""
+                if config.ghidra.keep_raw_output:
+                    return
+                for path in ingested_paths(ghidra_output_dir, rec.path, rec.sha256[:8]):
                     path.unlink(missing_ok=True)
                     path.with_name(path.name + ".tmp").unlink(missing_ok=True)
 
@@ -700,6 +711,15 @@ def run_analyze(
         # Every file under the root and whether the two inventories above took it in
         # (wipe-and-rebuild). After both, so it reads what they actually took.
         build_file_inventory(conn, fs_root, records, ingest_failed=nb_stats.ingest_failed)
+
+        # Sweep any raw extractor output still in the output directory — a failed binary's, or a
+        # backlog a scan before this cleanup existed left behind. Nothing reads it once ingested, so
+        # a clean scan ends with none (``keep_raw_output`` keeps it for debugging).
+        if not config.ghidra.keep_raw_output:
+            sweep_dir = workspace.path / "ghidra_output"
+            if sweep_dir.is_dir():
+                for leftover in (*sweep_dir.glob("*_ghidra.json"), *sweep_dir.glob("*.stubs.tsv")):
+                    leftover.unlink(missing_ok=True)
 
         # The scan finished. Record what built this analysis.db — the stamp grabbed at the start,
         # so it names the code this process ran. Last, inside the try, so it is written only on a

@@ -557,6 +557,14 @@ def export_paths(output_dir: Path, binary: Path, sha8: str) -> tuple[Path, Path]
     return output_dir / f"{stem}.BinExport", output_dir / f"{stem}.export_report.json"
 
 
+def ingested_paths(output_dir: Path, binary: Path, sha8: str) -> tuple[Path, Path]:
+    """(ghidra.json, stubs.tsv) the extractor writes for ``binary`` and the ingest reads once. After
+    ingest nothing reads them again (the cache key is the stored sha256 + pass_version), so a scan
+    deletes them rather than letting a whole image set of raw exports accumulate on disk."""
+    stem = f"{binary.name}_{sha8}"
+    return output_dir / f"{stem}_ghidra.json", output_dir / f"{stem}.stubs.tsv"
+
+
 def _build_cmd(
     headless: Path,
     binary: Path,
@@ -1164,8 +1172,7 @@ class GhidraRunner:
             cmd = _build_cmd(
                 headless, binary, arch, proj_dir, output_dir, self._script_dir, sha8, timeout, exp
             )
-            expected_out = output_dir / f"{binary.name}_{sha8}_ghidra.json"
-            stub_table = output_dir / f"{binary.name}_{sha8}.stubs.tsv"
+            expected_out, stub_table = ingested_paths(output_dir, binary, sha8)
             # A file left at the target path by an earlier run must never be read as this run's
             # output: clear it (and its in-flight .tmp, and an earlier run's stub table and export)
             # before starting, so the only files present afterwards are ones THIS run wrote. The

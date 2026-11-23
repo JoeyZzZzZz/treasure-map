@@ -1038,3 +1038,58 @@ def test_an_interrupt_tells_extracted_failed_and_left_apart(
     # the failure the serial re-run recorded was committed before the interrupt: it survives it
     st = _state(tmp_path / "ws" / "analysis.db")
     assert (st[_NAMES[1]]["ghidra_ok"], st[_NAMES[1]]["ghidra_status"]) == (0, "failed")
+
+
+# ── raw extractor output is not kept after ingest (M-3) ─────────────────────────
+
+
+def test_ingested_paths_names_the_json_and_stub_table() -> None:
+    """``ingested_paths`` points at the extractor output a scan deletes after ingest, matching the
+    names the extractor wrote (``<name>_<sha8>_ghidra.json`` / ``.stubs.tsv``)."""
+    from treasure_map.lib.analyze.ghidra_runner import ingested_paths
+
+    j, s = ingested_paths(Path("/o"), Path("/fs/usr/sbin/httpd"), "abc12345")
+    assert j == Path("/o/httpd_abc12345_ghidra.json")
+    assert s == Path("/o/httpd_abc12345.stubs.tsv")
+
+
+def test_a_clean_scan_sweeps_leftover_raw_output_but_keeps_logs(tmp_path: Path) -> None:
+    """A clean scan removes any ``*_ghidra.json`` / ``*.stubs.tsv`` left in the output directory —
+    nothing reads them once ingested — while leaving ``.log`` files. This also recovers a backlog a
+    scan before the cleanup existed left behind.
+
+    MUTATION (verified RED): drop the sweep (and the per-binary ``_drop_ingested``) -> the leftover
+    JSON survives the scan."""
+    rec = _rec()
+    runner = _mock_runner()
+    with patch(f"{MODULE}.GhidraRunner", return_value=runner):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest(set())):  # nothing dirty: clean finish
+                with Workspace(tmp_path / "ws") as ws:
+                    gdir = ws.path / "ghidra_output"
+                    gdir.mkdir(parents=True, exist_ok=True)
+                    (gdir / "httpd_abc12345_ghidra.json").write_text("{}")
+                    (gdir / "httpd_abc12345.stubs.tsv").write_text("x\ty\n")
+                    (gdir / "httpd_abc12345.log").write_text("log")
+                    run_analyze(tmp_path / "fs", ws, _cfg())
+                    assert not (gdir / "httpd_abc12345_ghidra.json").exists()
+                    assert not (gdir / "httpd_abc12345.stubs.tsv").exists()
+                    assert (gdir / "httpd_abc12345.log").exists()  # logs are kept
+
+
+def test_keep_raw_output_keeps_the_extractor_json(tmp_path: Path) -> None:
+    """``ghidra.keep_raw_output`` keeps the raw output for debugging — the same clean scan leaves
+    the JSON and stub table in place."""
+    cfg = Config.model_validate({"ghidra": {"keep_raw_output": True}})
+    assert cfg.ghidra.keep_raw_output is True
+    rec = _rec()
+    runner = _mock_runner()
+    with patch(f"{MODULE}.GhidraRunner", return_value=runner):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest(set())):
+                with Workspace(tmp_path / "ws") as ws:
+                    gdir = ws.path / "ghidra_output"
+                    gdir.mkdir(parents=True, exist_ok=True)
+                    (gdir / "httpd_abc12345_ghidra.json").write_text("{}")
+                    run_analyze(tmp_path / "fs", ws, cfg)
+                    assert (gdir / "httpd_abc12345_ghidra.json").exists()

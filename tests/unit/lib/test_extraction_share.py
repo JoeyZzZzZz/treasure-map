@@ -41,12 +41,16 @@ class _Counted:
         return dataclasses.replace(self.sessions(runner, *a, **k), session=uuid.uuid4().hex[:12])
 
 
-def _scan_two(tmp_path: Path, *, share: bool) -> tuple[_Counted, list[Path]]:
+def _scan_two(
+    tmp_path: Path, *, share: bool, keep_raw: bool = False
+) -> tuple[_Counted, list[Path]]:
     fs = _firmware(tmp_path)
     home = _ghidra(tmp_path)
     _with_extension(home)
     dec = _Counted(_Sessions({n: ["ok"] * 4 for n in _NAMES}))
     dbs = [tmp_path / f"ws{i}" / "analysis.db" for i in (1, 2)]
+    cfg = _e2e_cfg(home)
+    cfg.ghidra.keep_raw_output = keep_raw  # keep raw JSON on disk so a test can compare it
     with patch.object(GhidraRunner, "_run_session", lambda self, *a, **k: dec(self, *a, **k)):
         ctx = sharing_extractions() if share else None
         if ctx is not None:
@@ -54,7 +58,7 @@ def _scan_two(tmp_path: Path, *, share: bool) -> tuple[_Counted, list[Path]]:
         try:
             for db in dbs:
                 with Workspace(db.parent) as ws:
-                    run_analyze(fs, ws, _e2e_cfg(home))
+                    run_analyze(fs, ws, cfg)
         finally:
             if ctx is not None:
                 ctx.__exit__(None, None, None)
@@ -66,11 +70,13 @@ def test_a_rescan_decompiles_a_shared_binary_once_and_every_holder_stores_the_sa
 ) -> None:
     """★ Two runs holding the same six binaries, scanned within one sharing block: six sessions,
     not twelve. Both store the same functions, and archive the same export under the same session
-    name; the JSON each run stored is byte-identical. Without sharing, each run decompiles all six.
+    name; the raw JSON each run stored is byte-identical. Without sharing, each run decompiles all
+    six. (Run with ``keep_raw_output`` so the raw JSON survives the scan for the byte-comparison — a
+    normal scan deletes it once ingested; see test_pipeline.)
 
     MUTATION (verified RED): never hand a kept session on -> twelve sessions -> RED; archive under a
     fresh name per write -> the names differ -> RED."""
-    dec, (db1, db2) = _scan_two(tmp_path / "shared", share=True)
+    dec, (db1, db2) = _scan_two(tmp_path / "shared", share=True, keep_raw=True)
     assert dec.n == len(_NAMES)
     s1, s2 = _state(db1), _state(db2)
     assert {n: v["functions"] for n, v in s1.items()} == {n: v["functions"] for n, v in s2.items()}

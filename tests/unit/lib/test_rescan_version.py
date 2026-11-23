@@ -213,6 +213,7 @@ NON_CONTENT_CONFIG: dict[str, str] = {
         "incomplete/timeout markers, not by a run-level scan-stamp change"
     ),
     "ghidra.max_parallel_jvms": "how many JVMs run in parallel; does not change what is stored",
+    "ghidra.keep_raw_output": "keeps raw extractor output on disk for debugging; not ingested",
     "ghidra.local.home": "where Ghidra is installed; its version is recorded separately",
     "ghidra.docker.image": "unimplemented docker mode",
     "ghidra.remote.endpoint": "unimplemented remote mode",

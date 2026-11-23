@@ -60,6 +60,10 @@ class GhidraConfig(BaseModel):
     mode: GhidraMode = GhidraMode.LOCAL  # not read; accepted so an older config.yaml still loads
     headless_timeout_seconds: int = 600
     max_parallel_jvms: int = 4
+    # Keep each binary's raw extractor output (``*_ghidra.json`` / ``*.stubs.tsv``) after it is
+    # ingested, for debugging. Off by default: nothing reads it once the extraction is stored, so a
+    # scan deletes it. It does not change what is ingested — never a content stamp.
+    keep_raw_output: bool = False
     local: GhidraLocalConfig = Field(default_factory=GhidraLocalConfig)
     docker: GhidraDockerConfig = Field(default_factory=GhidraDockerConfig)
     remote: GhidraRemoteConfig = Field(default_factory=GhidraRemoteConfig)

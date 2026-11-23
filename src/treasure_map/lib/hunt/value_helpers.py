@@ -409,28 +409,6 @@ def _body_shape_ok(pseudocode: str) -> bool:
     return False
 
 
-def _return_taken_call_keys(funcs: Iterable[FuncRow]) -> dict[str, set[str]]:
-    """Per callee ``FUN_<addr>`` name, the distinct string literals passed where its RETURN is
-    taken across the binary's callers (gate 3). A call takes the return when a lone ``=`` sits
-    right before its name (one cast allowed): ``x = FUN_…(…)`` as a statement, and equally
-    ``if ((p = FUN_…(…)) != 0)`` inside a condition. Judged at the call, not per statement."""
-    keys: dict[str, set[str]] = defaultdict(set)
-    for f in funcs:
-        pc = f.pseudocode or ""
-        # The FUN-<addr> gate, enforced here: only such a name is ever collected.
-        for name in {m.group(1) for m in _FUN_CALL_RE.finditer(pc)}:
-            for off in call_offsets(pc, name):
-                start = off
-                while start > 0 and pc[start - 1].isspace():
-                    start -= 1
-                start -= len(name)
-                if not _RETURN_TAKEN_RE.search(pc[max(0, start - 120) : start]):
-                    continue  # gate 3: only callsites that TAKE the return count
-                for a in call_args_at(pc, off) or []:
-                    keys[name].update(_STRING_LIT_RE.findall(a))
-    return keys
-
-
 # ── the keyed-lookup rule: a getter that parses its own input ───────────────────────────────────
 
 # Parsing calls: a function handed a parameter to one of these reads a structure out of it rather
@@ -460,32 +438,50 @@ class _CallsiteKeys:
     positions: frozenset[int]
 
 
-def _every_callsite_keys(funcs: Iterable[FuncRow]) -> dict[str, _CallsiteKeys]:
-    """Per callee ``FUN_<addr>`` name, the string-literal keys passed at EVERY callsite in the
-    binary and the argument positions they arrived at.
+def _callsite_keys(
+    funcs: Iterable[FuncRow],
+) -> tuple[dict[str, set[str]], dict[str, _CallsiteKeys]]:
+    """Both key tables a binary's admission needs, in ONE pass over its callsites:
 
-    Unlike ``_return_taken_call_keys`` this does not require the call to take the return: the
-    getters this rule exists for write their value into a caller's buffer and return a status, so
-    no callsite of theirs takes a value at all. Only string LITERALS count — a ``&DAT_`` pointer
-    argument also names a key (see ``helper_keys_called``, which resolves one for a reader), but
-    counting those toward the gate widens the admitted population without reaching any getter the
-    literals do not already reach, so the gate stays on literals."""
-    keys: dict[str, set[str]] = defaultdict(set)
+      * ``taken`` — per callee ``FUN_<addr>`` name, the distinct string literals passed where its
+        RETURN is taken (gate 3 of the measured rule). A call takes the return when a lone ``=``
+        sits right before its name (one cast allowed): ``x = FUN_…(…)``, and equally
+        ``if ((p = FUN_…(…)) != 0)``. Judged at the call, not per statement.
+      * ``every`` — per such name, the string-literal keys passed at EVERY callsite and the
+        argument positions they arrived at (the keyed-lookup rule, whose getters write into a
+        caller's buffer and take no return). Only string LITERALS count toward the gate — a
+        ``&DAT_`` pointer also names a key for a reader (``helper_keys_called``), but counting
+        those would widen the admitted population without reaching a getter the literals miss.
+
+    These were two passes until the self-source feature made each walk every (function, FUN-name,
+    callsite); merged here so ``call_offsets`` / ``call_args_at`` and the return-taken test run
+    once per callsite, not twice."""
+    taken: dict[str, set[str]] = defaultdict(set)
+    every: dict[str, set[str]] = defaultdict(set)
     positions: dict[str, set[int]] = defaultdict(set)
     for f in funcs:
         pc = f.pseudocode or ""
-        # The FUN-<addr> gate, enforced here as in ``_return_taken_call_keys``: only such a name is
-        # ever collected, so a named callee can never accumulate keys.
+        # The FUN-<addr> gate, enforced here: only such a name is ever collected, so a named
+        # callee can never accumulate keys.
         for name in {m.group(1) for m in _FUN_CALL_RE.finditer(pc)}:
             for off in call_offsets(pc, name):
+                start = off
+                while start > 0 and pc[start - 1].isspace():
+                    start -= 1
+                start -= len(name)
+                is_taken = bool(_RETURN_TAKEN_RE.search(pc[max(0, start - 120) : start]))
                 for pos, a in enumerate(call_args_at(pc, off) or []):
                     found = _STRING_LIT_RE.findall(a)
-                    if found:
-                        keys[name].update(found)
-                        positions[name].add(pos)
-    return {
-        name: _CallsiteKeys(frozenset(ks), frozenset(positions[name])) for name, ks in keys.items()
+                    if not found:
+                        continue
+                    every[name].update(found)
+                    positions[name].add(pos)
+                    if is_taken:
+                        taken[name].update(found)
+    every_out = {
+        name: _CallsiteKeys(frozenset(ks), frozenset(positions[name])) for name, ks in every.items()
     }
+    return taken, every_out
 
 
 def _reads_indirect(pseudocode: str) -> bool:
@@ -669,8 +665,7 @@ def _binary_table(funcs: list[FuncRow]) -> SourceHelpers:
     the measured one (the M3 gate, then criterion A, RETURN_SLOT only) or the keyed-lookup one (a
     string-keyed lookup recognised on shape, both slots). A function may be admitted by both; the
     slots are a set, so one reading never doubles another."""
-    call_keys = _return_taken_call_keys(funcs)
-    every_keys = _every_callsite_keys(funcs)
+    call_keys, every_keys = _callsite_keys(funcs)
     bodies = {f.name: f.pseudocode or "" for f in funcs if f.name is not None}
     compared: dict[str, frozenset[int]] = {}
 
@@ -692,8 +687,8 @@ def _binary_table(funcs: list[FuncRow]) -> SourceHelpers:
         pc = f.pseudocode
         # ── the measured rule, unchanged ──
         # gate 3: called with >= 2 distinct string keys where its return is taken. Only a
-        # FUN_<addr> name accumulates keys (``_return_taken_call_keys``), so a named callee is
-        # excluded here, at the single enforcement point of the FUN-name gate.
+        # FUN_<addr> name accumulates keys (``_callsite_keys``), so a named callee is excluded
+        # here, at the single enforcement point of the FUN-name gate.
         if len(call_keys.get(name, ())) >= 2 and _body_shape_ok(pc):  # gate 4
             for slot in helper_slots(pc):
                 # Only the measured reading is admitted (see the module docstring).

@@ -1916,3 +1916,31 @@ def test_a_getter_lookalike_leaves_the_candidate_unknown() -> None:
     (match,) = shapes.pattern_cmd(fr, callees, body)
     assert match.source_class == "unknown"
     assert free_sources_called(body) == []
+
+
+def test_phantom_offset_bisect_matches_the_linear_scan() -> None:
+    """``_is_phantom_offset`` finds the literal span holding a ``name(`` paren by binary search over
+    the ascending, non-overlapping spans — equal to the old linear ``any(lo < off <= hi)`` for every
+    offset of every body. Property test over random literal-laced text; the linear form is the
+    reference.
+
+    MUTATION (verified RED): ``paren_off <= spans[i][1]`` -> ``<`` misses an offset that lands on a
+    span's closing quote; drop the ``- 1`` or the ``i >= 0`` guard -> a wrong span (or the last one,
+    via index -1) is tested."""
+    import random
+
+    from treasure_map.lib.pattern.classes import _is_phantom_offset, _literal_spans
+
+    def linear(off: int, spans: tuple[tuple[int, int], ...]) -> bool:
+        return any(lo < off <= hi for lo, hi in spans)
+
+    rng = random.Random(20261123)
+    alphabet = ["x", "(", ")", " ", '"', "'", "\\", "a", "1", "\n"]
+    for _ in range(3000):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 40)))
+        spans = _literal_spans(text)
+        for off in range(len(text) + 2):
+            assert _is_phantom_offset(off, -1, spans) == linear(off, spans)
+    # an offset exactly on a closing quote is phantom (the <= tooth)
+    spans = _literal_spans('a("b")')  # the inner literal "b" spans the quotes
+    assert spans and _is_phantom_offset(spans[0][1], -1, spans) is True
