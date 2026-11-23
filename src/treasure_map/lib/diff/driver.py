@@ -808,14 +808,14 @@ def _tail(raw: bytes | None, n: int) -> str:
 # guards the set because the parallel full diff runs several at a time.
 _RUNNING_PGIDS: set[int] = set()
 _RUNNING_PGIDS_LOCK = threading.Lock()
-# Set when the sweep is interrupted. A worker that had not yet started its BinExport when the
-# running groups were killed (side b after side a, say) would otherwise start a fresh JVM after the
-# kill and keep the shutdown waiting on it; _run_killable checks this before and after it starts.
+# Set when the sweep is interrupted. A worker that had not yet started its BinDiff when the running
+# groups were killed would otherwise start a fresh JVM after the kill and keep the shutdown waiting
+# on it; _run_killable checks this before and after it starts.
 _SWEEP_CANCELLED = threading.Event()
 
 
 class _SweepCancelledError(Exception):
-    """A BinExport step refused or stopped because the sweep it belongs to was interrupted."""
+    """A toolchain step refused or stopped because the sweep it belongs to was interrupted."""
 
 
 def _register_pgid(pgid: int) -> None:
@@ -829,8 +829,8 @@ def _unregister_pgid(pgid: int) -> None:
 
 
 def _kill_running_groups() -> None:
-    """SIGKILL every BinExport process group still running. Called when the sweep is interrupted:
-    the 4GB-heap JVMs die at once, instead of each being waited on until it hits its own timeout."""
+    """SIGKILL every toolchain (BinDiff) process group still running. Called when the sweep is
+    interrupted: the JVMs die at once, instead of each being waited on until it hits its timeout."""
     _SWEEP_CANCELLED.set()  # first: a worker about to start a JVM now refuses to
     with _RUNNING_PGIDS_LOCK:
         pgids = list(_RUNNING_PGIDS)
@@ -1018,9 +1018,12 @@ def _run_bindiff(export_a: Path, export_b: Path, out_dir: Path, timeout_s: int) 
         str(out_dir),
     ]
     try:
-        proc = subprocess.run(  # noqa: S603 -- fixed argv, no shell
-            cmd, capture_output=True, timeout=timeout_s
-        )
+        # Run in its own killable process group (registered while it runs): an interrupt reaching
+        # the sweep's main thread then kills this BinDiff group at once via _kill_running_groups,
+        # instead of leaving it to run to its own timeout while pool.shutdown(wait=True) waits it
+        # out. A _SweepCancelledError (the sweep was already interrupted) propagates to the sweep,
+        # which defers it like any transient failure and skips it when cancelled.
+        proc = _run_killable(cmd, env=os.environ.copy(), timeout=timeout_s)
     except subprocess.TimeoutExpired as exc:
         raise DiffToolchainError("BinDiff timed out", kind=FAIL_TIMEOUT) from exc
     output = (proc.stdout or b"") + (proc.stderr or b"")
@@ -2013,8 +2016,8 @@ def run_full_diff(
                 on_outcome(done, total, oc)
         except KeyboardInterrupt:
             # Ctrl-C (or SIGTERM/SIGHUP, which the CLI turns into this): stop the sweep NOW. First
-            # kill every in-flight BinExport group so the 4GB-heap JVMs die at once — without this
-            # the already-running subprocesses (<= workers) would each run to its own timeout while
+            # kill every in-flight BinDiff group so the JVMs die at once — without this the
+            # already-running subprocesses (<= workers) would each run to its own timeout while
             # shutdown(wait=True) waits them out. Then discard the current in-flight (uncommitted)
             # persist — every COMPLETED binary already committed its own transaction, so a rollback
             # drops at most the one mid-write.
@@ -2059,7 +2062,7 @@ def run_full_diff(
                 toolchain=rd.toolchain,
             )
         except KeyboardInterrupt:
-            # Ctrl-C during the serial retry: kill the one in-flight BinExport group, drop the
+            # Ctrl-C during the serial retry: kill the one in-flight BinDiff group, drop the
             # in-flight (uncommitted) persist, and stop — the rest run next time.
             _kill_running_groups()
             cancelled = True
