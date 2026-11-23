@@ -24,7 +24,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.diff.loader import FuncRow
 from treasure_map.lib.hunt import run_analyzer2
 from treasure_map.lib.hunt.value_helpers import build_helper_tables, helper_slots
-from treasure_map.lib.pattern.classes import RETURN_SLOT
+from treasure_map.lib.pattern.classes import RETURN_SLOT, SOURCE
 
 from .test_analyzer2 import _make_db
 
@@ -517,3 +517,168 @@ def test_a_helper_table_moves_only_the_candidates_it_feeds(
     order_on = sorted(rest, key=lambda r: int(on[r]["rank"]))  # type: ignore[call-overload]
     order_off = sorted(rest, key=lambda r: int(off[r]["rank"]))  # type: ignore[call-overload]
     assert order_on == order_off
+
+
+# ── the keyed-lookup rule: a getter that parses its own input ───────────────────────────────────
+
+# The shape this rule exists for: a request-field getter that calls NO known source name (it
+# searches its own input), compares the key its caller passed, writes the value into the caller's
+# buffer and returns nothing. Bare void, so gate 4 can never pass; no callsite takes its return, so
+# the measured gate counts zero keys. Only the keyed-lookup rule can reach it.
+_SELF_PARSING_WRITER = (
+    "void FUN_00003000(char *param_1,char *param_2,char *param_3){ char *pcVar1; "
+    "pcVar1 = strstr(param_1,param_2); if (pcVar1 != (char *)0x0) { strcpy(param_3,pcVar1 + 1); } }"
+)
+# Two distinct keys at argument position 1, the return taken at NEITHER callsite.
+_KEYED_CALLS = (
+    "void keyed(char *param_1){ char acStack_40[64]; char acStack_80[64]; "
+    'FUN_00003000(param_1,"ssid=",acStack_40); FUN_00003000(param_1,"passwd=",acStack_80); }'
+)
+# A getter whose key reaches the compare ONE HOP away, in the small matcher it hands it to — and
+# which returns the value, so it is the RETURN_SLOT reading of this rule.
+_ONE_HOP_GETTER = (
+    "char * FUN_00004000(char *param_1,char *param_2){ char *pcVar1; "
+    "pcVar1 = FUN_00005000(param_1,param_2); if (pcVar1 == (char *)0x0) { "
+    "pcVar1 = *(char **)(DAT_00010000 + 4); } return pcVar1; }"
+)
+_MATCHER = (
+    "char * FUN_00005000(char *param_1,char *param_2){ "
+    "if (strcmp(param_1,param_2) == 0) { return param_1; } return (char *)0x0; }"
+)
+_ONE_HOP_CALLS = (
+    'void hop_keys(char *param_1){ char *a; char *b; a = FUN_00004000(param_1,"host"); '
+    'b = FUN_00004000(param_1,"ipVer"); }'
+)
+# The reading the lock keeps out: a writer called with two literals whose key parameter reaches no
+# compare or search at all. Same slots, same body shape, no lookup — "any void writer".
+_UNKEYED_WRITER = (
+    "void FUN_00006000(char *param_1,char *param_2,char *param_3){ "
+    "strcpy(param_3,param_1); memcpy(param_3,param_2,8); }"
+)
+_UNKEYED_CALLS = (
+    "void unkeyed(char *param_1){ char acStack_40[64]; char acStack_80[64]; "
+    'FUN_00006000(param_1,"ssid=",acStack_40); FUN_00006000(param_1,"passwd=",acStack_80); }'
+)
+# A getter that keys itself: the field name is a literal INSIDE its body and its callsites pass
+# none, so the callsite key gate counts zero. Out of this rule's reach by construction.
+_SELF_KEYED = (
+    "void FUN_00007000(char *param_1,char *param_2){ char *pcVar1; "
+    'pcVar1 = strstr(param_1,"wan_proto="); '
+    "if (pcVar1 != (char *)0x0) { strcpy(param_2,pcVar1); } }"
+)
+_SELF_KEYED_CALLS = (
+    "void self_keyed(char *param_1){ char acStack_40[64]; FUN_00007000(param_1,acStack_40); }"
+)
+# Two hops to the compare: the getter hands the key to a function that hands it on again. One hop
+# is the stated boundary, so this is not a lookup here.
+_TWO_HOP_GETTER = (
+    "char * FUN_00008000(char *param_1,char *param_2){ char *pcVar1; "
+    "pcVar1 = FUN_00009000(param_1,param_2); if (pcVar1 == (char *)0x0) { "
+    "pcVar1 = *(char **)(DAT_00010000 + 4); } return pcVar1; }"
+)
+_FORWARDER = (
+    "char * FUN_00009000(char *param_1,char *param_2){ return FUN_00005000(param_1,param_2); }"
+)
+_TWO_HOP_CALLS = (
+    'void two_hop(char *param_1){ char *a; char *b; a = FUN_00008000(param_1,"host"); '
+    'b = FUN_00008000(param_1,"ipVer"); }'
+)
+
+_KEYED = [
+    # the out-parameter reading: admitted at the slot the writer's destination is
+    ("out_param_writer_in", [_SELF_PARSING_WRITER, _KEYED_CALLS], {("FUN_00003000", 2)}),
+    # the return reading, with the key compared one hop away
+    (
+        "one_hop_return_getter_in",
+        [_ONE_HOP_GETTER, _MATCHER, _ONE_HOP_CALLS],
+        {("FUN_00004000", R)},
+    ),
+    ("unkeyed_writer_out", [_UNKEYED_WRITER, _UNKEYED_CALLS], set()),
+    ("self_keyed_getter_out", [_SELF_KEYED, _SELF_KEYED_CALLS], set()),
+    (
+        "two_hops_to_the_compare_out",
+        [_TWO_HOP_GETTER, _FORWARDER, _MATCHER, _TWO_HOP_CALLS],
+        set(),
+    ),
+    # one key is not a lookup, under either rule
+    (
+        "one_keyed_call_out",
+        [
+            _SELF_PARSING_WRITER,
+            "void keyed(char *param_1){ char acStack_40[64]; "
+            'FUN_00003000(param_1,"ssid=",acStack_40); }',
+        ],
+        set(),
+    ),
+    # the FUN-<addr> gate holds for this rule too: a NAMED callee accumulates no keys
+    (
+        "named_keyed_callee_out",
+        [
+            _SELF_PARSING_WRITER.replace("FUN_00003000", "cfg_field"),
+            _KEYED_CALLS.replace("FUN_00003000", "cfg_field"),
+        ],
+        set(),
+    ),
+]
+
+
+@pytest.mark.parametrize(("name", "bodies", "want"), _KEYED, ids=[c[0] for c in _KEYED])
+def test_the_keyed_lookup_rule_admits_a_string_keyed_getter_only(
+    name: str, bodies: list[str], want: set[tuple[str, int]]
+) -> None:
+    """The second admission rule: a ``FUN_<addr>`` function called with at least two distinct
+    string-literal keys at ANY callsite, reading indirectly, whose KEY PARAMETER reaches a
+    compare/search in its body or one hop into a callee. The return slot when the getter body
+    shape holds, each written out-parameter when the body copies into one.
+
+    MUTATION (verified RED, per clause): drop the whole rule (the measured rule alone) ->
+    out_param_writer and one_hop_return_getter both drop out; count keys only where the return is
+    taken (the measured ``any`` -> ``ret``) -> out_param_writer drops out (no callsite of it takes
+    a return) while one_hop_return_getter stays (its callers do take it); drop the out-parameter
+    path -> out_param_writer drops out, one_hop_return_getter stays; drop the lookup lock
+    (``_keyed_lookup``) -> unkeyed_writer is admitted; follow two hops -> two_hops_to_the_compare
+    is admitted; lower the two-key threshold to one -> one_keyed_call is admitted; drop the
+    ``FUN_<addr>`` check -> named_keyed_callee is admitted.
+
+    MUTATION (intentionally GREEN, and why): widening either NARROWING gate leaves both targets
+    admitted — that is what makes them narrowing gates rather than enabling ones (the spec's gate-1
+    reverse check). The teeth of the key gate and of the lookup lock are in
+    ``test_the_lookup_lock_is_what_keeps_any_void_writer_out`` (population) and in the key-evidence
+    tests (visibility), never here."""
+    funcs = [_fn(i + 1, _name_of(b), b) for i, b in enumerate(bodies)]
+    assert _table_slots(funcs) == want
+
+
+def test_the_lookup_lock_is_what_keeps_any_void_writer_out() -> None:
+    """The lock's tooth, stated as the population difference it makes: two bodies identical in
+    every other gate — same ``FUN_<addr>`` name shape, two literal keys at the same argument
+    position, an indirect read, a copy into the same out-parameter — and the ONE that is a
+    string-keyed lookup is admitted while the one that merely writes a buffer is not.
+
+    MUTATION (verified RED): drop the lookup lock -> both are admitted -> the sets are equal."""
+    keyed = [_fn(1, "FUN_00003000", _SELF_PARSING_WRITER), _fn(2, "keyed", _KEYED_CALLS)]
+    unkeyed = [_fn(1, "FUN_00006000", _UNKEYED_WRITER), _fn(2, "unkeyed", _UNKEYED_CALLS)]
+    assert _table_slots(keyed) == {("FUN_00003000", 2)}
+    assert _table_slots(unkeyed) == set()
+
+
+def test_the_keyed_lookup_fixtures_are_blocked_by_the_measured_rule_alone() -> None:
+    """The precondition the parametrised cases rest on: the two admitted fixtures are NOT reachable
+    by the measured rule, so what admits them is the new one and a mutation of it turns them red.
+    Each is blocked for its own stated reason — no known source NAME in the body (criterion A sees
+    nothing), and for the writer a bare-void return and no callsite taking its return."""
+    from treasure_map.lib.hunt.value_helpers import (
+        _body_shape_ok,
+        _return_taken_call_keys,
+        _return_type_is_bare_void,
+        _source_calls,
+    )
+
+    assert set(helper_slots(_SELF_PARSING_WRITER)) == set()  # criterion A: no source call
+    assert set(helper_slots(_ONE_HOP_GETTER)) == set()
+    assert _source_calls(_SELF_PARSING_WRITER, set(SOURCE)) == set()
+    assert _source_calls(_ONE_HOP_GETTER, set(SOURCE)) == set()
+    assert _return_type_is_bare_void(_SELF_PARSING_WRITER) is True
+    assert _body_shape_ok(_SELF_PARSING_WRITER) is False
+    keys = _return_taken_call_keys([_fn(2, "keyed", _KEYED_CALLS)])
+    assert keys.get("FUN_00003000", set()) == set()  # no callsite takes the return

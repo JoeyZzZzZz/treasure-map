@@ -131,11 +131,11 @@ RETURN_SLOT = -1
 
 @dataclass(frozen=True)
 class SourceHelpers:
-    """One binary's value-getter helpers: functions DEFINED IN THAT BINARY that call a known source
-    (``SOURCE``) and hand its value on — by returning it (``RETURN_SLOT``) or by writing it into one
-    of their parameters (that parameter's 0-based position). A call to one of them is read as a
-    call to a WEAK source: never a strong one, whatever source the helper calls, so it can label a
-    candidate and seed weak taint but never grade one confirmed.
+    """One binary's value-getter helpers: functions DEFINED IN THAT BINARY that hand on a value
+    read from outside the function — by returning it (``RETURN_SLOT``) or by writing it into one of
+    their parameters (that parameter's 0-based position). A call to one of them is read as a call
+    to a WEAK source: never a strong one, whatever the helper reads, so it can label a candidate
+    and seed weak taint but never grade one confirmed.
 
     Per binary because a helper's name means something only in its own binary: an unnamed
     function's name is its address, and two binaries can hold different functions under one name.
@@ -144,9 +144,11 @@ class SourceHelpers:
     a body's reading take it as part of the cache key: one body read in two binaries can seed
     differently. ``slots`` is the whole value (equality and hash); ``names`` is derived from it.
 
-    ★ WHICH functions qualify is not decided anywhere yet: nothing in this tree builds a non-empty
-    table, so every reader runs on the empty default and the readings are what they were before
-    this type existed. The mechanism is here, the criterion is not."""
+    ★ WHICH functions qualify is decided in ONE place, ``hunt.value_helpers.build_helper_tables``
+    (two admission rules, each with its own gate — read that module's docstring before changing
+    what a helper is). A binary with no qualifying function is absent from the table map, so every
+    reader there runs on the empty default and reads exactly what it read before this type
+    existed."""
 
     slots: frozenset[tuple[str, int]] = frozenset()
     names: frozenset[str] = field(init=False, compare=False, hash=False, repr=False)

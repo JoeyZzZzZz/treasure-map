@@ -25,7 +25,7 @@ import hashlib
 import json
 import logging
 import sqlite3
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +68,7 @@ from treasure_map.lib.atlas.writer import (
 )
 from treasure_map.lib.diff.loader import FuncRow, load_functions
 from treasure_map.lib.hunt.bridge import callsite_addr_out_of_body, callsite_address_offset
+from treasure_map.lib.hunt.data_strings import DataStrings
 from treasure_map.lib.hunt.dispatch_tables import detect_run, elf_file_state
 from treasure_map.lib.hunt.downweight import (
     CONST_SINK_ARG,
@@ -101,7 +102,7 @@ from treasure_map.lib.hunt.refs import (
     callsite_offset_suffix,
     mint_out_of_body_refs,
 )
-from treasure_map.lib.hunt.value_helpers import build_helper_tables
+from treasure_map.lib.hunt.value_helpers import build_helper_tables, helper_keys_called
 from treasure_map.lib.hunt.wrapper_propagation import (
     PATH_SINK_CLASS,
     WrapperCandidate,
@@ -115,6 +116,7 @@ from treasure_map.lib.pattern.classes import (
     NO_HELPERS,
     SOURCE_STRONG,
     ArgRef,
+    SourceHelpers,
     all_path_calls_literal,
     arg_ref,
     path_arg_ref,
@@ -232,6 +234,68 @@ def _source_names_keys(names: Iterable[str]) -> dict[str, Any]:
             {"name": n, "strength": "strong" if n in SOURCE_STRONG else "weak"} for n in ordered
         ]
     }
+
+
+def _source_keys_keys(
+    rows: Iterable[dict[str, Any]],
+    resolved: Mapping[tuple[int, str], str],
+    binary_id: int,
+) -> dict[str, Any]:
+    """``{"source_keys": [...]}`` for the keys a candidate's function passes to its binary's
+    value-getter helpers (value_helpers.helper_keys_called), or ``{}`` when it passes none.
+
+    A ``data_ref`` row's text is filled in from ``resolved`` (the data-block read done once per
+    run); a key that did not resolve keeps ``key: None`` and its ``address``, so a reader sees
+    "a key this getter was asked for, whose text is not recoverable" rather than a key that is
+    missing or empty. Evidence for a reader, never a claim: see ``helper_keys_called`` on what a
+    key here does and does not say."""
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("key_origin") == "data_ref" and row.get("key") is None:
+            addr = str(row.get("address") or "")
+            text = resolved.get((binary_id, addr.lower()))
+            row = {**row, "key": text} if text is not None else dict(row)
+        out.append(row)
+    return {"source_keys": out} if out else {}
+
+
+def _load_helper_key_strings(
+    db_path: Path | str,
+    funcs: Iterable[FuncRow],
+    helpers_by_binary: Mapping[int, SourceHelpers],
+) -> dict[tuple[int, str], str]:
+    """Every ``&DAT_<addr>`` key passed to a value-getter helper, resolved to its text out of the
+    binary's loaded data blocks, keyed by ``(binary_id, lowercased address)``.
+
+    Done ONCE per run, before the candidate loop: the same key address is passed by many callers,
+    and the block bytes are megabytes. An address in no initialized block is absent here rather
+    than present-and-empty (see data_strings.DataStrings)."""
+    wanted: dict[int, set[str]] = defaultdict(set)
+    for f in funcs:
+        helpers = helpers_by_binary.get(f.binary_id)
+        if helpers is None or not f.pseudocode:
+            continue
+        for row in helper_keys_called(f.pseudocode, helpers):
+            if row.get("key_origin") == "data_ref" and row.get("address"):
+                wanted[f.binary_id].add(str(row["address"]).lower())
+    if not wanted:
+        return {}
+    uri = ro_uri(Path(db_path))
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        reader = DataStrings(conn)
+        out: dict[tuple[int, str], str] = {}
+        for binary_id, addrs in wanted.items():
+            for addr in addrs:
+                try:
+                    text = reader.string_at(binary_id, int(addr, 16))
+                except ValueError:
+                    continue
+                if text:
+                    out[(binary_id, addr)] = text
+        return out
+    finally:
+        conn.close()
 
 
 def _with_evidence_keys(flow_evidence: str | None, keys: dict[str, Any]) -> str | None:
@@ -1486,6 +1550,9 @@ def run_analyzer2(
     # on a known source's value, so a call to one reads as a WEAK source in that binary. Built from
     # the loaded functions once and handed to the scan and to every per-candidate reader below.
     helpers_by_binary = build_helper_tables(all_funcs)
+    # The ``&DAT_<addr>`` keys those helpers are called with, resolved to text once (see
+    # _load_helper_key_strings): a key spelled that way has no row in the extracted strings table.
+    helper_key_strings = _load_helper_key_strings(db_path, all_funcs, helpers_by_binary)
     result = scan(db_path, helpers_by_binary=helpers_by_binary)
     # Each binary's resolved stub table (see analyze/stub_resolve), loaded once: the readers below
     # run on decompiled TEXT, where a lazy-binding call is spelled after the stub it goes through
@@ -1971,6 +2038,15 @@ def run_analyzer2(
                 # Which sources the function calls, read from the callee list exactly as the
                 # detector read it to set source_class — on every sink axis, not only cmd.
                 evidence_keys.update(_source_names_keys(classify(callees, helpers).source))
+                # Which KEYS the function asks those getters for (F-1): the field names a reader
+                # needs to confirm the lead, carried beside the source names, never as a claim.
+                evidence_keys.update(
+                    _source_keys_keys(
+                        helper_keys_called(row.pseudocode, helpers),
+                        helper_key_strings,
+                        row.binary_id,
+                    )
+                )
                 flow_evidence = _with_evidence_keys(flow_evidence, evidence_keys)
                 pattern_id = upsert_pattern(
                     atlas,
@@ -2297,7 +2373,14 @@ def run_analyzer2(
                             | _detector_error_keys(detector_errors_by_func, f.func_id)
                             # The sources called in the body, by the same name check the wrapper
                             # reading above uses when a called source's flow is not fully traced.
-                            | _source_names_keys(free_sources_called(f_pseudocode, wc_helpers)),
+                            | _source_names_keys(free_sources_called(f_pseudocode, wc_helpers))
+                            # Which KEYS the body asks its binary's getters for (F-1), by the same
+                            # reading the direct candidate path above carries.
+                            | _source_keys_keys(
+                                helper_keys_called(f_pseudocode, wc_helpers),
+                                helper_key_strings,
+                                f.binary_id,
+                            ),
                             sort_keys=True,
                         ),
                     ),

@@ -2575,7 +2575,24 @@ def _dim_completeness(function_origin: str | None) -> Dimension:
     )
 
 
-def _dim_source(source_class: str, source_kind: str) -> Dimension:
+def _source_key_rows(flow_evidence: Evidence) -> tuple[dict[str, Any], ...]:
+    """The stored ``source_keys`` rows — which KEYS this function asks its binary's own value
+    getters for (``{key, key_origin, accessor, hops}``; a ``data_ref`` key whose bytes did not
+    resolve carries ``key: None`` and its ``address``).
+
+    () covers every case a reader cannot tell apart from the stored row: the function calls no such
+    getter, it passes one no literal key, and a candidate hunted before the key existed. So an
+    empty tuple is never read as "no key" — like ``recorded_source_names``, absence is absence."""
+    data = _as_evidence(flow_evidence)
+    rows = data.get("source_keys") if data is not None else None
+    if not isinstance(rows, list):
+        return ()
+    return tuple(r for r in rows if isinstance(r, dict))
+
+
+def _dim_source(
+    source_class: str, source_kind: str, source_keys: tuple[dict[str, Any], ...] = ()
+) -> Dimension:
     """The ORTHOGONAL source axis: is the sink argument fed by external input that the hunt's
     pattern scan recognised (a request/POST param)? ``source_class == external_input`` =>
     ``structural:param`` — a structural command/exec-injection lead whose controllability is
@@ -2593,7 +2610,13 @@ def _dim_source(source_class: str, source_kind: str) -> Dimension:
     It NEVER claims controllable: a source is not a controllability proof (asymmetry — mark weak,
     never overclaim). ``charset`` (from source_kind) carries the injection feasibility.
     Non-external => unknown (not carried; the demotion-visible rule leaves a real source
-    untouched)."""
+    untouched).
+
+    ``source_keys`` (``_source_key_rows``) rides along as ``evidence``: when the recognised source
+    is the binary's OWN value getter, these are the field names the function asked it for, so a
+    reader confirms or dismisses the lead without re-deriving the callsite. Evidence only — it
+    never changes ``state``/``value``/``note``, and a key here is an argument the caller passed,
+    not proof that the value reached the sink or that anyone outside controls it."""
     if source_class == "external_input":
         return Dimension(
             "source",
@@ -2607,6 +2630,7 @@ def _dim_source(source_class: str, source_kind: str) -> Dimension:
             "discrimination — it "
             "fires on nearly every external-input candidate in ANY sink class: cmd, fmt_string, "
             "path_sink). Confirm the concrete request field and reachability by hand.",
+            evidence=source_keys,
         )
     return Dimension(
         "source",
@@ -2735,7 +2759,7 @@ def _build_dimensions(
             wrapper_names=wrapper_names,
             callsite_addr=callsite_addr,
         ),
-        _dim_source(source_class, source_kind),
+        _dim_source(source_class, source_kind, _source_key_rows(flow_evidence)),
         _dim_source_writability(nvram_key, web_settable),
         _dim_reachability(entry_reach, web_triggers, string_keyed_edges, flow_evidence),
         _dim_filtering(flow_evidence),

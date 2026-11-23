@@ -15,22 +15,36 @@ Two layers, kept apart on purpose:
     not a value getter. Pure; it reads the fixed SOURCE names only (never another helper — one
     layer, no transitivity).
 
-  * ``build_helper_tables`` — the population gate plus criterion A, per binary. The gate is the
-    measured one (M3): a stripped ``FUN_<addr>`` name, called with at least two distinct string
-    keys where its return is taken, and a body whose shape reads like a getter. Only a function
-    through the gate is handed to ``helper_slots``. ★ Only the ``RETURN_SLOT`` reading enters a
-    table: the return slot's precision was measured on the built tables, and the out-parameter
-    reading has had no member on any corpus it was measured on, so its precision is unknown. It
-    stays computed by ``helper_slots`` (to be measured where it has members) and is not admitted
-    — a table under-collects rather than grow its population through an unmeasured rule.
+  * ``build_helper_tables`` — the population gates plus criterion A, per binary. TWO admission
+    rules, each with its own gate, and a function admitted by either is in the table:
+
+      - the MEASURED rule (M3): a stripped ``FUN_<addr>`` name, called with at least two distinct
+        string keys where its return is taken, and a body whose shape reads like a getter
+        (``_body_shape_ok``). Only such a function is handed to ``helper_slots``, and only its
+        ``RETURN_SLOT`` reading is admitted — the return slot's precision was measured on the built
+        tables, while the out-parameter reading had no member on any corpus it was measured on, so
+        under this rule it stays computed (to be measured where it has members) and unadmitted.
+
+      - the KEYED-LOOKUP rule: a getter that parses its own input, so it calls no known source NAME
+        at all and criterion A cannot see it. It is admitted on shape instead, behind a gate narrow
+        enough to keep "any void writer" out: a ``FUN_<addr>`` name called with at least two
+        distinct string-literal keys (at ANY callsite — a writer whose return nobody takes is the
+        case this rule exists for), an indirect read in the body, and — the narrowing lock — the
+        PARAMETER the keys arrive at must reach a compare/search, in the body or one hop into a
+        callee (``_keyed_lookup``). Both slots are admitted under this rule: the RETURN_SLOT when
+        the getter body-shape holds, and each out-parameter a buffer writer fills when the body
+        writes one (a bare-void writer cannot pass ``_body_shape_ok`` at all, and that is the shape
+        this rule most needs to reach).
 
 A helper is read as WEAK input downstream, so it labels a candidate and seeds weak taint and never
 grades one ``confirmed``. Finding one says nothing about whether the value it hands on is
 attacker-controlled — a structural reading, not a verdict.
 
 Deliberately narrow, every boundary stated rather than approximated:
-  * a value getter that calls no known source NAME (it parses a request itself, walks a document)
-    is not found here — a shape guess for it mislabels more than it finds;
+  * a value getter that calls no known source NAME is reached ONLY through the keyed-lookup rule,
+    on the shape of a string-keyed lookup — never on "it dereferences something" alone, which is
+    nearly every function. What the keys name is evidence for a reader (``helper_keys_called``),
+    not a claim that the value is controlled;
   * the out-parameter slot and the return slot both rest on the existing seeding tables, so a
     helper wrapping a source the taint layer does not seed (uci_get / uci_lookup_ptr; scanf-family)
     falls out as the empty set — under-collection, the safe direction;
@@ -49,7 +63,9 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any
 
 from treasure_map.lib.diff.loader import FuncRow
 from treasure_map.lib.pattern.classes import (
@@ -405,26 +421,246 @@ def _return_taken_call_keys(funcs: Iterable[FuncRow]) -> dict[str, set[str]]:
     return keys
 
 
+# ── the keyed-lookup rule: a getter that parses its own input ───────────────────────────────────
+
+# Parsing calls: a function handed a parameter to one of these reads a structure out of it rather
+# than taking a value whole, which is what makes it a getter the SOURCE-name rule cannot see.
+_PARSE_CALLS: frozenset[str] = frozenset({"strstr", "strtok", "strsep", "sscanf", "strchr"})
+# Compare / search calls: the key parameter reaching one of these is what separates a string-KEYED
+# lookup from any function that happens to be called with two literals.
+_LOOKUP_CALLS: frozenset[str] = frozenset({"strcmp", "strncmp", "strstr", "memcmp"})
+# Buffer writers whose destination (argument 0) is where an out-parameter getter puts its value.
+_OUT_WRITE_CALLS: frozenset[str] = frozenset({"strcpy", "memcpy", "strncpy", "sprintf"})
+_DEREF_RE = re.compile(r"\*\s*\(")
+# A ``&DAT_<addr>`` pointer argument: a key whose text the extractor never typed as a string.
+_DAT_REF_RE = re.compile(r"&?\bDAT_([0-9a-fA-F]+)\b")
+_PARAM_IN_RE = re.compile(r"\bparam_(\d+)\b")
+_ANY_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+
+
+@dataclass(frozen=True)
+class _CallsiteKeys:
+    """What a binary's callers pass to one ``FUN_<addr>`` callee: the distinct string-literal keys,
+    and the 0-based ARGUMENT POSITIONS a key was seen at. The positions are what makes the lookup
+    lock checkable — they say which of the callee's own parameters is the key."""
+
+    keys: frozenset[str]
+    positions: frozenset[int]
+
+
+def _every_callsite_keys(funcs: Iterable[FuncRow]) -> dict[str, _CallsiteKeys]:
+    """Per callee ``FUN_<addr>`` name, the string-literal keys passed at EVERY callsite in the
+    binary and the argument positions they arrived at.
+
+    Unlike ``_return_taken_call_keys`` this does not require the call to take the return: the
+    getters this rule exists for write their value into a caller's buffer and return a status, so
+    no callsite of theirs takes a value at all. Only string LITERALS count — a ``&DAT_`` pointer
+    argument also names a key (see ``helper_keys_called``, which resolves one for a reader), but
+    counting those toward the gate widens the admitted population without reaching any getter the
+    literals do not already reach, so the gate stays on literals."""
+    keys: dict[str, set[str]] = defaultdict(set)
+    positions: dict[str, set[int]] = defaultdict(set)
+    for f in funcs:
+        pc = f.pseudocode or ""
+        # The FUN-<addr> gate, enforced here as in ``_return_taken_call_keys``: only such a name is
+        # ever collected, so a named callee can never accumulate keys.
+        for name in {m.group(1) for m in _FUN_CALL_RE.finditer(pc)}:
+            for off in call_offsets(pc, name):
+                for pos, a in enumerate(call_args_at(pc, off) or []):
+                    found = _STRING_LIT_RE.findall(a)
+                    if found:
+                        keys[name].update(found)
+                        positions[name].add(pos)
+    return {
+        name: _CallsiteKeys(frozenset(ks), frozenset(positions[name])) for name, ks in keys.items()
+    }
+
+
+def _reads_indirect(pseudocode: str) -> bool:
+    """The body reads through something rather than only taking values whole: a ``memcpy``, a
+    reference to a ``DAT_`` global, a pointer dereference, or a parse call handed a parameter.
+
+    Honest about what this is: a NECESSARY condition that nearly every non-trivial body meets, not
+    a filter. It states the shape the rule is about (a getter reads a structure) and keeps a
+    straight-line arithmetic helper out; the admitted population is held down by the key gate and
+    by ``_keyed_lookup``, never by this."""
+    body = _body(pseudocode)
+    if "memcpy" in body or "DAT_" in body or _DEREF_RE.search(body) is not None:
+        return True
+    return any(
+        (args := call_args_at(pseudocode, off)) and "param_" in args[0]
+        for name in _PARSE_CALLS
+        for off in call_offsets(pseudocode, name)
+    )
+
+
+def _compared_param_positions(pseudocode: str) -> frozenset[int]:
+    """The 0-based parameter positions that reach a compare/search call IN THIS body."""
+    hit: set[int] = set()
+    for name in _LOOKUP_CALLS:
+        for off in call_offsets(pseudocode, name):
+            for a in call_args_at(pseudocode, off) or []:
+                hit.update(int(m.group(1)) - 1 for m in _PARAM_IN_RE.finditer(a))
+    return frozenset(hit)
+
+
+def _forwarded_param_positions(pseudocode: str) -> dict[str, set[tuple[int, int]]]:
+    """Per callee name, the (this function's 0-based parameter position, the callee's 0-based
+    argument position) pairs — how this body's parameters are handed on one hop."""
+    out: dict[str, set[tuple[int, int]]] = defaultdict(set)
+    for m in _ANY_CALL_RE.finditer(pseudocode):
+        args = call_args_at(pseudocode, m.start(1)) or []
+        for pos, a in enumerate(args):
+            for pm in _PARAM_IN_RE.finditer(a):
+                out[m.group(1)].add((int(pm.group(1)) - 1, pos))
+    return out
+
+
+def _keyed_lookup(
+    pseudocode: str,
+    key_positions: frozenset[int],
+    compared_in: Callable[[str], frozenset[int]],
+) -> bool:
+    """The narrowing lock: a parameter the callers pass a KEY at reaches a compare/search — in this
+    body, or one hop into a callee at an argument position that callee compares.
+
+    This is what separates a string-keyed lookup ("find the field named k") from any function that
+    merely happens to be called with two literals. One hop is needed and no more: a request parser
+    commonly hands the name straight to a small matcher, and a hop count beyond that would be a
+    flow relation this layer deliberately does not compute (see the module docstring). It reads
+    PARAMETER POSITIONS, never values: nothing here claims the key is attacker-controlled."""
+    if key_positions & compared_in(pseudocode):
+        return True
+    for callee, pairs in _forwarded_param_positions(pseudocode).items():
+        compared = compared_in(callee)
+        if compared and any(mine in key_positions and theirs in compared for mine, theirs in pairs):
+            return True
+    return False
+
+
+def _writes_a_caller_buffer(pseudocode: str) -> bool:
+    """The out-parameter rule's stand-in for gate 4: the body copies into a buffer. A bare-void
+    getter can never pass ``_body_shape_ok`` (no return type to read as a getter's), so the shape
+    this rule most needs to reach has to be recognised by what the body DOES instead."""
+    body = _body(pseudocode)
+    return "strcpy" in body or "memcpy" in body
+
+
+def _out_write_slots(pseudocode: str) -> frozenset[int]:
+    """The 0-based parameter positions a buffer writer's destination IS — the slots this body hands
+    its value out through. Unlike ``_out_param_slots`` (criterion A) this does not ask whether a
+    KNOWN source fed the value: under the keyed-lookup rule there is no known source to find, so
+    the destination parameter is read from the write itself."""
+    out: set[int] = set()
+    for name in _OUT_WRITE_CALLS:
+        for off in call_offsets(pseudocode, name):
+            args = call_args_at(pseudocode, off) or []
+            if not args:
+                continue
+            root = arg_ref(args[0]).root
+            m = _PARAM_RE.match(root) if root is not None else None
+            if m is not None:
+                out.add(int(m.group(1)) - 1)
+    return frozenset(out)
+
+
+def _keyed_lookup_slots(
+    pseudocode: str,
+    callsite_keys: _CallsiteKeys | None,
+    compared_in: Callable[[str], frozenset[int]],
+) -> frozenset[int]:
+    """The slots one body hands a value through under the KEYED-LOOKUP rule, or the empty set when
+    the rule does not reach it. The gate order is by cost: the precomputed key count first, the
+    body-local shape next, the lookup lock (which may read a callee's body) last."""
+    if callsite_keys is None or len(callsite_keys.keys) < 2:  # the key gate
+        return frozenset()
+    if not _reads_indirect(pseudocode):
+        return frozenset()
+    if not _keyed_lookup(pseudocode, callsite_keys.positions, compared_in):
+        return frozenset()
+    slots: set[int] = set()
+    if _body_shape_ok(pseudocode):
+        slots.add(RETURN_SLOT)
+    if _writes_a_caller_buffer(pseudocode):
+        slots |= _out_write_slots(pseudocode)
+    return frozenset(slots)
+
+
+def helper_keys_called(pseudocode: str, helpers: SourceHelpers) -> tuple[dict[str, Any], ...]:
+    """The keys THIS function passes to its binary's value-getter helpers, as evidence rows for a
+    reader: ``{"key", "key_origin", "accessor", "hops"}``, ordered by accessor then key.
+
+    ``key_origin`` is ``literal`` for an inline string and ``data_ref`` for a ``&DAT_<addr>``
+    pointer argument, whose text is not in the extracted ``strings`` table (Ghidra left the bytes
+    untyped) and is resolved from the loaded data blocks by the caller — the row then carries
+    ``address`` and a ``key`` of None until it is. ``hops`` is 1: the key is passed at a direct
+    call to the accessor.
+
+    It names ARGUMENTS, not flows: a key here is what the caller asked the getter for, not proof
+    that the value came back, reached the sink, or is controlled by anyone."""
+    rows: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+    for name in sorted(helpers.names):
+        if name not in pseudocode:  # the cheap gate first: a binary can hold many helpers
+            continue
+        for off in call_offsets(pseudocode, name):
+            for a in call_args_at(pseudocode, off) or []:
+                for lit in _STRING_LIT_RE.findall(a):
+                    key = lit[1:-1]
+                    rows[(name, "literal", key)] = {
+                        "key": key,
+                        "key_origin": "literal",
+                        "accessor": name,
+                        "hops": 1,
+                    }
+                for m in _DAT_REF_RE.finditer(a):
+                    addr = m.group(1)
+                    rows[(name, "data_ref", addr)] = {
+                        "key": None,
+                        "key_origin": "data_ref",
+                        "address": addr,
+                        "accessor": name,
+                        "hops": 1,
+                    }
+    return tuple(rows[k] for k in sorted(rows, key=lambda k: (k[0], k[1], k[2] or "")))
+
+
 def _binary_table(funcs: list[FuncRow]) -> SourceHelpers:
-    """One binary's value-getter helpers: every ``FUN_<addr>`` function through the M3 gate whose
-    body hands on a source value (criterion A)."""
+    """One binary's value-getter helpers: every ``FUN_<addr>`` function admitted by EITHER rule —
+    the measured one (the M3 gate, then criterion A, RETURN_SLOT only) or the keyed-lookup one (a
+    string-keyed lookup recognised on shape, both slots). A function may be admitted by both; the
+    slots are a set, so one reading never doubles another."""
     call_keys = _return_taken_call_keys(funcs)
+    every_keys = _every_callsite_keys(funcs)
+    bodies = {f.name: f.pseudocode or "" for f in funcs if f.name is not None}
+    compared: dict[str, frozenset[int]] = {}
+
+    def compared_in(name_or_body: str) -> frozenset[int]:
+        """The compared parameter positions of a callee NAME, or of a body passed whole. Memoised:
+        a request parser's matcher is reached from many of its callers."""
+        body = bodies.get(name_or_body, name_or_body)
+        hit = compared.get(body)
+        if hit is None:
+            hit = _compared_param_positions(body)
+            compared[body] = hit
+        return hit
+
     slots: set[tuple[str, int]] = set()
     for f in funcs:
         name = f.name
-        if name is None:
+        if name is None or not f.pseudocode:
             continue
+        pc = f.pseudocode
+        # ── the measured rule, unchanged ──
         # gate 3: called with >= 2 distinct string keys where its return is taken. Only a
         # FUN_<addr> name accumulates keys (``_return_taken_call_keys``), so a named callee is
         # excluded here, at the single enforcement point of the FUN-name gate.
-        if len(call_keys.get(name, ())) < 2:
-            continue
-        if not f.pseudocode or not _body_shape_ok(f.pseudocode):  # gate 4
-            continue
-        for slot in helper_slots(f.pseudocode):
-            # Only the measured reading is admitted (see the module docstring).
-            if slot == RETURN_SLOT:
-                slots.add((name, slot))
+        if len(call_keys.get(name, ())) >= 2 and _body_shape_ok(pc):  # gate 4
+            for slot in helper_slots(pc):
+                # Only the measured reading is admitted (see the module docstring).
+                if slot == RETURN_SLOT:
+                    slots.add((name, slot))
+        # ── the keyed-lookup rule ──
+        slots |= {(name, s) for s in _keyed_lookup_slots(pc, every_keys.get(name), compared_in)}
     return SourceHelpers(frozenset(slots))
 
 
