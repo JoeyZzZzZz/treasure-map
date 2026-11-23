@@ -80,10 +80,13 @@ class Dimension:
     """One map layer's honest three-state annotation for a candidate — a FACT, never a verdict.
 
     ``state`` is the glyph-level certainty: ``proven`` (✓ established — RESERVED for a positive
-    proof: a SaTC front↔back cross, a provably-constant argument, a sound rootfs entry edge; NEVER
-    an optimistic fallback or a coarse zero-discrimination pattern label), ``likely`` (~ an
-    optimistic-but-unconfirmed reading, e.g. a router_defaults-member controllability or the
-    optimistic 'free' text-level fallback — carries ``value`` but never claims proof),
+    proof: a SaTC front↔back cross, a provably-constant argument, a sound rootfs entry edge, or —
+    the one reading that is an inference rather than a proof — a reachability entry the hunt layer
+    inferred from placement, which then carries what it rests on in ``source``/``note``/``evidence``
+    so a reader can DEMOTE it; NEVER an optimistic fallback or a coarse zero-discrimination pattern
+    label), ``likely`` (~ an optimistic-but-unconfirmed reading, e.g. a router_defaults-member
+    controllability or the optimistic 'free' text-level fallback — carries ``value`` but never
+    claims proof),
     ``structural`` (~ a structural lead from the coarse pattern layer, e.g. an analyzer2
     external_input source — a fact about shape that points somewhere to look, NOT a
     controllability proof),
@@ -229,7 +232,10 @@ def _entry_reach_status(flow_evidence: Evidence) -> str:
     ``entry_reach.sites`` entry's ``kind`` (the fact the evidence layer recorded) — NOT collapsing
     every site to a single misleading "found":
 
-      ``entry:web``         a web-asset endpoint references this binary (boundary match)
+      ``entry:web``         a web-asset endpoint references this binary (boundary match), or the
+                            hunt layer inferred the reading from PLACEMENT (a site carrying
+                            ``basis: inferred``) — one label, the two told apart in
+                            ``_dim_reachability``'s note and source, never here
       ``entry:script``      a boot/rootfs script invokes this binary (exact tail match)
       ``entry:exec``        another binary's code launches this binary (a resolved launch edge)
       ``entry:web+script``  several kinds of reference exist — reported TOGETHER in a fixed order,
@@ -2209,6 +2215,20 @@ _REACH_CAVEAT_COMPLETENESS = (
     "entry:web is an INCOMPLETE slice of the web-reachable set, and entry:script is not evidence "
     "of lower reachability"
 )
+# ★ The third caveat, and the one that REPLACES the standard-flow sentence rather than joining it:
+# a web reading the hunt layer inferred from PLACEMENT has no reference behind it at all, so
+# "an entry edge references this binary" would be untrue of it. The reading still reads proven
+# (the placement is a fact), which is exactly why the note has to say what it rests on — the
+# dimension carries the basis so a reader can DEMOTE it, instead of reading an inference as a
+# web-asset reference.
+_REACH_CAVEAT_INFERRED = (
+    "the web reading is INFERRED from placement, not a reference: no web asset names this "
+    "binary — it sits in a directory tree a named CGI is served from; confirm the server "
+    "actually serves this file, and demote it if not"
+)
+# The ``basis`` an entry site carries when the hunt layer inferred it from placement
+# (lib/hunt/evidence ``_served_site``); a site read from a real reference carries no basis.
+_INFERRED_BASIS = "inferred"
 
 
 def _edge_leads(
@@ -2294,6 +2314,58 @@ def _string_keyed_edge_note(edges: tuple[dict[str, Any], ...]) -> str:
     )
 
 
+_REACH_SOURCE_REFERENCE = (
+    "flow_evidence.entry_reach.sites (rootfs script / web-asset / launch-edge reference)"
+)
+_REACH_SOURCE_INFERRED = (
+    "flow_evidence.entry_reach.sites (served-tree placement inference, basis: inferred)"
+)
+_REACH_SOURCE_MIXED = (
+    "flow_evidence.entry_reach.sites (rootfs script / launch-edge reference; web: served-tree "
+    "placement inference, basis: inferred)"
+)
+
+
+def _reach_basis(
+    entry_reach: str, flow_evidence: Evidence
+) -> tuple[str, str, tuple[dict[str, Any], ...]]:
+    """What an ``entry:`` reading RESTS ON: ``(the note's leading caveat, the dimension's source,
+    the inferred sites as evidence rows)``.
+
+    A web site the hunt layer inferred from placement (``basis: inferred``) is not a reference, so
+    where the WHOLE web reading is such a site the standard-flow sentence is replaced rather than
+    joined — "an entry edge references this binary" is untrue of it. Where a script or exec
+    reference stands beside it, the standard sentence stays and is told apart from the inferred web
+    part explicitly, because it is true of that part only.
+
+    A named web site makes this a reference reading again, byte for byte as before the inference
+    existed: a NAMED binary is offered no inferred site (lib/hunt/evidence's ``web_named`` guard),
+    so the two never mix — and were an evidence blob to carry both, the reference reading is the
+    one that claims less."""
+    sites = _entry_reach_sites(flow_evidence)
+    inferred = [
+        s for s in sites if s.get("kind") == "web_endpoint" and s.get("basis") == _INFERRED_BASIS
+    ]
+    named_web = any(
+        s.get("kind") == "web_endpoint" and s.get("basis") != _INFERRED_BASIS for s in sites
+    )
+    if not inferred or named_web:
+        return _REACH_CAVEAT_STANDARD_FLOW, _REACH_SOURCE_REFERENCE, ()
+    # The sites' own notes, QUOTED rather than re-derived into a seed name here: that text is what
+    # the hunt layer stored and what an overlay judgement's basis compares.
+    quoted = list(dict.fromkeys(str(s["note"]) for s in inferred if s.get("note")))
+    cited = f" ({'; '.join(quoted)})" if quoted else ""
+    rows = tuple({"via": "served_tree_inference", **s} for s in inferred)
+    if entry_reach == "entry:web":
+        return _REACH_CAVEAT_INFERRED + cited, _REACH_SOURCE_INFERRED, rows
+    return (
+        f"{_REACH_CAVEAT_STANDARD_FLOW} — that reference is the script / exec part of this "
+        f"reading ONLY; as for the web part, {_REACH_CAVEAT_INFERRED}{cited}",
+        _REACH_SOURCE_MIXED,
+        rows,
+    )
+
+
 def _dim_reachability(
     entry_reach: str,
     web_triggers: tuple[str, ...] = (),
@@ -2311,6 +2383,13 @@ def _dim_reachability(
     state/value (the reachability-caveat contract). This answers the ENTRY level only — entry->sink
     flow within a function is a separate, unmodeled question.
 
+    ★ The ONE reading here that is not a reference: a web site the hunt layer inferred from
+    PLACEMENT (``basis: inferred`` — a CGI in a tree a named CGI is served from). It reads proven
+    like the rest, so the note and the ``source`` MUST say it is an inference, the standard-flow
+    sentence is REPLACED by ``_REACH_CAVEAT_INFERRED`` where the whole web reading rests on it, and
+    the site's own text joins the note and ``evidence`` — the basis is on the page or a reader
+    cannot tell an inference from a web asset naming the file, and cannot demote it.
+
     ★ IRON LAW: a string-keyed edge — whether it dispatches straight here (0 hops) or lands one call
     above (1 hop) — is APPENDED to the note as a key lead and mirrored into ``evidence`` as a
     structured row. It NEVER changes ``state``/``value``. A candidate with no entry stays unknown
@@ -2321,8 +2400,9 @@ def _dim_reachability(
     edge_note += _one_hop_lead_note(leads)
     if entry_reach.startswith("entry:"):
         trig = f" ({', '.join(web_triggers)})" if web_triggers else ""
+        lead_caveat, source, inferred = _reach_basis(entry_reach, flow_evidence)
         note = (
-            f"{entry_reach}{trig}: {_REACH_CAVEAT_STANDARD_FLOW}. Completeness: "
+            f"{entry_reach}{trig}: {lead_caveat}. Completeness: "
             f"{_REACH_CAVEAT_COMPLETENESS}. Entry-level only — tmap does not connect entry->sink "
             "within a function (sink-level reachability unknown)."
         )
@@ -2330,9 +2410,9 @@ def _dim_reachability(
             "reachability",
             "proven",
             entry_reach,
-            "flow_evidence.entry_reach.sites (rootfs script / web-asset / launch-edge reference)",
+            source,
             note + edge_note,
-            leads,
+            leads + inferred,
         )
     return Dimension(
         "reachability",

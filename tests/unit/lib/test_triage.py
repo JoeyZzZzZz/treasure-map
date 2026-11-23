@@ -83,6 +83,15 @@ def _entry_sites(spec: str) -> list[dict[str, object]]:
     return sites
 
 
+# An entry site the hunt layer inferred from PLACEMENT rather than reading a reference
+# (lib/hunt/evidence ``_served_site``) — the shape that file writes, verbatim.
+_INFERRED_WEB_SITE: dict[str, object] = {
+    "kind": "web_endpoint",
+    "basis": "inferred",
+    "note": "co-located with proven CGI a.cgi under served root web",
+}
+
+
 def _inst(
     conn: sqlite3.Connection,
     pattern_id: int,
@@ -95,6 +104,7 @@ def _inst(
     sink_anchor: str = "system",
     binary_path: str | None = None,
     entry_reach: str | None = None,
+    entry_sites: list[dict[str, object]] | None = None,
     source_kind: str | None = None,
     sink_provenance: list[dict[str, object]] | None = None,
     function_origin: str | None = None,
@@ -104,9 +114,15 @@ def _inst(
     # flow_evidence: None when neither signal is set; else the minimal payload for whichever of
     # entry_reach.sites / source_kind was requested (both parsed back by the read view). entry_reach
     # is now derived from the sites' kinds, so the fixture builds real sites (web_endpoint /
-    # script_call) rather than only a status word.
+    # script_call) rather than only a status word. ``entry_sites`` takes the sites as given, for a
+    # shape the status words do not name (an inferred web site).
     evidence: dict[str, object] = {}
-    if entry_reach is not None:
+    if entry_sites is not None:
+        evidence["entry_reach"] = {
+            "status": "found" if entry_sites else "unknown",
+            "sites": entry_sites,
+        }
+    elif entry_reach is not None:
         sites = _entry_sites(entry_reach)
         evidence["entry_reach"] = {"status": "found" if sites else "unknown", "sites": sites}
     if source_kind is not None:
@@ -370,11 +386,38 @@ def test_reachability_source_has_no_pre_auth_vocabulary() -> None:
         [
             mod._REACH_CAVEAT_STANDARD_FLOW,
             mod._REACH_CAVEAT_COMPLETENESS,
+            mod._REACH_CAVEAT_INFERRED,
             mod.VIEWS["reachable-first"]["desc"],
         ]
     ).lower()
     assert "pre-auth" not in reach_strings
     assert "attack surface" not in reach_strings
+
+
+def test_an_inferred_web_reading_does_not_move_the_default_order(tmp_path: Path) -> None:
+    # ★ sort contract, the other half of the web-vs-script one above: whether a web reading was
+    # read from a reference or INFERRED from placement is said in the note and the source only. It
+    # is not a sort axis and not a filter axis — both candidates read proven:entry:web, the
+    # deterministic (function-name) order holds in BOTH arrangements, and an entry:web filter
+    # floats both. Testing one arrangement alone would miss a basis that lifts or sinks it.
+    from treasure_map.lib.query.triage import filter_by_dimension
+
+    for names in (("aaa_inferred", "bbb_named"), ("aaa_named", "bbb_inferred")):
+        conn = _atlas(tmp_path / names[0])
+        p = _pattern(conn, "fp", sink_class="cmd", source_class="external_input")
+        for name in names:
+            if name.endswith("_inferred"):
+                _inst(conn, p, fn=name, entry_sites=[dict(_INFERRED_WEB_SITE)])
+            else:
+                _inst(conn, p, fn=name, entry_reach="entry:web")
+        ranked = triage(conn)
+        assert [c.function for c in ranked] == list(names)
+        assert {(c.dim("reachability").state, c.dim("reachability").value) for c in ranked} == {
+            ("proven", "entry:web")
+        }
+        floated = filter_by_dimension(ranked, "reachability", "entry:web")
+        assert {c.function for c in floated} == set(names)
+        conn.close()
 
 
 # ── circle-and-weight: --filter reachability FLOATS matches, NEVER reduces the corpus ──

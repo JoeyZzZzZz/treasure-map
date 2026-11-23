@@ -25,12 +25,20 @@ from pathlib import Path
 
 from treasure_map.lib.hunt.evidence import (
     EntryIndex,
+    _rootfs_relative,
     build_flow_evidence,
     load_entry_index,
     served_cgi_roots,
 )
 from treasure_map.lib.query.triage import (
     _ENTRY_KIND_LABELS,
+    _REACH_CAVEAT_COMPLETENESS,
+    _REACH_CAVEAT_INFERRED,
+    _REACH_CAVEAT_STANDARD_FLOW,
+    _REACH_SOURCE_INFERRED,
+    _REACH_SOURCE_MIXED,
+    _REACH_SOURCE_REFERENCE,
+    Dimension,
     _dim_reachability,
     _entry_reach_status,
     _entry_web_triggers,
@@ -51,13 +59,16 @@ def _analysis(
     scripts: tuple[tuple[str, str], ...] = (),
     uninventoried: tuple[str, ...] = (),
     image_prefix: str = _IMG,
+    extra_inventory: tuple[tuple[str, str], ...] = (),
 ) -> Path:
     """A real analysis.db (project schema) holding ``binaries`` at rootfs-relative paths.
 
     ``endpoints`` are (web asset path, endpoint) pairs, ``scripts`` (script path, command) pairs,
     and ``uninventoried`` the binaries deliberately left out of the file inventory.
     ``image_prefix`` is what the binaries table prefixes each path with — "" spells the binaries
-    rootfs-relative, as a database built elsewhere may."""
+    rootfs-relative, as a database built elsewhere may. ``extra_inventory`` are
+    (binary, further inventory path) pairs: one content listed at a second path, which is what
+    makes the join's choice between them observable."""
     db = tmp_path / "analysis.db"
     conn = open_db(db)
     for i, rel in enumerate(binaries, start=1):
@@ -77,6 +88,12 @@ def _analysis(
                 "VALUES (?, ?, 4, 'elf_exec', 'elf')",
                 (rel, f"{i:064d}"),
             )
+    for rel, extra in extra_inventory:
+        conn.execute(
+            "INSERT INTO file_inventory (path, sha256, size, file_type, inventoried_as) "
+            "VALUES (?, ?, 4, 'elf_exec', 'elf')",
+            (extra, f"{binaries.index(rel) + 1:064d}"),
+        )
     for j, (asset, endpoint) in enumerate(endpoints, start=1):
         conn.execute(
             "INSERT INTO non_binary_files (id, kind, name, path) VALUES (?, 'web_asset', ?, ?)",
@@ -204,10 +221,10 @@ def test_a_cgi_outside_every_served_tree_stays_unknown(tmp_path: Path) -> None:
     assert evidence["entry_reach"] == {"status": "unknown", "sites": []}
 
 
-# ── the read layer grades it, and is not touched ─────────────────────────────────────
+# ── the read layer grades it, by the same label table ────────────────────────────────
 
 
-def test_the_inferred_site_grades_through_the_unchanged_read_layer(tmp_path: Path) -> None:
+def test_the_inferred_site_grades_through_the_unchanged_label_table(tmp_path: Path) -> None:
     """The site's ``kind`` is the EXISTING ``web_endpoint``, so the triage read layer's fixed
     kind->label table grades it with no change there: entry:web -> proven. It contributes no
     trigger label, having no endpoint to quote.
@@ -253,6 +270,125 @@ def test_a_served_cgi_a_script_also_launches_reports_both_kinds(tmp_path: Path) 
     sites = _sites(_index(db), "web/both.cgi")
     assert {str(s["kind"]) for s in sites} == {"script_call", "web_endpoint"}
     assert _entry_reach_status({"entry_reach": {"sites": sites}}) == "entry:web+script"
+
+
+# ── and says, on the page, that the reading is an inference ──────────────────────────
+
+
+def _reach(sites: list[dict[str, object]]) -> Dimension:
+    """The reachability dimension the read layer gives for these sites — the whole path the hunt
+    layer's site text arrives through, with no string-keyed edge beside it."""
+    evidence = {"entry_reach": {"status": "found" if sites else "unknown", "sites": sites}}
+    status = _entry_reach_status(evidence)
+    return _dim_reachability(status, _entry_web_triggers(evidence), (), evidence)
+
+
+def _note(value: str, trig: str, lead: str) -> str:
+    """The note's fixed envelope with ``lead`` as its leading caveat — written out so a branch
+    that picks the wrong caveat is caught by EQUALITY, not by a substring that both readings could
+    satisfy."""
+    return (
+        f"{value}{trig}: {lead}. Completeness: {_REACH_CAVEAT_COMPLETENESS}. Entry-level only — "
+        "tmap does not connect entry->sink within a function (sink-level reachability unknown)."
+    )
+
+
+def test_an_inferred_reading_says_so_in_its_note_source_and_evidence(tmp_path: Path) -> None:
+    """A candidate whose only web site was inferred: the note says the reading is INFERRED and
+    quotes the co-location the hunt recorded, the source names the inference and NOT a web-asset
+    reference, and the site rides in ``evidence`` as a drill-down row.
+
+    The standard-flow sentence is GONE from this note on purpose: "an entry edge references this
+    binary" is untrue of a placement inference, and leaving it in is what made the inference read
+    as a reference.
+
+    Verified RED by dropping the inferred branch from ``_reach_basis`` (the note and source go
+    back to the reference reading): 1 failed. Also RED by leaving the inferred rows out of
+    ``evidence``: 1 failed.
+    """
+    db = _analysis(
+        tmp_path,
+        binaries=("web/named.cgi", "web/other.cgi"),
+        endpoints=(("web/index.htm", "/named.cgi"),),
+    )
+    sites = _sites(_index(db), "web/other.cgi")
+    assert [s.get("basis") for s in sites] == ["inferred"]  # fixture precondition
+    dim = _reach(sites)
+    assert (dim.state, dim.value) == ("proven", "entry:web")
+    assert dim.note == _note(
+        "entry:web",
+        "",
+        _REACH_CAVEAT_INFERRED + " (co-located with proven CGI named.cgi under served root web)",
+    )
+    assert "INFERRED" in dim.note
+    assert "named.cgi" in dim.note
+    assert _REACH_CAVEAT_STANDARD_FLOW not in dim.note
+    assert dim.source == _REACH_SOURCE_INFERRED
+    assert "basis: inferred" in dim.source
+    assert "web-asset" not in dim.source
+    assert dim.evidence == (
+        {
+            "via": "served_tree_inference",
+            "kind": "web_endpoint",
+            "basis": "inferred",
+            "note": "co-located with proven CGI named.cgi under served root web",
+        },
+    )
+
+
+def test_a_named_cgis_reading_is_unchanged_to_the_byte(tmp_path: Path) -> None:
+    """The seed itself — named by a web asset — reads exactly as it did before the inference
+    existed: the standard-flow caveat, the reference source, and no evidence row. A named binary
+    is offered no inferred site at all (``web_named``), so this is the whole other side of the
+    branch and the one that must not move.
+
+    Verified RED by taking the inferred branch unconditionally: 1 failed. Also RED by classifying
+    every web site as inferred (not reading ``basis``): 1 failed.
+    """
+    db = _analysis(
+        tmp_path,
+        binaries=("web/named.cgi", "web/other.cgi"),
+        endpoints=(("web/index.htm", "/named.cgi"),),
+    )
+    dim = _reach(_sites(_index(db), "web/named.cgi"))
+    assert (dim.state, dim.value) == ("proven", "entry:web")
+    assert dim.note == _note("entry:web", " (GET /named.cgi)", _REACH_CAVEAT_STANDARD_FLOW)
+    assert dim.source == _REACH_SOURCE_REFERENCE
+    assert "web-asset" in dim.source
+    assert dim.evidence == ()
+    assert "INFERRED" not in dim.note
+
+
+def test_a_real_reference_beside_an_inferred_web_reading_keeps_both_caveats(
+    tmp_path: Path,
+) -> None:
+    """A CGI a script launches AND the inference places in a served tree: the standard-flow
+    sentence stays — it is true of the script part — and is told apart from the web part, which
+    gets the inferred caveat. Dropping either sentence misreads one of the two halves.
+
+    Verified RED by replacing the standard caveat here as well (the script reference then reads as
+    an inference): 1 failed.
+    """
+    db = _analysis(
+        tmp_path,
+        binaries=("web/named.cgi", "web/both.cgi"),
+        endpoints=(("web/index.htm", "/named.cgi"),),
+        scripts=(("etc/init.d/rcS", f"{_IMG}/web/both.cgi"),),
+    )
+    sites = _sites(_index(db), "web/both.cgi")
+    dim = _reach(sites)
+    assert (dim.state, dim.value) == ("proven", "entry:web+script")
+    assert dim.note == _note(
+        "entry:web+script",
+        "",
+        f"{_REACH_CAVEAT_STANDARD_FLOW} — that reference is the script / exec part of this "
+        f"reading ONLY; as for the web part, {_REACH_CAVEAT_INFERRED}"
+        " (co-located with proven CGI named.cgi under served root web)",
+    )
+    assert _REACH_CAVEAT_STANDARD_FLOW in dim.note
+    assert "INFERRED" in dim.note
+    assert dim.source == _REACH_SOURCE_MIXED
+    assert [r["via"] for r in dim.evidence] == ["served_tree_inference"]
 
 
 # ── what may NOT seed a tree ─────────────────────────────────────────────────────────
@@ -420,6 +556,37 @@ def test_the_most_specific_served_tree_is_the_one_cited(tmp_path: Path) -> None:
     assert {r.rel_directory for r in index._served_roots} == {"www", "www/cgi"}  # precondition
     assert _sites(index, "www/cgi/other.cgi")[0]["note"] == (
         "co-located with proven CGI also.cgi under served root www/cgi"
+    )
+
+
+def test_the_longest_inventory_path_places_a_seed_not_the_first_that_matches(
+    tmp_path: Path,
+) -> None:
+    """One content listed at two paths that BOTH suffix-match the binary's host path: the longest
+    is the specific one, so a seed under ``usr/www/cgi`` is placed there and not at the shallower
+    ``www/cgi`` its path also ends with. It matters twice: the refusal list is read against this
+    path, and the note cites it to the reader as the tree to go and check.
+
+    Verified RED three ways, each 1 failed: sorting the matches shortest-first (the note then
+    cites ``www/cgi``); taking the first match as it arrives; breaking a tie by reverse name.
+    """
+    assert _rootfs_relative("/img/usr/sbin/foo", ("sbin/foo", "usr/sbin/foo")) == "usr/sbin/foo"
+    # Determinism on a tie, the other half of the sort key: two spellings of the same length (only
+    # a path listed twice produces one) resolve by name, whichever order they arrive in.
+    tie = ("//aa/foo", "p/aa/foo")
+    assert _rootfs_relative("/p/aa/foo", tie) == "//aa/foo"
+    assert _rootfs_relative("/p/aa/foo", tuple(reversed(tie))) == "//aa/foo"
+
+    db = _analysis(
+        tmp_path,
+        binaries=("usr/www/cgi/a.cgi", "usr/www/cgi/other.cgi"),
+        endpoints=(("web/index.htm", "/a.cgi"),),
+        extra_inventory=(("usr/www/cgi/a.cgi", "www/cgi/a.cgi"),),
+    )
+    index = _index(db)
+    assert {(r.rel_directory, r.seed) for r in index._served_roots} == {("usr/www/cgi", "a.cgi")}
+    assert _sites(index, "usr/www/cgi/other.cgi")[0]["note"] == (
+        "co-located with proven CGI a.cgi under served root usr/www/cgi"
     )
 
 
