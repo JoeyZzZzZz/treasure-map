@@ -23,7 +23,6 @@ from typing import Any
 from treasure_map.lib import rescan_version as rv
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.diff import code_version as dcv
-from treasure_map.lib.diff.loader import FuncRow
 from treasure_map.lib.hunt import exec_runners as er
 from treasure_map.lib.hunt import run_analyzer2
 from treasure_map.lib.hunt.exec_edges import (
@@ -34,6 +33,7 @@ from treasure_map.lib.hunt.exec_edges import (
     build_symlink_index,
     exec_entry_sites,
 )
+from treasure_map.lib.hunt.function_rows import FuncRow
 from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.query import exec_edges as qee
 from treasure_map.lib.query import launched_by
@@ -1113,7 +1113,7 @@ def test_the_hunt_lands_runner_rows_beside_the_projection_and_keeps_them_apart(
     """The runner row and the projection row share the table; the runner row is marked by its
     exec_api (the runner) and argv_provenance, so the two never read alike.
 
-    MUTATION (verified RED, 1 failed): in analyzer2 write only the projection's rows
+    MUTATION (verified RED, 1 failed): in analyzer write only the projection's rows
     (``add_exec_edges(atlas, exec_edge_rows, commit=False)``) -> launched_by finds no edge."""
     atlas_path = _hunt(tmp_path)
     conn = open_atlas(atlas_path)
@@ -1142,10 +1142,10 @@ def test_the_projection_status_keeps_its_own_count(tmp_path: Path) -> None:
     """The projection's exec_argv row counts the projection's rows only; the runner pass has its
     own row per binary, also where it found nothing.
 
-    MUTATION (verified RED, 1 failed): in analyzer2 feed both row sets to the projection's status
+    MUTATION (verified RED, 1 failed): in analyzer feed both row sets to the projection's status
     (``_exec_scan_status(exec_edge_rows + runner_edge_rows, ...)``) -> daemon_one's exec_argv
     count is 2.
-    MUTATION (verified RED, 1 failed): in analyzer2 drop ``detector_status_rows +=
+    MUTATION (verified RED, 1 failed): in analyzer drop ``detector_status_rows +=
     runner_status_rows`` -> no runner status row."""
     atlas_path = _hunt(tmp_path)
     conn = open_atlas(atlas_path)
@@ -1224,17 +1224,17 @@ def test_the_runner_edge_moves_only_the_launched_binarys_candidates(
     reach_promote 0 -> 1); every other candidate keeps its sort atoms and their relative order is
     unchanged. Measured against the same firmware hunted with the pass switched off.
 
-    MUTATION (verified RED, 1 failed): in analyzer2 build the entry index from the projection's
+    MUTATION (verified RED, 1 failed): in analyzer build the entry index from the projection's
     rows alone (``exec_entry_sites(exec_edge_rows)``) -> do_work's reach rank stays 1.
     MUTATION (verified RED, 1 failed): in build_runner_edges send every row's target to the
     launcher's own file (``row = replace(row, argv_provenance=RUNNER_PROVENANCE,
     target_binary=func.binary_path)``) -> daemon_one's candidate is lifted too and the relative
     order of the untouched candidates changes."""
-    from treasure_map.lib.hunt import analyzer2
+    from treasure_map.lib.hunt import analyzer
 
     on_order, on_atoms = _order_and_atoms(_hunt(_run_dir(tmp_path, "on")))
-    real = analyzer2._runner_exec_edges
-    monkeypatch.setattr(analyzer2, "_runner_exec_edges", lambda *a, **k: ([], real(*a, **k)[1]))
+    real = analyzer._runner_exec_edges
+    monkeypatch.setattr(analyzer, "_runner_exec_edges", lambda *a, **k: ([], real(*a, **k)[1]))
     off_order, off_atoms = _order_and_atoms(_hunt(_run_dir(tmp_path, "off")))
 
     assert set(on_order) == set(off_order)
@@ -1256,7 +1256,7 @@ def test_the_pass_builds_no_candidate(tmp_path: Path, monkeypatch: Any) -> None:
     it. A structural guarantee — ``runner_pass`` returns edge and status rows and has no channel
     into the candidate set — pinned here against the hunt as a regression guard (there is no
     one-line mutation inside the pass that reaches the candidate set)."""
-    from treasure_map.lib.hunt import analyzer2
+    from treasure_map.lib.hunt import analyzer
 
     def _identities(path: Path) -> list[tuple[Any, ...]]:
         conn = open_atlas(path)
@@ -1271,7 +1271,7 @@ def test_the_pass_builds_no_candidate(tmp_path: Path, monkeypatch: Any) -> None:
             conn.close()
 
     with_pass = _identities(_hunt(_run_dir(tmp_path, "on")))
-    monkeypatch.setattr(analyzer2, "_runner_exec_edges", lambda *a, **k: ([], []))
+    monkeypatch.setattr(analyzer, "_runner_exec_edges", lambda *a, **k: ([], []))
     without = _identities(_hunt(_run_dir(tmp_path, "off")))
     assert with_pass == without
     assert len(with_pass) >= 3

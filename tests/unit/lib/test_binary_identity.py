@@ -568,7 +568,7 @@ def test_load_baseline_is_the_resolved_binarys_whole_function_map(
     MUTATION: restore the ``WHERE b.name = ? OR b.sha256 = ?`` query (taking a selector) -> RED on
     shape II, where the shared addresses carry different names.
     """
-    from treasure_map.lib.diff.layer0 import load_baseline
+    from treasure_map.lib.diff.alignment import load_baseline
 
     con = _ro(same_name_binaries_db)
     try:

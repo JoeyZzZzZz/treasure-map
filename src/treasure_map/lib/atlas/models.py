@@ -360,7 +360,7 @@ class FunctionPresenceRow:
     # 1 when its export wrote an operand of this function in its default form (additional fact).
     operand_markup_incomplete: int = 0
     # What the other side holds where this function maps through the nearest pair at or below it
-    # (lib/diff/layer0.probe_counterparts): unpaired / occupied / uncovered / residual_code /
+    # (lib/diff/alignment.probe_counterparts): unpaired / occupied / uncovered / residual_code /
     # undisassembled_bytes (W11) / coverage_unknown / unmappable; the other side's
     # function or thunk there (counterpart_addr); the leftover-code or undisassembled ranges the
     # mapped span meets (JSON, counterpart_overlap); and why the probe made the state undetermined
@@ -471,7 +471,7 @@ class DiffMetaRow:
     toolchain_ghidra: str | None = None
     toolchain_binexport: str | None = None
     toolchain_bindiff: str | None = None
-    # The import stubs, accounted by import name outside the pairs (lib/diff/layer0.StubLedger):
+    # The import stubs, accounted by import name outside the pairs (lib/diff/alignment.StubLedger):
     # each side's stub table resolved / unknown; with both resolved, the import names on both
     # sides (stub_pairs), on one side only (JSON name lists), and the pairs the diff tool made
     # between a stub and a function that is not one (JSON [[addr_a, addr_b], ...]). NULL = not

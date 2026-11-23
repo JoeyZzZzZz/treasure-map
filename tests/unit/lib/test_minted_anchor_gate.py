@@ -28,7 +28,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
 )
 from treasure_map.cli.hunt_cli import triage as triage_cmd
 from treasure_map.lib.errors import ConfigError
-from treasure_map.lib.hunt.analyzer2 import run_analyzer2
+from treasure_map.lib.hunt.analyzer import run_analyzer2
 from treasure_map.lib.query import sink_overlay as so
 
 _RUN = "runA"

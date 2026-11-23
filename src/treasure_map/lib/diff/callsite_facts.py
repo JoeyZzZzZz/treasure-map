@@ -44,7 +44,7 @@ from treasure_map.lib.atlas.writer import set_callsite_facts_state, set_instruct
 from treasure_map.lib.binary_id import BinaryRow
 from treasure_map.lib.facts import analysis_run_counts
 from treasure_map.lib.hunt.refs import _norm_addr
-from treasure_map.lib.pattern.classes import stub_resolved_name
+from treasure_map.lib.pattern.sink_vocabulary import stub_resolved_name
 from treasure_map.lib.ro_db import ro_connect
 
 KIND_STUB_RESOLVED = "stub_resolved"
@@ -265,7 +265,7 @@ def read_side_facts(
         conn.row_factory = None
         build_hash = _build_hash_with_rows(conn, analysis_db_path)
         # the same per-DATABASE decision the hunt makes (imported lazily: a heavy module)
-        from treasure_map.lib.hunt.analyzer2 import _db_has_bridge
+        from treasure_map.lib.hunt.analyzer import _db_has_bridge
 
         bridged = _db_has_bridge(analysis_db_path)
         facts = load_binary_call_facts(

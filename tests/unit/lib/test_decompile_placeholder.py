@@ -18,7 +18,7 @@ import pytest
 from tests.unit.lib.test_d29_callsite import _pair, _scc
 from tests.unit.lib.test_patch_view import DIFF, SHA_A, World
 from treasure_map.lib import facts
-from treasure_map.lib.diff.layer0 import _decompile_status
+from treasure_map.lib.diff.alignment import _decompile_status
 from treasure_map.lib.query import patch_view as pv
 from treasure_map.lib.query import sameness
 

@@ -26,13 +26,13 @@ from typing import Any
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.writer import begin_run
 from treasure_map.lib.binary_id import resolve_binary_in_db
-from treasure_map.lib.diff.export_report import ExportReport
-from treasure_map.lib.diff.layer0 import (
+from treasure_map.lib.diff.alignment import (
     COUNTERPART_SUSPECTED,
     BaselineDomain,
     probe_counterparts,
     run_layer0_parse,
 )
+from treasure_map.lib.diff.export_report import ExportReport
 from treasure_map.lib.query.diff_align import _GenerationCache, _partial_blindspots, get_diff_meta
 from treasure_map.lib.storage.connection import open_db
 
@@ -796,7 +796,7 @@ def test_the_thunk_list_reads_null_and_unreadable_as_not_known() -> None:
     read list cannot show a thunk is absent.
 
     Mutation: return ``{}`` for NULL -> RED."""
-    from treasure_map.lib.diff.layer0 import _thunk_spans
+    from treasure_map.lib.diff.alignment import _thunk_spans
 
     assert _thunk_spans("[]") == {}
     assert _thunk_spans('[["0x10", [["0x10", "0x17"]]]]') == {"00000010": ((0x10, 0x17),)}
@@ -862,7 +862,7 @@ def test_a_null_thunk_list_is_read_as_not_known_from_the_analysis_db(tmp_path: P
     ``{}``.
 
     Mutation: ``thunks = _thunk_spans(...) or {}`` in load_baseline -> RED."""
-    from treasure_map.lib.diff.layer0 import load_baseline
+    from treasure_map.lib.diff.alignment import load_baseline
 
     for raw, want in ((None, None), ("[]", {})):
         db = _analysis(tmp_path / f"t_{raw}.db", "sha_t", [(0x2000, "f", 0x10, None)], thunks=raw)

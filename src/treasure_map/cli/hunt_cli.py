@@ -473,8 +473,8 @@ def _diff_rescan_plan(
     from treasure_map.lib.analyze.ghidra_runner import current_pass_version
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.binary_id import resolve_binary_in_db
+    from treasure_map.lib.diff.alignment import _resolve_run, make_diff_id
     from treasure_map.lib.diff.driver import _analysis_build_hash, _concrete_hash, _selector_error
-    from treasure_map.lib.diff.layer0 import _resolve_run, make_diff_id
     from treasure_map.lib.query.diff_align import pair_diffs
     from treasure_map.lib.query.runs import Staleness, _remedy_for, run_staleness
 
@@ -685,8 +685,8 @@ def _recheck_after_rescan(
     the diff (it names the run and exits RESCAN_PARTIAL_EXIT, which the caller lets through), so
     its outcome is read from the atlas, never assumed. Refuses rather than rescanning again."""
     from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.diff.alignment import _resolve_run, _version_skew
     from treasure_map.lib.diff.driver import check_run_pair_currency
-    from treasure_map.lib.diff.layer0 import _resolve_run, _version_skew
 
     again = "Not rescanning again; see the rescan output above."
     conn = open_atlas(resolved_atlas)
@@ -1258,7 +1258,7 @@ def _render_triage(
         loc = f"        in: {c.binary_path or '?'}"
         if c.nvram_source_key:
             loc += f"   nvram_source_key={c.nvram_source_key}"
-        # the orthogonal source=param signal (analyzer2 external_input) — surfaced here so the human
+        # the orthogonal source=param signal (analyzer external_input) — surfaced here so the human
         # list carries it too, not only the MCP compact row / explain (contract C6 guardrail 2).
         if c.dim("source").value == "param":
             loc += "   source=param"
@@ -2418,7 +2418,7 @@ def scan(
         # re-scan from scratch) but BEFORE run_analyze (the traversal that writes binaries.path runs
         # there, well before firmware_path is recorded — resolving only near firmware_path would
         # leave binaries.path relative, exactly the half that blocks diff). One resolve here keeps
-        # both paths consistent (mirrors analyzer2's resolve of analysis_db_path).
+        # both paths consistent (mirrors analyzer's resolve of analysis_db_path).
         fs_root = fs_root.resolve()
 
         effective_run_id = run_id if run_id is not None else ws_path.name

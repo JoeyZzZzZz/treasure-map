@@ -35,7 +35,7 @@ from treasure_map.lib.hunt.refs import (
     build_evidence_ref,
     callsite_offset_suffix,
 )
-from treasure_map.lib.pattern import classes
+from treasure_map.lib.pattern import sink_vocabulary
 from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.query import sort_candidates, triage
 from treasure_map.lib.query.triage import (
@@ -1384,7 +1384,9 @@ def test_variadic_iron_law_is_untouched_by_the_gate(sink: str, tmp_path: Path) -
     # MUTATION (H-3, verified RED, 7 failed): make the variadic downgrade return "controllable"
     # instead of "unknown" -> each case reads ('proven', 'controllable'). Asserting only
     # `!= ('proven', 'constant')` let that pass: the reading is pinned exactly.
-    assert sink in classes.CMD  # premise: the candidate reaches the const-command exits at all
+    assert (
+        sink in sink_vocabulary.CMD
+    )  # premise: the candidate reaches the const-command exits at all
     conn = open_atlas(tmp_path / "atlas.db")
     try:
         pid = _pattern(conn, f"fp_g4_{sink}")
@@ -1415,7 +1417,9 @@ def test_the_multi_arg_set_keeps_the_exec_family_and_nothing_shell_running() -> 
     floor = {"execl", "execle", "execlp", "execv", "execve", "execvp", "execvpe"}
     assert floor <= _MULTI_ARG_COMMAND_SINKS, sorted(floor - _MULTI_ARG_COMMAND_SINKS)
     assert not ({"system", "popen", "doSystem"} & _MULTI_ARG_COMMAND_SINKS)
-    assert _MULTI_ARG_COMMAND_SINKS <= classes.CMD, sorted(_MULTI_ARG_COMMAND_SINKS - classes.CMD)
+    assert _MULTI_ARG_COMMAND_SINKS <= sink_vocabulary.CMD, sorted(
+        _MULTI_ARG_COMMAND_SINKS - sink_vocabulary.CMD
+    )
 
 
 def test_a_sink_class_def_use_does_not_cover_is_never_read_as_an_escape() -> None:

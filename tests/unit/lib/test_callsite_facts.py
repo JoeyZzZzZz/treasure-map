@@ -18,7 +18,7 @@ from treasure_map.lib.binary_id import BinaryRow
 from treasure_map.lib.diff import binexport2 as bx
 from treasure_map.lib.diff import callsite_facts as cf
 from treasure_map.lib.hunt.bridge import op_addr_at
-from treasure_map.lib.pattern.classes import call_offsets, stub_resolved_name
+from treasure_map.lib.pattern.sink_vocabulary import call_offsets, stub_resolved_name
 from treasure_map.lib.storage.connection import open_db
 
 # ── a minimal protobuf encoder (wire format) for synthetic BinExport2 messages ────────────────

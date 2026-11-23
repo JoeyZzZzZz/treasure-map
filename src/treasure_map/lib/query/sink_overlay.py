@@ -119,7 +119,7 @@ from treasure_map.lib.diff.export_report import DEGENERATE_BLOCK_SOURCE, load_ex
 from treasure_map.lib.errors import TreasureMapError
 from treasure_map.version import UNKNOWN_VERSION
 
-ALIGN_THRESHOLD = 0.9  # mirrors lib/diff/layer0.ALIGN_THRESHOLD; a pair below it is undetermined
+ALIGN_THRESHOLD = 0.9  # mirrors lib/diff/alignment.ALIGN_THRESHOLD; a pair below it is undetermined
 
 # key_granularity values
 _G_CALLSITE = "callsite"

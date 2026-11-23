@@ -4,12 +4,12 @@
 
 Composes two hermetic primitives and persists the result: the call-sequence shape detector
 locates shape candidates in one analysis.db; the reachability grader grades each candidate's
-reachability; analyzer2 upserts the RICH "callseq-v1" pattern and writes a graded instance into
+reachability; analyzer upserts the RICH "callseq-v1" pattern and writes a graded instance into
 the atlas. This is the first time the shape detector's output reaches the persistent store — the
 pattern table was designed for exactly this.
 
 Fully hermetic: neither the shape detector nor the reachability grader uses an LLM, so
-analyzer2 needs no router.
+analyzer needs no router.
 
 Discipline (enforced here and by the schema):
 - L0/L1 only (confirmed -> L1, unknown -> L0); never L2/L3, never an external_anchor.
@@ -66,7 +66,6 @@ from treasure_map.lib.atlas.writer import (
     refresh_run_lineage,
     upsert_pattern,
 )
-from treasure_map.lib.diff.loader import FuncRow, load_functions
 from treasure_map.lib.hunt.bridge import callsite_addr_out_of_body, callsite_address_offset
 from treasure_map.lib.hunt.data_strings import DataStrings
 from treasure_map.lib.hunt.dispatch_tables import detect_run, elf_file_state
@@ -92,8 +91,8 @@ from treasure_map.lib.hunt.exec_edges import (
     exec_entry_sites,
 )
 from treasure_map.lib.hunt.exec_runners import runner_pass
-from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
 from treasure_map.lib.hunt.fmt_provenance import constant_format_record, format_argument
+from treasure_map.lib.hunt.function_rows import FuncRow, load_functions
 from treasure_map.lib.hunt.refs import (
     _WRAPPER_AXIS,
     _addr_to_int,
@@ -103,6 +102,7 @@ from treasure_map.lib.hunt.refs import (
     mint_out_of_body_refs,
 )
 from treasure_map.lib.hunt.value_helpers import build_helper_tables, helper_keys_called
+from treasure_map.lib.hunt.wrapper_facts import is_thin_cmd_wrapper
 from treasure_map.lib.hunt.wrapper_propagation import (
     PATH_SINK_CLASS,
     WrapperCandidate,
@@ -111,7 +111,9 @@ from treasure_map.lib.hunt.wrapper_propagation import (
     path_wrapper_calls_literal,
 )
 from treasure_map.lib.pattern import scan
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.scanner import load_stub_names
+from treasure_map.lib.pattern.shapes import classify
+from treasure_map.lib.pattern.sink_vocabulary import (
     CMD,
     NO_HELPERS,
     SOURCE_STRONG,
@@ -121,8 +123,6 @@ from treasure_map.lib.pattern.classes import (
     arg_ref,
     path_arg_ref,
 )
-from treasure_map.lib.pattern.scanner import load_stub_names
-from treasure_map.lib.pattern.shapes import classify
 from treasure_map.lib.query.nvram import template_has_anchor
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import locate_sink_arg_ref
@@ -222,10 +222,10 @@ def _source_names_keys(names: Iterable[str]) -> dict[str, Any]:
     differ.
 
     Each entry is ``{"name": <source name>, "strength": "strong" | "weak"}``, the strength being the
-    set the name is listed in (classes.SOURCE_STRONG / SOURCE_WEAK). The coarse ``source_class``
-    says only that SOME source is called; this keeps which one, so a stored setting and a network
-    receive are not folded into one label. It names calls, not flows: a name here may never reach
-    the sink."""
+    set the name is listed in (sink_vocabulary.SOURCE_STRONG / SOURCE_WEAK). The coarse
+    ``source_class`` says only that SOME source is called; this keeps which one, so a stored setting
+    and a network receive are not folded into one label. It names calls, not flows: a name here may
+    never reach the sink."""
     ordered = sorted(set(names))
     if not ordered:
         return {}
@@ -674,8 +674,9 @@ def _wrapper_sink_arg_ref(
     stub_names: Mapping[int, str] | None = None,
     occurrence: int | None = None,
 ) -> ArgRef | None:
-    """The wrapper's dangerous argument, read (``classes.arg_ref``) — at the FORMAT position when
-    one is known, otherwise the first argument. None when the call or the argument is not there.
+    """The wrapper's dangerous argument, read (``sink_vocabulary.arg_ref``) — at the FORMAT position
+    when one is known, otherwise the first argument. None when the call or the argument is not
+    there.
 
     ``occurrence`` (0-based, text order, located with ``stub_names``) reads the candidate's OWN call
     to the wrapper. None is the function-level fallback and keeps the historical reading of the
@@ -1282,7 +1283,7 @@ def _attach_edge_leads(
 def _load_wrapper_data(
     db_path: Path | str,
 ) -> tuple[dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]]]:
-    """Load the analyzer2 transport columns: func_id -> nvram_wrapper {op,api}, and func_id ->
+    """Load the analyzer transport columns: func_id -> nvram_wrapper {op,api}, and func_id ->
     the calls that pass a constant literal to a local function. A missing column (older
     analysis.db) or an unparsable cell yields no entry — wrapper-indirect recovery is additive."""
     uri = ro_uri(Path(db_path))
@@ -1292,7 +1293,7 @@ def _load_wrapper_data(
     try:
         rows = conn.execute("SELECT id, nvram_wrapper, wrapper_call_args FROM functions").fetchall()
     except sqlite3.OperationalError:
-        return wrappers, call_args  # pre-analyzer2 analysis.db -> no data
+        return wrappers, call_args  # pre-analyzer analysis.db -> no data
     finally:
         conn.close()
     for func_id, w_raw, ca_raw in rows:
@@ -1591,7 +1592,7 @@ def run_analyzer2(
     nvram_flow_rows = _flatten_nvram_ops(all_funcs, _load_nvram_ops(db_path), source_run_id)
     # resolve each caller's constant-literal call into a recognized thin nvram wrapper into
     # an INDIRECT key edge (via_wrapper) — the wrapper-indirect reads/writes the direct graph
-    # misses. Empty when the analysis.db predates the analyzer2 columns. Appended to the run's
+    # misses. Empty when the analysis.db predates the analyzer columns. Appended to the run's
     # flow rows.
     _wrappers, _call_args = _load_wrapper_data(db_path)
     wrapper_edge_rows = _flatten_wrapper_edges(all_funcs, _wrappers, _call_args, source_run_id)

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 
-from treasure_map.lib.diff.loader import FuncRow
+from treasure_map.lib.hunt.function_rows import FuncRow
 from treasure_map.lib.hunt.wrapper_propagation import find_wrapper_propagated_candidates
 
 
@@ -337,7 +337,7 @@ def test_calls_are_counted_with_the_stub_table_the_readers_use() -> None:
 
     MUTATION (verified RED): count calls without ``stub_names`` in ``_axis_candidates`` -> one
     candidate, and occurrence 1 then reads a call that does not exist."""
-    from treasure_map.lib.hunt.analyzer2 import _wrapper_sink_arg_ref
+    from treasure_map.lib.hunt.analyzer import _wrapper_sink_arg_ref
 
     pc = "void f(void){ FUN_00012340(first); do_cmd(second); }"
     caller = _fn(9, "f", pc, ["do_cmd"])

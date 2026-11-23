@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for lib/hunt/facts — the thin-command-wrapper structural fact.
+"""Unit tests for lib/hunt/wrapper_facts — the thin-command-wrapper structural fact.
 
 Pure functions over synthetic, vendor-neutral pseudocode, plus an atlas round-trip proving the
 fact persists (and is readable once the source analysis.db is gone). The fact is structural —
@@ -16,7 +16,7 @@ from pathlib import Path
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, add_instances, upsert_pattern
-from treasure_map.lib.hunt.facts import (
+from treasure_map.lib.hunt.wrapper_facts import (
     _WRAPPER_MAX_STATEMENTS,
     is_thin_cmd_wrapper,
     is_thin_fmt_wrapper,
@@ -380,9 +380,9 @@ def test_no_recall_or_score_path_reads_the_fact() -> None:
     for rel in ("lib/hunt/downweight.py", "lib/query/views.py"):
         text = (_SRC / rel).read_text()
         assert "wrapped_sink" not in text, f"{rel} unexpectedly references the fact"
-    # analyzer2 writes the fact but must not READ it back to alter recall/score: the only
+    # analyzer writes the fact but must not READ it back to alter recall/score: the only
     # occurrences are the import, the call, and the two InstanceRow kwargs — never a comparison.
-    a2 = (_SRC / "lib/hunt/analyzer2.py").read_text()
+    a2 = (_SRC / "lib/hunt/analyzer.py").read_text()
     assert "if thin_wrapper" not in a2 and "if is_thin_cmd_wrapper" not in a2
 
 
@@ -422,7 +422,7 @@ def test_triage_reads_the_wrapped_sink_name_only_for_drill_down() -> None:
 def test_thin_cmd_wrapper_finds_a_stub_rendered_sink_call_with_the_stub_table() -> None:
     """The callee list names `system`, but the body spells the call after its stub. Only the stub
     table connects the two; without it the call is invisible and the answer is a safe no."""
-    from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
+    from treasure_map.lib.hunt.wrapper_facts import is_thin_cmd_wrapper
 
     pc = "void do_cmd(char *param_1){ FUN_00412000(param_1); }"
     assert is_thin_cmd_wrapper(pc, ["system"]) == (False, None)

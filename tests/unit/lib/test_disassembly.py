@@ -10,7 +10,7 @@ import zlib
 from pathlib import Path
 
 from treasure_map.lib import facts
-from treasure_map.lib.diff.layer0 import norm_hex
+from treasure_map.lib.diff.alignment import norm_hex
 from treasure_map.lib.query import sameness
 from treasure_map.lib.storage.connection import open_db
 
@@ -518,10 +518,10 @@ def test_the_status_note_and_the_truncation_note_are_two_keys(tmp_path: Path) ->
 
 
 def test_the_status_splits_empty_text_as_the_diff_baseline_does() -> None:
-    """facts.pseudocode_status and lib/diff/layer0._decompile_status read one empty text the same
+    """facts.pseudocode_status and lib/diff/alignment._decompile_status read one empty text the same
     way over every text and size shape (the text check strips whitespace in both); a function with
     text gets no status, where layer0 says ok."""
-    from treasure_map.lib.diff.layer0 import _decompile_status
+    from treasure_map.lib.diff.alignment import _decompile_status
 
     to_layer0 = {"skipped_micro": "skipped_micro", "decompile_empty": "failed"}
     to_layer0["size_unknown"] = "unknown"

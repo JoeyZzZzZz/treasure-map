@@ -1450,7 +1450,7 @@ def test_attempted_by_the_running_pass_reads_the_same_as_the_hunts_extraction_no
     ran Ghidra.
 
     MUTATION (verified RED): read timeout_pass_version for every failure, launch_failed included."""
-    from treasure_map.lib.hunt.analyzer2 import _load_extraction_notes
+    from treasure_map.lib.hunt.analyzer import _load_extraction_notes
     from treasure_map.lib.query.runs import extraction_attempt_state
 
     cur = current_pass_version()

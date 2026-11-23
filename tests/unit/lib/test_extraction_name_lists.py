@@ -21,7 +21,7 @@ from tests.unit.lib.test_dispatch_tables import _table
 from tests.unit.lib.test_ghidra_ingest import _make_record, _setup_db, _write_ghidra_json
 from treasure_map.lib.analyze import ghidra_ingest as ingest_mod
 from treasure_map.lib.analyze.ghidra_ingest import TABLE_ACCESS_ROW_KEYS, ingest_ghidra_output
-from treasure_map.lib.diff.layer0 import _thunk_spans
+from treasure_map.lib.diff.alignment import _thunk_spans
 from treasure_map.lib.hunt import dispatch_tables as dt
 from treasure_map.lib.storage.connection import open_db
 

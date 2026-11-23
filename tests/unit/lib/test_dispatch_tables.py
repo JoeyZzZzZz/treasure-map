@@ -991,7 +991,7 @@ def test_the_hunt_fingerprint_moves_with_the_elf_on_disk(tmp_path: Path) -> None
     """
     import hashlib
 
-    from treasure_map.lib.hunt.analyzer2 import hunt_input_fingerprint
+    from treasure_map.lib.hunt.analyzer import hunt_input_fingerprint
 
     elf = tmp_path / "fx_bin"
     elf.write_bytes(b"\x7fELF the scanned bytes")

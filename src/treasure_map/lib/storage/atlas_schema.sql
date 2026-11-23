@@ -566,7 +566,7 @@ CREATE TABLE IF NOT EXISTS function_presence (
     operand_markup_incomplete INTEGER DEFAULT 0, -- 1 = its export wrote an operand of it in its
                                     --   default form: an additional fact, never a state
     -- What the other side holds where this function maps through the nearest pair at or below it
-    -- (lib/diff/layer0.probe_counterparts): unpaired (a function OR a thunk in no pair: the state is
+    -- (lib/diff/alignment.probe_counterparts): unpaired (a function OR a thunk in no pair: the state is
     -- then 'counterpart_suspected', existence UNDETERMINED, never an add/delete) / occupied (a
     -- paired function, a paired thunk, or an import-stub slot) / uncovered (no function, and neither
     -- the other side's leftover code nor its undisassembled bytes reach it) / residual_code /
@@ -731,7 +731,7 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     toolchain_ghidra        TEXT,            -- the external toolchain the diff ran (Ghidra's
     toolchain_binexport     TEXT,            --   application.version, the BinExport extension's
     toolchain_bindiff       TEXT,            --   version, `bindiff --version`); NULL = not read
-    -- The import stubs, accounted by import name outside the pairs (lib/diff/layer0.StubLedger).
+    -- The import stubs, accounted by import name outside the pairs (lib/diff/alignment.StubLedger).
     stub_table_a            TEXT,            -- per side: resolved | none_named | unknown
     stub_table_b            TEXT,            --   (binaries.stub_names: named / '{}' / NULL)
     stub_pairs              INTEGER,         -- import names stubbed on both sides; NULL unless both

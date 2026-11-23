@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Which of a binary's own functions hand on a known source's value (E-2a H8, criterion A).
 
-The mechanism layer (classes.SourceHelpers, threaded through the readers) is in place; this is the
-half that decides WHICH functions go in a binary's table. A firmware binary often reads its input
-through a small local function: it calls a known source (classes.SOURCE) and either returns that
-value or writes it into a buffer its caller passed. A caller of such a function reads, to the shape
-scan, as taking no input at all — its callee list names only the local function.
+The mechanism layer (sink_vocabulary.SourceHelpers, threaded through the readers) is in place;
+this is the half that decides WHICH functions go in a binary's table. A firmware binary often reads
+its input through a small local function: it calls a known source (sink_vocabulary.SOURCE) and
+either returns that value or writes it into a buffer its caller passed. A caller of such a function
+reads, to the shape scan, as taking no input at all — its callee list names only the local
+function.
 
 Two layers, kept apart on purpose:
 
@@ -77,8 +78,9 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from treasure_map.lib.diff.loader import FuncRow
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.hunt.function_rows import FuncRow
+from treasure_map.lib.pattern.extractor_names import REGISTRY
+from treasure_map.lib.pattern.sink_vocabulary import (
     RETURN_SLOT,
     SOURCE,
     SourceHelpers,
@@ -86,7 +88,6 @@ from treasure_map.lib.pattern.classes import (
     call_args_at,
     call_offsets,
 )
-from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.reachability.taint import _seed_sets
 
 # Buffer-building calls: REGISTRY.writers (writer + writer_fmt), the same set facts._BUILDERS reads.
@@ -94,9 +95,9 @@ from treasure_map.lib.reachability.taint import _seed_sets
 _WRITERS: frozenset[str] = REGISTRY.writers
 # One-layer value-preserving copies: a source call wrapped in one of these still hands on the value.
 _COPY_CALLS: frozenset[str] = frozenset({"strdup", "strndup"})
-# The forms in which an expression IS the value it reads (of the forms classes.arg_ref returns):
-# a variable, a cast of one, a read through it, its address. Arithmetic / a comparison / any other
-# call is something else.
+# The forms in which an expression IS the value it reads (of the forms sink_vocabulary.arg_ref
+# returns): a variable, a cast of one, a read through it, its address. Arithmetic / a comparison /
+# any other call is something else.
 _VALUE_FORMS: frozenset[str] = frozenset({"var", "cast", "load", "addr_of"})
 # Comparison-family calls: their result is a verdict about the value, not the value.
 _COMPARE_CALLS: frozenset[str] = frozenset(

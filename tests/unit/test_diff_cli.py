@@ -24,7 +24,7 @@ from treasure_map.lib.analyze import ghidra_runner
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.config.config import load_config
 from treasure_map.lib.diff import driver
-from treasure_map.lib.diff.layer0 import make_diff_id
+from treasure_map.lib.diff.alignment import make_diff_id
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.rescan_version import CodeStamp
 from treasure_map.lib.storage.connection import open_db

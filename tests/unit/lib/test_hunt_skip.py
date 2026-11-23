@@ -24,7 +24,7 @@ import pytest
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import RunRow
 from treasure_map.lib.atlas.writer import begin_run, finish_run
-from treasure_map.lib.hunt.analyzer2 import hunt_currency
+from treasure_map.lib.hunt.analyzer import hunt_currency
 from treasure_map.lib.query import get_run, run_staleness
 from treasure_map.lib.rescan_version import CodeStamp
 from treasure_map.lib.storage.connection import open_db
@@ -515,7 +515,7 @@ _BODY = (
 def _seeded(tmp_path: Path, pass_version: str = "pv_x") -> Path:
     """A tiny analysis.db that yields exactly one candidate, with a uniform pipeline stamp.
 
-    Built here rather than borrowed from the analyzer2 suite: what these tests assert is that a
+    Built here rather than borrowed from the analyzer suite: what these tests assert is that a
     hunt's OUTPUT survives untouched, so the input has to stay pinned to this file. A shared
     fixture that later grew a second function would quietly change what "unchanged" means.
     ``last_seen_at`` is required — current_binaries selects on MAX(last_seen_at), and NULL never
@@ -563,7 +563,7 @@ def test_a_second_hunt_by_the_same_commit_skips_and_touches_nothing(
     MUTATION: move the skip gate below ``delete_run_instances`` -> RED (rows vanish). Remove the
     gate entirely -> RED (instance_ids change, because a re-hunt reinserts).
     """
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
@@ -581,7 +581,7 @@ def test_a_second_hunt_by_the_same_commit_skips_and_touches_nothing(
 
 
 def test_rehunt_overrides_the_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
@@ -602,7 +602,7 @@ def test_the_hunt_code_stamp_is_grabbed_once_so_the_skip_and_the_write_agree(
     reusing the one taken at the start -> the stand-in's second value "B" would be written while the
     skip judged against "A", and ``call_count`` would be 2.
     """
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     stand_in = MagicMock(side_effect=["A", "B", "C"])
@@ -647,7 +647,7 @@ def test_either_input_changing_defeats_the_skip(
     the non_binary_files query from ``hunt_input_fingerprint`` -> the 'non_binary' case; drop the
     fs_symlinks query -> the 'symlink' case.
     """
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
@@ -713,7 +713,7 @@ def test_a_completed_hunt_always_leaves_the_stamp_current(
     run would re-hunt forever (harmless but pointless) or, worse, a staleness read would report a
     run as produced by code that did not produce it.
     """
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
     for _ in range(2):  # the working pass, then the skipping one
@@ -741,7 +741,7 @@ def test_an_editable_install_skips_when_the_code_stamp_matches(
     MUTATION: make ``hunt_currency`` consult ``commit`` again -> RED (the unknown commit would
     force a re-hunt and this would never skip).
     """
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: UNKNOWN_VERSION)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
@@ -792,7 +792,7 @@ def test_the_stamp_records_how_many_rows_the_hunt_wrote(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The count is written beside the commit, by the same call, after the same transaction."""
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
@@ -819,7 +819,7 @@ def test_rows_deleted_out_from_under_the_stamp_defeat_the_skip(
     unchanged", which holds just as well when both sides are zero. No mutation deleted data, so
     nothing ever produced the state in which the stamp is wrong.
     """
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
@@ -848,7 +848,7 @@ def test_extra_rows_under_the_stamp_also_defeat_the_skip(
 
     MUTATION: replace the count comparison with ``if live_rows == 0`` -> RED.
     """
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
@@ -876,7 +876,7 @@ def test_a_run_stamped_before_the_count_existed_re_hunts_once(
 
     MUTATION: treat a NULL ``hunt_instances`` as matching -> RED.
     """
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
@@ -907,7 +907,7 @@ def test_a_run_that_legitimately_found_nothing_still_skips(
     MUTATION: change the check to an existence probe -> RED (skipped is False). Measured RED at
     1 failed.
     """
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded_no_candidates(tmp_path), tmp_path / "atlas.db"
@@ -996,7 +996,7 @@ def test_a_skipped_hunt_records_the_new_locations_and_nothing_else(
     """
     import shutil
 
-    from treasure_map.lib.hunt import analyzer2 as a2
+    from treasure_map.lib.hunt import analyzer as a2
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"

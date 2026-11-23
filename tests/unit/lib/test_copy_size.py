@@ -10,7 +10,7 @@ source-length copy, an unrelated clamp) must never be demoted.
 
 from __future__ import annotations
 
-from treasure_map.lib.pattern.classes import COPY
+from treasure_map.lib.pattern.sink_vocabulary import COPY
 from treasure_map.lib.reachability.copy_size import (
     _SIZED_COPY,
     _UNSIZED_COPY,

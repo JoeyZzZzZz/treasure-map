@@ -27,7 +27,7 @@ BUCKETS (``bucket``):
   C  a changed pair (similarity below 1) with no sink candidate on either side.
   P  a function in no matched pair (``presence_state`` from function_presence, ``absent`` when the
      function has no presence record at all). ``counterpart_probe`` says what the other side holds
-     where it maps (lib/diff/layer0.probe_counterparts): a thunk or import-stub slot there is
+     where it maps (lib/diff/alignment.probe_counterparts): a thunk or import-stub slot there is
      ``occupied``, bytes the other side never disassembled are ``undisassembled_bytes``;
      ``counterpart_suspected`` (a function or thunk in no pair there) and
      ``unmatched_analysis_incomplete`` never read as an existence.
@@ -126,13 +126,13 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Generic, TypeVar
 
+from treasure_map.lib.diff.alignment import _thunk_spans, norm_hex
 from treasure_map.lib.diff.callsite_facts import _parse_stub_table
 from treasure_map.lib.diff.code_version import diff_code_version, sink_overlay_logic_version
-from treasure_map.lib.diff.layer0 import _thunk_spans, norm_hex
 from treasure_map.lib.facts import _DECOMPILE_MIN_SIZE, DECOMPILE_ERROR_PLACEHOLDER
 from treasure_map.lib.facts import has_text as _has_text
 from treasure_map.lib.hunt.downweight import _address_taken
-from treasure_map.lib.pattern import classes
+from treasure_map.lib.pattern import sink_vocabulary
 from treasure_map.lib.query import alt_pairings, diff_review, diff_sink_axes, entry_words, sameness
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN
 from treasure_map.lib.query.diff_align import diff_source_staleness, get_diff_deltas
@@ -185,7 +185,11 @@ RECALL_GAP_SINKS: dict[str, tuple[str, ...]] = {
 # classes, as the extractor registry holds them, plus the sinks it does not recall. Matched by
 # exact name; any other name (strlcpy, strdup, a FUN_<addr>) is not a sink here.
 SINK_CALLEE_NAMES: frozenset[str] = (
-    classes.FORMAT | classes.CMD | classes.COPY | classes.FMT_STRING | classes.PATH_SINK
+    sink_vocabulary.FORMAT
+    | sink_vocabulary.CMD
+    | sink_vocabulary.COPY
+    | sink_vocabulary.FMT_STRING
+    | sink_vocabulary.PATH_SINK
 ).union(*RECALL_GAP_SINKS.values())
 # The recall-gap sink names alone (flattened), for the caller-set edge's relevance ordering: an E
 # entry with no candidate of its own whose callee is one of these leads its lane.
@@ -210,7 +214,8 @@ SWAP_PAIRING_NOTE = (
     "counterpart and not floated until the pairing is corroborated"
 )
 # Callee-name prefixes of an input-source family the hunt mostly does not model: only three of its
-# getters (uci_get, uci_get_option, uci_lookup_ptr) are recognized sources (classes.SOURCE_WEAK),
+# getters (uci_get, uci_get_option, uci_lookup_ptr) are recognized sources
+# (sink_vocabulary.SOURCE_WEAK),
 # the rest of the family is not. The prefix still matches those three. Only tagged on A / B entries
 # (``source_gap:<family>``); never moves an entry.
 SOURCE_GAP_PREFIXES: dict[str, tuple[str, ...]] = {"uci_ubus": ("uci_", "ubus_")}
@@ -733,7 +738,7 @@ class _Unpaired:
     presence_state: str  # from function_presence; ``absent`` with no record
     export_gap: str | None
     markup: int = 0  # 1 when its export wrote an operand of it in its default form
-    # What the other side holds where this function maps (lib/diff/layer0.probe_counterparts):
+    # What the other side holds where this function maps (lib/diff/alignment.probe_counterparts):
     # the probe, the function found there, why it left existence undetermined, and the
     # leftover-code ranges met (JSON text). None: not probed (a diff written before the probe).
     counterpart_probe: str | None = None
@@ -867,9 +872,9 @@ def _sink_callsites(
     NOT deduplicated), or None when the count cannot be read.
 
     A token naming a lazy-binding stub (``FUN_<addr>`` with ``addr`` in the binary's stub table) is
-    counted under the import the table resolves it to (``classes.stub_resolved_name``, the rule the
-    hunt and the callsite facts use), so a sink called through its stub on one side and by name on
-    the other counts alike. With no table the token is counted as written.
+    counted under the import the table resolves it to (``sink_vocabulary.stub_resolved_name``, the
+    rule the hunt and the callsite facts use), so a sink called through its stub on one side and by
+    name on the other counts alike. With no table the token is counted as written.
 
     None when the column is absent (an older analysis.db) or the JSON will not parse — the reader
     reports that side unknown, never 0. An empty / '[]' value parses to ``{}``: the function's
@@ -886,7 +891,7 @@ def _sink_callsites(
         if isinstance(tok, dict) and tok.get("opcode") == 7:
             name = tok.get("call_token")
             if isinstance(name, str):
-                name = classes.stub_resolved_name(name, stubs) or name
+                name = sink_vocabulary.stub_resolved_name(name, stubs) or name
             if isinstance(name, str) and name in SINK_CALLEE_NAMES:
                 counts[name] = counts.get(name, 0) + 1
     return counts

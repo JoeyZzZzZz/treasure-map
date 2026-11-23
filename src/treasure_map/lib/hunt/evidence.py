@@ -50,7 +50,7 @@ from treasure_map.lib.hunt.downweight import (
     _CHARSET_SAFE,
     _charset_inline_constrained,
 )
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.sink_vocabulary import (
     FMT_STRING_ARG,
     FORMAT_ARG,
     NO_HELPERS,
@@ -256,9 +256,9 @@ def _trace_boundary(
                         number cast to a pointer): what was stored there is not in this read.
     sink_arg_unparsed — there is an argument, but no variable could be read out of it.
 
-    ``ref`` is the argument as ``classes.arg_ref`` read it (its form and lead); ``located`` False
-    when there was no argument to read. Without a ``ref`` the argument is taken as the variable
-    ``sink_arg`` names, or as a literal when there is none (the reading before forms existed).
+    ``ref`` is the argument as ``sink_vocabulary.arg_ref`` read it (its form and lead); ``located``
+    False when there was no argument to read. Without a ``ref`` the argument is taken as the
+    variable ``sink_arg`` names, or as a literal when there is none (the reading before forms exist.
 
     Honest by design — it NEVER claims `reached_sink` when a converter was seen but the value ran
     through an intermediate variable (that would pretend not to have seen the converter). A
@@ -336,10 +336,10 @@ def build_flow_evidence(
     and trace_boundary states `reached_sink_via_one_hop_wrapper` — honest about following exactly
     one hop. ``source_kind`` still classifies the forwarded argument (the dangerous value).
 
-    ``sink_ref`` is the sink argument as ``classes.arg_ref`` read it, None when it could not be
-    located: its form is recorded (``flow_path.sink_arg_form``) and decides the trace boundary for a
-    literal, a value loaded through a pointer, or one no variable could be read from. Left unset,
-    the boundary reads ``sink_arg`` alone, as before forms were recorded."""
+    ``sink_ref`` is the sink argument as ``sink_vocabulary.arg_ref`` read it, None when it could not
+    be located: its form is recorded (``flow_path.sink_arg_form``) and decides the trace boundary
+    for a literal, a value loaded through a pointer, or one no variable could be read from. Left
+    unset, the boundary reads ``sink_arg`` alone, as before forms were recorded."""
     deps = _derives_map(pseudocode, helpers)
     path = (
         ({sink_arg} | flows_into(pseudocode, sink_arg, helpers)) if sink_arg is not None else set()

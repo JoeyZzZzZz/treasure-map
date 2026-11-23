@@ -17,7 +17,7 @@ import pytest
 from treasure_map import mcp_app
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.diff.layer0 import make_diff_id
+from treasure_map.lib.diff.alignment import make_diff_id
 from treasure_map.lib.query import diff_align
 from treasure_map.version import UNKNOWN_VERSION
 

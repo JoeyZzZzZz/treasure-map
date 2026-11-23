@@ -2590,7 +2590,7 @@ def test_the_on_disk_stamp_is_rehashed_only_when_a_package_file_changes(
     assert first["server"]["code_moved_on_disk"] is False
     assert second["server"]["code_moved_on_disk"] is False
     assert hashed >= 1 and calls["n"] == hashed, (hashed, calls["n"])
-    target = pkg / "lib" / "hunt" / "analyzer2.py"
+    target = pkg / "lib" / "hunt" / "analyzer.py"
     target.write_text(target.read_text() + "\n_MOVED_ON_DISK = 1\n")
     moved = _server_call(server, "start_diff_review", {"run_pair": PAIR})
     assert moved["server"]["code_moved_on_disk"] is True

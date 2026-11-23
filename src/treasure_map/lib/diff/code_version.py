@@ -12,8 +12,9 @@ without anyone remembering to bump a number. Two hashes:
 The export scripts each side's export was made by are hashed by the scan that made it and recorded
 with the archive (lib/export_stamp); a diff compares those (lib/diff/currency).
 
-An entry is a module of the ``treasure_map`` package (``lib.diff.layer0``) or one top-level name in
-it (``lib.atlas.writer:add_diff_meta``), for a large shared module of which only that function,
+An entry is a module of the ``treasure_map`` package (``lib.diff.alignment``) or one top-level
+name in it (``lib.atlas.writer:add_diff_meta``), for a large shared module of which only that
+function,
 class or constant feeds the rows. Python source is hashed after normalisation: parsed, docstrings
 dropped, and dumped without positions and without empty fields — so comments, docstrings and
 formatting do not count, and the value is the same under the Python versions tmap supports (a newer
@@ -43,14 +44,14 @@ _PACKAGE = Path(__file__).resolve().parents[2]
 # The code a stored diff row is produced by: the diff modules, and what they take from shared
 # modules into what they write.
 DIFF_CODE_ENTRIES: tuple[str, ...] = (
+    "lib.diff.alignment",
     "lib.diff.binexport2",
     "lib.diff.callsite_facts",
     "lib.diff.code_version",
     "lib.diff.currency",
+    "lib.diff.dimension_delta",
     "lib.diff.driver",
     "lib.diff.export_report",
-    "lib.diff.layer0",
-    "lib.diff.layer2",
     "lib.binary_id",
     "lib.binexport_archive",
     "lib.callsite_ref",
@@ -79,9 +80,9 @@ DIFF_CODE_ENTRIES: tuple[str, ...] = (
     "lib.facts:_DECOMPILE_MIN_SIZE",
     "lib.facts:DECOMPILE_ERROR_PLACEHOLDER",
     "lib.facts:has_text",
-    "lib.hunt.analyzer2:_db_has_bridge",
-    "lib.pattern.classes:_STUB_NAME_RE",
-    "lib.pattern.classes:stub_resolved_name",
+    "lib.hunt.analyzer:_db_has_bridge",
+    "lib.pattern.sink_vocabulary:_STUB_NAME_RE",
+    "lib.pattern.sink_vocabulary:stub_resolved_name",
     "version:UNKNOWN_VERSION",
 )
 

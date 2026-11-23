@@ -31,13 +31,17 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from treasure_map.lib.pattern import classes
-from treasure_map.lib.pattern.classes import stub_resolved_name
+from treasure_map.lib.pattern import sink_vocabulary
+from treasure_map.lib.pattern.sink_vocabulary import stub_resolved_name
 from treasure_map.lib.ro_db import ro_connect
 
 # The names the hunt recalls candidates for (its sink classes).
 HUNT_SINKS: frozenset[str] = (
-    classes.FORMAT | classes.CMD | classes.COPY | classes.FMT_STRING | classes.PATH_SINK
+    sink_vocabulary.FORMAT
+    | sink_vocabulary.CMD
+    | sink_vocabulary.COPY
+    | sink_vocabulary.FMT_STRING
+    | sink_vocabulary.PATH_SINK
 )
 # How many sink names one function lists (the count is always exact).
 SINK_NAME_SAMPLE = 10

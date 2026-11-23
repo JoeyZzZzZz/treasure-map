@@ -1391,7 +1391,7 @@ def test_a_name_with_no_match_says_so_apart_from_an_address_with_none(
             "name": "only_a",
             "presence_state": "unmatched_analysis_complete",
             "export_gap": None,
-            # a presence row written directly, not probed by a diff (lib/diff/layer0)
+            # a presence row written directly, not probed by a diff (lib/diff/alignment)
             "counterpart_probe": None,
             "counterpart_addr": None,
             "presence_reason": None,

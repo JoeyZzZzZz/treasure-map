@@ -12,7 +12,7 @@ re-run would read leaves every run current.
 Two stamps, each a ``src-<16hex>`` content hash:
 
   * ``hunt_code_version()`` — the Python whose output the hunt writes, the import closure of
-    ``lib.hunt.analyzer2``.
+    ``lib.hunt.analyzer``.
   * ``pipeline_code_version()`` — the Python whose output the scan writes, the closure of
     ``lib.analyze.pipeline``. It rides inside the fuller SCAN STAMP (``scan_stamp_for``), which also
     carries the pyelftools version the extraction parses ELF with and the content-marked config
@@ -60,7 +60,7 @@ from treasure_map.version import UNKNOWN_VERSION
 _PACKAGE = Path(__file__).resolve().parents[1]
 
 PIPELINE_ROOT = "lib.analyze.pipeline"
-HUNT_ROOT = "lib.hunt.analyzer2"
+HUNT_ROOT = "lib.hunt.analyzer"
 
 # Modules never entered when walking a closure, with the reason. This module computes the stamp, so
 # hashing it would make an edit to it read every run as stale.

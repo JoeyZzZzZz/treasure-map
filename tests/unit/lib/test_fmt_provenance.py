@@ -9,12 +9,12 @@ argument SPLITTING (get it wrong and index N is not argument N) and what counts 
 
 from __future__ import annotations
 
-from treasure_map.lib.hunt.facts import fmt_wrapper_format_index, signature_slots
 from treasure_map.lib.hunt.fmt_provenance import (
     call_arguments,
     constant_format_record,
     format_argument,
 )
+from treasure_map.lib.hunt.wrapper_facts import fmt_wrapper_format_index, signature_slots
 
 
 def test_arguments_split_at_top_level_only() -> None:

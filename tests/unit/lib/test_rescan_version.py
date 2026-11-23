@@ -441,7 +441,7 @@ def test_the_stamp_reacts_to_code_not_comments(
         ("lib.analyze.xrefs", rv.PIPELINE_ROOT),
         ("lib.analyze.non_binary.orchestrator", rv.PIPELINE_ROOT),
         ("lib.hunt.exec_edges", rv.HUNT_ROOT),
-        ("lib.diff.loader", rv.HUNT_ROOT),
+        ("lib.hunt.function_rows", rv.HUNT_ROOT),
     ],
 )
 def test_expected_members_are_in_the_closure(module: str, root: str) -> None:

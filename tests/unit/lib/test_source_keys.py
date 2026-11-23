@@ -26,7 +26,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.hunt import run_analyzer2
 from treasure_map.lib.hunt.data_strings import DataStrings
 from treasure_map.lib.hunt.value_helpers import build_helper_tables, helper_keys_called
-from treasure_map.lib.pattern.classes import NO_HELPERS, RETURN_SLOT, SourceHelpers
+from treasure_map.lib.pattern.sink_vocabulary import NO_HELPERS, RETURN_SLOT, SourceHelpers
 from treasure_map.lib.query.triage import (
     _build_dimensions,
     _source_key_rows,
@@ -356,16 +356,16 @@ def test_admitting_a_getter_writes_no_source_kind_here_but_the_charset_layer_sti
         return {}
 
     real = vh.build_helper_tables
-    import treasure_map.lib.hunt.analyzer2 as analyzer2
+    import treasure_map.lib.hunt.analyzer as analyzer
 
-    real_a2 = analyzer2.build_helper_tables
+    real_a2 = analyzer.build_helper_tables
     try:
         vh.build_helper_tables = _no_tables  # type: ignore[assignment]
-        analyzer2.build_helper_tables = _no_tables  # type: ignore[assignment]
+        analyzer.build_helper_tables = _no_tables  # type: ignore[assignment]
         bare = _hunt_with_keys(tmp_path)
     finally:
         vh.build_helper_tables = real  # type: ignore[assignment]
-        analyzer2.build_helper_tables = real_a2  # type: ignore[assignment]
+        analyzer.build_helper_tables = real_a2  # type: ignore[assignment]
     assert bare["source_class"] == "unknown"
     assert bare["flow_evidence"].get("source_kind") == "unknown"
     assert "source_keys" not in bare["flow_evidence"]
@@ -428,7 +428,7 @@ def test_an_empty_string_key_is_recorded_as_empty_not_dropped(tmp_path: Path) ->
 
     MUTATION (verified RED): ``if text:`` instead -> the empty key is dropped and reads as
     unresolved."""
-    from treasure_map.lib.hunt.analyzer2 import _load_helper_key_strings
+    from treasure_map.lib.hunt.analyzer import _load_helper_key_strings
 
     db = tmp_path / "empty.db"
     _blocks_db(db, [(1, ".rodata", "0x20000", b"\x00rest\x00", 1)]).close()

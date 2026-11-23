@@ -80,7 +80,7 @@ def _thunks(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> frozense
     """The B side's thunk entries; None when they are not known (the list not recorded — NULL,
     unreadable, no such column — or the analysis.db not read), never an empty set for want of
     the list."""
-    from treasure_map.lib.diff.layer0 import _thunk_spans
+    from treasure_map.lib.diff.alignment import _thunk_spans
     from treasure_map.lib.ro_db import ro_connect
 
     row = atlas.execute("SELECT analysis_db_path FROM run WHERE run_id = ?", (run_id,)).fetchone()

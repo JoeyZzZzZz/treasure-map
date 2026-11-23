@@ -91,7 +91,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from treasure_map.lib.atlas.models import DetectorScanStatusRow, ExecEdgeRow
-from treasure_map.lib.diff.loader import FuncRow
 from treasure_map.lib.hunt.bridge import op_addr_at
 from treasure_map.lib.hunt.exec_edges import (
     ExecEdgeInventory,
@@ -99,9 +98,15 @@ from treasure_map.lib.hunt.exec_edges import (
     _exec_facts,
     replace_occurrences,
 )
+from treasure_map.lib.hunt.function_rows import FuncRow
 from treasure_map.lib.hunt.refs import _addr_to_int
-from treasure_map.lib.pattern.classes import _literal_spans, arg_ref, call_args_at, call_offsets
 from treasure_map.lib.pattern.extractor_names import REGISTRY
+from treasure_map.lib.pattern.sink_vocabulary import (
+    _literal_spans,
+    arg_ref,
+    call_args_at,
+    call_offsets,
+)
 from treasure_map.lib.ro_db import ro_uri
 
 RUNNER_DETECTOR = "exec_runner_argv0"

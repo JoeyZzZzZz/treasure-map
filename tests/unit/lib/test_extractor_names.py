@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from treasure_map.lib.hunt import facts
-from treasure_map.lib.pattern import classes
+from treasure_map.lib.hunt import wrapper_facts
+from treasure_map.lib.pattern import sink_vocabulary
 from treasure_map.lib.pattern.extractor_names import (
     HEADER,
     NVRAM_OPS,
@@ -336,9 +336,9 @@ _READ_SIDE_ONLY_GETTERS: dict[str, str] = {
 
 def test_cmd_and_fmt_string_sinks_are_the_registry_sinks() -> None:
     """The read side's sink classes and format positions are the def-use pass's, exactly."""
-    assert classes.CMD == frozenset(REGISTRY.sink_cmd)
-    assert classes.FMT_STRING == frozenset(REGISTRY.sink_fmt)
-    assert classes.FMT_STRING_ARG == dict(REGISTRY.sink_fmt)
+    assert sink_vocabulary.CMD == frozenset(REGISTRY.sink_cmd)
+    assert sink_vocabulary.FMT_STRING == frozenset(REGISTRY.sink_fmt)
+    assert sink_vocabulary.FMT_STRING_ARG == dict(REGISTRY.sink_fmt)
     assert set(REGISTRY.sink_cmd.values()) == {0}
 
 
@@ -346,20 +346,20 @@ def test_copy_and_format_partition_the_registry_writers() -> None:
     """COPY and FORMAT split the extractor's writers between them, with only the named writer-only
     exceptions left out.
 
-    MUTATION (verified RED): drop "__strcat_chk" from classes.FORMAT."""
-    assert not classes.COPY & classes.FORMAT
-    assert REGISTRY.writers - (classes.COPY | classes.FORMAT) == set(_WRITER_ONLY)
-    assert (classes.COPY | classes.FORMAT) <= REGISTRY.writers
-    assert classes.FORMAT_ARG == dict(REGISTRY.writer_fmt)
-    assert set(classes.FORMAT_ARG) <= classes.FORMAT
+    MUTATION (verified RED): drop "__strcat_chk" from sink_vocabulary.FORMAT."""
+    assert not sink_vocabulary.COPY & sink_vocabulary.FORMAT
+    assert REGISTRY.writers - (sink_vocabulary.COPY | sink_vocabulary.FORMAT) == set(_WRITER_ONLY)
+    assert (sink_vocabulary.COPY | sink_vocabulary.FORMAT) <= REGISTRY.writers
+    assert sink_vocabulary.FORMAT_ARG == dict(REGISTRY.writer_fmt)
+    assert set(sink_vocabulary.FORMAT_ARG) <= sink_vocabulary.FORMAT
 
 
 def test_the_wrapper_test_builders_are_the_registry_writers() -> None:
     """The Python thin-wrapper test treats exactly the extractor's writers as builders — the set
     the extractor's own wrapper test derives its builders from — so the two judge a body alike."""
-    assert facts._BUILDERS == REGISTRY.writers
-    assert facts._FORWARD_CMD_SINKS == REGISTRY.forward_cmd
-    assert REGISTRY.forward_cmd <= classes.CMD
+    assert wrapper_facts._BUILDERS == REGISTRY.writers
+    assert wrapper_facts._FORWARD_CMD_SINKS == REGISTRY.forward_cmd
+    assert REGISTRY.forward_cmd <= sink_vocabulary.CMD
 
 
 def test_nvram_getters_against_the_registry() -> None:
@@ -372,7 +372,7 @@ def test_nvram_getters_against_the_registry() -> None:
 
 def test_the_size_tables_cover_every_copy_and_fortified_writer() -> None:
     """Length / cap / append / object-size positions exist for exactly the calls that have them."""
-    assert classes.COPY == copy_size._SIZED_COPY | copy_size._UNSIZED_COPY
-    assert set(copy_size._CAP_ARG) | set(copy_size._APPEND_ARG) <= classes.FORMAT
-    fortified = {n for n in classes.COPY | classes.FORMAT if n.endswith("_chk")}
+    assert sink_vocabulary.COPY == copy_size._SIZED_COPY | copy_size._UNSIZED_COPY
+    assert set(copy_size._CAP_ARG) | set(copy_size._APPEND_ARG) <= sink_vocabulary.FORMAT
+    fortified = {n for n in sink_vocabulary.COPY | sink_vocabulary.FORMAT if n.endswith("_chk")}
     assert set(copy_size._OBJSIZE_ARG) == fortified

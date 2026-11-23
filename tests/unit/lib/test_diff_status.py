@@ -27,8 +27,8 @@ from treasure_map.lib.atlas.writer import (
 )
 from treasure_map.lib.binexport_archive import read_stored_export
 from treasure_map.lib.diff import code_version, currency, driver
+from treasure_map.lib.diff.alignment import make_diff_id
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT, DiffToolchainError
-from treasure_map.lib.diff.layer0 import make_diff_id
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query import diff_align
 from treasure_map.lib.storage.connection import open_db

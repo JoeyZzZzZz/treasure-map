@@ -9,6 +9,7 @@ a 'compare raw addr, skip alignment' regression is observable (it would flip unc
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from treasure_map.lib.atlas.connection import open_atlas
@@ -22,9 +23,9 @@ from treasure_map.lib.atlas.writer import (
     add_run_capabilities,
     add_string_keyed_edges,
 )
-from treasure_map.lib.diff import layer2
-from treasure_map.lib.diff.layer0 import norm_hex
-from treasure_map.lib.diff.layer2 import DECLARED_DELTA_DIMENSIONS, run_layer2_delta
+from treasure_map.lib.diff import dimension_delta
+from treasure_map.lib.diff.alignment import norm_hex
+from treasure_map.lib.diff.dimension_delta import DECLARED_DELTA_DIMENSIONS, run_layer2_delta
 from treasure_map.lib.query.triage import _CANONICAL_DIMENSION_NAMES  # the authoritative universe
 
 _SKE = "reachability.string_keyed_edge"
@@ -165,7 +166,7 @@ def test_capability_three_state_missing_row_is_registration_unknown(tmp_path: Pa
 def test_no_hardcoded_analysis_subdim_names_in_source() -> None:
     # ★ the analysis sub-dimension namespace is open-ended, discovered from run_capability;
     # unmodeled names like auth_boundary must never be a literal in the layer-2 code.
-    src = Path(layer2.__file__).read_text()
+    src = Path(dimension_delta.__file__).read_text()
     assert "auth_boundary" not in src
     assert "dispatch_resolved" not in src
 
@@ -444,11 +445,12 @@ def test_bug_d_subject_anchor_survives_dirty_from_func(tmp_path: Path) -> None:
 
 
 def test_no_second_address_normalizer_in_layer2() -> None:
-    # ★ layer-2 REUSES layer0.norm_hex; it must not define a second address canonicalizer
+    # ★ layer-2 REUSES alignment.norm_hex; it must not define a second address canonicalizer
     # (double normalization is exactly what norm_hex's docstring warns against).
-    src = Path(layer2.__file__).read_text()
+    src = Path(dimension_delta.__file__).read_text()
     assert "def norm_hex" not in src and "def _norm_addr" not in src
-    assert "from treasure_map.lib.diff.layer0 import norm_hex" in src
+    # the import, however the formatter wraps it
+    assert re.search(r"from treasure_map\.lib\.diff\.alignment import \(?\s*norm_hex", src)
 
 
 def test_bug_b_thunk_name_is_the_stable_anchor(tmp_path: Path) -> None:
@@ -570,12 +572,12 @@ def test_bug_a_edge_filter_scopes_to_the_diffed_binary(tmp_path: Path) -> None:
 def test_bug_a_edge_filter_is_load_bearing(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     # ★ reverse: if _load_edges ignored the binary scope (the pre-fix bug), the OTHER binary's
     # edges flood in -> more than one subject, undetermined explosion. Proves the filter has teeth.
-    real = layer2._load_edges
+    real = dimension_delta._load_edges
 
     def unfiltered(atlas, run_id, binary):  # type: ignore[no-untyped-def]
         return real(atlas, run_id, None)  # drop the binary scope -> whole-firmware edges
 
-    monkeypatch.setattr(layer2, "_load_edges", unfiltered)
+    monkeypatch.setattr(dimension_delta, "_load_edges", unfiltered)
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
@@ -705,7 +707,7 @@ def test_three_kinds_of_no_delta_are_distinguishable(tmp_path: Path) -> None:
 def test_declared_dimensions_and_handlers_are_bidirectional() -> None:
     # ★ each declared delta_supported dim has a handler; each handler is declared. Prevents the
     # declaration table and the implementation drifting apart.
-    handlers = set(layer2._DELTA_HANDLERS)
+    handlers = set(dimension_delta._DELTA_HANDLERS)
     supported = {d.name for d in DECLARED_DELTA_DIMENSIONS if d.delta_supported}
     assert handlers == supported
     assert handlers <= _declared_names()
@@ -768,7 +770,7 @@ def test_reverse_callee_alignment_is_load_bearing(tmp_path: Path, monkeypatch) -
         # compare RAW callee addrs, skipping function_alignment AND normalization (the pre-fix bug)
         return frozenset(str(c.get("addr")) for c in callees if c.get("addr")), None, None, {"addr"}
 
-    monkeypatch.setattr(layer2, "_aligned_callee_set", broken)
+    monkeypatch.setattr(dimension_delta, "_aligned_callee_set", broken)
     con = _atlas(tmp_path)
     _seed_matched(con)  # would be layer_unchanged with real alignment
     run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
@@ -780,7 +782,7 @@ def test_reverse_callee_alignment_is_load_bearing(tmp_path: Path, monkeypatch) -
 def test_reverse_completeness_guard_has_teeth(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     # ★ disable G3 -> the partial-region subject stops being undetermined (would become a verdict).
     # Proves the completeness guard is what produces the honest undetermined, not something else.
-    monkeypatch.setattr(layer2, "_completeness_guard", lambda *a, **k: None)
+    monkeypatch.setattr(dimension_delta, "_completeness_guard", lambda *a, **k: None)
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
@@ -799,10 +801,12 @@ def test_reverse_missing_row_mapped_to_declared_absent_would_be_wrong(tmp_path: 
     # by contrast: the real resolver returns registration_unknown where a broken one would not.
     con = _atlas(tmp_path)
     assert (
-        layer2._analysis_capability(con, "nobody", "x.never_registered") == "registration_unknown"
+        dimension_delta._analysis_capability(con, "nobody", "x.never_registered")
+        == "registration_unknown"
     )
     _cap(con, "r", "x.declared", 0)
-    assert layer2._analysis_capability(con, "r", "x.declared") == "declared_absent"  # 0 != missing
+    # 0 is not the same as missing
+    assert dimension_delta._analysis_capability(con, "r", "x.declared") == "declared_absent"
     con.close()
 
 
@@ -833,8 +837,10 @@ def test_source_dimension_visibility_is_load_bearing(tmp_path: Path, monkeypatch
     # vanishes from the capability rows -> proving the DimensionSpec("source", ...) declaration is
     # what makes it visible, not something else. If source still appeared, the forward assertion
     # above would not be reading the declaration.
-    without_source = tuple(d for d in layer2.DECLARED_DELTA_DIMENSIONS if d.name != "source")
-    monkeypatch.setattr(layer2, "DECLARED_DELTA_DIMENSIONS", without_source)
+    without_source = tuple(
+        d for d in dimension_delta.DECLARED_DELTA_DIMENSIONS if d.name != "source"
+    )
+    monkeypatch.setattr(dimension_delta, "DECLARED_DELTA_DIMENSIONS", without_source)
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)

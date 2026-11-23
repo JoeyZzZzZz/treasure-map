@@ -35,7 +35,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.sink_vocabulary import (
     FORMAT,
     ArgRef,
     _match_close,
@@ -89,12 +89,12 @@ _FORM_NOTE: dict[str, str] = {
     SIZE_POINTER_GUARD: POINTER_GUARD_SIZE,
 }
 
-# Copies whose write length is an explicit third argument. mempcpy and wmemcpy also take
-# (dst, src, n); wmemcpy's n counts wide characters, but only the length's SOURCE (const /
-# variable / untraced) is classified here, never its byte magnitude, so the element width does not
-# change the reading. Every length-taking name in classes.COPY must appear here. The fortified
-# _chk forms keep the length in the same third position; their extra last argument is the
-# destination's object size (see _OBJSIZE_ARG), never the length.
+# Copies whose write length is an explicit third argument. mempcpy and wmemcpy also take (dst, src,
+# n); wmemcpy's n counts wide characters, but only the length's SOURCE (const / variable / untraced)
+# is classified here, never its byte magnitude, so the element width does not change the reading.
+# Every length-taking name in sink_vocabulary.COPY must appear here. The fortified _chk forms keep
+# the length in the same third position; their extra last argument is the destination's object size
+# (see _OBJSIZE_ARG), never the length.
 _SIZED_COPY: frozenset[str] = frozenset(
     {
         "memcpy",
@@ -183,7 +183,7 @@ class CopySize:
 
     kind is one of the SIZE_* labels. size_text is the raw length expression (or, for an
     unsized strcpy, the source argument that determines the length). size_var is its root
-    variable (``classes.arg_ref``) when the length is not a literal. clamps lists the
+    variable (``sink_vocabulary.arg_ref``) when the length is not a literal. clamps lists the
     upper-bound/guard shapes seen referencing the length (each is coverage-unjudged — presence
     only, never a dominance claim). ``form`` / ``lead`` / ``path`` are the argument's form, the
     kind of its first operand and — when that operand is read through a pointer, an index or a
@@ -210,10 +210,10 @@ def _call_args(
 ) -> list[str] | None:
     """Top-level arguments of the ``occurrence``-th call to ``name`` (0-based), or None.
 
-    The call positions come from ``classes.call_offsets`` — the same authority the detector counts
-    callsites with. That is what makes "candidate for the 2nd memcpy" and "the arguments of the 2nd
-    memcpy" the same call: a second regex here would agree with the first only until one of them
-    was adjusted, and then a candidate would silently carry another call's length.
+    The call positions come from ``sink_vocabulary.call_offsets`` — the same authority the detector
+    counts callsites with. That is what makes "candidate for the 2nd memcpy" and "the arguments of
+    the 2nd memcpy" the same call: a second regex here would agree with the first only until one of
+    them was adjusted, and then a candidate would silently carry another call's length.
 
     None when the call is not there — an occurrence past the end, or a callee the body never spells
     out. The caller reports that as ``untraced``, never as an absence of length.

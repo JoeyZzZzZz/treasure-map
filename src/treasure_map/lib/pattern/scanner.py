@@ -20,9 +20,9 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from treasure_map.lib.errors import ConfigError
-from treasure_map.lib.pattern.classes import NO_HELPERS, SourceHelpers
 from treasure_map.lib.pattern.models import FuncRef, PatternMatch, PatternStats, ScanResult
 from treasure_map.lib.pattern.shapes import DETECTORS
+from treasure_map.lib.pattern.sink_vocabulary import NO_HELPERS, SourceHelpers
 from treasure_map.lib.ro_db import ro_uri
 
 logger = logging.getLogger(__name__)

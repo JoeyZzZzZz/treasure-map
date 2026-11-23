@@ -566,8 +566,8 @@ def has_text(pseudocode: str | None) -> bool:
 
 
 # Why a function's pseudocode is empty: its recorded decompile outcome when that was a failure,
-# else by its recorded size — the same split as lib/diff/layer0._decompile_status (not imported:
-# layer0 imports this module).
+# else by its recorded size — the same split as lib/diff/alignment._decompile_status (not imported:
+# the alignment layer imports this module).
 PSEUDOCODE_SKIPPED_MICRO = "skipped_micro"
 PSEUDOCODE_DECOMPILE_EMPTY = "decompile_empty"
 PSEUDOCODE_SIZE_UNKNOWN = "size_unknown"

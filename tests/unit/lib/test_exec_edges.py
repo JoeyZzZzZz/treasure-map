@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.diff.loader import FuncRow
 from treasure_map.lib.hunt import run_analyzer2
 from treasure_map.lib.hunt.exec_edges import (
     CLASSIFIER_RESOLUTIONS,
@@ -33,6 +32,7 @@ from treasure_map.lib.hunt.exec_edges import (
     parse_shell_command,
     resolve_symlink,
 )
+from treasure_map.lib.hunt.function_rows import FuncRow
 from treasure_map.lib.query import launched_by
 from treasure_map.lib.storage.connection import open_db
 
@@ -960,7 +960,7 @@ def test_hunt_writes_the_edge_and_the_consumer_reads_it_back(tmp_path: Path) -> 
     # the read tool must answer from it. A test of build_exec_edges alone stays green even if the
     # analyzer never calls it.
     #
-    # MUTATION (verified RED, 1 failed): in analyzer2.run_analyzer2 comment out
+    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer2 comment out
     # `add_exec_edges(atlas, exec_edge_rows, commit=False)` -> launched_by returns 0 edges.
     db = _analysis_db(tmp_path)
     atlas_path = tmp_path / "atlas.db"
@@ -987,7 +987,7 @@ def test_hunt_wires_the_script_inventory_end_to_end(tmp_path: Path) -> None:
     # real loader: a shell_script row with a path, a caller that launches it by bare name, and a
     # read tool that answers for it.
     #
-    # MUTATION (verified RED, 1 failed): in analyzer2._load_exec_inventory drop the paths —
+    # MUTATION (verified RED, 1 failed): in analyzer._load_exec_inventory drop the paths —
     # `scripts={k: () for k in scripts}` in place of the sorted-tuple mapping -> the edge resolves
     # but carries no target_binary, so launched_by answers 0.
     db = tmp_path / "analysis.db"
@@ -1036,7 +1036,7 @@ def test_hunt_registers_the_capability_unconditionally(tmp_path: Path) -> None:
     # No edges in this firmware, yet the capability is registered: the pass RAN. Absence of edges
     # is not absence of the capability, and a cross-version comparison relies on the difference.
     #
-    # MUTATION (verified RED, 1 failed): in analyzer2.run_analyzer2 delete the
+    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer2 delete the
     # `RunCapabilityRow(... "reachability.exec_argv_edge" ...)` entry -> the capability is missing.
     db = tmp_path / "empty.db"
     conn = open_db(db)
@@ -1061,7 +1061,7 @@ def test_zero_edge_result_carries_a_visible_scan_status(tmp_path: Path) -> None:
     # ★ An empty answer must not read as "nothing launches this binary". The status row says the
     # pass ran and names what it cannot see — including the thin-wrapper gap.
     #
-    # MUTATION (verified RED, 1 failed): in analyzer2.run_analyzer2 drop the
+    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer2 drop the
     # `detector_status_rows += _exec_scan_status(...)` line -> statuses come back empty, so an
     # empty result carries no honesty at all.
     db = _analysis_db(tmp_path)
@@ -1102,11 +1102,11 @@ def test_scan_status_covers_a_binary_that_produced_no_edges(tmp_path: Path) -> N
     # for binaries that produced edges is the silent-gap shape: "no row" and "scanned, found none"
     # would look identical to the reader, and only the second one is trustworthy.
     #
-    # MUTATION (verified RED, 1 failed): in analyzer2._exec_scan_status derive the binary set from
+    # MUTATION (verified RED, 1 failed): in analyzer._exec_scan_status derive the binary set from
     # the edges alone — `binaries = set(found)` in place of
     # `binaries = {f.binary_name for f in all_funcs} | set(found)` -> the quiet binary loses its
     # row, so found_count 0 becomes indistinguishable from never-scanned.
-    from treasure_map.lib.hunt.analyzer2 import _exec_scan_status
+    from treasure_map.lib.hunt.analyzer import _exec_scan_status
 
     db = _analysis_db(tmp_path)
     conn = open_db(db)
@@ -1142,7 +1142,7 @@ def test_exec_edge_grants_an_entry_site_that_can_only_be_found_or_unknown(tmp_pa
     # ★ THE IRON LAW AT THE SEAM. A launch edge may raise a candidate's entry reading to
     # entry:exec — it may NEVER produce 'blocked'. The evidence layer only knows found/unknown.
     #
-    # MUTATION (verified RED, 1 failed): in analyzer2.run_analyzer2 build the entry index without
+    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer2 build the entry index without
     # the edges — `entry_index = _load_entry_index(db_path)` -> the candidate reads 'unknown'.
     db = tmp_path / "analysis.db"
     conn = open_db(db)
@@ -1308,7 +1308,7 @@ def test_a_binary_with_an_unread_command_caller_is_not_scanned() -> None:
     empty launched_by must not cover its binary as if it had been.
 
     MUTATION: write scanned=1 whatever was read -> RED."""
-    from treasure_map.lib.hunt.analyzer2 import _exec_scan_status
+    from treasure_map.lib.hunt.analyzer import _exec_scan_status
 
     read = _func(name="ok", binary="web_daemon", fid=1)
     read = dataclasses.replace(read, pseudocode="void ok(){ system(x); }", callees='["system"]')

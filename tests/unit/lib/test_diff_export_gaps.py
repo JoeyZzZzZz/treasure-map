@@ -30,13 +30,13 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.writer import begin_run, finish_run
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.diff import driver
+from treasure_map.lib.diff.alignment import make_diff_id
 from treasure_map.lib.diff.driver import DiffToolchainError
 from treasure_map.lib.diff.export_report import (
     DEGENERATE_BLOCK_SOURCE,
     ExportReportError,
     parse_export_report,
 )
-from treasure_map.lib.diff.layer0 import make_diff_id
 from treasure_map.lib.query import diff_align
 from treasure_map.lib.query import sink_overlay as so
 from treasure_map.lib.storage.connection import open_db
@@ -711,7 +711,7 @@ def test_a_gap_on_one_side_marks_only_that_sides_unmatched_function(
 ) -> None:
     """helper is unmatched on both sides; only side b's export dropped it. Side a's helper is not
     marked by the gap: it reads counterpart_suspected — b's helper, itself in no pair, sits where
-    it maps (lib/diff/layer0.probe_counterparts).
+    it maps (lib/diff/alignment.probe_counterparts).
 
     MUTATION (verified RED): compute side b's presence with side a's gaps -> b's helper reads
     counterpart_suspected, not the gap."""

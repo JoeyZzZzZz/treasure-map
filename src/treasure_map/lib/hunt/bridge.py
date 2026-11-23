@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 
 from treasure_map.lib.hunt.refs import _addr_to_int, _norm_offset
-from treasure_map.lib.pattern.classes import call_offsets
+from treasure_map.lib.pattern.sink_vocabulary import call_offsets
 
 
 def addr_in_body(addr: str | None, body_ranges_json: str | None) -> bool:

@@ -67,7 +67,7 @@ from difflib import SequenceMatcher
 from itertools import zip_longest
 from typing import Any, NamedTuple
 
-from treasure_map.lib.diff.layer0 import _decompile_status, norm_hex
+from treasure_map.lib.diff.alignment import _decompile_status, norm_hex
 from treasure_map.lib.facts import DECOMPILE_FAILURES, has_text, listing_items
 from treasure_map.lib.ro_db import ro_connect
 
@@ -352,9 +352,9 @@ def _body_status(bodies: Bodies | None, addr: str) -> str:
     """One side's body CAUSE at ``addr`` (see the DB_UNAVAILABLE / SKIPPED_MICRO / … constants):
     ``ok`` (there is pseudocode to compare), ``no_body`` (absent from the table — an import / PLT
     stub), ``db_unavailable`` (the analysis.db could not be read), or, for a present-but-empty body,
-    the exporter's own reason via ``layer0._decompile_status`` — ``skipped_micro`` (a design skip),
-    ``decompile_empty`` (a real empty decompile) or ``size_unknown`` (size 0 / unrecorded). The
-    pair-level state (:func:`pair_reading`) folds these to NO_BODY / SKIPPED_MICRO_STATE /
+    the exporter's own reason via ``alignment._decompile_status`` — ``skipped_micro`` (a design
+    skip), ``decompile_empty`` (a real empty decompile) or ``size_unknown`` (size 0 / unrecorded).
+    The pair-level state (:func:`pair_reading`) folds these to NO_BODY / SKIPPED_MICRO_STATE /
     UNAVAILABLE; the cause is a read-face detail, never a verdict."""
     if bodies is None:
         return DB_UNAVAILABLE

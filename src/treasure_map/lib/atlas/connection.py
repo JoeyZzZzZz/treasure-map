@@ -214,7 +214,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("toolchain_ghidra", "TEXT"),
         ("toolchain_binexport", "TEXT"),
         ("toolchain_bindiff", "TEXT"),
-        # the import-stub accounting and the export gaps split by it (lib/diff/layer0)
+        # the import-stub accounting and the export gaps split by it (lib/diff/alignment)
         ("stub_table_a", "TEXT"),
         ("stub_table_b", "TEXT"),
         ("stub_pairs", "INTEGER"),
@@ -247,7 +247,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE function_presence ADD COLUMN operand_markup_incomplete INTEGER DEFAULT 0"
         )
-    # The counterpart probe (lib/diff/layer0.probe_counterparts). Nullable TEXT, no index
+    # The counterpart probe (lib/diff/alignment.probe_counterparts). Nullable TEXT, no index
     # references them; existing rows carry NULL (not probed) until re-diffed. Idempotent.
     for _fpcol in (
         "counterpart_probe",

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.sink_vocabulary import (
     COPY,
     FMT_STRING,
     FORMAT,
@@ -194,8 +194,8 @@ def grade_candidate(
     graded like any other; with none, such a call is invisible and the verdict degrades honestly to
     "the sink call or its argument could not be located".
 
-    ``helpers`` is the binary's value-getter helpers (classes.SourceHelpers): their values seed
-    WEAK, so a flow from one grades unknown, never confirmed.
+    ``helpers`` is the binary's value-getter helpers (sink_vocabulary.SourceHelpers): their values
+    seed WEAK, so a flow from one grades unknown, never confirmed.
     """
     if not callees:
         return ReachabilityVerdict("unknown", None, _BASIS_NO_CALLEES, degraded=True)

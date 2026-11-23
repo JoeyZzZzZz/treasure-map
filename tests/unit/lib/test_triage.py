@@ -1860,7 +1860,7 @@ def test_format_command_sink_set_is_hand_maintained(tmp_path: Path) -> None:
     question CMD answers (is this a command sink?).
 
     MUTATION (must go RED): derive it from CMD, or add system/popen."""
-    from treasure_map.lib.pattern.classes import CMD
+    from treasure_map.lib.pattern.sink_vocabulary import CMD
     from treasure_map.lib.query.triage import _FORMAT_COMMAND_SINKS
 
     assert _FORMAT_COMMAND_SINKS == frozenset({_DOSYS})

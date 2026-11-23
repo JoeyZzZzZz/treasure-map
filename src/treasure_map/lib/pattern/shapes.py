@@ -23,7 +23,12 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.fingerprint import (
+    FINGERPRINT_ALGO_VERSION,
+    structural_fingerprint,
+)
+from treasure_map.lib.pattern.models import FuncRef, PatternKind, PatternMatch
+from treasure_map.lib.pattern.sink_vocabulary import (
     CMD,
     COPY,
     FMT_STRING,
@@ -36,11 +41,6 @@ from treasure_map.lib.pattern.classes import (
     format_call_is_risky,
     sink_callsites,
 )
-from treasure_map.lib.pattern.fingerprint import (
-    FINGERPRINT_ALGO_VERSION,
-    structural_fingerprint,
-)
-from treasure_map.lib.pattern.models import FuncRef, PatternKind, PatternMatch
 
 # A quoted literal carrying %s is shell-ish if it names a system path, contains a shell
 # metacharacter, or carries a command-style flag — i.e. it looks built to feed a shell.
@@ -67,13 +67,13 @@ def classify(
 ) -> CallClasses:
     """Bucket callee names into source / format / cmd / copy / fmt_string / path_sink classes.
 
-    ``helpers`` is the callee's binary's value-getter helpers (classes.SourceHelpers): a call to
-    one counts as a source here, the same as a name in SOURCE. ``func_name`` is the function THIS
-    candidate lives in: when it is itself an admitted helper, it counts as a WEAK source for its own
-    body — a value getter reads external input (it is why it was admitted), so the candidates inside
-    it handle that input even though it calls no source NAME of its own. This is the only way a
-    getter whose body parses its input (it calls no known source) reads as sourced at all; its
-    callers already read it as a source through its presence in their callee list."""
+    ``helpers`` is the callee's binary's value-getter helpers (sink_vocabulary.SourceHelpers): a
+    call to one counts as a source here, the same as a name in SOURCE. ``func_name`` is the function
+    THIS candidate lives in: when it is itself an admitted helper, it counts as a WEAK source for
+    its own body — a value getter reads external input (it is why it was admitted), so the
+    candidates inside it handle that input even though it calls no source NAME of its own. This is
+    the only way a getter whose body parses its input (it calls no known source) reads as sourced
+    at all; its callers already read it as a source through its presence in their callee list."""
     names = {c.strip() for c in callees if isinstance(c, str) and c.strip()}
     source = frozenset(names & SOURCE) | frozenset(names & helpers.names)
     if func_name is not None and func_name in helpers.names:

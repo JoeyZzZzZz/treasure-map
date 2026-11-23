@@ -66,8 +66,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from treasure_map.lib.atlas.models import ExecEdgeRow
-from treasure_map.lib.diff.loader import FuncRow
 from treasure_map.lib.fmt_spec import conversions
+from treasure_map.lib.hunt.function_rows import FuncRow
 from treasure_map.lib.pattern.extractor_names import REGISTRY
 
 # Both families come from the name registry, so a new command sink there is classified here with

@@ -5015,7 +5015,7 @@ def test_a_swap_is_not_in_what_a_judgement_rests_on(tmp_path: Path, current: Non
 def test_the_sink_names_are_the_sink_classes_and_the_unrecalled_sinks() -> None:
     """MUTATION (verified RED, 1 failed): union the RECALL_GAP_SINKS dict itself (its family keys)
     instead of its names -> RED."""
-    from treasure_map.lib.pattern import classes as cl
+    from treasure_map.lib.pattern import sink_vocabulary as cl
 
     want = (cl.FORMAT | cl.CMD | cl.COPY | cl.FMT_STRING | cl.PATH_SINK).union(
         *pv.RECALL_GAP_SINKS.values()

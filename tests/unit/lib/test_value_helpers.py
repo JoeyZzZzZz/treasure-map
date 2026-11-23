@@ -21,10 +21,10 @@ from pathlib import Path
 import pytest
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.diff.loader import FuncRow
 from treasure_map.lib.hunt import run_analyzer2
+from treasure_map.lib.hunt.function_rows import FuncRow
 from treasure_map.lib.hunt.value_helpers import build_helper_tables, helper_slots
-from treasure_map.lib.pattern.classes import RETURN_SLOT, SOURCE
+from treasure_map.lib.pattern.sink_vocabulary import RETURN_SLOT, SOURCE
 
 from .test_analyzer2 import _make_db
 
@@ -420,12 +420,12 @@ _OTHER_CALLER = (
 def _hunt_three(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, table: bool
 ) -> dict[str, dict[str, object]]:
-    from treasure_map.lib.hunt import analyzer2
+    from treasure_map.lib.hunt import analyzer
     from treasure_map.lib.query import triage
     from treasure_map.lib.query.triage import _sort_atoms
 
     if not table:
-        monkeypatch.setattr(analyzer2, "build_helper_tables", lambda funcs: {})
+        monkeypatch.setattr(analyzer, "build_helper_tables", lambda funcs: {})
     d = Path(tempfile.mkdtemp(dir=tmp_path))
     db = _make_db(
         d,
@@ -701,7 +701,7 @@ def test_callsite_keys_merges_the_two_passes_without_changing_either_table() -> 
         _callsite_keys,
         _CallsiteKeys,
     )
-    from treasure_map.lib.pattern.classes import call_args_at, call_offsets
+    from treasure_map.lib.pattern.sink_vocabulary import call_args_at, call_offsets
 
     def ref_taken(funcs: list[FuncRow]) -> dict[str, set[str]]:
         keys: dict[str, set[str]] = defaultdict(set)

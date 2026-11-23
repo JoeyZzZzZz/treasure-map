@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.diff.loader import load_functions
+from treasure_map.lib.hunt.function_rows import load_functions
 from treasure_map.lib.pattern.scanner import scan
 from treasure_map.lib.storage.connection import open_db
 
@@ -138,7 +138,7 @@ def test_the_hunt_carries_only_the_current_scans_tables_into_the_atlas(
     back AND three status rows instead of one (a list, not a set, so the old webd's row is not
     folded into the new one's).
     """
-    from treasure_map.lib.hunt.analyzer2 import run_analyzer2
+    from treasure_map.lib.hunt.analyzer import run_analyzer2
 
     db, atlas = _replaced_firmware_db(tmp_path), tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="r", rehunt=True)

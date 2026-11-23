@@ -31,8 +31,8 @@ from treasure_map.lib.atlas.writer import add_diff_meta, begin_run, finish_run
 from treasure_map.lib.binexport_archive import read_stored_export
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.diff import code_version, currency, driver, toolchain
+from treasure_map.lib.diff.alignment import make_diff_id
 from treasure_map.lib.diff.driver import DiffToolchainError
-from treasure_map.lib.diff.layer0 import make_diff_id
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query import diff_align
 from treasure_map.lib.query import sink_overlay as so
@@ -598,7 +598,7 @@ def test_the_stamps_are_read_inside_the_write_transaction(
 def test_attempts_continue_only_at_the_same_inputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """MUTATION (verified RED): ignore the stamps in ``layer0._next_attempts`` -> the count keeps
+    """MUTATION (verified RED): ignore the stamps in ``alignment._next_attempts`` -> the count keeps
     climbing (3) after the hunt output changed."""
     w = _two(tmp_path)
     w.fail.add("liba")

@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS binaries (
     -- The .plt / .MIPS.stubs regions, JSON [[".plt"|".MIPS.stubs","0x<lo>","0x<hi>"], ...], so a
     -- diff can tell a point that maps into the other side's stub region (a taken spot) from one in
     -- real code. Each range is HALF-OPEN [lo, hi) — hi is EXCLUSIVE, unlike the inclusive promote_*
-    -- ranges below — and lib/diff/layer0 tests it the same half-open way. NULL = not recorded (see
+    -- ranges below — and lib/diff/alignment tests it the same half-open way. NULL = not recorded (see
     -- stub_names).
     stub_regions TEXT,
     -- The thunks the export skipped (PLT / lazy-binding stubs; they carry no real body), JSON

@@ -7,13 +7,13 @@
 ``.BinDiff``:
 
     preflight (cheap, fail-fast)  ->  the two scans' archived exports  ->  BinDiff CLI
-      ->  .BinDiff (temp)  ->  layer0 parse (alignment facts)  ->  layer2 delta (projection)
+      ->  .BinDiff (temp)  ->  alignment parse (pairing facts)  ->  dimension_delta (projection)
 
 Preflight runs the five cheap checks BEFORE any heavy work so a missing run / missing analysis.db /
 version skew / unlocatable binary / missing toolchain fails FAST with an actionable message instead
-of crashing deep inside an IO/subprocess call. It reuses layer0's run-resolution and version
-helpers (one source of truth) and NEVER judges — it only gates and drives; the map projection is
-layer2's job.
+of crashing deep inside an IO/subprocess call. It reuses the alignment layer's run-resolution
+and version helpers (one source of truth) and NEVER judges — it only gates and drives; the map
+projection is dimension_delta's job.
 
 BOUNDARY — running the external tool (the BinDiff CLI, over the exports the two scans archived) is
 real-machine engineering that CANNOT run in CI (no BinDiff here). The preflight is fully
@@ -57,6 +57,15 @@ from treasure_map.lib.binexport_archive import (
     uncompressed_size,
 )
 from treasure_map.lib.diff import toolchain as _toolchain
+from treasure_map.lib.diff.alignment import (
+    _confirmed_same_version,
+    _next_attempts,
+    _resolve_run,
+    _version_skew,
+    make_diff_id,
+    persist_instruction_matches,
+    run_layer0_parse,
+)
 from treasure_map.lib.diff.binexport2 import BinExportDecodeError, decode_call_targets
 from treasure_map.lib.diff.callsite_facts import (
     _build_hash_with_rows,
@@ -77,21 +86,12 @@ from treasure_map.lib.diff.currency import (
     stamps_equal,
     toolchain_columns,
 )
+from treasure_map.lib.diff.dimension_delta import run_layer2_delta
 from treasure_map.lib.diff.export_report import (
     ExportReport,
     ExportReportError,
     read_export_report,
 )
-from treasure_map.lib.diff.layer0 import (
-    _confirmed_same_version,
-    _next_attempts,
-    _resolve_run,
-    _version_skew,
-    make_diff_id,
-    persist_instruction_matches,
-    run_layer0_parse,
-)
-from treasure_map.lib.diff.layer2 import run_layer2_delta
 from treasure_map.lib.errors import ConfigError, TreasureMapError
 from treasure_map.lib.machine import clamp_parallelism_to_memory
 from treasure_map.lib.query.runs import run_staleness
@@ -1067,13 +1067,13 @@ def _persist_success(
     toolchain: _toolchain.Toolchain | None = None,
     exports: tuple[StoredExport | None, StoredExport | None] = (None, None),
 ) -> DiffSummary:
-    """The serial persist phase for a SUCCESSFUL compute: parse the .BinDiff into the atlas (layer0)
-    and project the deltas (layer2), as ONE atomic write. The call-site facts for the chosen
-    instruction pairs are written in the same transaction (``targets_a``/``targets_b``: the
-    BinExport call targets decoded in the compute phase, None when not decoded). A layer-2 failure
-    is recorded as an atomic blind-spot row (rollback -> no dirty ok=1 residue) and re-raised — the
-    exact retry-status logic, unchanged, just moved out of the fused pipeline so it runs on the main
-    thread after compute.
+    """The serial persist phase for a SUCCESSFUL compute: parse the .BinDiff into the atlas
+    (alignment) and project the deltas (dimension_delta), as ONE atomic write. The call-site facts
+    for the chosen instruction pairs are written in the same transaction
+    (``targets_a``/``targets_b``: the BinExport call targets decoded in the compute phase, None when
+    not decoded). A layer-2 failure is recorded as an atomic blind-spot row (rollback -> no dirty
+    ok=1 residue) and re-raised — the exact retry-status logic, unchanged, just moved out of the
+    fused pipeline so it runs on the main thread after compute.
 
     ★ The transaction is opened with BEGIN IMMEDIATE, before anything is read: the input stamps
     (lib/diff/currency) and the hunt output the diff consumes are then read under the write lock,
@@ -1215,7 +1215,7 @@ def run_version_diff(
 
     Single binary by design — a whole-firmware loop is orders of magnitude more expensive, so the
     caller diffs one ``--binary`` at a time. ``binary_a == binary_b == binary_name``. The alignment
-    is produced by the external differ (never self-built), then layer0/layer2 only project it.
+    is produced by the external differ (never self-built), then the two layers only project it.
 
     Structured as the three phases (preflight -> compute -> persist); the ``td`` is owned here (not
     a ``with`` block) so the same compute/persist split powers the parallel full diff. Any toolchain
@@ -1280,8 +1280,8 @@ def _marked_dropped(atlas: sqlite3.Connection, diff_id: str) -> bool:
 
 
 def _delta_counts(atlas: sqlite3.Connection, diff_id: str) -> dict[str, int]:
-    """The tri-state delta distribution for one diff, read back from what layer2 wrote (edge
-    deltas only; the candidate overlay's rows share the table and are not layer2's)."""
+    """The tri-state delta distribution for one diff, read back from what dimension_delta wrote
+    (edge deltas only; the candidate overlay's rows share the table and are not its)."""
     rows = atlas.execute(
         "SELECT delta_kind, COUNT(*) FROM dimension_delta "
         "WHERE diff_id = ? AND subject_kind != 'candidate' GROUP BY delta_kind",
@@ -1541,7 +1541,7 @@ def _persist_outcome(
 ) -> BinaryDiffOutcome:
     """The serial persist step for ONE binary's compute result -> its outcome. Main thread only.
 
-    Success -> layer0/layer2 write (an atomic transaction) + a recovered flag if it entered failed.
+    Success -> both layers write (an atomic transaction) + a recovered flag if it entered failed.
     Compute failure OR a persist (layer-2) failure -> the retry-status atomic blind-spot write
     (rollback -> delete -> insert -> commit), so every binary is its own independent transaction
     even under parallel compute — one binary's failure never corrupts another's row."""
@@ -1692,7 +1692,7 @@ def run_full_diff(
     analysis.db, so it cannot run off the main thread); (2) the CPU-heavy compute (BinExport x2 +
     BinDiff, zero atlas) runs in a thread pool sized to ``max_parallel_jvms``, clamped down for THIS
     run by current memory/disk; (3) as each compute completes, the main thread persists it SERIALLY
-    (layer0/layer2 or the atomic failure write) — SQLite is written by one thread only, so no WAL /
+    (both layers, or the atomic failure write) — SQLite is written by one thread only, so no WAL /
     multi-connection complexity, and each binary stays its own independent atomic transaction.
 
     The run-pair-global preconditions are checked ONCE up front so a global problem fails fast:

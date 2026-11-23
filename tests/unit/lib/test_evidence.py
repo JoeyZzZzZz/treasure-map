@@ -24,7 +24,7 @@ from treasure_map.lib.hunt.evidence import (
     build_size_evidence,
     load_entry_index,
 )
-from treasure_map.lib.pattern.classes import ArgRef
+from treasure_map.lib.pattern.sink_vocabulary import ArgRef
 from treasure_map.lib.reachability.copy_size import SIZE_VARIABLE
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
@@ -613,8 +613,9 @@ def test_the_design_rationale_measurements_are_left_alone() -> None:
     triage = (_SRC / "lib/query/triage.py").read_text()
     assert "~90-fold" in triage  # why the non-empty guard has to be there
     assert "written anyway so a future one cannot slip" in triage  # a guard that admits it is idle
-    layer0 = (_SRC / "lib/diff/layer0.py").read_text()
-    assert "matching BinDiff's own overall confidence" in layer0  # where ALIGN_THRESHOLD came from
+    alignment = (_SRC / "lib/diff/alignment.py").read_text()
+    # where ALIGN_THRESHOLD came from
+    assert "matching BinDiff's own overall confidence" in alignment
 
 
 # ── the fortified-call object-size fact rides on the size record, and only there ──────────────
@@ -652,12 +653,12 @@ def test_only_a_fortified_call_carries_the_objsize_fact_and_it_never_moves_the_s
 
 # ── R4 / R9: the trace boundary and form fields follow the argument's ArgRef ──────────────────
 
-from treasure_map.lib.pattern.classes import arg_ref  # noqa: E402
+from treasure_map.lib.pattern.sink_vocabulary import arg_ref  # noqa: E402
 
 
 def _cmd_boundary(sink_arg_text: str) -> tuple[str, str | None]:
     """(trace_boundary, flow_path.sink_arg_form) for a command sink whose argument is
-    ``sink_arg_text`` — read exactly as analyzer2 passes it: the ArgRef and its root."""
+    ``sink_arg_text`` — read exactly as analyzer passes it: the ArgRef and its root."""
     ref = arg_ref(sink_arg_text)
     ev = build_flow_evidence(
         pseudocode="void f(void){ system(X); }",
@@ -680,7 +681,7 @@ def test_the_boundary_follows_the_sink_argument_form() -> None:
     assert _cmd_boundary("(char *)0x401234") == ("loaded_through_pointer", "const_addr")
     assert _cmd_boundary("*(char **)(p + 4)") == ("loaded_through_pointer", "load")
     assert _cmd_boundary("size_t") == ("sink_arg_unparsed", "none")
-    # the call/argument could not be located at all (analyzer2 passes sink_ref=None)
+    # the call/argument could not be located at all (analyzer passes sink_ref=None)
     located_none = build_flow_evidence(
         pseudocode="void f(void){ system(X); }",
         callees=["system"],
@@ -718,7 +719,7 @@ def test_free_sources_called_matches_a_per_name_call_check() -> None:
     import re
 
     from treasure_map.lib.hunt.evidence import free_sources_called
-    from treasure_map.lib.pattern.classes import SOURCE
+    from treasure_map.lib.pattern.sink_vocabulary import SOURCE
 
     def reference(text: str) -> list[str]:
         return sorted(s for s in SOURCE if re.search(rf"\b{re.escape(s)}\s*\(", text))

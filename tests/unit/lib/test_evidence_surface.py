@@ -36,7 +36,7 @@ import pytest
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
-from treasure_map.lib.pattern.classes import FMT_STRING, FMT_STRING_ARG
+from treasure_map.lib.pattern.sink_vocabulary import FMT_STRING, FMT_STRING_ARG
 from treasure_map.lib.query.sink_impact import CONSTRAINED_MARKERS, PROVABLY_CONSTANT_MARKERS
 from treasure_map.lib.query.triage import _dim_controllability, evidence_surface
 

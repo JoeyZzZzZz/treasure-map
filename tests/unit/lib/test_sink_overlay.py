@@ -705,7 +705,7 @@ def _bindiff(path: Path, pairs: list[tuple[int, int]]) -> Path:
 def test_persist_instruction_matches(tmp_path: Path) -> None:
     """layer-0 instruction persistence: an A candidate callsite's match is stored, 1:1 on the A
     address; an instruction neither side flags is not."""
-    from treasure_map.lib.diff.layer0 import persist_instruction_matches
+    from treasure_map.lib.diff.alignment import persist_instruction_matches
 
     # 0x1010(4112) <-> 0x2010(8208) is the candidate callsite; 0x1018 is noise (no candidate)
     bindiff = _bindiff(tmp_path / "t.BinDiff", [(0x1010, 0x2010), (0x1018, 0x2018)])
@@ -736,7 +736,7 @@ def test_instruction_match_keeps_b_candidate_pairs(tmp_path: Path) -> None:
 
     MUTATION (verified RED): keep only ``addr_a in candidate_addrs_a`` pairs in
     ``parse_instruction_matches`` -> one row stored, reason instruction_unmatched."""
-    from treasure_map.lib.diff.layer0 import persist_instruction_matches
+    from treasure_map.lib.diff.alignment import persist_instruction_matches
 
     bindiff = _bindiff(tmp_path / "t.BinDiff", [(0x1010, 0x2010), (0x1060, 0x2060)])
     atlas = open_atlas(tmp_path / "atlas.db")
@@ -1329,7 +1329,7 @@ def test_degraded_wrapper_call_folds_into_the_wrapper_callsite(atlas: sqlite3.Co
 def test_layer0_collects_wrapper_call_addresses(tmp_path: Path) -> None:
     """MUTATION (verified RED): drop the ``wrapper_call_abs_addr`` fallback in
     ``_candidate_callsite_addrs`` -> the wrapper call's instruction pair is not kept."""
-    from treasure_map.lib.diff.layer0 import _candidate_callsite_addrs
+    from treasure_map.lib.diff.alignment import _candidate_callsite_addrs
 
     atlas = open_atlas(tmp_path / "atlas.db")
     _inst(atlas, "runA", SHA_A, _ref("runA", "00001000", "cmd_via_wrapper", "0x000090"), "cmd")
@@ -1734,7 +1734,7 @@ def test_a_minted_anchor_owns_its_call_and_the_other_claimant_folds_onto_it(
     ``coclaim_unresolved``, and every candidate is still represented.
 
     MUTATION (verified RED): skip the minting -> both keys read coclaim_unresolved -> RED."""
-    from treasure_map.lib.hunt.analyzer2 import _mint_out_of_body_anchors
+    from treasure_map.lib.hunt.analyzer import _mint_out_of_body_anchors
 
     for fa, fb in (("00012000", "00022000"), ("00013000", "00023000")):
         _falign(atlas, fa, fb, 0.95, "aligned")

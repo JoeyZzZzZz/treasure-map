@@ -24,8 +24,8 @@ import pytest
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import FunctionAlignmentRow, FunctionPresenceRow
 from treasure_map.lib.atlas.writer import add_function_alignment, begin_run
-from treasure_map.lib.diff import layer0
-from treasure_map.lib.diff.layer0 import (
+from treasure_map.lib.diff import alignment
+from treasure_map.lib.diff.alignment import (
     BaselineDomain,
     alignment_state,
     compute_side_presence,
@@ -35,7 +35,7 @@ from treasure_map.lib.diff.layer0 import (
     parse_bindiff,
     run_layer0_parse,
 )
-from treasure_map.lib.diff.layer2 import _load_alignment, run_layer2_delta
+from treasure_map.lib.diff.dimension_delta import _load_alignment, run_layer2_delta
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query.diff_align import align_by_a, align_by_b
 from treasure_map.lib.storage.connection import open_db
@@ -328,9 +328,9 @@ def test_reverse_d2_operand_swap_reds_only_g4(tmp_path: Path) -> None:
 def test_reverse_d3_mapping_broken_reds_g5(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     # THE BUG (_presence_state): mis-map skipped_micro -> analysis_incomplete (reverse of the
     # micro-function fix). G5 catches it; G1/G3/G4 (set-membership, not per-row status) stay green.
-    real = layer0._presence_state
+    real = alignment._presence_state
     monkeypatch.setattr(
-        layer0,
+        alignment,
         "_presence_state",
         lambda st, gap=None: (
             "unmatched_analysis_incomplete" if st == "skipped_micro" else real(st, gap)
@@ -695,16 +695,18 @@ def test_confirmed_same_version_contract() -> None:
     # versions. A missing value (None) OR the explicit UNKNOWN_VERSION on EITHER side is
     # unconfirmable -> False (cannot-confirm-same != confirmed-same, the conservative direction).
     # ★ both-unknown: two failed detections most need skew, so it MUST
-    # be False. Deleting layer0's `if a == UNKNOWN_VERSION or b == UNKNOWN_VERSION: return False`
+    # be False. Deleting alignment's `if a == UNKNOWN_VERSION or b == UNKNOWN_VERSION: return False`
     # line flips this one case to True -> this assertion goes red (its teeth). Anchors on the
     # UNKNOWN_VERSION constant (single source), never the literal "unknown".
-    assert layer0._confirmed_same_version("11.0", "11.0") is True
-    assert layer0._confirmed_same_version("11.0", "11.1") is False
-    assert layer0._confirmed_same_version(UNKNOWN_VERSION, UNKNOWN_VERSION) is False  # both unknown
-    assert layer0._confirmed_same_version("11.0", UNKNOWN_VERSION) is False  # one unknown
-    assert layer0._confirmed_same_version(UNKNOWN_VERSION, "11.0") is False
-    assert layer0._confirmed_same_version("11.0", None) is False  # one NULL (legacy/pre-column run)
-    assert layer0._confirmed_same_version(None, None) is False
+    assert alignment._confirmed_same_version("11.0", "11.0") is True
+    assert alignment._confirmed_same_version("11.0", "11.1") is False
+    # both unknown
+    assert alignment._confirmed_same_version(UNKNOWN_VERSION, UNKNOWN_VERSION) is False
+    assert alignment._confirmed_same_version("11.0", UNKNOWN_VERSION) is False  # one unknown
+    assert alignment._confirmed_same_version(UNKNOWN_VERSION, "11.0") is False
+    # one NULL (a legacy / pre-column run)
+    assert alignment._confirmed_same_version("11.0", None) is False
+    assert alignment._confirmed_same_version(None, None) is False
 
 
 def test_version_skew_ghidra_criterion_is_live(tmp_path: Path) -> None:
@@ -720,7 +722,7 @@ def test_version_skew_ghidra_criterion_is_load_bearing(tmp_path: Path, monkeypat
     # ghidra-differing fixture must then drop to skew=0 -> proves the Ghidra criterion (not
     # something else) produced the skew=1 above. If it stayed 1, the forward anchor is not reading
     # the criterion and must be rewritten.
-    monkeypatch.setattr(layer0, "_confirmed_same_version", lambda a, b: True)
+    monkeypatch.setattr(alignment, "_confirmed_same_version", lambda a, b: True)
     r = _parse_two_runs(tmp_path, ghidra_a="11.0", ghidra_b="11.1")
     assert r.meta.version_skew == 0
 
@@ -728,7 +730,7 @@ def test_version_skew_ghidra_criterion_is_load_bearing(tmp_path: Path, monkeypat
 def test_version_skew_both_unknown_is_conservative(tmp_path: Path) -> None:
     # ★ end-to-end: both sides recorded UNKNOWN_VERSION (two failed detections), tool_version
     # equal -> cannot confirm the same decompiler -> skew=1. The trap: a truthy
-    # "unknown" == "unknown" must NOT read as confirmed-same. Deleting layer0's UNKNOWN_VERSION
+    # "unknown" == "unknown" must NOT read as confirmed-same. Deleting alignment's UNKNOWN_VERSION
     # guard line reddens this (both-unknown would fall through to a == b -> skew=0).
     r = _parse_two_runs(tmp_path, ghidra_a=UNKNOWN_VERSION, ghidra_b=UNKNOWN_VERSION)
     assert r.meta.version_skew == 1
@@ -738,7 +740,7 @@ def test_version_skew_forward_is_load_bearing(tmp_path: Path, monkeypatch) -> No
     # ★ anchor independence: break _version_skew (force False); a tool_version-differing diff
     # must then report version_skew=0 -> proves the forward skew assertions genuinely read
     # _version_skew's output, not a constant.
-    monkeypatch.setattr(layer0, "_version_skew", lambda a, b: False)
+    monkeypatch.setattr(alignment, "_version_skew", lambda a, b: False)
     r = _parse_two_runs(tmp_path, tool_a="0.0.1", tool_b="0.0.2")
     assert r.meta.version_skew == 0
 
@@ -876,7 +878,7 @@ def _full_diff(con, bd, binary):  # type: ignore[no-untyped-def]
 def test_two_binaries_diff_do_not_overwrite_each_other(tmp_path: Path) -> None:
     # ★ The overwrite bug: delete_diff wipes every table by diff_id, so diffing a second binary
     # under a binary-free diff_id deleted the first binary's rows. With the binary in the diff_id,
-    # both survive. Diff liba, then libb (layer0 + layer2 each); assert liba's rows are STILL there
+    # both survive. Diff liba, then libb (both layers each); assert liba's rows are STILL there
     # in all diff tables.
     atlas_path, bd_a, bd_b = _seed_two_binaries(tmp_path)
     con = open_atlas(atlas_path)
@@ -907,7 +909,7 @@ def test_two_binaries_diff_overwrite_when_binary_dropped_from_id(
     # Reverse-verify the fix's teeth: drop the binary from the diff_id (the pre-fix behavior) and
     # the second diff DOES clobber the first — proving the binary segment is what isolates them.
     monkeypatch.setattr(
-        "treasure_map.lib.diff.layer0.make_diff_id", lambda a, b, _binary: f"{a}::{b}"
+        "treasure_map.lib.diff.alignment.make_diff_id", lambda a, b, _binary: f"{a}::{b}"
     )
     atlas_path, bd_a, bd_b = _seed_two_binaries(tmp_path)
     con = open_atlas(atlas_path)

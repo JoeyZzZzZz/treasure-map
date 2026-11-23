@@ -84,7 +84,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from treasure_map.lib.pattern import classes
+from treasure_map.lib.pattern import sink_vocabulary
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN, UNSEEN
 
@@ -105,7 +105,9 @@ MAX_CITED = 20
 
 # The sinks whose fewer calls on the B side make an aligned pair must-read: the command class (the
 # exec-path variant among it) and the argv-array runner the hunt does not recall.
-COMMAND_CALL_SINKS: frozenset[str] = frozenset(classes.CMD) | frozenset({"_eval", "execvpe"})
+COMMAND_CALL_SINKS: frozenset[str] = frozenset(sink_vocabulary.CMD) | frozenset(
+    {"_eval", "execvpe"}
+)
 # The B subclasses whose attention-0/1 entries are must-read (``aligned_b_sink``): a sink candidate
 # whose matched pair shows no visible delta at it, or whose sink instruction found no match on the
 # other side — a fix to a sink call can read as either, ranked past the first k.

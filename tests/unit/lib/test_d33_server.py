@@ -65,7 +65,7 @@ def test_code_moved_on_disk_tracks_the_disk_but_fields_do_not(
     t = make_tools(_world(tmp_path).path)  # pins _server_base at startup
     before = t["list_runs"]()["server"]
     assert before["code_moved_on_disk"] is False
-    target = pkg / "lib" / "hunt" / "analyzer2.py"
+    target = pkg / "lib" / "hunt" / "analyzer.py"
     target.write_text(target.read_text() + "\n_MOVED_ON_DISK = 1\n")
     after = t["list_runs"]()["server"]
     assert after["code_moved_on_disk"] is True

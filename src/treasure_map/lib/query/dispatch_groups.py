@@ -52,7 +52,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-from treasure_map.lib.diff.layer0 import norm_hex
+from treasure_map.lib.diff.alignment import norm_hex
 
 DISPATCH_GROUP_VERSION = "dispatch-v1"
 STATIC, GATE = "static_string_table", "strcmp_gate"

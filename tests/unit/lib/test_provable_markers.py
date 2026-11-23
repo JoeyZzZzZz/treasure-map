@@ -17,7 +17,7 @@ from collections.abc import Callable
 import pytest
 
 from treasure_map.lib.hunt.downweight import CONST_SINK_ARG, detect_form_signal
-from treasure_map.lib.pattern.classes import all_path_calls_literal
+from treasure_map.lib.pattern.sink_vocabulary import all_path_calls_literal
 from treasure_map.lib.query.sink_impact import PROVABLY_CONSTANT_MARKERS
 from treasure_map.lib.reachability.copy_size import (
     SIZE_CONST,

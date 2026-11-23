@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The per-binary value-getter mechanism (E-2a H8, the three NEW-MAJOR points).
 
-A binary's own value-getter helpers are carried in ``classes.SourceHelpers`` and handed, as an
-EXPLICIT parameter, to every reader that asks "is this callee a source" (the A class). The readers
+A binary's own value-getter helpers are carried in ``sink_vocabulary.SourceHelpers`` and handed,
+as an EXPLICIT parameter, to every reader that asks "is this callee a source" (the A class). The
+readers
 that consume an already-computed ``source_class`` / ``structural_fingerprint`` (the B class) take
 no table and follow by themselves.
 
@@ -26,14 +27,14 @@ import pytest
 
 from treasure_map.lib.hunt.downweight import _caller_only_constants, detect_form_signal
 from treasure_map.lib.hunt.evidence import build_flow_evidence, free_sources_called
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.models import FuncRef
+from treasure_map.lib.pattern.shapes import classify, pattern_cmd
+from treasure_map.lib.pattern.sink_vocabulary import (
     NO_HELPERS,
     RETURN_SLOT,
     SOURCE_STRONG,
     SourceHelpers,
 )
-from treasure_map.lib.pattern.models import FuncRef
-from treasure_map.lib.pattern.shapes import classify, pattern_cmd
 from treasure_map.lib.reachability import grade_candidate
 from treasure_map.lib.reachability.taint import (
     _derives_map,

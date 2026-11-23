@@ -48,7 +48,7 @@ from itertools import compress
 from typing import Any, Literal
 
 from treasure_map.lib.binary_id import resolve_binary
-from treasure_map.lib.diff.layer0 import _thunk_spans
+from treasure_map.lib.diff.alignment import _thunk_spans
 from treasure_map.lib.facts import (
     _RX_BYTES_WARNING,
     _hex_addr_int,

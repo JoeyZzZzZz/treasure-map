@@ -28,7 +28,8 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.extractor_names import REGISTRY
+from treasure_map.lib.pattern.sink_vocabulary import (
     _FMT_LITERAL_RE,
     FMT_STRING,
     PATH_SINK,
@@ -37,7 +38,6 @@ from treasure_map.lib.pattern.classes import (
     format_string_call,
     path_arg_ref,
 )
-from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.reachability.taint import (
     _CALLER_SUPPLIED_RE,
     _IDENT_RE,

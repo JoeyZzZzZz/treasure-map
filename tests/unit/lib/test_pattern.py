@@ -20,7 +20,10 @@ import pytest
 
 import treasure_map.lib.pattern.shapes as shapes
 from treasure_map.lib.pattern import scan
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.fingerprint import FINGERPRINT_ALGO_VERSION
+from treasure_map.lib.pattern.models import FuncRef, PatternStats
+from treasure_map.lib.pattern.scanner import DETECTORS, shape_scan_invariant_holds
+from treasure_map.lib.pattern.sink_vocabulary import (
     CMD,
     COPY,
     FMT_STRING,
@@ -37,9 +40,6 @@ from treasure_map.lib.pattern.classes import (
     path_arg_ref,
     sink_callsites,
 )
-from treasure_map.lib.pattern.fingerprint import FINGERPRINT_ALGO_VERSION
-from treasure_map.lib.pattern.models import FuncRef, PatternStats
-from treasure_map.lib.pattern.scanner import DETECTORS, shape_scan_invariant_holds
 from treasure_map.lib.storage.connection import open_db
 
 from ..boundary_words import listed_words_in
@@ -1756,7 +1756,7 @@ def test_rename_is_constant_only_when_both_paths_are() -> None:
     """rename("/tmp/x", param_1) moves a fixed file to wherever the caller says.
 
     MUTATION: read only the source path of rename / renameat -> RED."""
-    from treasure_map.lib.pattern.classes import all_path_calls_literal
+    from treasure_map.lib.pattern.sink_vocabulary import all_path_calls_literal
 
     pc = 'void f(char *param_1){ rename("/tmp/x", param_1); }'
     assert not all_path_calls_literal(pc, "rename")
@@ -1770,7 +1770,7 @@ def test_a_parenthesis_inside_a_literal_does_not_end_the_call() -> None:
     """fopen(q,"(") once read as `fopen(q,"` — and the NEXT call's path was handed to it.
 
     MUTATION: match parentheses without skipping string / char literals -> RED."""
-    from treasure_map.lib.pattern.classes import (
+    from treasure_map.lib.pattern.sink_vocabulary import (
         all_format_calls_literal,
         all_path_calls_literal,
         format_call_is_risky,
@@ -1792,15 +1792,15 @@ def test_the_literal_spans_of_a_text_are_read_once_for_every_reader() -> None:
 
     MUTATION (verified RED): drop the cache -> no cache_info / a miss -> RED."""
     from treasure_map.lib.hunt import downweight
-    from treasure_map.lib.pattern import classes
+    from treasure_map.lib.pattern import sink_vocabulary
     from treasure_map.lib.reachability import taint
 
     text = 'syslog(1, "x (y) z"); system(buf);'
-    classes._literal_spans.cache_clear()
-    first = classes._literal_spans(text)
-    assert downweight._literal_spans is classes._literal_spans is taint._literal_spans
+    sink_vocabulary._literal_spans.cache_clear()
+    first = sink_vocabulary._literal_spans(text)
+    assert downweight._literal_spans is sink_vocabulary._literal_spans is taint._literal_spans
     assert taint._literal_spans(text) is first
-    info = classes._literal_spans.cache_info()
+    info = sink_vocabulary._literal_spans.cache_info()
     assert (info.hits, info.misses) == (1, 1)
 
 
@@ -1937,7 +1937,7 @@ def test_phantom_offset_bisect_matches_the_linear_scan() -> None:
     via index -1) is tested."""
     import random
 
-    from treasure_map.lib.pattern.classes import _is_phantom_offset, _literal_spans
+    from treasure_map.lib.pattern.sink_vocabulary import _is_phantom_offset, _literal_spans
 
     def linear(off: int, spans: tuple[tuple[int, int], ...]) -> bool:
         return any(lo < off <= hi for lo, hi in spans)

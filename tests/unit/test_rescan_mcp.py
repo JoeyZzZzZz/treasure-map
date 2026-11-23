@@ -196,7 +196,7 @@ def test_the_restart_hint_is_recomputed_on_every_refusal_not_cached(
     first = tools["get_pseudocode"]("handle_req", run_id="run_m")
     assert first.get("found") is False and "Restart the MCP server" not in first["remedy"]
 
-    target = pkg / "lib" / "hunt" / "analyzer2.py"
+    target = pkg / "lib" / "hunt" / "analyzer.py"
     target.write_text(target.read_text() + "\n_MOVED_ON_DISK = 1\n")
     second = tools["get_pseudocode"]("handle_req", run_id="run_m")
     assert second.get("found") is False and "Restart the MCP server" in second["remedy"]
@@ -229,12 +229,12 @@ def test_on_disk_code_stamp_follows_the_tree_not_the_startup_cache(
     cached = rescan_version.hunt_code_version()
     pkg = _package_copy(tmp_path, monkeypatch)
     before = rescan_version.on_disk_code_stamp(cfg)
-    target = pkg / "lib" / "hunt" / "analyzer2.py"
+    target = pkg / "lib" / "hunt" / "analyzer.py"
     target.write_text(target.read_text() + "\n_MOVED_ON_DISK = 1\n")
     after = rescan_version.on_disk_code_stamp(cfg)
     assert before.hunt == cached, "an unedited copy hashes as the installed package"
     assert after.hunt != before.hunt, "on_disk reads the tree now"
-    assert after.scan == before.scan, "analyzer2 is outside the scan's closure"
+    assert after.scan == before.scan, "analyzer is outside the scan's closure"
     assert rescan_version.hunt_code_version() == cached, "the cached stamp is untouched"
 
 
@@ -270,7 +270,7 @@ def test_servers_in_one_process_share_the_on_disk_hash_until_a_file_changes(
     assert sorted(calls) == both, "the second server reused the first one's hash"
     assert first["code_moved_on_disk"] is False and second["code_moved_on_disk"] is False
 
-    target = pkg / "lib" / "hunt" / "analyzer2.py"
+    target = pkg / "lib" / "hunt" / "analyzer.py"
     target.write_text(target.read_text() + "\n_MOVED_ON_DISK = 1\n")
     third = mcp_app.make_tools(atlas, config=Config())["list_runs"]()["server"]
     assert sorted(calls) == sorted(both * 2), "an edited package is hashed again"

@@ -24,10 +24,10 @@ from typing import TypeVar
 import pytest
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.diff.loader import FuncRow
 from treasure_map.lib.hunt import run_analyzer2
 from treasure_map.lib.hunt import wrapper_propagation as wp
-from treasure_map.lib.hunt.facts import is_thin_path_wrapper, path_wrapper_param_positions
+from treasure_map.lib.hunt.function_rows import FuncRow
+from treasure_map.lib.hunt.wrapper_facts import is_thin_path_wrapper, path_wrapper_param_positions
 from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
     path_wrapper_arg_ref,
@@ -160,7 +160,7 @@ def test_a_constant_argument_zero_does_not_make_the_path_constant(tmp_path: Path
     rests on is real). The path axis reads position 1, finds a variable, and attaches no note; the
     candidate's flow evidence names that variable as the sink argument.
 
-    Mutation: give the path axis the command note (``wrapper_propagation_form_note``) in analyzer2
+    Mutation: give the path axis the command note (``wrapper_propagation_form_note``) in analyzer
     -> RED (1 failed, AssertionError: blocking_mechanism 'const_sink_arg').
     Mutation: read the path axis with ``_wrapper_sink_arg_ref`` (argument 0) -> RED (1 failed,
     AssertionError: sink_arg None, the literal mode was read)."""
@@ -354,7 +354,7 @@ def test_every_path_candidate_is_unknown_and_level_zero(tmp_path: Path) -> None:
     """A-E4-24. The real sink is across a call boundary, so no path candidate is graded beyond
     ``unknown`` / L0 — whatever its argument.
 
-    Mutation: write ``confirmed`` for a path-axis wrapper instance in analyzer2 -> RED (1 failed,
+    Mutation: write ``confirmed`` for a path-axis wrapper instance in analyzer -> RED (1 failed,
     AssertionError)."""
     funcs = [
         READ_FILE,
@@ -424,7 +424,7 @@ def test_path_via_wrapper_is_minted_and_read_like_the_other_wrapper_classes(tmp_
         ref_suffix_parts,
         wrapper_call_abs_addr,
     )
-    from treasure_map.lib.hunt.analyzer2 import _WRAPPER_AXIS_LABELS
+    from treasure_map.lib.hunt.analyzer import _WRAPPER_AXIS_LABELS
     from treasure_map.lib.hunt.refs import _WRAPPER_AXIS, build_evidence_ref, callsite_offset_suffix
     from treasure_map.lib.query import diff_sink_axes
 

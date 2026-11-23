@@ -30,6 +30,7 @@ from treasure_map.lib.binexport_archive import (
     StoredExport,
     read_all_stored_exports,
 )
+from treasure_map.lib.diff.alignment import norm_hex
 from treasure_map.lib.diff.code_version import diff_code_version
 from treasure_map.lib.diff.currency import (
     diff_toolchain,
@@ -39,7 +40,6 @@ from treasure_map.lib.diff.currency import (
     toolchain_columns,
 )
 from treasure_map.lib.diff.driver import _DIFF_RETRY_LIMIT
-from treasure_map.lib.diff.layer0 import norm_hex
 from treasure_map.lib.diff.toolchain import current_bindiff_version
 from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW
 from treasure_map.lib.query.upstream_version import library_of
@@ -599,7 +599,7 @@ def align_by_function(
         **head,
         # each unmatched function of this name or address; export_gap is non-null when it is
         # unmatched because its export did not hold it as it is; counterpart_probe says what the
-        # other side holds where it maps (lib/diff/layer0.probe_counterparts)
+        # other side holds where it maps (lib/diff/alignment.probe_counterparts)
         "presence": [dict(p) for p in presence],
         **diff_source_staleness(atlas, diff_id),
         "note": miss + _NOT_PROOF + _ALIGN_NOTE,
@@ -869,7 +869,7 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
 
 
 def _import_stubs(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] | None:
-    """The diff's import stubs, accounted by import name outside the pairs (lib/diff/layer0
+    """The diff's import stubs, accounted by import name outside the pairs (lib/diff/alignment
     ``StubLedger``): each side's stub table (resolved / none_named / unknown); with both resolved,
     the names stubbed on both sides (``pairs``), on one side only, the pairs the diff tool had made
     between a stub and a function that is not one (``pair_mismatch``), and each side's export gaps

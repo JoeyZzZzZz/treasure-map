@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-import treasure_map.lib.hunt.analyzer2 as analyzer2_mod
+import treasure_map.lib.hunt.analyzer as analyzer2_mod
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.hunt import run_analyzer2
 from treasure_map.lib.query import explain_candidate, get_run
@@ -31,7 +31,7 @@ from ..boundary_words import listed_words_in
 from .dispatch_image import Image
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
-_HUNT_A2 = _SRC / "lib" / "hunt" / "analyzer2.py"
+_HUNT_A2 = _SRC / "lib" / "hunt" / "analyzer.py"
 _QUERY_PKG = _SRC / "lib" / "query"
 _ATLAS_SCHEMA = _SRC / "lib" / "storage" / "atlas_schema.sql"
 
@@ -192,9 +192,9 @@ def _cmd_injection_fn(name: str, *, param_sourced: bool = True) -> dict[str, obj
 def _data_gap_cmd_fn(name: str) -> dict[str, object]:
     """A function whose call graph shows a command sink but whose body Ghidra could not
     decompile (whitespace-only pseudocode). It forms a bare_cmd shape match on its callees, so
-    analyzer2 must SKIP it (no decompilable body) yet COUNT it — never a silent drop. The
+    analyzer must SKIP it (no decompilable body) yet COUNT it — never a silent drop. The
     whitespace is non-NULL so it passes the scan's `pseudocode IS NOT NULL` filter, then strips
-    to empty at the analyzer2 data-gap guard."""
+    to empty at the analyzer data-gap guard."""
     return {
         "name": name,
         "pseudocode": "   ",
@@ -3265,7 +3265,7 @@ def test_each_command_callsite_reaches_the_atlas_with_its_own_callee(tmp_path: P
     ["execv", "system"].
 
     MUTATION (measured: 1 failed of 112, this test alone): drop "cmd" from the evidence-anchored
-    tuple in analyzer2 -> both rows read "system". Nothing else in the file noticed, which is why
+    tuple in analyzer -> both rows read "system". Nothing else in the file noticed, which is why
     this guard is here rather than left to the detector-level tests."""
     fn = {
         "name": "run_both",
@@ -3372,7 +3372,7 @@ def test_flatten_detector_status_reads_analysis_db(tmp_path: Path) -> None:
     #
     # MUTATION (verified RED, 1 failed): drop the detector filter from the flatten's query -> the
     # 'string_tables' row crosses beside the other one -> RED.
-    from treasure_map.lib.hunt.analyzer2 import _flatten_detector_status
+    from treasure_map.lib.hunt.analyzer import _flatten_detector_status
 
     db = tmp_path / "a.db"
     conn = open_db(db)
@@ -3403,7 +3403,7 @@ def test_flatten_detector_status_reads_analysis_db(tmp_path: Path) -> None:
 
 def test_flatten_detector_status_missing_table_is_empty(tmp_path: Path) -> None:
     # a pre-feature analysis.db (no detector_scan_status table) -> [] (query reports 'no status').
-    from treasure_map.lib.hunt.analyzer2 import _flatten_detector_status
+    from treasure_map.lib.hunt.analyzer import _flatten_detector_status
 
     db = tmp_path / "old.db"
     raw = sqlite3.connect(db)
@@ -3533,7 +3533,7 @@ def test_fmt_position_aware_not_arg0(tmp_path: Path) -> None:
     Argument 0 here is the constant `2`; the real format is the variable `pcVar2`. Reading argument
     0 judges a value that never reaches the sink, and judges it SAFE.
 
-    MUTATION (must go RED): in analyzer2's wrapper loop restore the argument-0 reading —
+    MUTATION (must go RED): in analyzer's wrapper loop restore the argument-0 reading —
     `sink_arg = locate_sink_arg(f_pseudocode, wc.wrapper_name)` and drop the recovered record, or
     force `fmt_index = None`. The candidate then reads its constant stream argument and this
     assertion sees a constant."""
@@ -3774,7 +3774,7 @@ def test_fmt_tagfirst_const_traced_not_arg0marker(tmp_path: Path) -> None:
     Before the fix, real format candidates took the note's path; after it none do, and no verdict
     changed — the fault was attribution only.
 
-    MUTATION (must go RED): restore the unconditional call in analyzer2's wrapper loop
+    MUTATION (must go RED): restore the unconditional call in analyzer's wrapper loop
     (`blocking = wrapper_propagation_form_note(...)` for both axes) -> the reading is credited to
     `blocking_mechanism=const_sink_arg` again."""
     atlas = _fmt_atlas(
@@ -4335,7 +4335,7 @@ def test_interleaved_textual_and_stub_calls_keep_the_reader_aligned(tmp_path: Pa
     argument is readable by eye and owes nothing to the enumerator under test.
 
     MUTATION (measured: 2 failed — this guard and the end-to-end one): drop the occurrence forward
-    in analyzer2's locate_sink_arg call -> all three rows report ``first``, i.e. two candidates are
+    in analyzer's locate_sink_arg call -> all three rows report ``first``, i.e. two candidates are
     graded on a value their own call never passes."""
     fn = {
         "name": "mix",

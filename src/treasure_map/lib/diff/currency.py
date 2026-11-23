@@ -180,16 +180,17 @@ def hunt_inputs_digest(
     """A digest of the hunt output one side of a diff reads, and nothing else.
 
     The parts are the ones the diff actually consumes: the candidate call-site addresses its
-    instruction pairs are selected by (``layer0._candidate_callsite_addrs``, by sha256), the
-    binary's string_keyed_edge rows in the columns the edge delta loads (``layer2._EDGE_COLS``, by
+    instruction pairs are selected by (``alignment._candidate_callsite_addrs``, by sha256), the
+    binary's string_keyed_edge rows in the columns the edge delta loads
+    (``dimension_delta._EDGE_COLS``, by
     short name), every run_capability row of the run (present / declared absent / no row are three
     different inputs), and the run row's tool and decompiler versions the version-skew check
     compares. A column the diff never reads (a candidate's reachability, say) is deliberately left
     out, so changing it does not make a diff stale."""
-    # imported here: layer0 imports this module, and layer2 imports layer0, so importing either
-    # at module level would be circular
-    from treasure_map.lib.diff.layer0 import _candidate_callsite_addrs
-    from treasure_map.lib.diff.layer2 import _EDGE_COLS
+    # imported here: alignment imports this module, and dimension_delta imports alignment, so
+    # importing either at module level would be circular
+    from treasure_map.lib.diff.alignment import _candidate_callsite_addrs
+    from treasure_map.lib.diff.dimension_delta import _EDGE_COLS
 
     addrs = sorted(_candidate_callsite_addrs(atlas, run_id, sha)) if sha else []
     edges = _canonical_rows(

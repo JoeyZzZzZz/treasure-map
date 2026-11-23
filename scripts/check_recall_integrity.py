@@ -161,7 +161,7 @@ def gate_e_violations(atlas_db: Path, analysis_db: Path) -> tuple[int, int]:
     """(violations, unverifiable) of Gate E over the instances whose function is in this
     analysis database."""
     from treasure_map.lib.hunt.downweight import _SHELL_RUN_SINKS, _sink_arg_is_literal
-    from treasure_map.lib.pattern.classes import all_path_calls_literal, call_offsets
+    from treasure_map.lib.pattern.sink_vocabulary import all_path_calls_literal, call_offsets
 
     atlas = ro_connect(atlas_db)
     analysis = ro_connect(analysis_db)

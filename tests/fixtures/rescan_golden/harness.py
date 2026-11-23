@@ -17,7 +17,7 @@ putting its ``src`` first on ``PYTHONPATH`` and passes ``--expect-package`` to h
 The harness and the fixture always come from the tree the caller lives in, so two runs differ in
 the package under test and in nothing else. Every package name used here lives in a module inside
 the two stamp closures (``lib.analyze.pipeline`` and the ``ghidra_runner`` / ``stub_resolve`` /
-``workspace`` / ``config`` modules it reaches, and ``lib.hunt.analyzer2``), so the harness runs
+``workspace`` / ``config`` modules it reaches, and ``lib.hunt.analyzer``), so the harness runs
 unchanged against any tree whose stamps equal the current one's.
 
 THE FIXTURE, assembled fresh under ``--work`` on every run:
@@ -205,7 +205,7 @@ def run_fixture(work: Path) -> tuple[Path, Path]:
 
     from treasure_map.lib.analyze import pipeline
     from treasure_map.lib.config.config import Config
-    from treasure_map.lib.hunt.analyzer2 import run_analyzer2
+    from treasure_map.lib.hunt.analyzer import run_analyzer2
     from treasure_map.lib.workspace.workspace import Workspace
 
     fs_root = work / "fs"

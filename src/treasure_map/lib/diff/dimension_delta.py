@@ -28,8 +28,10 @@ from treasure_map.lib.atlas.writer import (
     add_dimension_deltas,
     delete_dimension_delta,
 )
+from treasure_map.lib.diff.alignment import (
+    norm_hex,  # the ONE address canonicalizer (no second one)
+)
 from treasure_map.lib.diff.export_report import DEGENERATE_BLOCK_SOURCE, load_export_gaps
-from treasure_map.lib.diff.layer0 import norm_hex  # the ONE address canonicalizer (no second one)
 
 # ── the layer-2 DELTA-capability declaration (a property of THIS code version, NOT of a run) ──
 # What this layer version can (or explicitly cannot yet) delta. This is legitimately code-declared:

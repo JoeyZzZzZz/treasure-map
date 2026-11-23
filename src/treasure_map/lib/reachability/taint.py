@@ -24,16 +24,16 @@ from collections.abc import Set as AbstractSet
 from functools import lru_cache
 from types import MappingProxyType
 
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.sink_vocabulary import (
     _HEX_FRAGMENT_RE as _HEX_FRAGMENT_RE,
 )
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.sink_vocabulary import (
     _SIZED_TYPE_RE as _SIZED_TYPE_RE,
 )
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.sink_vocabulary import (
     _TYPE_WORDS as _TYPE_WORDS,
 )
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.sink_vocabulary import (
     CMD,
     COPY,
     FMT_STRING,
@@ -51,10 +51,10 @@ from treasure_map.lib.pattern.classes import (
     format_string_ident,
 )
 
-# Identifiers that are NOT variables and must not become flow edges (they pollute the flow
-# set and let an unrelated validator spuriously "cover" a dangerous input). Callee names are
-# detected per-function; these cover C/Ghidra type words and control keywords. A binary's own
-# value-getter helpers (classes.SourceHelpers) are added to this per call, never folded in here.
+# Identifiers that are NOT variables and must not become flow edges (they pollute the flow set and
+# let an unrelated validator spuriously "cover" a dangerous input). Callee names are detected
+# per-function; these cover C/Ghidra type words and control keywords. A binary's own value-getter
+# helpers (sink_vocabulary.SourceHelpers) are added to this per call, never folded in here.
 _CALL_CLASS_NAMES = SOURCE | FORMAT | COPY | CMD | FMT_STRING
 _BUILDER_NAMES = FORMAT | COPY
 _SOURCE_NAMES = SOURCE_STRONG | SOURCE_WEAK
@@ -73,7 +73,8 @@ _RETURN_SOURCES: frozenset[str] = frozenset(
         "get_cgi",
         "b64_decode",
         "base64_decode",
-        # JSON string getters: the returned pointer carries the external value (see classes.py).
+        # JSON string getters: the returned pointer carries the external value (see
+        # sink_vocabulary.py).
         "json_object_get_string",
         "json_object_get_string_len",
         # Config-store getter that returns the stored value's string (``config_get(key)``).
@@ -83,8 +84,8 @@ _RETURN_SOURCES: frozenset[str] = frozenset(
 
 # Buffer-output sources: the source writes into one argument buffer, at a known position.
 #
-# Two config-store getters are recognized as sources (classes.SOURCE_WEAK) but deliberately have
-# no entry here or in _RETURN_SOURCES, so they set the source label and seed nothing:
+# Two config-store getters are recognized as sources (sink_vocabulary.SOURCE_WEAK) but deliberately
+# have no entry here or in _RETURN_SOURCES, so they set the source label and seed nothing:
 #   * uci_lookup_ptr fills a lookup struct passed by pointer; the value sits in a field of that
 #     struct, two indirections from the argument. Seeding the argument would taint the whole
 #     struct root, which over-taints.
@@ -158,7 +159,8 @@ def locate_sink_arg_ref(
     stub_names: Mapping[int, str] | None = None,
     occurrence: int = 0,
 ) -> ArgRef | None:
-    """The sink's first argument, read (``classes.arg_ref``): its form, root, access path and cast.
+    """The sink's first argument, read (``sink_vocabulary.arg_ref``): its form, root, access path
+    and its cast.
 
     None when the ``occurrence``-th call is not there, never closes, or passes no argument — the
     argument could not be located at all, which is not the same as a literal."""
@@ -213,7 +215,7 @@ def locate_format_arg(
 
 
 def _arg_ident(args: list[str], pos: int) -> str | None:
-    """The root variable of the argument at ``pos`` (``classes.arg_ref``), or None."""
+    """The root variable of the argument at ``pos`` (``sink_vocabulary.arg_ref``), or None."""
     if pos >= len(args):
         return None
     return arg_ref(args[pos]).root
@@ -236,16 +238,15 @@ def _calls_in(stmt: str, names: frozenset[str]) -> list[tuple[str, list[str]]]:
 
 # ★ Per-function memoization (H-4). _derives_map / _seed_sets / _call_names are pure functions of
 # their arguments — the pseudocode text and, for the first two, the binary's value-getter helpers
-# (classes.SourceHelpers). The helpers are part of the key on purpose: whether a call is a source
-# depends on the binary, so one body read in two binaries can seed differently, and a cache keyed
-# on the text alone would hand the second binary the first one's answer. One function's body is
-# read many times over — once per candidate it
-# holds, and `grader` calls `flows_into` once per covered variable, each rebuilding the whole
-# dependency map. The hunt passes the SAME `row.pseudocode` object to every read of one function
-# (analyzer2 loads it once), so a small bounded cache keyed on that text turns a per-candidate
-# rebuild into a per-function one. The cached dict / sets are treated as READ-ONLY by every caller
-# (verified: flows_into / free_taint_reaches / grader / evidence only read them); a future caller
-# that needs to mutate one must copy it first.
+# (sink_vocabulary.SourceHelpers). The helpers are part of the key on purpose: whether a call is a
+# source depends on the binary, so one body read in two binaries can seed differently, and a cache
+# keyed on the text alone would hand the second binary the first one's answer. One function's body
+# is read many times over — once per candidate it holds, and `grader` calls `flows_into` once per
+# covered variable, each rebuilding the whole dependency map. The hunt passes the SAME
+# `row.pseudocode` object to every read of one function (analyzer loads it once), so a small
+# bounded cache keyed on that text turns a per-candidate rebuild into a per-function one. The cached
+# dict / sets are treated as READ-ONLY by every caller (verified: flows_into / free_taint_reaches /
+# grader / evidence only read them); a future caller that needs to mutate one must copy it first.
 _CACHE_SIZE = 256
 
 

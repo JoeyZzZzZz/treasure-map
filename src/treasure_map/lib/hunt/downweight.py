@@ -30,9 +30,10 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-from treasure_map.lib.hunt.facts import signature_slots
 from treasure_map.lib.hunt.fmt_provenance import _string_literal, call_arguments
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.hunt.wrapper_facts import signature_slots
+from treasure_map.lib.pattern.extractor_names import REGISTRY
+from treasure_map.lib.pattern.sink_vocabulary import (
     CMD,
     COPY,
     FORMAT,
@@ -46,7 +47,6 @@ from treasure_map.lib.pattern.classes import (
     call_args_at,
     call_offsets,
 )
-from treasure_map.lib.pattern.extractor_names import REGISTRY
 from treasure_map.lib.reachability.taint import (
     _CALL_HEAD_RE,
     flows_into,
@@ -750,7 +750,7 @@ def detect_form_signal(
     under any doubt (no downweight), so recall is never reduced — a missed downweight only leaves
     a candidate at its normal score.
 
-    ``sink_form`` is the sink argument's :class:`classes.ArgRef` form. A note that makes the
+    ``sink_form`` is the sink argument's :class:`sink_vocabulary.ArgRef` form. A note that makes the
     candidate look SAFE is trusted only when the root IS the value: numeric / charset need a safe
     form (``var`` / ``addr_of`` / ``cast``), caller_constant needs the argument to BE the parameter
     (``var`` / ``cast``, not ``&param``). A value read through a pointer / an expression / a call

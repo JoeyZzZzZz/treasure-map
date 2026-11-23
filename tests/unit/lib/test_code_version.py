@@ -110,7 +110,7 @@ def test_every_name_the_hashed_code_takes_is_hashed_or_excluded_with_a_reason(
 ) -> None:
     """★ THE LOCK. Call a new helper from a diff module without listing it, and this fails.
 
-    MUTATION (verified RED): call a helper from an unlisted module in layer0 -> it is reported
+    MUTATION (verified RED): call a helper from an unlisted module in alignment -> it is reported
     here; drop ``lib.hunt.refs`` from the diff entries -> the same."""
     assert _uncovered(entries) == []
 
@@ -119,8 +119,8 @@ def test_the_writers_of_the_rows_are_hashed() -> None:
     """The modules that write diff rows and baseline rows are the roots of the two sets."""
     for root in (
         "lib.diff.driver",
-        "lib.diff.layer0",
-        "lib.diff.layer2",
+        "lib.diff.alignment",
+        "lib.diff.dimension_delta",
         "lib.diff.callsite_facts",
     ):
         assert root in cv.DIFF_CODE_ENTRIES
@@ -160,15 +160,15 @@ def test_comments_and_docstrings_do_not_move_the_hash_and_code_does(tmp_path: Pa
     _copy_entries(tmp_path, cv.DIFF_CODE_ENTRIES)
     before = cv.code_hash(tmp_path, cv.DIFF_CODE_ENTRIES)
     assert before == cv.code_hash(_PACKAGE, cv.DIFF_CODE_ENTRIES)
-    layer0 = tmp_path / "lib" / "diff" / "layer0.py"
-    text = layer0.read_text(encoding="utf-8")
+    alignment = tmp_path / "lib" / "diff" / "alignment.py"
+    text = alignment.read_text(encoding="utf-8")
     edited = text.replace('"""Layer-0 parse:', '"""Layer-0 parse (reworded):', 1).replace(
         "ALIGN_THRESHOLD = 0.9", "# a comment\nALIGN_THRESHOLD = 0.9  # and another", 1
     )
     assert edited != text
-    layer0.write_text(edited, encoding="utf-8")
+    alignment.write_text(edited, encoding="utf-8")
     assert cv.code_hash(tmp_path, cv.DIFF_CODE_ENTRIES) == before
-    layer0.write_text(edited.replace("ALIGN_THRESHOLD = 0.9", "ALIGN_THRESHOLD = 0.8"), "utf-8")
+    alignment.write_text(edited.replace("ALIGN_THRESHOLD = 0.9", "ALIGN_THRESHOLD = 0.8"), "utf-8")
     assert cv.code_hash(tmp_path, cv.DIFF_CODE_ENTRIES) != before
 
 
@@ -245,7 +245,7 @@ def test_the_empty_text_reading_moves_the_diff_stamp_only_through_the_size_floor
 ) -> None:
     """get_pseudocode's empty-text status, its listing read and the read face's micro pair state
     (sameness / patch_view / diff_align) are read at view time and stored nowhere: none is a diff
-    or overlay entry. Of lib/facts only what layer0 stores a function's decompile status by is
+    or overlay entry. Of lib/facts only what alignment stores a function's decompile status by is
     hashed — the size floor, and the test that a stored text is text (an earlier extractor's
     placeholder for a decompile that threw is not) — so changing get_pseudocode's code leaves the
     diff stamp where it was, and changing the floor's value or that test moves it."""

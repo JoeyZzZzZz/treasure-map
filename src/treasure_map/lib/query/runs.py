@@ -369,7 +369,7 @@ def extraction_attempt_state(
     A binary's last attempt ran under ``pass_version`` when it succeeded (``ghidra_ok = 1``) and
     under ``timeout_pass_version`` when it failed for a reason recorded after Ghidra actually ran
     (``_ATTEMPTED_FAILURES``); any other failure counts as not attempted. This is the same reading
-    of the same columns as the hunt's ``analyzer2._load_extraction_notes``, which marks the
+    of the same columns as the hunt's ``analyzer._load_extraction_notes``, which marks the
     candidates of a failed binary with the pass it attempted.
 
     None when the database cannot be read or lacks one of the columns this reads — the caller then

@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""``classes.arg_ref`` — one call argument read into (form, root, path, cast, lead).
+"""``sink_vocabulary.arg_ref`` — one call argument read into (form, root, path, cast, lead).
 
 The shared reader behind every "the variable behind an argument" site. Synthetic, vendor-neutral
 inputs only; the shapes are the ones real decompiler output takes."""
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from treasure_map.lib.pattern.classes import SAFE_FORMS, arg_ref, is_type_word
+from treasure_map.lib.pattern.sink_vocabulary import SAFE_FORMS, arg_ref, is_type_word
 
 # (text, form, lead, root, path, cast_type)
 _TABLE = [

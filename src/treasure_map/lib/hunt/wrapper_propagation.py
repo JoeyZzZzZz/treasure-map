@@ -52,15 +52,15 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from treasure_map.lib.diff.loader import FuncRow
-from treasure_map.lib.hunt.facts import (
+from treasure_map.lib.hunt.function_rows import FuncRow
+from treasure_map.lib.hunt.wrapper_facts import (
     fmt_wrapper_format_index,
     is_thin_cmd_wrapper,
     is_thin_fmt_wrapper,
     is_thin_path_wrapper,
     path_wrapper_param_positions,
 )
-from treasure_map.lib.pattern.classes import (
+from treasure_map.lib.pattern.sink_vocabulary import (
     _FMT_LITERAL_RE,
     PATH_SINK,
     ArgRef,
@@ -287,11 +287,11 @@ def _registries(
 
 # ── reading a path-axis candidate's call: the caller's arguments at the wrapper's positions ──
 #
-# The two readers below are the wrapper-axis forms of ``classes.path_arg_ref`` and
-# ``classes.all_path_calls_literal``, with the caller's call to the wrapper standing in for the
-# sink call and the wrapper's forwarded positions standing in for the sink's path positions. Same
-# selection, same literal test, same whole-function rule for a constant: a path candidate reached
-# through a wrapper is judged exactly as the direct one it stands for would be.
+# The two readers below are the wrapper-axis forms of ``sink_vocabulary.path_arg_ref`` and
+# ``sink_vocabulary.all_path_calls_literal``, with the caller's call to the wrapper standing in for
+# the sink call and the wrapper's forwarded positions standing in for the sink's path positions.
+# Same selection, same literal test, same whole-function rule for a constant: a path candidate
+# reached through a wrapper is judged exactly as the direct one it stands for would be.
 
 
 def _path_args_at(
@@ -321,10 +321,11 @@ def path_wrapper_arg_ref(
     stub_names: Mapping[int, str] | None = None,
     occurrence: int | None = None,
 ) -> ArgRef | None:
-    """The path a path-axis candidate's call hands its wrapper, read as ``classes.path_arg_ref``
-    reads a direct sink's: among the caller's arguments at the wrapper's forwarded ``positions``,
-    the first non-literal one that has a root (else the first non-literal one); a ``literal`` ref
-    when every readable one is a literal; None when none could be read.
+    """The path a path-axis candidate's call hands its wrapper, read as
+    ``sink_vocabulary.path_arg_ref`` reads a direct sink's: among the caller's arguments at the
+    wrapper's forwarded ``positions``, the first non-literal one that has a root (else the first
+    non-literal one); a ``literal`` ref when every readable one is a literal; None when none could
+    be read.
 
     ``occurrence`` reads the candidate's OWN call to the wrapper (0-based, text order, located with
     ``stub_names``); None reads across every call, the function-level reading.
@@ -372,8 +373,8 @@ def path_wrapper_calls_literal(
     to it passes a string literal at EVERY one of those positions.
 
     The direct path sink's constant rule, carried through the hop unchanged
-    (``classes.all_path_calls_literal``): a call is a constant path only when each of its path
-    arguments is a literal — ``W("/tmp/x", dest)`` into ``rename`` is not — and a function is
+    (``sink_vocabulary.all_path_calls_literal``): a call is a constant path only when each of its
+    path arguments is a literal — ``W("/tmp/x", dest)`` into ``rename`` is not — and a function is
     judged on all its calls, so one variable call leaves its literal siblings unmarked too. A
     position that could not be established, a call that cannot be read, or no call found at all
     answers False: never marked constant on a reading that did not happen."""

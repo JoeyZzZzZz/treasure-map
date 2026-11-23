@@ -140,7 +140,7 @@ def test_pair_reading_tells_no_body_apart_from_an_empty_body() -> None:
 
 
 def test_body_status_splits_an_empty_body_by_the_exporter_s_own_reason() -> None:
-    """``_body_status`` tells the six per-side causes apart, reusing layer0._decompile_status for
+    """``_body_status`` tells the six per-side causes apart, reusing alignment._decompile_status for
     the present-but-empty body: a design-skipped micro-stub, a real empty decompile and an
     unrecorded size are not one ``unavailable``.
 
