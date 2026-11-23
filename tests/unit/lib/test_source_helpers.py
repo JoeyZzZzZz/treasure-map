@@ -80,6 +80,23 @@ def test_classify_counts_a_call_to_the_binarys_helper_as_a_source() -> None:
     assert classify(CALLER_CALLEES, NO_HELPERS).source == frozenset()
 
 
+def test_classify_counts_the_candidates_own_helper_function_as_a_source() -> None:
+    """丁 (whole-function self-source): a candidate whose OWN function is an admitted helper reads
+    that function as a weak source — a value getter parses external input (it is why it was
+    admitted), so its body handles that input even when it calls no source NAME of its own. Passing
+    ``func_name`` is what enables it; without it, or when the function is not a helper, the body
+    reads unknown exactly as before.
+
+    MUTATION (verified RED): drop the ``func_name in helpers.names`` clause -> a getter whose body
+    calls no source and no helper reads unknown, leaving the getter sourceless (the B-1 anchor's
+    local-buffer copy never lifts)."""
+    body_callees = ["strstr", "strcpy"]  # a getter body: libc parse + copy, no SOURCE, no helper
+    assert classify(body_callees, HELPERS, RETURNING).source == frozenset({RETURNING})
+    assert classify(body_callees, HELPERS, WRITING).source == frozenset({WRITING})
+    assert classify(body_callees, HELPERS, "not_a_helper").source == frozenset()  # not a helper
+    assert classify(body_callees, HELPERS).source == frozenset()  # func_name omitted = old reading
+
+
 def test_the_shape_detector_labels_the_candidate_from_the_binarys_table() -> None:
     """The command detector's candidate reads ``external_input`` in the binary whose table holds
     the helper and ``unknown`` in one whose does not — and the two carry DIFFERENT structural

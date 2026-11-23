@@ -62,14 +62,24 @@ class CallClasses:
     path_sink: frozenset[str]
 
 
-def classify(callees: list[str], helpers: SourceHelpers = NO_HELPERS) -> CallClasses:
+def classify(
+    callees: list[str], helpers: SourceHelpers = NO_HELPERS, func_name: str | None = None
+) -> CallClasses:
     """Bucket callee names into source / format / cmd / copy / fmt_string / path_sink classes.
 
     ``helpers`` is the callee's binary's value-getter helpers (classes.SourceHelpers): a call to
-    one counts as a source here, the same as a name in SOURCE."""
+    one counts as a source here, the same as a name in SOURCE. ``func_name`` is the function THIS
+    candidate lives in: when it is itself an admitted helper, it counts as a WEAK source for its own
+    body — a value getter reads external input (it is why it was admitted), so the candidates inside
+    it handle that input even though it calls no source NAME of its own. This is the only way a
+    getter whose body parses its input (it calls no known source) reads as sourced at all; its
+    callers already read it as a source through its presence in their callee list."""
     names = {c.strip() for c in callees if isinstance(c, str) and c.strip()}
+    source = frozenset(names & SOURCE) | frozenset(names & helpers.names)
+    if func_name is not None and func_name in helpers.names:
+        source = source | {func_name}
     return CallClasses(
-        source=frozenset(names & SOURCE) | frozenset(names & helpers.names),
+        source=source,
         fmt=frozenset(names & FORMAT),
         cmd=frozenset(names & CMD),
         copy=frozenset(names & COPY),
@@ -179,7 +189,7 @@ def pattern_cmd(
 
     A function whose body spells out no call to any of its command callees yields exactly ONE
     candidate with no callsite anchor — the same recall floor the copy split keeps."""
-    cc = classify(callees, helpers)
+    cc = classify(callees, helpers, func_ref.func_name)
     if not cc.cmd:
         return []
     # A constructed shell command needs a formatter to build it AND a shell-ish literal to build.
@@ -232,7 +242,7 @@ def pattern_b(
     function still yields exactly ONE candidate with no callsite anchor: the function-level match
     it has always produced, byte-for-byte. Emitting nothing there would pay for the split with a
     silent recall loss, which is the trade this change exists to refuse."""
-    cc = classify(callees, helpers)
+    cc = classify(callees, helpers, func_ref.func_name)
     if not cc.copy:
         return []
     shape = "source->copy" if cc.source else "copy"
@@ -287,7 +297,7 @@ def pattern_format(
 
     A function whose body spells out no call (the callee list names one, the text does not) yields
     ONE function-level candidate with no callsite anchor — the same recall floor pattern_b keeps."""
-    cc = classify(callees, helpers)
+    cc = classify(callees, helpers, func_ref.func_name)
     if not cc.fmt:
         return []
     shape = "source->format" if cc.source else "format"
@@ -344,7 +354,7 @@ def pattern_fmtstr(
     floor pattern_b keeps; emitting nothing there would pay for the split with a silent recall
     loss. A call whose format position cannot be read counts as risky, never as exempt:
     prove-safe-to-exempt, never prove-dangerous-to-keep."""
-    cc = classify(callees, helpers)
+    cc = classify(callees, helpers, func_ref.func_name)
     if not cc.fmt_string:
         return []
     shape = "source->fmt_string" if cc.source else "fmt_string"
@@ -406,7 +416,7 @@ def pattern_path(
     A function whose body spells out no call to any of its path callees still yields exactly ONE
     candidate with no callsite anchor — the function-level match it has always produced. Emitting
     nothing there would pay for the split with a silent recall loss."""
-    cc = classify(callees, helpers)
+    cc = classify(callees, helpers, func_ref.func_name)
     if not cc.path_sink:
         return []
     shape = "source->path_sink" if cc.source else "path_sink"

@@ -142,7 +142,9 @@ class SourceHelpers:
     So this is passed, explicitly, to every reader that asks "is this callee a source" — never
     folded into a module-wide list, and never read from ambient state — and the readers that cache
     a body's reading take it as part of the cache key: one body read in two binaries can seed
-    differently. ``slots`` is the whole value (equality and hash); ``names`` is derived from it.
+    differently. ``slots`` is the whole IDENTITY (equality and hash); ``names`` is derived from it,
+    and ``key_positions`` is carried beside it, out of identity (two tables with equal slots seed
+    taint identically whatever key argument each helper reads).
 
     ★ WHICH functions qualify is decided in ONE place, ``hunt.value_helpers.build_helper_tables``
     (two admission rules, each with its own gate — read that module's docstring before changing
@@ -151,6 +153,15 @@ class SourceHelpers:
     existed."""
 
     slots: frozenset[tuple[str, int]] = frozenset()
+    # Per helper name, the 0-based parameter positions at which its KEY arrives: the positions its
+    # own body compares/searches, or forwards one hop to a callee that compares. Carried for
+    # ``helper_keys_called`` so a key is read only from the key argument, never a default-value or
+    # separator argument that shares the callsite. Derived from the same bodies as ``slots`` but not
+    # from ``slots`` itself, so it is passed in; it is not part of identity (it does not change how
+    # a call seeds taint), so it stays out of eq/hash/repr like ``names``.
+    key_positions: frozenset[tuple[str, int]] = field(
+        default=frozenset(), compare=False, hash=False, repr=False
+    )
     names: frozenset[str] = field(init=False, compare=False, hash=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -162,6 +173,11 @@ class SourceHelpers:
     def out_positions(self, name: str) -> tuple[int, ...]:
         """The parameter positions ``name`` writes its value into, ascending."""
         return tuple(sorted(slot for n, slot in self.slots if n == name and slot != RETURN_SLOT))
+
+    def key_positions_of(self, name: str) -> frozenset[int]:
+        """The 0-based argument positions at which ``name``'s key arrives, or the empty set when
+        none could be computed — a helper with none contributes no key rows (no anchor, no row)."""
+        return frozenset(pos for n, pos in self.key_positions if n == name)
 
 
 # A binary with no value-getter helper (and the default wherever none is passed).

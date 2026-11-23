@@ -38,7 +38,17 @@ Two layers, kept apart on purpose:
 
 A helper is read as WEAK input downstream, so it labels a candidate and seeds weak taint and never
 grades one ``confirmed``. Finding one says nothing about whether the value it hands on is
-attacker-controlled — a structural reading, not a verdict.
+attacker-controlled — a structural reading, not a verdict. A CALLER of a helper reads this way
+because the helper is in its callee list; the helper's OWN body does not call itself, so its own
+candidates would read as having no source at all. ``shapes.classify`` closes that: a candidate
+whose function IS an admitted helper reads that function as the same weak source its callers read
+(it was admitted because it reads external input, so its body handles that input) — never a new
+admission, never widening the population, only a reading of the one already decided here.
+
+Which KEY a caller hands a helper is evidence a reader confirms a lead with. A key is read only
+from the helper's key argument position (``SourceHelpers.key_positions``, the parameters the body
+compares/searches — the one authority ``_key_reaching_positions``); a default-value or separator
+argument sharing the callsite is not a key and is never reported as one.
 
 Deliberately narrow, every boundary stated rather than approximated:
   * a value getter that calls no known source NAME is reached ONLY through the keyed-lookup rule,
@@ -432,8 +442,10 @@ _LOOKUP_CALLS: frozenset[str] = frozenset({"strcmp", "strncmp", "strstr", "memcm
 # Buffer writers whose destination (argument 0) is where an out-parameter getter puts its value.
 _OUT_WRITE_CALLS: frozenset[str] = frozenset({"strcpy", "memcpy", "strncpy", "sprintf"})
 _DEREF_RE = re.compile(r"\*\s*\(")
-# A ``&DAT_<addr>`` pointer argument: a key whose text the extractor never typed as a string.
-_DAT_REF_RE = re.compile(r"&?\bDAT_([0-9a-fA-F]+)\b")
+# A ``&DAT_<addr>`` pointer argument: a key whose text the extractor never typed as a string. The
+# ``&`` is required — a bare ``DAT_<addr>`` is the global's VALUE passed by value, not a pointer to
+# a key, so it names no key here.
+_DAT_REF_RE = re.compile(r"&DAT_([0-9a-fA-F]+)\b")
 _PARAM_IN_RE = re.compile(r"\bparam_(\d+)\b")
 _ANY_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 
@@ -516,6 +528,24 @@ def _forwarded_param_positions(pseudocode: str) -> dict[str, set[tuple[int, int]
     return out
 
 
+def _key_reaching_positions(
+    pseudocode: str, compared_in: Callable[[str], frozenset[int]]
+) -> frozenset[int]:
+    """This body's own 0-based parameter positions that reach a compare/search — in the body, or
+    one hop into a callee at an argument position that callee compares.
+
+    The SINGLE authority for "which of this function's parameters is a key": the admission lock
+    (``_keyed_lookup``) asks whether the callers' key positions land in this set, and the key
+    evidence layer (``SourceHelpers.key_positions``) records this set so a reader takes a key only
+    from the key argument. One hop and no more (see ``_keyed_lookup`` on why)."""
+    hit: set[int] = set(compared_in(pseudocode))
+    for callee, pairs in _forwarded_param_positions(pseudocode).items():
+        compared = compared_in(callee)
+        if compared:
+            hit.update(mine for mine, theirs in pairs if theirs in compared)
+    return frozenset(hit)
+
+
 def _keyed_lookup(
     pseudocode: str,
     key_positions: frozenset[int],
@@ -529,13 +559,7 @@ def _keyed_lookup(
     commonly hands the name straight to a small matcher, and a hop count beyond that would be a
     flow relation this layer deliberately does not compute (see the module docstring). It reads
     PARAMETER POSITIONS, never values: nothing here claims the key is attacker-controlled."""
-    if key_positions & compared_in(pseudocode):
-        return True
-    for callee, pairs in _forwarded_param_positions(pseudocode).items():
-        compared = compared_in(callee)
-        if compared and any(mine in key_positions and theirs in compared for mine, theirs in pairs):
-            return True
-    return False
+    return bool(key_positions & _key_reaching_positions(pseudocode, compared_in))
 
 
 def _writes_a_caller_buffer(pseudocode: str) -> bool:
@@ -588,40 +612,56 @@ def _keyed_lookup_slots(
 
 def helper_keys_called(pseudocode: str, helpers: SourceHelpers) -> tuple[dict[str, Any], ...]:
     """The keys THIS function passes to its binary's value-getter helpers, as evidence rows for a
-    reader: ``{"key", "key_origin", "accessor", "hops"}``, ordered by accessor then key.
+    reader: ``{"key", "key_origin", "accessor", "hops", "position"}``, ordered by accessor, origin,
+    key then position.
+
+    A key is read ONLY from the helper's KEY argument position (``helpers.key_positions_of``): the
+    position its body compares/searches the parameter at. A getter's other arguments — the
+    default value a lookup returns when the key is absent, a separator literal — are not keys, and
+    reading them as keys reports a field name the getter was never asked for. A helper whose key
+    position could not be computed contributes no rows at all (no anchor, no row).
 
     ``key_origin`` is ``literal`` for an inline string and ``data_ref`` for a ``&DAT_<addr>``
     pointer argument, whose text is not in the extracted ``strings`` table (Ghidra left the bytes
     untyped) and is resolved from the loaded data blocks by the caller — the row then carries
     ``address`` and a ``key`` of None until it is. ``hops`` is 1: the key is passed at a direct
-    call to the accessor.
+    call to the accessor. ``position`` is the 0-based argument index the key sat at.
 
     It names ARGUMENTS, not flows: a key here is what the caller asked the getter for, not proof
     that the value came back, reached the sink, or is controlled by anyone."""
-    rows: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+    rows: dict[tuple[str, str, str | None, int], dict[str, Any]] = {}
     for name in sorted(helpers.names):
         if name not in pseudocode:  # the cheap gate first: a binary can hold many helpers
             continue
+        key_positions = helpers.key_positions_of(name)
+        if not key_positions:  # no computed key position → this helper names no key here
+            continue
         for off in call_offsets(pseudocode, name):
-            for a in call_args_at(pseudocode, off) or []:
+            for pos, a in enumerate(call_args_at(pseudocode, off) or []):
+                if (
+                    pos not in key_positions
+                ):  # read only the key argument, never a default/separator
+                    continue
                 for lit in _STRING_LIT_RE.findall(a):
                     key = lit[1:-1]
-                    rows[(name, "literal", key)] = {
+                    rows[(name, "literal", key, pos)] = {
                         "key": key,
                         "key_origin": "literal",
                         "accessor": name,
                         "hops": 1,
+                        "position": pos,
                     }
                 for m in _DAT_REF_RE.finditer(a):
                     addr = m.group(1)
-                    rows[(name, "data_ref", addr)] = {
+                    rows[(name, "data_ref", addr, pos)] = {
                         "key": None,
                         "key_origin": "data_ref",
                         "address": addr,
                         "accessor": name,
                         "hops": 1,
+                        "position": pos,
                     }
-    return tuple(rows[k] for k in sorted(rows, key=lambda k: (k[0], k[1], k[2] or "")))
+    return tuple(rows[k] for k in sorted(rows, key=lambda k: (k[0], k[1], k[2] or "", k[3])))
 
 
 def _binary_table(funcs: list[FuncRow]) -> SourceHelpers:
@@ -661,7 +701,14 @@ def _binary_table(funcs: list[FuncRow]) -> SourceHelpers:
                     slots.add((name, slot))
         # ── the keyed-lookup rule ──
         slots |= {(name, s) for s in _keyed_lookup_slots(pc, every_keys.get(name), compared_in)}
-    return SourceHelpers(frozenset(slots))
+    # The key argument position of each admitted helper (``helper_keys_called`` reads a key only
+    # there). Computed for admitted names only, over the same memoised ``compared_in``.
+    key_positions = {
+        (name, pos)
+        for name in {n for n, _ in slots}
+        for pos in _key_reaching_positions(bodies.get(name, ""), compared_in)
+    }
+    return SourceHelpers(frozenset(slots), key_positions=frozenset(key_positions))
 
 
 def build_helper_tables(funcs: Iterable[FuncRow]) -> dict[int, SourceHelpers]:

@@ -291,7 +291,9 @@ def _load_helper_key_strings(
                     text = reader.string_at(binary_id, int(addr, 16))
                 except ValueError:
                     continue
-                if text:
+                # None means NOT RESOLVED (no loaded block holds it); an empty string is a resolved
+                # key that is empty, recorded as such, never conflated with unresolved.
+                if text is not None:
                     out[(binary_id, addr)] = text
         return out
     finally:
@@ -2036,8 +2038,13 @@ def run_analyzer2(
                     _detector_error_keys(detector_errors_by_func, match.func_ref.func_id)
                 )
                 # Which sources the function calls, read from the callee list exactly as the
-                # detector read it to set source_class — on every sink axis, not only cmd.
-                evidence_keys.update(_source_names_keys(classify(callees, helpers).source))
+                # detector read it to set source_class — on every sink axis, not only cmd. Passing
+                # the function name lets an admitted value-getter helper count as a weak source for
+                # its own body (the detector set source_class=external_input on the same predicate),
+                # so the names here agree with that class.
+                evidence_keys.update(
+                    _source_names_keys(classify(callees, helpers, match.func_ref.func_name).source)
+                )
                 # Which KEYS the function asks those getters for (F-1): the field names a reader
                 # needs to confirm the lead, carried beside the source names, never as a claim.
                 evidence_keys.update(

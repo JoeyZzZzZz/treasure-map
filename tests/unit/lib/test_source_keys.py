@@ -26,7 +26,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.hunt import run_analyzer2
 from treasure_map.lib.hunt.data_strings import DataStrings
 from treasure_map.lib.hunt.value_helpers import build_helper_tables, helper_keys_called
-from treasure_map.lib.pattern.classes import NO_HELPERS, SourceHelpers
+from treasure_map.lib.pattern.classes import NO_HELPERS, RETURN_SLOT, SourceHelpers
 from treasure_map.lib.query.triage import (
     _build_dimensions,
     _source_key_rows,
@@ -69,8 +69,8 @@ def _name(body: str) -> str:
 def test_the_rows_name_both_key_spellings_and_claim_nothing_about_the_value() -> None:
     """An inline literal and a ``&DAT_<addr>`` pointer are both keys, told apart by ``key_origin``
     so a reader knows which text was read from bytes. ``hops`` is 1 (a direct call), the accessor
-    is the getter, and a data_ref row carries its address with ``key`` still None — this layer does
-    not read the database.
+    is the getter, ``position`` is the argument index the key sat at, and a data_ref row carries its
+    address with ``key`` still None — this layer does not read the database.
 
     MUTATION (verified RED): collect only string literals -> the data_ref row is gone, and the one
     key the spec's gate 5 needs resolved disappears; drop the de-duplication -> the repeated
@@ -91,8 +91,15 @@ def test_the_rows_name_both_key_spellings_and_claim_nothing_about_the_value() ->
             "address": "00020000",
             "accessor": "FUN_00003000",
             "hops": 1,
+            "position": 1,
         },
-        {"key": "ipVer", "key_origin": "literal", "accessor": "FUN_00003000", "hops": 1},
+        {
+            "key": "ipVer",
+            "key_origin": "literal",
+            "accessor": "FUN_00003000",
+            "hops": 1,
+            "position": 1,
+        },
     )
 
 
@@ -111,13 +118,20 @@ def test_a_body_that_calls_no_getter_of_its_binary_carries_no_rows() -> None:
 # ── a data_ref key's text, out of the loaded blocks ─────────────────────────────────────────────
 
 
-def _blocks_db(path: Path, rows: list[tuple[int, str, bytes, int]]) -> sqlite3.Connection:
+def _blocks_db(path: Path, rows: list[tuple]) -> sqlite3.Connection:
+    """A minimal ``data_blocks`` table carrying the columns the reader uses: ``id`` (the per-block
+    fetch key the per-lookup path needs) and ``truncated`` (default 0). A row may be a 5-tuple
+    ``(binary_id, block_name, start_addr, bytes, initialized)`` or a 6-tuple with ``truncated``."""
     conn = sqlite3.connect(path)
     conn.execute(
-        "CREATE TABLE data_blocks (binary_id INT, block_name TEXT, start_addr TEXT, "
-        "bytes BLOB, initialized INT)"
+        "CREATE TABLE data_blocks (id INTEGER PRIMARY KEY AUTOINCREMENT, binary_id INT, "
+        "block_name TEXT, start_addr TEXT, bytes BLOB, initialized INT, truncated INT DEFAULT 0)"
     )
-    conn.executemany("INSERT INTO data_blocks VALUES (?, ?, ?, ?, ?)", rows)
+    conn.executemany(
+        "INSERT INTO data_blocks "
+        "(binary_id, block_name, start_addr, bytes, initialized, truncated) VALUES (?,?,?,?,?,?)",
+        [(row + (0,))[:6] for row in rows],  # default truncated = 0 when a 5-tuple is given
+    )
     conn.commit()
     return conn
 
@@ -233,8 +247,15 @@ def test_the_hunt_records_the_keys_with_the_data_ref_one_resolved(tmp_path: Path
             "address": f"{RODATA_BASE:08x}",
             "accessor": "FUN_00003000",
             "hops": 1,
+            "position": 1,
         },
-        {"key": "ipVer", "key_origin": "literal", "accessor": "FUN_00003000", "hops": 1},
+        {
+            "key": "ipVer",
+            "key_origin": "literal",
+            "accessor": "FUN_00003000",
+            "hops": 1,
+            "position": 1,
+        },
     ]
     # The source NAMES key keeps saying what it always said: the two ride together, neither
     # replacing the other.
@@ -348,3 +369,145 @@ def test_admitting_a_getter_writes_no_source_kind_here_but_the_charset_layer_sti
     assert bare["source_class"] == "unknown"
     assert bare["flow_evidence"].get("source_kind") == "unknown"
     assert "source_keys" not in bare["flow_evidence"]
+
+
+# ── M-12: a key is read only from the key argument, told apart from empty / unresolved ────────────
+
+
+def test_a_key_is_read_only_from_the_key_argument_never_a_default_or_separator() -> None:
+    """A getter's other arguments are not keys: the default value a lookup returns when the field is
+    absent, and a separator literal, share the callsite but are never the field asked for. A key is
+    read only at the helper's key position.
+
+    MUTATION (verified RED): drop the key-position filter -> the default value and the separator
+    read as keys the getter was asked for."""
+    helpers = SourceHelpers(
+        frozenset({("FUN_00005000", RETURN_SLOT)}),
+        key_positions=frozenset({("FUN_00005000", 1)}),
+    )
+    caller = 'void h(char *param_1){ FUN_00005000(param_1,"name","default-value","/"); }'
+    assert helper_keys_called(caller, helpers) == (
+        {
+            "key": "name",
+            "key_origin": "literal",
+            "accessor": "FUN_00005000",
+            "hops": 1,
+            "position": 1,
+        },
+    )
+
+
+def test_a_getter_with_no_computed_key_position_names_no_key() -> None:
+    """A helper whose key position could not be computed (its body compares no parameter) carries no
+    rows at all — no anchor, no row — rather than reporting every literal it is passed. This is the
+    position filter read from the other side: an empty key-position set matches nothing."""
+    helpers = SourceHelpers(frozenset({("FUN_00005000", RETURN_SLOT)}))  # no key_positions
+    caller = 'void h(char *param_1){ FUN_00005000(param_1,"name","dflt"); }'
+    assert helper_keys_called(caller, helpers) == ()
+
+
+def test_a_bare_dat_value_is_not_a_key() -> None:
+    """Only ``&DAT_<addr>`` (a pointer to the bytes) names a key. A bare ``DAT_<addr>`` is the
+    global's VALUE passed by value, not a pointer to a key, so it names no key here.
+
+    MUTATION (verified RED): accept an optional ``&`` -> the by-value global reads as a key."""
+    helpers = SourceHelpers(
+        frozenset({("FUN_00005000", RETURN_SLOT)}),
+        key_positions=frozenset({("FUN_00005000", 1)}),
+    )
+    assert helper_keys_called("void h(char *p){ FUN_00005000(p,DAT_00020000); }", helpers) == ()
+    # the &-prefixed form IS a key (control)
+    rows = helper_keys_called("void h(char *p){ FUN_00005000(p,&DAT_00020000); }", helpers)
+    assert [r["key_origin"] for r in rows] == ["data_ref"]
+
+
+def test_an_empty_string_key_is_recorded_as_empty_not_dropped(tmp_path: Path) -> None:
+    """``if text is not None`` (not ``if text``): a ``&DAT_`` pointing at an empty string resolves
+    to ``""`` and is recorded, so a reader sees a key whose text is empty rather than one that could
+    not be read.
+
+    MUTATION (verified RED): ``if text:`` instead -> the empty key is dropped and reads as
+    unresolved."""
+    from treasure_map.lib.hunt.analyzer2 import _load_helper_key_strings
+
+    db = tmp_path / "empty.db"
+    _blocks_db(db, [(1, ".rodata", "0x20000", b"\x00rest\x00", 1)]).close()
+    helpers = SourceHelpers(
+        frozenset({("FUN_00005000", RETURN_SLOT)}),
+        key_positions=frozenset({("FUN_00005000", 1)}),
+    )
+    func = _fn(1, "h", "void h(char *p){ FUN_00005000(p,&DAT_00020000); }")
+    resolved = _load_helper_key_strings(db, [func], {1: helpers})
+    assert resolved == {(1, "00020000"): ""}
+
+
+def test_a_truncated_block_reads_as_not_resolved(tmp_path: Path) -> None:
+    """A truncated block's stored bytes cover LESS than its extent, so a NUL inside them is not
+    where the real string ends — such a block reads as None (not resolved), never a key.
+
+    MUTATION (verified RED): drop the truncated filter -> the truncated block resolves a key."""
+    conn = _blocks_db(tmp_path / "trunc.db", [(1, ".rodata", "0x20000", b"host\x00", 1, 1)])
+    try:
+        assert DataStrings(conn).string_at(1, 0x20000) is None
+    finally:
+        conn.close()
+    # the same block not truncated DOES resolve (control)
+    ok = _blocks_db(tmp_path / "ok.db", [(1, ".rodata", "0x20000", b"host\x00", 1, 0)])
+    try:
+        assert DataStrings(ok).string_at(1, 0x20000) == "host"
+    finally:
+        ok.close()
+
+
+# ── B-1 丁: every candidate in an admitted helper function reads it as a weak self-source ─────────
+
+
+def test_every_sink_in_an_admitted_helper_reads_it_as_a_weak_self_source(tmp_path: Path) -> None:
+    """End to end: a value-getter helper reads external input (it is why it was admitted), so EVERY
+    sink candidate in its body reads the function itself as a weak source — including a copy into a
+    LOCAL buffer, not only the one that writes the out-parameter. The getter here copies the parsed
+    value into a local stack buffer AND into the caller's buffer; both read external_input. A plain
+    function that is not a helper keeps its copy unknown — the lift rests entirely on helper
+    membership.
+
+    MUTATION (verified RED by the scratch re-hunt and the classify test): drop the
+    ``func_name in helpers.names`` self-source -> the helper's own copies read unknown and the
+    getter is left sourceless."""
+    # FUN_00409c6c's shape: parse param_1 by key param_2, copy into a local buffer AND the out-param
+    getter = (
+        "void FUN_00003000(char *param_1,char *param_2,char *param_3){ char acStack_40[64]; "
+        "char *pcVar1; pcVar1 = strstr(param_1,param_2); "
+        "if (pcVar1 != (char *)0x0) { strcpy(acStack_40,pcVar1); strcpy(param_3,acStack_40); } }"
+    )
+    plain = "void plain(char *param_1){ char acStack_40[64]; strcpy(acStack_40,param_1); }"
+    funcs = [
+        _func("FUN_00003000", getter, ["strstr", "strcpy"]),
+        _func("keys_fn", _KEYED_CALLS, ["FUN_00003000"]),
+        _func("plain", plain, ["strcpy"]),
+    ]
+    d = Path(tempfile.mkdtemp(dir=tmp_path))
+    db = _make_db(d, [{"name": "cfgd", "path": "usr/sbin/cfgd", "funcs": funcs}])
+    atlas = d / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_self")
+    conn = open_atlas(atlas)
+    try:
+        rows = [
+            (r[0], r[1], json.loads(r[2] or "{}"))
+            for r in conn.execute(
+                "SELECT i.source_anchor, p.source_class, i.flow_evidence "
+                "FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
+                "WHERE p.sink_class = 'copy' ORDER BY i.evidence_ref"
+            )
+        ]
+    finally:
+        conn.close()
+    getter_rows = [r for r in rows if r[0] == "FUN_00003000"]
+    plain_rows = [r for r in rows if r[0] == "plain"]
+    # BOTH of the getter's copies (local buffer and out-parameter) read external_input + self-source
+    assert len(getter_rows) == 2
+    for _anchor, sc, ev in getter_rows:
+        assert sc == "external_input"
+        assert ev["source_names"] == [{"name": "FUN_00003000", "strength": "weak"}]
+    # the plain (non-helper) copy stays unknown with no source
+    assert plain_rows and all(sc == "unknown" for _a, sc, _e in plain_rows)
+    assert all("source_names" not in ev for _a, _sc, ev in plain_rows)
