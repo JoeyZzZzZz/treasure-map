@@ -1,9 +1,13 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""The changed-row citation gate on a function_pair entry (lib/query/review_units
-``entry_citations_short``): a ``changed_real`` on a must-read entry is disposed only when its
-``evidence`` cites the rows the change LANDED on — the rows whose landing is not ``persisted`` —
-up to ``MAX_CITED`` of them.
+"""The changed-row citation gate on a diff entry (lib/query/review_units
+``entry_citations_short``): a ``changed_real`` on a must-read entry — function_pair or
+function_presence — is disposed only when its ``evidence`` cites the rows the change LANDED on —
+the rows whose landing is not ``persisted`` — up to ``MAX_CITED`` of them.
+
+The gate's scope is ONE predicate (``entry_citation_applies``), read by the report that holds a
+judgement back and by the MCP write that says what it owes; the last section here pins the two to
+the same set of anchors.
 
 Zero real data: test_diff_review's World (two diffs of one run pair), synthetic addresses and
 candidate refs throughout.
@@ -301,3 +305,245 @@ def test_the_write_answers_with_what_it_still_has_to_cite(
         "missing_sample": [],
     }
     assert "row_citations_short" not in whole
+
+
+# ── the same gate on a function only one side holds ─────────────────────────────────────────
+
+# A function the B side holds alone (added) and one the A side holds alone (removed): their rows
+# all land, ``landing`` P, so a changed_real owes every one of them.
+ADDED, REMOVED, BARE = "00003000", "00004000", "00006000"
+# A pair the predicate does NOT hold: listed, with a landed row, and second tier (attention 1 on a
+# same-callee B row, no lift_basis) — so ``must_read`` is False.
+A3, B3 = "00005000", "00005100"
+
+
+def _one_sided(side: str, func: str, at: str) -> Any:
+    """A candidate row of a function with no counterpart, on that function's side only."""
+    ref = _ref("runA" if side == "a" else "runB", func, at)
+    return _row(
+        ref if side == "a" else None,
+        None if side == "a" else ref,
+        reason="function_unmatched",
+        conf=None,
+    )
+
+
+def _mixed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[World, dict[str, Any]]:
+    """One diff holding, side by side, every entry the gate has to tell apart — a must-read pair
+    with a landed row, a second-tier pair with one, a one-sided function on each side with landed
+    rows, and a one-sided function with no candidate row at all. One fixture, so the report's
+    scope and the write's are compared over the same five subjects.
+
+    Returns the world and the rows by name, for citing them."""
+    w = World(tmp_path, monkeypatch)
+    w.pair(DX, A1, B1, conf=0.97, sim=0.8)  # bucket A -> attention 0 -> must-read
+    w.pair(DX, A3, B3, conf=0.97, sim=0.5)
+    for side, func in (("b", ADDED), ("a", REMOVED), ("b", BARE)):
+        w.unpaired(DX, side, func, "unmatched_analysis_complete")
+    rows = {
+        "must_read_pair": _landed(A1, "0x10"),
+        "second_tier_pair": _row(
+            _ref("runA", A3, "0x10"), _ref("runB", B3, "0x10"), reason="counterpart_same_callee"
+        ),
+        "added_1": _one_sided("b", ADDED, "0x20"),
+        "added_2": _one_sided("b", ADDED, "0x24"),
+        "removed": _one_sided("a", REMOVED, "0x30"),
+    }
+    w.rows[DX] = list(rows.values())
+    return w, rows
+
+
+def _presence_anchor(side: str, func: str) -> str:
+    return dr.presence_anchor("runA", "runB", "libx", side, func)
+
+
+def _members(w: World) -> dict[str, Any]:
+    return {m.entry_id: m for m in ru.diff_facts(w.atlas, DX).entries}
+
+
+def test_a_changed_real_on_an_added_function_cites_every_row_it_landed_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ the extended scope: a function only the B side holds is a must-read entry (``p_entry``)
+    whose rows all land, so a changed_real citing one of its two reads needs_recheck and is named
+    in ``entry_citations_short`` with the uncited ref; citing both disposes it.
+
+    The reason the gate skipped these — "a function_presence subject has no row list of this
+    shape" — is not true of them: they have rows, and every one of them lands.
+
+    MUTATION (verified RED, ``1 failed``): put the ``pair:`` prefix test back in the predicate ->
+    the judgement reads disposed uncited -> RED."""
+    w, rows = _mixed(tmp_path, monkeypatch)
+    anchor = _presence_anchor("b", ADDED)
+    m = _members(w)[f"b:{ADDED}"]
+    assert (m.kind, m.must_read, m.reasons, m.rows) == ("entry", True, ("p_entry",), 2)
+    assert ru.entry_citation_applies(m)
+
+    _judge(w, anchor, [rows["added_1"].b_ref])
+    rev = _review(w)
+    assert rev.progress.states.get(anchor) == "needs_recheck"
+    gap = rev.report["entry_citations_short"].get(anchor)
+    assert gap is not None
+    assert (gap["required"], gap["cited"], gap["owed"]) == (2, 1, 2)
+    assert gap["missing_sample"] == [rows["added_2"].b_ref]
+
+    _judge(w, anchor, [rows["added_1"].b_ref, rows["added_2"].b_ref])
+    whole = _review(w)
+    assert ru.disposed(whole.progress.states.get(anchor))
+    assert anchor not in whole.report["entry_citations_short"]
+
+
+def test_a_removed_functions_row_is_cited_by_its_a_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ the other side of it: a function only the A side holds carries its rows on the A side, so
+    the citation names the ``a_ref``. One gate, both directions — the row is cited by either of
+    its refs and a one-sided row has only one.
+
+    MUTATION (verified RED, ``1 failed``): read the b_ref alone -> RED."""
+    w, rows = _mixed(tmp_path, monkeypatch)
+    anchor = _presence_anchor("a", REMOVED)
+    assert rows["removed"].b_ref is None  # fixture premise: there is no b_ref to cite
+    _judge(w, anchor, [anchor, "the function is gone"])
+    assert _review(w).report["entry_citations_short"].get(anchor) is not None
+    _judge(w, anchor, [rows["removed"].a_ref])
+    rev = _review(w)
+    assert ru.disposed(rev.progress.states.get(anchor))
+    assert anchor not in rev.report["entry_citations_short"]
+
+
+def test_the_gate_on_a_one_sided_function_holds_changed_real_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ scope, not severity: the extended gate keeps the changed_real-only rule. A
+    no_real_change and a change_inconclusive on a one-sided function, citing none of its rows, are
+    disposed by their own rules.
+
+    MUTATION (verified RED, ``1 failed``): hold every verdict -> both read needs_recheck -> RED."""
+    w, _rows = _mixed(tmp_path, monkeypatch)
+    anchor = _presence_anchor("b", ADDED)
+    w.judge(
+        DX,
+        anchor,
+        "no_real_change",
+        verdict_basis={"checked": [anchor], "why_unchanged": "a renamed wrapper, same call"},
+    )
+    rev = _review(w)
+    assert ru.disposed(rev.progress.states.get(anchor))
+    assert anchor not in rev.report["entry_citations_short"]
+    w.judge(DX, anchor, "change_inconclusive")
+    again = _review(w)
+    assert anchor not in again.report["entry_citations_short"]
+
+
+def test_a_one_sided_function_with_no_candidate_row_owes_no_citation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ the denominator is the LANDED rows, so a one-sided function holding no candidate row at
+    all owes nothing — a changed_real on it is disposed with no citation. The predicate holds it
+    (it is must-read); the gap is what says nothing is owed.
+
+    MUTATION (verified RED, ``1 failed``): owe a citation whenever the predicate holds -> RED."""
+    w, _rows = _mixed(tmp_path, monkeypatch)
+    anchor = _presence_anchor("b", BARE)
+    assert _members(w)[f"b:{BARE}"].rows == 0  # fixture premise
+    assert ru.entry_citation_applies(_members(w)[f"b:{BARE}"])
+    _judge(w, anchor, [anchor, "a new function, at no candidate"])
+    rev = _review(w)
+    assert ru.disposed(rev.progress.states.get(anchor))
+    assert anchor not in rev.report["entry_citations_short"]
+
+
+def test_a_second_tier_entry_with_a_landed_row_is_not_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ ``must_read`` stays in the predicate: a listed pair that is second tier — nobody was asked
+    to read it — owes no row citation even with a landed row, on either path. Dropping that test
+    would hold back hundreds of judgements on entries the review never handed out.
+
+    MUTATION (verified RED, ``1 failed``): drop ``must_read`` from the predicate -> RED."""
+    w, _rows = _mixed(tmp_path, monkeypatch)
+    anchor = _pair_anchor(DX, A3, B3)
+    m = _members(w)[f"pair:{A3}:{B3}"]
+    assert (m.must_read, m.reasons, m.rows) == (False, (), 1)  # fixture premise
+    assert not ru.entry_citation_applies(m)
+    _judge(w, anchor, [anchor, "read it, the call is the same"])
+    rev = _review(w)
+    assert ru.disposed(rev.progress.states.get(anchor))
+    assert anchor not in rev.report["entry_citations_short"]
+
+
+def test_the_write_answers_short_on_exactly_what_the_report_holds_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ ONE predicate, two paths: over a fixture holding all five entry shapes, the anchors the
+    MCP write answers ``row_citations_short`` on are exactly the anchors the report holds back —
+    a must-read pair and the two one-sided functions with rows, and neither the second-tier pair
+    nor the one-sided function without rows. Two spellings of this question is how a write comes
+    back claiming needs_recheck on an entry the review reads as disposed.
+
+    The report is read first, off judgements written straight onto the overlay; the MCP writes
+    follow, each carrying the same under-citing basis.
+
+    MUTATION (verified RED, ``1 failed``): the write path not going through
+    ``entry_citation_applies`` -> the second-tier pair answers short, the sets differ -> RED; the
+    ``pair:`` prefix test back in the predicate -> the report holds neither one-sided entry -> RED.
+    """
+    from treasure_map import mcp_app
+
+    w, _rows = _mixed(tmp_path, monkeypatch)
+    anchors = {
+        "must_read_pair": _pair_anchor(DX, A1, B1),
+        "second_tier_pair": _pair_anchor(DX, A3, B3),
+        "added": _presence_anchor("b", ADDED),
+        "removed": _presence_anchor("a", REMOVED),
+        "bare": _presence_anchor("b", BARE),
+    }
+    for anchor in anchors.values():
+        _judge(w, anchor, [anchor, "read it"])  # cites the subject, none of its rows
+    held = set(_review(w).report["entry_citations_short"])
+
+    tools = mcp_app.make_tools(w.path)
+    answered = set()
+    for anchor in anchors.values():
+        res = tools["annotate_diff"](
+            anchor, "changed_real", "read it", diff_id=DX, evidence=[anchor]
+        )
+        assert res["written"] is True, res
+        if "row_citations_short" in res:
+            answered.add(anchor)
+
+    assert held == answered
+    assert held == {anchors["must_read_pair"], anchors["added"], anchors["removed"]}
+
+
+def test_a_write_naming_its_unit_reads_the_gate_off_the_review_it_already_paid_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ the write reads the predicate's member from TWO sources — the pair review a unit-naming
+    write already computed, and the one diff a write that names no unit reads on its own — and
+    both have to answer the same. Here the first: a write naming the unit of a one-sided function
+    answers the same ``row_citations`` as the write without one above.
+
+    The two sources are EQUIVALENT by design, so swapping which one is read is not a red; what has
+    teeth is a source that answers nothing (then the gate silently stops applying) — verified RED
+    by making the review branch return None: the short goes missing: 1 failed."""
+    from treasure_map import mcp_app
+
+    w, rows = _mixed(tmp_path, monkeypatch)
+    anchor = _presence_anchor("b", ADDED)
+    unit = next(u for u in _review(w).units if any(m.anchor_ref == anchor for m in u.members))
+    tools = mcp_app.make_tools(w.path)
+    res = tools["annotate_diff"](
+        anchor,
+        "changed_real",
+        "read it",
+        diff_id=DX,
+        evidence=[rows["added_1"].b_ref],
+        unit_id=unit.unit_id,
+    )
+    assert res["written"] is True, res
+    assert res["row_citations"]["owed"] == 2
+    assert res["row_citations"]["cited"] == 1
+    assert res["row_citations"]["missing_sample"] == [rows["added_2"].b_ref]
+    assert "needs_recheck" in res["row_citations_short"]

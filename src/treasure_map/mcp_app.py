@@ -5830,6 +5830,7 @@ def make_tools(
         workers: Any,
         attributed_to: Any,
         verdicts: dict[str, Any],
+        reviews: dict[int, Any] | None = None,
     ) -> tuple[dict[str, Any], bool, str | None, int]:
         """``(context per anchor, shadow, error, k)`` of a diff write. A ``unit_id`` (from
         start_diff_review(run_pair)) must hold every anchor written; an audit unit's write is a
@@ -5841,7 +5842,10 @@ def make_tools(
         ``verdicts`` maps each anchor to the verdict written on it: a write that read nothing of its
         subject (basis ``none``), or a no_real_change / change_inconclusive that read it only in
         part (review_units ``held_unread``), is marked ``unread_before_verdict`` when the subject is
-        must-read at ``k``."""
+        must-read at ``k``.
+        ``reviews`` is this call's pair-review cache (k -> review), the caller's dict when it hands
+        one in — so a later read in the same write reuses a review already paid for here, and sees
+        which k were read, rather than computing the pair again (see ``_listed_entry_member``)."""
         from treasure_map.lib.overlay import WriteContext
         from treasure_map.lib.query import read_basis as _rb
 
@@ -5878,11 +5882,11 @@ def make_tools(
             return {}, False, "the diff names no run pair", _ru.DEFAULT_K
         lines = _rb.session_lines(call_log)
         session = _session_id()
-        reviews: dict[int, Any] = {}
+        cache: dict[int, Any] = {} if reviews is None else reviews
 
         def review(k: int = _ru.DEFAULT_K) -> Any:
-            if k not in reviews:
-                reviews[k] = _ru.review_pair(
+            if k not in cache:
+                cache[k] = _ru.review_pair(
                     atlas,
                     runs[0],
                     runs[1],
@@ -5890,7 +5894,7 @@ def make_tools(
                     pair_staleness={"source_stale": False, "source_stale_reason": None},
                     server_commit=None,
                 )
-            return reviews[k]
+            return cache[k]
 
         unit = audit = None
         # The k this write is read at: every k this session's start_diff_review calls were
@@ -6183,13 +6187,49 @@ def make_tools(
             )
         return out
 
+    def _listed_entry_member(
+        atlas: sqlite3.Connection, diff_id: str | None, anchor_ref: str, reviews: dict[int, Any]
+    ) -> Any:
+        """The listed-entry member ``anchor_ref`` names — what the entry citation gate is read by
+        (``review_units.entry_citation_applies``); None when the current view lists no such entry.
+
+        Taken from a pair review this write already read (any k: ``must_read`` leaves ``top_k``
+        out), else read from the ONE diff the anchor belongs to. The caller asks only once it knows
+        the judgement could owe citations at all, so a write that owes none reads no facts for
+        this."""
+        if reviews:
+            rev = reviews[max(reviews)]
+            return next(
+                (m for d in rev.facts.diffs for m in d.entries if m.anchor_ref == anchor_ref),
+                None,
+            )
+        if diff_id is None:
+            return None
+        facts = _ru.diff_facts(atlas, diff_id)
+        if facts is None:
+            return None
+        return next((m for m in facts.entries if m.anchor_ref == anchor_ref), None)
+
     def _entry_citations(
-        view: dict[str, Any], anchor_ref: str, verdict: str, basis: Any
+        atlas: sqlite3.Connection,
+        diff_id: str | None,
+        view: dict[str, Any],
+        anchor_ref: str,
+        verdict: str,
+        basis: Any,
+        reviews: dict[int, Any],
     ) -> dict[str, Any]:
-        """A changed_real's answer on a function_pair entry: how far it cites the rows the change
-        LANDED on (the gate's shape, ``review_units.entry_citation_gap``), and — when it cites
-        fewer than it owes — which rows are missing, so the next write can name them. Without
-        this the gate would bounce a write with nothing to act on."""
+        """A changed_real's answer on a must-read diff entry (function_pair or function_presence):
+        how far it cites the rows the change LANDED on (the gate's shape,
+        ``review_units.entry_citation_gap``), and — when it cites fewer than it owes — which rows
+        are missing, so the next write can name them. Without this the gate would bounce a write
+        with nothing to act on.
+
+        ★ Scoped by the SAME predicate the report's gate is (``entry_citation_applies``): an entry
+        the report does not hold back gets no answer here, so the write is never told it reads
+        needs_recheck over something the review will read as disposed. The cheap tests come first —
+        the gap is read off the built view this write already has, and the member (which may cost
+        a read) only once a gap exists."""
         entry_id = _entry_id_of(anchor_ref)
         built = view.get("built") if isinstance(view, dict) else None
         if verdict != "changed_real" or built is None or entry_id is None:
@@ -6199,6 +6239,9 @@ def make_tools(
             return {}
         gap = _ru.entry_citation_gap(entry, basis)
         if gap is None:
+            return {}
+        member = _listed_entry_member(atlas, diff_id, anchor_ref, reviews)
+        if member is None or not _ru.entry_citation_applies(member):
             return {}
         out: dict[str, Any] = {"row_citations": gap}
         if gap["cited"] < gap["owed"]:
@@ -6403,6 +6446,9 @@ def make_tools(
             if refusal is not None:
                 return refusal
             runs = _pair_of(atlas, diff_id, run_pair)
+            # Shared with _write_plan so the citation gate below reads a pair review this write
+            # already paid for, instead of computing the pair a second time.
+            reviews: dict[int, Any] = {}
             ctxs, shadow, bad, unit_k = _write_plan(
                 atlas,
                 runs,
@@ -6412,6 +6458,7 @@ def make_tools(
                 workers=workers,
                 attributed_to=attributed_to,
                 verdicts={anchor_ref: verdict},
+                reviews=reviews,
             )
             if bad is not None:
                 return {"written": False, "error": bad}
@@ -6474,7 +6521,11 @@ def make_tools(
             ):
                 result.update(_presence_citations(atlas, run_pair, anchor_ref, given or None))
             if not shadow and _entry_id_of(anchor_ref) is not None:
-                result.update(_entry_citations(view, anchor_ref, verdict, given or None))
+                result.update(
+                    _entry_citations(
+                        atlas, diff_id, view, anchor_ref, verdict, given or None, reviews
+                    )
+                )
             # Read when written, before the answer's size is taken: the next unit's material is fit
             # in what this leaves.
             hints_pass = _write_hints_pass()

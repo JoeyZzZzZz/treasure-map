@@ -36,9 +36,10 @@ so are the binaries one run of the pair holds alone (``binary_presence``): each 
 binary holding a candidate is a must-read member (a binary holding none is one member on its own
 anchor), handed out per binary in batches. Such a member is disposed only when its judgement, of
 whatever verdict, cites every candidate of its subject (``presence_citations_short``). A
-``changed_real`` on a must-read function_pair entry is held to the same shape: it is disposed only
-when its ``checked`` / ``evidence`` cite every row of the entry that LANDED somewhere — every row
-whose ``landing`` is not ``persisted``, which is the rows the change is visible at — up to
+``changed_real`` on a must-read diff entry — function_pair or function_presence — is held to the
+same shape: it is disposed only when its ``checked`` / ``evidence`` cite every row of the entry
+that LANDED somewhere — every row whose ``landing`` is not ``persisted``, which is the rows the
+change is visible at — up to
 ``MAX_CITED`` of them (``entry_citations_short``); an entry all of whose rows are ``persisted``
 owes no citation (a function-level change lands on no candidate row, which is legitimate). Every
 candidate row of a must-read entry is read with it: its unit's material carries up to a page of
@@ -870,7 +871,24 @@ def presence_citations_short(
     return out
 
 
-# ── the function_pair entries: whether a changed_real cites the rows it landed on ────────────
+# ── the diff entries: whether a changed_real cites the rows it landed on ─────────────────────
+
+
+def entry_citation_applies(m: Member) -> bool:
+    """Whether the entry citation gate holds a ``changed_real`` on this member: a must-read diff
+    entry, function_pair or function_presence (a function only one side holds — every one of its
+    candidate rows lands, landing ``P``, so the gate asks for all of them).
+
+    ★ The ONE predicate the two paths share: the report's ``entry_citations_short``, which decides
+    whether a stored judgement reads disposed, and the MCP write's answer, which tells the writer
+    what it still owes. Two spellings of this question is how a write comes back saying it reads
+    needs_recheck on an entry the report never holds — or the reverse, a judgement held back with
+    nothing said about it. ``must_read`` is k-independent (``diff_facts`` leaves ``top_k`` out of a
+    member's reasons), so either side may read it at whatever k it has.
+
+    A binary_presence subject is NOT here: it is held to the stricter candidate gate instead
+    (``presence_citations_short``, every candidate on every verdict)."""
+    return m.kind == "entry" and m.must_read and m.entry_id is not None
 
 
 def entry_citation_gap(e: Any, verdict_basis: Any) -> dict[str, Any] | None:
@@ -901,9 +919,9 @@ def entry_citation_gap(e: Any, verdict_basis: Any) -> dict[str, Any] | None:
 def entry_citations_short(
     atlas: sqlite3.Connection, facts: PairFacts, states: dict[str, str]
 ) -> dict[str, dict[str, Any]]:
-    """The disposed ``changed_real`` judgements on must-read function_pair entries whose
-    ``checked`` / ``evidence`` do not cite the rows the change landed on — anchor -> what is
-    missing (``entry_citation_gap``).
+    """The disposed ``changed_real`` judgements on must-read diff entries (function_pair and
+    function_presence — ``entry_citation_applies``) whose ``checked`` / ``evidence`` do not cite
+    the rows the change landed on — anchor -> what is missing (``entry_citation_gap``).
 
     Read against the LIVE view, the way ``presence_citations_short`` reads the live presence: an
     entry the current view no longer lists under the judged id (re-paired since) is not read here
@@ -926,16 +944,16 @@ def entry_citations_short(
     for d in facts.diffs:
         for m in d.entries:
             if (
-                m.kind == "entry"
-                and m.must_read
-                and m.entry_id is not None
-                # function_pair only: a function_presence subject has no row list of this shape,
-                # and a binary_presence one is already held to the stricter candidate gate.
-                and m.entry_id.startswith("pair:")
+                # The shared predicate (function_pair and function_presence; a binary_presence
+                # subject is held to the stricter candidate gate instead) — read here and by the
+                # MCP write's answer, so the two never disagree about what is owed.
+                entry_citation_applies(m)
+                # The predicate already requires one; read here to look the entry up by it.
+                and (entry_id := m.entry_id) is not None
                 and m.anchor_ref in rows
                 and disposed(states.get(m.anchor_ref))
             ):
-                want.setdefault(d.diff_id, {})[m.entry_id] = m.anchor_ref
+                want.setdefault(d.diff_id, {})[entry_id] = m.anchor_ref
     for diff_id, by_entry in want.items():
         built = pv.build_diff_view(atlas, diff_id)
         if built is None:
