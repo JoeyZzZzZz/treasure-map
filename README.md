@@ -177,12 +177,6 @@ your agent chooses which firmware or diff to work on.
 | `tmap update` | Install the newest version, then run its `tmap init` |
 | `tmap uninstall` | Remove what `tmap init` installed; your data stays |
 
-`tmap runs` is the inventory: each scan with its status and counts, then the diffs grouped by run
-pair (`--diffs` lists every binary under its pair). `--delete` takes a run id, a `run_a::run_b`
-pair or one `run_a::run_b::binary` and removes those atlas records only — firmware files and
-workspaces are never touched. Scanning into a workspace that already holds a different firmware
-asks first.
-
 ## Install details
 
 ### Platforms

@@ -4,6 +4,18 @@
   "title": "Treasure Map",
   "description": "Firmware attack-surface map and patch diff for AI agents. Requires tmap init (Ghidra toolchain).",
   "websiteUrl": "https://tmap.tools/",
+  "icons": [
+    {
+      "src": "https://tmap.tools/favicon-32.png",
+      "mimeType": "image/png",
+      "sizes": ["32x32"]
+    },
+    {
+      "src": "https://tmap.tools/apple-touch-icon.png",
+      "mimeType": "image/png",
+      "sizes": ["180x180"]
+    }
+  ],
   "repository": {
     "url": "https://github.com/JoeyZzZzZz/treasure-map",
     "source": "github"

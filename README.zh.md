@@ -125,10 +125,6 @@ tmap diff --before fw-v1 --after fw-v2
 | `tmap update` | 装上最新版本，再运行它的 `tmap init` |
 | `tmap uninstall` | 移除 `tmap init` 装的东西，数据保留 |
 
-`tmap runs` 就是清单：每个扫描连状态和计数，后面是按 run 对分组的对比（`--diffs` 展开每对下的每个
-二进制）。`--delete` 接受 run id、`run_a::run_b` 一对、或单个 `run_a::run_b::binary`，只删 atlas
-记录 —— 固件文件和工作目录绝不触碰。往一个已装着别的固件的工作目录里扫描时会先询问。
-
 ## 安装细节
 
 ### 平台
