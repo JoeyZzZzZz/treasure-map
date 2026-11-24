@@ -9,6 +9,17 @@ process on the spot — none of that cleanup runs, and each JVM it started (they
 session, out of the terminal's reach) keeps running on its own. Turning those two signals into the
 same ``KeyboardInterrupt`` routes them through the cleanup that already exists.
 
+SIGINT is deliberately NOT installed here: Python's own default already raises
+``KeyboardInterrupt`` for it. That default is INHERITED, though — a process started with SIGINT
+set to ``SIG_IGN`` has no SIGINT handling at all, and POSIX has a non-interactive shell ignore
+SIGINT in an ASYNCHRONOUS command, so ``tmap … &`` inside a script (or under a supervisor that
+starts children that way) is such a process. Taking SIGINT back would override an ignore the
+parent set on purpose, which is the one thing a child is asked not to do; the cost of not taking
+it is small, because an ignored SIGINT does not kill the process half-way — it does nothing at
+all, and whatever the command was supervising stays supervised. **Signal such a run with
+SIGTERM**: those two are rewritten unconditionally, so every guarantee that rests on an interrupt
+(``review run`` killing the agent it launched, a scan killing its JVMs) holds on that route.
+
 The exit code follows the shell convention, 128 + the signal number: 130 for Ctrl-C, 143 for
 SIGTERM, 129 for SIGHUP.
 """

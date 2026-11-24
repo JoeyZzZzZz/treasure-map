@@ -520,15 +520,21 @@ def test_an_interrupt_of_the_driver_kills_the_agent_it_launched(tmp_path: Path) 
     The marker the survivors are looked up by reaches the driver through the environment, never in
     its own argv, so what ``pgrep`` matches is the agent alone.
 
+    The driver restores SIGINT's default disposition, because the SIGINT half rests on it and it
+    is inherited: run this suite as an async command of a non-interactive shell (``pytest … &``)
+    and the whole process tree has SIGINT ignored, which read as a 20-second timeout here and as
+    nothing at all in cli/interrupts — see the next test for the contract on that route.
+
     MUTATION (verified RED, ``1 failed`` each signal): drop run_agent's ``except BaseException``
     kill -> the sleeper survives -> RED."""
     marker = f"tmap-test-agent-{os.getpid()}"
     driver = (
-        "import os, sys\n"
+        "import os, signal, sys\n"
         f"sys.path.insert(0, {str(_SRC)!r})\n"
         "from pathlib import Path\n"
         "from treasure_map.cli.interrupts import install_termination_handlers\n"
         "from treasure_map.lib import review_driver as rd\n"
+        "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
         "install_termination_handlers()\n"
         "agent = 'import time; time.sleep(600)  # ' + os.environ['TMAP_TEST_MARKER']\n"
         "print('READY', flush=True)\n"
@@ -557,6 +563,60 @@ def test_an_interrupt_of_the_driver_kills_the_agent_it_launched(tmp_path: Path) 
         time.sleep(0.5)  # let SIGKILL propagate before we look
         left = _reap(marker)
         assert left == [], f"the agent survived {sig.name}: {left}"
+
+
+def test_sigterm_kills_the_agent_even_where_sigint_was_inherited_ignored(tmp_path: Path) -> None:
+    """The contract when SIGINT cannot work: a non-interactive shell ignores SIGINT in an async
+    (``&``) command and the disposition is inherited, so ``tmap review run … &`` in a script has
+    no SIGINT handling — cli/interrupts says so and says to use SIGTERM, and here that is read
+    back on a driver started the same way. SIGINT does nothing (it does not kill the driver
+    half-way, so the agent is still supervised, with its deadline); SIGTERM then takes both down,
+    because cli.interrupts rewrites SIGTERM whatever the parent set.
+
+    MUTATION (verified RED, ``1 failed``): drop SIGTERM from ``_HANDLED`` -> its default action
+    ends the driver on the spot, the agent is orphaned and survives -> RED."""
+    marker = f"tmap-test-inherited-{os.getpid()}"
+    driver = (
+        "import os, signal, sys\n"
+        f"sys.path.insert(0, {str(_SRC)!r})\n"
+        "from pathlib import Path\n"
+        "from treasure_map.cli import interrupts\n"
+        "from treasure_map.lib import review_driver as rd\n"
+        # what the shell did to this process before exec, not something tmap chose
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "interrupts.install_termination_handlers()\n"
+        "agent = 'import time; time.sleep(600)  # ' + os.environ['TMAP_TEST_MARKER']\n"
+        "print('READY', flush=True)\n"
+        "try:\n"
+        "    rd.run_agent(\n"
+        f"        [sys.executable, '-c', agent], cwd=Path({str(tmp_path)!r}), timeout=600\n"
+        "    )\n"
+        "except KeyboardInterrupt:\n"
+        # 128 + the signal, as the commands do: 143 here, and never 130, which is what it would be
+        # if a KeyboardInterrupt had come from somewhere other than the SIGTERM
+        "    raise SystemExit(interrupts.interrupt_exit_code())\n"
+    )
+    proc = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", driver],
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "TMAP_TEST_MARKER": marker},
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "READY"
+        _wait_for(lambda: _pids(marker) != [], 10)
+        os.kill(proc.pid, signal.SIGINT)
+        time.sleep(1)
+        assert proc.poll() is None, "SIGINT was ignored by the shell's order, not by the process"
+        assert _pids(marker) != [], "the agent stopped although nothing reached the driver"
+        os.kill(proc.pid, signal.SIGTERM)
+        assert proc.wait(timeout=20) == 128 + int(signal.SIGTERM)
+    finally:
+        proc.kill()
+    time.sleep(0.5)
+    left = _reap(marker)
+    assert left == [], f"the agent survived SIGTERM on a run with SIGINT ignored: {left}"
 
 
 def test_the_claude_preset_switches_builtin_tools_off_and_loads_only_tmap() -> None:
