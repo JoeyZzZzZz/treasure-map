@@ -748,6 +748,7 @@ def run(
     calls no model itself. A unit counts only when the overlay's history holds a judgement naming
     it for every member. Ends when no unit is left, or at a limit. By default only the must-read
     units are handed out (--until must_read); --until complete hands out the second tier too."""
+    import shutil
     import tempfile
 
     from treasure_map.lib import review_driver as rd
@@ -777,78 +778,87 @@ def run(
             "than is installed — the MCP server refuses it; re-scan it first (tmap rescan)"
         )
     workdir = Path(tempfile.mkdtemp(prefix="tmap-review-"))
-    deadline = timeout or rd.DEFAULT_TIMEOUT
-    click.echo(f"probing {preset.name} ({preset.note or 'preset'}) …")
-    pr = rd.probe(
-        preset,
-        atlas_path=Path(atlas),
-        workdir=workdir,
-        timeout=min(deadline, 300),
-        handoff=handoff_out is not None,
-    )
-    click.echo(
-        f"probe: tmap reached {pr.tmap_reached}, built-in tools blocked {pr.builtin_blocked} — "
-        f"{pr.why}"
-    )
-    if not pr.ok:
-        raise click.ClickException("the probe failed: no unit is handed to this agent")
-    if probe_only:
-        return
-    result = rd.drive(
-        Path(atlas),
-        run_a,
-        run_b,
-        preset,
-        workdir=workdir,
-        k=ru.DEFAULT_K if k is None else k,
-        worker=worker,
-        workers=workers,
-        max_units=max_units,
-        max_minutes=max_minutes,
-        timeout=deadline,
-        retries=rd.DEFAULT_RETRIES if retries is None else retries,
-        pair_staleness=staleness,
-        echo=click.echo,
-        until=until,
-    )
-    click.echo(
-        f"units tried {result.units_tried}, done {result.units_done}, failed "
-        f"{len(result.failed)} — {result.stopped}"
-    )
-    for f in result.failed:
-        click.echo(f"  failed {f['unit_id']} ({f['kind']}): {f['written']}/{f['members']} written")
-    if result.statement:
-        click.echo(result.statement)
-    if result.offer is not None:
-        second = result.offer["second_tier"]
-        click.echo(
-            f"second tier: {second['members']} member(s) in {second['units']} unit(s) not judged "
-            f"(by bucket {second['by_bucket']}, {second['due_recheck']} due a re-check)"
-            + (" — read them with --until complete" if result.offer["continue_with"] else "")
-            + f"; must_read_complete {result.offer['must_read_complete']}, complete "
-            f"{result.offer['complete']}"
+    try:
+        deadline = timeout or rd.DEFAULT_TIMEOUT
+        click.echo(f"probing {preset.name} ({preset.note or 'preset'}) …")
+        pr = rd.probe(
+            preset,
+            atlas_path=Path(atlas),
+            workdir=workdir,
+            timeout=min(deadline, 300),
+            handoff=handoff_out is not None,
         )
-    if handoff_out is not None:
-        held = _handoff_held(result, atlas, run_a, run_b, k, staleness)
-        if held is not None:
-            click.echo(f"hand-off skipped: {held}")
-        else:
-            click.echo(f"writing the findings hand-off with {preset.name} …")
-            ho = rd.run_handoff(
-                preset,
-                atlas_path=Path(atlas),
-                run_pair=run_pair,
-                workdir=workdir,
-                out_file=Path(handoff_out),
-                timeout=deadline,
+        click.echo(
+            f"probe: tmap reached {pr.tmap_reached}, built-in tools blocked {pr.builtin_blocked} — "
+            f"{pr.why}"
+        )
+        if not pr.ok:
+            raise click.ClickException("the probe failed: no unit is handed to this agent")
+        if probe_only:
+            return
+        result = rd.drive(
+            Path(atlas),
+            run_a,
+            run_b,
+            preset,
+            workdir=workdir,
+            k=ru.DEFAULT_K if k is None else k,
+            worker=worker,
+            workers=workers,
+            max_units=max_units,
+            max_minutes=max_minutes,
+            timeout=deadline,
+            retries=rd.DEFAULT_RETRIES if retries is None else retries,
+            pair_staleness=staleness,
+            echo=click.echo,
+            until=until,
+        )
+        click.echo(
+            f"units tried {result.units_tried}, done {result.units_done}, failed "
+            f"{len(result.failed)} — {result.stopped}"
+        )
+        for f in result.failed:
+            click.echo(
+                f"  failed {f['unit_id']} ({f['kind']}): {f['written']}/{f['members']} written"
             )
-            if ho["ok"]:
-                gap = ho.get("nothing_written") or 0
-                click.echo(
-                    f"wrote {ho['out_file']} ({ho['bytes']} bytes, {ho.get('findings')} findings"
-                    + (f"; the agent wrote nothing for {gap} of them)" if gap else ")")
-                )
+        if result.statement:
+            click.echo(result.statement)
+        if result.offer is not None:
+            second = result.offer["second_tier"]
+            click.echo(
+                f"second tier: {second['members']} member(s) in {second['units']} unit(s) not "
+                f"judged (by bucket {second['by_bucket']}, {second['due_recheck']} due a re-check)"
+                + (" — read them with --until complete" if result.offer["continue_with"] else "")
+                + f"; must_read_complete {result.offer['must_read_complete']}, complete "
+                f"{result.offer['complete']}"
+            )
+        if handoff_out is not None:
+            held = _handoff_held(result, atlas, run_a, run_b, k, staleness)
+            if held is not None:
+                click.echo(f"hand-off skipped: {held}")
             else:
-                click.echo(f"hand-off failed: {ho['error']}")
-    if result.failed:
-        raise SystemExit(3)
+                click.echo(f"writing the findings hand-off with {preset.name} …")
+                ho = rd.run_handoff(
+                    preset,
+                    atlas_path=Path(atlas),
+                    run_pair=run_pair,
+                    workdir=workdir,
+                    out_file=Path(handoff_out),
+                    timeout=deadline,
+                )
+                if ho["ok"]:
+                    gap = ho.get("nothing_written") or 0
+                    click.echo(
+                        f"wrote {ho['out_file']} ({ho['bytes']} bytes, "
+                        f"{ho.get('findings')} findings"
+                        + (f"; the agent wrote nothing for {gap} of them)" if gap else ")")
+                    )
+                else:
+                    click.echo(f"hand-off failed: {ho['error']}")
+        if result.failed:
+            raise SystemExit(3)
+    finally:
+        # Every exit leaves nothing behind: the probe-only return, a failed probe, an
+        # interrupt, and the SystemExit a failed unit raises. The directory holds the
+        # generated mcp.json and the probe's marker file, nothing a later run reads.
+        shutil.rmtree(workdir, ignore_errors=True)

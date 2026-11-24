@@ -324,22 +324,33 @@ def run_agent(argv: Sequence[str], *, cwd: Path, timeout: float, keep_full: bool
         text=True,
         start_new_session=True,
     )
-    try:
-        out, _ = proc.communicate(timeout=timeout)
-        return Launch(
-            proc.returncode,
-            time.monotonic() - t0,
-            False,
-            out if keep_full else out[-4000:],
-            final=final_json(out),
-        )
-    except subprocess.TimeoutExpired:
+    def kill_whole_group() -> None:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             proc.kill()
         proc.communicate()
+
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_whole_group()
         return Launch(None, time.monotonic() - t0, True)
+    except BaseException:
+        # An interrupt reaches the driver, never the agent: a new session put the agent outside
+        # the terminal's process group, and cli.interrupts turns SIGTERM / SIGHUP into the same
+        # KeyboardInterrupt. Without this the agent runs on with nothing watching its deadline,
+        # writing judgements onto the overlay the person believes they stopped — and a second
+        # `tmap review run` would hand the same unit to another agent beside it.
+        kill_whole_group()
+        raise
+    return Launch(
+        proc.returncode,
+        time.monotonic() - t0,
+        False,
+        out if keep_full else out[-4000:],
+        final=final_json(out),
+    )
 
 
 def history_mark(atlas: sqlite3.Connection) -> int:

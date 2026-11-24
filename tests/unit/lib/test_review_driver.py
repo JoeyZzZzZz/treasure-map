@@ -10,7 +10,10 @@ Zero real data: the callee-group World of test_callee_groups; the agent is simul
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -25,6 +28,34 @@ from treasure_map.lib import tool_call_log as tcl
 from treasure_map.lib.query import review_units as ru
 
 PRESET = rd.Preset("test", ("agent", "{unit_id}", "{prompt}"), blind_argv=("--deny", "list"))
+
+_SRC = Path(__file__).resolve().parents[3] / "src"
+_FAILED_UNIT = {"unit_id": "u", "kind": "entry", "written": 0, "members": 1}
+
+
+def _pids(marker: str) -> list[str]:
+    out = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True)  # noqa: S603,S607
+    return [p for p in out.stdout.split() if p]
+
+
+def _reap(marker: str) -> list[str]:
+    """Find, kill and return any surviving agent PIDs for ``marker`` (never leave a real leak)."""
+    pids = _pids(marker)
+    for p in pids:
+        try:
+            os.kill(int(p), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+    return pids
+
+
+def _wait_for(cond: Any, seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if cond():
+            return
+        time.sleep(0.05)
+    raise AssertionError("the condition never held")
 
 
 def _units(w: Any) -> dict[str, ru.Unit]:
@@ -434,6 +465,98 @@ def test_a_launch_past_its_deadline_is_killed_whole(tmp_path: Path) -> None:
     assert got.timed_out and got.exit is None and time.monotonic() - t0 < 10
     time.sleep(4)
     assert not marker.exists()
+
+
+def test_the_run_leaves_no_working_directory_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every exit of ``tmap review run`` removes the temporary working directory it made: the
+    --probe return, a failed probe, and a run that ends with a failed unit (SystemExit). It holds
+    only the generated mcp.json and the probe's marker, and before this they piled up one per run
+    — 116 of them in /tmp on the machine the release audit ran on, plus 11 per full test run.
+
+    MUTATION (verified RED, ``1 failed``): drop the finally's rmtree -> three directories are
+    left -> RED."""
+    import tempfile
+
+    from click.testing import CliRunner
+
+    from treasure_map.cli import review_cli
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    class _Conn:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(review_cli, "_open", lambda a, pair: (_Conn(), "runA", "runB", "a.db"))
+    monkeypatch.setattr(ru, "pair_staleness", lambda *a, **k: {"source_stale": False})
+    ok = rd.ProbeResult(True, True, True, "faked")
+    runs: list[tuple[list[str], Any, Any, int]] = [
+        (["--probe"], ok, None, 0),
+        ([], rd.ProbeResult(False, False, True, "no tmap"), None, 1),
+        ([], ok, rd.DriveResult(stopped="s", finished=True, failed=[_FAILED_UNIT]), 3),
+    ]
+    for extra, probe, drive, want_code in runs:
+        monkeypatch.setattr(rd, "probe", lambda *a, **k: probe)  # noqa: B023
+        if drive is not None:
+            monkeypatch.setattr(rd, "drive", lambda *a, **k: drive)  # noqa: B023
+        res = CliRunner().invoke(
+            review_cli.review, ["run", "runA::runB", "--agent", "claude-code", *extra]
+        )
+        assert res.exit_code == want_code, (extra, res.exit_code, res.output)
+        left = sorted(p.name for p in tmp_path.glob("tmap-review-*"))
+        assert left == [], f"{extra or 'a driven run'} left {left}"
+
+
+def test_an_interrupt_of_the_driver_kills_the_agent_it_launched(tmp_path: Path) -> None:
+    """An interrupt reaching the driver takes the launched agent down with it. The agent runs in
+    its OWN session, so a Ctrl-C in the terminal — and the SIGTERM / SIGHUP cli.interrupts turns
+    into the same KeyboardInterrupt — never reaches it; before the group kill it ran on with
+    nothing left watching its deadline, still writing judgements the person believes they stopped.
+
+    The driver is a real child process here, because the claim is about signal delivery. It is
+    signalled with SIGINT and with SIGTERM; after each, no process of the launched agent is left.
+    The marker the survivors are looked up by reaches the driver through the environment, never in
+    its own argv, so what ``pgrep`` matches is the agent alone.
+
+    MUTATION (verified RED, ``1 failed`` each signal): drop run_agent's ``except BaseException``
+    kill -> the sleeper survives -> RED."""
+    marker = f"tmap-test-agent-{os.getpid()}"
+    driver = (
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(_SRC)!r})\n"
+        "from pathlib import Path\n"
+        "from treasure_map.cli.interrupts import install_termination_handlers\n"
+        "from treasure_map.lib import review_driver as rd\n"
+        "install_termination_handlers()\n"
+        "agent = 'import time; time.sleep(600)  # ' + os.environ['TMAP_TEST_MARKER']\n"
+        "print('READY', flush=True)\n"
+        "try:\n"
+        "    rd.run_agent(\n"
+        f"        [sys.executable, '-c', agent], cwd=Path({str(tmp_path)!r}), timeout=600\n"
+        "    )\n"
+        "except KeyboardInterrupt:\n"
+        "    raise SystemExit(130)\n"
+    )
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        proc = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", driver],
+            stdout=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "TMAP_TEST_MARKER": marker},
+        )
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == "READY"
+            _wait_for(lambda: _pids(marker) != [], 10)  # the agent is really running
+            os.kill(proc.pid, sig)
+            assert proc.wait(timeout=20) != 0  # the driver did not swallow the interrupt
+        finally:
+            proc.kill()
+        time.sleep(0.5)  # let SIGKILL propagate before we look
+        left = _reap(marker)
+        assert left == [], f"the agent survived {sig.name}: {left}"
 
 
 def test_the_claude_preset_switches_builtin_tools_off_and_loads_only_tmap() -> None:
