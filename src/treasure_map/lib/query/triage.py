@@ -3090,7 +3090,8 @@ def sort_candidates(
 # The --filter LENS set: the dimensions a user can filter/sort candidates by. This is NOT the
 # authoritative dimension universe -- `source` is deliberately absent (it is an orthogonal
 # param/source axis, not a filterable lens). Anything that must COVER every dimension (a consumer,
-# the layer-2 universe guard) must anchor on _CANONICAL_DIMENSION_NAMES below, never on this set.
+# the dimension-delta universe guard) must anchor on _CANONICAL_DIMENSION_NAMES below, never on
+# this set.
 _DIMENSION_NAMES = frozenset(
     {
         "controllability",

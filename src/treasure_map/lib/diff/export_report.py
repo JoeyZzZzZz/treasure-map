@@ -11,17 +11,17 @@ repairs). Two kinds of function are listed, and both are blind spots of the diff
     contains a basic block entered through a delay-slot instruction. Its flow graph is exported,
     but under the block's first entry, so whatever BinDiff says about it is not reliable.
 
-Layer 0 marks these functions on their presence / alignment rows, and every reader reports them as
-undetermined with reason ``degenerate_block_source`` — never as matched, unmatched, changed or
-unchanged. The two counts that change nothing (explicit entry addresses written where the reader
-would have derived the same value) are recorded on diff_meta only.
+The alignment stage marks these functions on their presence / alignment rows, and every reader
+reports them as undetermined with reason ``degenerate_block_source`` — never as matched,
+unmatched, changed or unchanged. The two counts that change nothing (explicit entry addresses
+written where the reader would have derived the same value) are recorded on diff_meta only.
 
 A third list is NOT a blind spot: ``operand_markup_degraded`` names the functions holding an
 instruction one of whose operands the builder had to write in its default, unmarked form (a
 variable whose storage starts on the stack but does not end there). Instructions, blocks and calls
-are exported as they are; only that operand's text lacks its markup. Layer 0 records the function
-as ``operand_markup_incomplete`` on its rows, an additional fact that changes no state, no bucket
-and no undetermined count.
+are exported as they are; only that operand's text lacks its markup. The alignment stage records
+the function as ``operand_markup_incomplete`` on its rows, an additional fact that changes no
+state, no bucket and no undetermined count.
 """
 
 from __future__ import annotations

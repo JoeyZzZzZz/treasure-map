@@ -162,7 +162,7 @@ def test_comments_and_docstrings_do_not_move_the_hash_and_code_does(tmp_path: Pa
     assert before == cv.code_hash(_PACKAGE, cv.DIFF_CODE_ENTRIES)
     alignment = tmp_path / "lib" / "diff" / "alignment.py"
     text = alignment.read_text(encoding="utf-8")
-    edited = text.replace('"""Layer-0 parse:', '"""Layer-0 parse (reworded):', 1).replace(
+    edited = text.replace('"""Alignment parse:', '"""Alignment parse (reworded):', 1).replace(
         "ALIGN_THRESHOLD = 0.9", "# a comment\nALIGN_THRESHOLD = 0.9  # and another", 1
     )
     assert edited != text

@@ -1,4 +1,4 @@
-"""Candidate-level sink overlay (Layer 0.5).
+"""Candidate-level sink overlay.
 
 On top of BinDiff's function-level alignment, line up the A/B sink candidates of one diff (or of
 every diff between two runs), or mark them honestly as not lined-up. EVIDENCE ONLY: two states
@@ -750,9 +750,10 @@ def _tier1_verdict(cand: _Cand, d: _Dir) -> _Verdict:
         return _P_UNDET, "crossside_match_degraded", "instruction", None, None, None
     other_addr = d.imatch.get(ca)
     if other_addr is None:
-        # No instruction data at all -> the degraded period before layer-0 instruction persistence
-        # was re-run. Data present but not this callsite -> an export gap OR a changed basic block
-        # BinDiff did not pair; this backend cannot tell which, so it names neither.
+        # No instruction data at all -> the degraded period before the alignment stage's
+        # instruction persistence was re-run. Data present but not this callsite -> an export gap
+        # OR a changed basic block BinDiff did not pair; this backend cannot tell which, so it
+        # names neither.
         reason = "instruction_unmatched" if d.imatch_present else "crossside_match_degraded"
         return _P_UNDET, reason, "instruction", None, None, None
     t1 = d.other.t1_at.get(other_addr, [])
@@ -1575,8 +1576,8 @@ def _coclaim_json(r: SinkOverlayRow) -> str | None:
 
 def persist_sink_overlay(atlas: sqlite3.Connection, diff_id: str, *, commit: bool = True) -> int:
     """Compute the overlay for one diff and write it to dimension_delta as subject_kind='candidate'
-    rows (the durable baseline). Replace-by-diff scoped to 'candidate' so a layer-2 edge refresh is
-    untouched and vice versa. Returns the row count.
+    rows (the durable baseline). Replace-by-diff scoped to 'candidate' so a dimension-delta edge
+    refresh is untouched and vice versa. Returns the row count.
 
     REFUSED (SinkOverlayBaselineError, nothing written) when either run's ``hunt_commit`` is absent
     or ``unknown`` — the generation stamps could never be checked against a later hunt — or when the

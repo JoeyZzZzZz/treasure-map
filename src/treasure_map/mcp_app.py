@@ -4111,7 +4111,7 @@ def make_tools(
         reason: str | None = None,
         side: str | None = None,
     ) -> dict[str, Any]:
-        """Candidate-level SINK OVERLAY (Layer 0.5): line up the A/B sink candidates and report an
+        """Candidate-level SINK OVERLAY: line up the A/B sink candidates and report an
         honest ``presence`` per candidate — two states plus undetermined: ``persisted`` /
         ``presence_undetermined``. EVIDENCE ONLY, never a fix-status verdict. A whole function with
         no counterpart is ``presence_undetermined`` / ``function_unmatched`` — NOT evidence of a

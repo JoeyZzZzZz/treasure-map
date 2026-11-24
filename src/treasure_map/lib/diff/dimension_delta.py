@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Layer-2 dimension delta: PROJECT two already-computed layer annotations into a per-dimension,
+"""Dimension delta: PROJECT two already-computed layer annotations into a per-dimension,
 per-subject difference. It ONLY projects; it never re-analyzes and never judges quality.
 
 Every row says "this annotation differs / is unchanged / is undetermined" for one subject between
@@ -10,7 +10,7 @@ unresolved is ``delta_undetermined`` (never collapsed into unchanged). ``state_a
 carried as OPAQUE evidence and compared ONLY for existence/equality -- never branched on by content
 (that would make this a second verdict engine).
 
-Layer-2a implements the one function-level dimension that is computable today
+This stage implements the one function-level dimension that is computable today
 (``reachability.string_keyed_edge``); candidate-level dimensions are gated on candidate alignment
 (a later layer) and appear here as ``delta_supported=0`` capability rows, never silently absent.
 """
@@ -33,7 +33,7 @@ from treasure_map.lib.diff.alignment import (
 )
 from treasure_map.lib.diff.export_report import DEGENERATE_BLOCK_SOURCE, load_export_gaps
 
-# ── the layer-2 DELTA-capability declaration (a property of THIS code version, NOT of a run) ──
+# ── the DELTA-capability declaration (a property of THIS code version, NOT of a run) ────
 # What this layer version can (or explicitly cannot yet) delta. This is legitimately code-declared:
 # a delta needs a handler, and having a handler is a fact about the code, not a hardcoded slice of
 # the open-ended ANALYSIS sub-dimension namespace (that comes from run_capability, never hardcoded).
@@ -59,9 +59,9 @@ DECLARED_DELTA_DIMENSIONS: tuple[DimensionSpec, ...] = (
     # gated on candidate-level alignment (a later layer) -> visible here as delta_supported=0
     DimensionSpec("controllability", delta_supported=False, always_present=True),
     # `source` (the orthogonal param/source axis) is the SAME class as the candidate dims here. It
-    # was silently absent from the layer-2 universe -- the exact gap-by-absence this layer kills --
-    # because the coverage guard's anchor was the 7-name --filter set, which omits it. Declared
-    # delta_supported=0 so it is VISIBLE (a capability row), never absent-by-omission.
+    # was silently absent from the dimension-delta universe -- the exact gap-by-absence this layer
+    # kills -- because the coverage guard's anchor was the 7-name --filter set, which omits it.
+    # Declared delta_supported=0 so it is VISIBLE (a capability row), never absent-by-omission.
     DimensionSpec("source", delta_supported=False, always_present=True),
     DimensionSpec("filtering", delta_supported=False, always_present=True),
     DimensionSpec("source_writability", delta_supported=False, always_present=True),
@@ -75,8 +75,8 @@ DECLARED_DELTA_DIMENSIONS: tuple[DimensionSpec, ...] = (
 )
 
 
-# subjects whose function-anchor alignment is low-confidence: the layer-0 state that means "aligned,
-# but do not trust the pairing" (mirrors function_alignment.alignment_state).
+# subjects whose function-anchor alignment is low-confidence: the alignment-stage state that means
+# "aligned, but do not trust the pairing" (mirrors function_alignment.alignment_state).
 _LOW_CONF_STATE = "alignment_undetermined"
 
 
@@ -93,7 +93,7 @@ def _analysis_capability(atlas: sqlite3.Connection, run_id: str, dimension: str)
     return "present" if row[0] == 1 else "declared_absent"
 
 
-# ── string_keyed_edge delta (the layer-2a handler) ──────────────────────────────────────────
+# ── string_keyed_edge delta (this stage's handler) ──────────────────────────────────────────
 
 _EDGE_COLS = (
     "binary, from_function, from_func_addr, key, mechanism, callee_name, callee_addr, "
@@ -613,11 +613,11 @@ def run_dimension_delta(
 
     ★ Iron law 6 (version skew): edge dimensions cannot be recomputed at diff time, so under a
     version skew they are degraded to version_skew undetermined (see _version_skew_rows). ``skew``
-    is read from diff_meta (layer-0 computes it from tool_version, NOT firmware hash); a MISSING /
-    unreadable diff_meta row is treated AS a skew (cannot-confirm-same-version != confirmed-same,
-    empty != absent on the version axis). BOUNDARY: version_skew only compares the ANALYSIS-TOOL
-    version -- it does NOT catch a detector-logic change within one tool_version, nor build-side
-    compiler/inlining skew between the two firmware; not all comparability risk."""
+    is read from diff_meta (the alignment stage computes it from tool_version, NOT firmware hash);
+    a MISSING / unreadable diff_meta row is treated AS a skew (cannot-confirm-same-version !=
+    confirmed-same, empty != absent on the version axis). BOUNDARY: version_skew only compares the
+    ANALYSIS-TOOL version -- it does NOT catch a detector-logic change within one tool_version, nor
+    build-side compiler/inlining skew between the two firmware; not all comparability risk."""
     meta_row = atlas.execute(
         "SELECT version_skew, binary_a, binary_b FROM diff_meta WHERE diff_id = ?", (diff_id,)
     ).fetchone()
@@ -681,8 +681,9 @@ def run_dimension_delta(
         for r in delta_rows
     ]
 
-    # Scope the refresh to this producer's own rows: layer-2 owns 'edge' (and capability state);
-    # The sink overlay's 'candidate' rows live in the same table and must survive a layer-2 re-run.
+    # Scope the refresh to this producer's own rows: the dimension delta owns 'edge' (and
+    # capability state); The sink overlay's 'candidate' rows live in the same table and must
+    # survive a dimension-delta re-run.
     delete_dimension_delta(atlas, diff_id, subject_kind="edge", commit=False)
     add_dimension_capability_states(atlas, cap_rows, commit=False)
     add_dimension_deltas(atlas, delta_rows, commit=False)

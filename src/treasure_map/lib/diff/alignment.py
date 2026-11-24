@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Layer-0 parse: a ``.BinDiff`` SQLite -> the atlas function-alignment substrate.
+"""Alignment parse: a ``.BinDiff`` SQLite -> the atlas function-alignment substrate.
 
 This layer ONLY aligns; it never judges semantics. Every ``function_alignment`` row is the
 deterministic fact "BinDiff matched these two addresses", NEVER "this function changed / did not
@@ -1213,8 +1213,9 @@ def run_alignment(
         run_a_id=run_a_id,
         run_b_id=run_b_id,
         # the diff's target binary per side, normalized to the short name AT WRITE TIME so the
-        # layer-2 per-binary filter matches (a caller-supplied sha256 would zero-match there). Same
-        # value that forms the diff_id's binary segment above (consistent by construction).
+        # dimension-delta per-binary filter matches (a caller-supplied sha256 would zero-match
+        # there). Same value that forms the diff_id's binary segment above (consistent by
+        # construction).
         binary_a=norm_a,
         binary_b=norm_b,
         # The PATH of the file actually diffed on each side. binary_a/binary_b hold the short name,
@@ -1248,9 +1249,10 @@ def run_alignment(
         presence_computed_a=1,
         presence_computed_b=1,
         # A successful parse: diff_ok=1 / status='ok'. This row is written with commit=False in the
-        # real pipeline, so it only reaches disk when layer-2 also commits -- a layer-2 failure
-        # rolls the whole transaction back, leaving NO ok=1 residue (the driver's failure path then
-        # writes the honest failed row). attempts continues/reset by content identity (sha).
+        # real pipeline, so it only reaches disk when the dimension delta also commits -- a
+        # dimension-delta failure rolls the whole transaction back, leaving NO ok=1 residue (the
+        # driver's failure path then writes the honest failed row). attempts continues/reset by
+        # content identity (sha).
         diff_ok=1,
         diff_status="ok",
         diff_status_reason=None,

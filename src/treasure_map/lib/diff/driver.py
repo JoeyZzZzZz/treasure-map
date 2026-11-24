@@ -292,11 +292,12 @@ def _record_diff_failure(
     (attempts, reason).
 
     diff's write model differs from scan's (add_diff_meta is a pure INSERT keyed on a PRIMARY KEY
-    diff_id, and one diff spans an uncommitted layer-0 INSERT + a layer-2 commit), so "also write a
-    failed row" cannot be a bare INSERT: a layer-2 failure would leave layer-0's uncommitted row to
-    conflict, and a retry would hit the prior failed row's PK. The safe order is:
+    diff_id, and one diff spans an uncommitted alignment INSERT + a dimension-delta commit), so
+    "also write a failed row" cannot be a bare INSERT: a dimension-delta failure would leave
+    alignment's uncommitted row to conflict, and a retry would hit the prior failed row's PK. The
+    safe order is:
 
-        rollback  -> discard any uncommitted layer-0 residue (no ok=1 row leaks through)
+        rollback  -> discard any uncommitted alignment residue (no ok=1 row leaks through)
         next_attempts (read the prior row BEFORE deleting it)
         delete_diff(commit=False)  -> clear a prior committed failed row (else the INSERT conflicts)
         add_diff_meta(failed row, commit=False)  -> now the INSERT cannot conflict
@@ -313,7 +314,7 @@ def _record_diff_failure(
     or a single-binary re-run). If it had a stored candidate baseline, that baseline goes with it;
     the failed row then says so (``baseline_dropped=1``) rather than leaving the loss silent, and
     keeps saying so through further failures until a successful re-diff stores it again."""
-    atlas.rollback()  # ① drop layer-0's uncommitted diff_meta/alignment residue, if any
+    atlas.rollback()  # ① drop the alignment stage's uncommitted diff_meta/alignment residue, if any
     sha_a, sha_b = _current_shas(atlas, run_a_id, run_b_id, binary_short)
     stamps = _failure_stamps(atlas, run_a_id, run_b_id, binary_short, sha_a, sha_b, toolchain)
     attempts = _next_attempts(atlas, diff_id, sha_a, sha_b, stamps)  # read prior BEFORE delete
@@ -1071,9 +1072,9 @@ def _persist_success(
     (alignment) and project the deltas (dimension_delta), as ONE atomic write. The call-site facts
     for the chosen instruction pairs are written in the same transaction
     (``targets_a``/``targets_b``: the BinExport call targets decoded in the compute phase, None when
-    not decoded). A layer-2 failure is recorded as an atomic blind-spot row (rollback -> no dirty
-    ok=1 residue) and re-raised — the exact retry-status logic, unchanged, just moved out of the
-    fused pipeline so it runs on the main thread after compute.
+    not decoded). A dimension-delta failure is recorded as an atomic blind-spot row (rollback -> no
+    dirty ok=1 residue) and re-raised — the exact retry-status logic, unchanged, just moved out of
+    the fused pipeline so it runs on the main thread after compute.
 
     ★ The transaction is opened with BEGIN IMMEDIATE, before anything is read: the input stamps
     (lib/diff/currency) and the hunt output the diff consumes are then read under the write lock,
@@ -1110,7 +1111,7 @@ def _persist_success(
         # Sink-overlay cross-side bridge: store this diff's candidate-callsite instruction matches
         # (either side's candidates) while the .BinDiff is still on disk (the caller rmtrees the
         # temp dir only after this returns), AFTER run_alignment's delete_diff cleared any prior
-        # rows; one txn with layer-2's commit.
+        # rows; one txn with the dimension delta's commit.
         persist_instruction_matches(
             atlas,
             bindiff_path=bindiff_path,
@@ -1544,9 +1545,9 @@ def _persist_outcome(
     """The serial persist step for ONE binary's compute result -> its outcome. Main thread only.
 
     Success -> both layers write (an atomic transaction) + a recovered flag if it entered failed.
-    Compute failure OR a persist (layer-2) failure -> the retry-status atomic blind-spot write
-    (rollback -> delete -> insert -> commit), so every binary is its own independent transaction
-    even under parallel compute — one binary's failure never corrupts another's row."""
+    Compute failure OR a persist (dimension-delta) failure -> the retry-status atomic blind-spot
+    write (rollback -> delete -> insert -> commit), so every binary is its own independent
+    transaction even under parallel compute — one binary's failure never corrupts another's row."""
     if compute_exc is not None:
         _record_diff_failure(
             atlas,

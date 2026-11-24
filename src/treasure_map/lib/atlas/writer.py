@@ -300,7 +300,7 @@ def delete_run_capabilities(conn: sqlite3.Connection, run_id: str, *, commit: bo
 
 def delete_diff(conn: sqlite3.Connection, diff_id: str, *, commit: bool = True) -> None:
     """Delete every row of one diff (replace-by-diff refresh) so a re-parse is idempotent — touches
-    ONLY this diff_id across the layer-0 and layer-2 diff tables."""
+    ONLY this diff_id across the alignment and the dimension-delta diff tables."""
     conn.execute("DELETE FROM function_alignment WHERE diff_id = ?", (diff_id,))
     conn.execute("DELETE FROM function_presence WHERE diff_id = ?", (diff_id,))
     conn.execute("DELETE FROM instruction_match WHERE diff_id = ?", (diff_id,))
@@ -314,20 +314,22 @@ def delete_diff(conn: sqlite3.Connection, diff_id: str, *, commit: bool = True) 
 def delete_dimension_delta(
     conn: sqlite3.Connection, diff_id: str, *, subject_kind: str | None = None, commit: bool = True
 ) -> None:
-    """Delete a diff's layer-2/sink-overlay rows (replace-by-diff refresh for a re-run without
-    touching the layer-0 alignment) — touches ONLY this diff_id.
+    """Delete a diff's dimension-delta / sink-overlay rows (replace-by-diff refresh for a re-run
+    without touching the alignment rows) — touches ONLY this diff_id.
 
     ``subject_kind`` scopes the delete so the two producers never clobber each other's rows:
-    layer-2 passes ``'edge'`` (and still owns dimension_capability_state), the sink overlay passes
-    ``'candidate'`` (and must NOT delete capability state, which is layer-2's). ``None`` wipes every
-    subject_kind for a full layer-2 + sink-overlay refresh."""
+    the dimension delta passes ``'edge'`` (and still owns dimension_capability_state), the sink
+    overlay passes ``'candidate'`` (and must NOT delete capability state, which is the dimension
+    delta's). ``None`` wipes every subject_kind for a full dimension-delta + sink-overlay
+    refresh."""
     sql = "DELETE FROM dimension_delta WHERE diff_id = ?"
     params: list[str] = [diff_id]
     if subject_kind is not None:
         sql += " AND subject_kind = ?"
         params.append(subject_kind)
     conn.execute(sql, params)
-    # dimension_capability_state is layer-2's (edge) domain; a candidate-scoped refresh leaves it.
+    # dimension_capability_state is the dimension delta's (edge) domain; a candidate-scoped
+    # refresh leaves it.
     if subject_kind in (None, "edge"):
         conn.execute("DELETE FROM dimension_capability_state WHERE diff_id = ?", (diff_id,))
     if commit:
@@ -394,7 +396,7 @@ def add_instruction_matches(
     """Insert instruction_match rows (A<->B candidate-callsite address pairs) in one batch; return
     the count. The pair is BinDiff's positional match; the per-side call-site facts are written
     afterwards by ``set_instruction_match_facts`` (see the instruction_match comment in the schema).
-    commit=False joins the caller's txn (layer-0 persist)."""
+    commit=False joins the caller's txn (the alignment persist)."""
     if not rows:
         return 0
     conn.executemany(
@@ -789,8 +791,9 @@ def delete_run_pair_diffs(
     conn: sqlite3.Connection, run_a_id: str, run_b_id: str, *, commit: bool = True
 ) -> int:
     """Delete every diff_meta row recorded for (run_a_id, run_b_id) — the leftover whole-run-pair
-    row (diff_id == 'a::b') included — through delete_diff, so each diff's layer-0 and layer-2 rows
-    go with it. Returns the number of diff ids deleted. commit=False joins the caller's txn."""
+    row (diff_id == 'a::b') included — through delete_diff, so each diff's alignment and
+    dimension-delta rows go with it. Returns the number of diff ids deleted. commit=False joins
+    the caller's txn."""
     diff_ids = [
         r[0]
         for r in conn.execute(

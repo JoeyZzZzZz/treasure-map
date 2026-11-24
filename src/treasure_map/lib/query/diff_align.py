@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Read-only query face over the layer-0 (alignment) and layer-2 (dimension-delta) diff tables.
+"""Read-only query face over the alignment and the dimension-delta diff tables.
 
 The 80%-case alignment workflow: "I found something at A-side address X -- did B patch it?" So a
 single-side address (or a function name, which may match several functions -- all listed, none
@@ -10,11 +10,12 @@ honest ``alignment_state`` -- never only the thresholded state (a continuous qua
 collapse to a binary one). Names ride along as a pairing SANITY signal a consumer reads, never a
 verdict the tool draws.
 
-The layer-2 read face (``get_diff_deltas`` / ``get_diff_meta`` / ``get_diff_capabilities``) surfaces
-the tri-state dimension deltas, the diff's meta facts, and the per-dimension capability state. Every
-one is READ-ONLY and takes the atlas connection EXPLICITLY (no ambient/default-atlas fallback), only
-ever emits facts, and NEVER a change/quality verdict -- a delta is a projection of existing
-annotations, an ``layer_changed`` is not 'this matters', and an empty result is not 'no changes'.
+The dimension-delta read face (``get_diff_deltas`` / ``get_diff_meta`` /
+``get_diff_capabilities``) surfaces the tri-state dimension deltas, the diff's meta facts, and the
+per-dimension capability state. Every one is READ-ONLY and takes the atlas connection EXPLICITLY
+(no ambient/default-atlas fallback), only ever emits facts, and NEVER a change/quality verdict --
+a delta is a projection of existing annotations, an ``layer_changed`` is not 'this matters', and
+an empty result is not 'no changes'.
 """
 
 from __future__ import annotations
@@ -565,7 +566,7 @@ def align_by_function(
     }
 
 
-# ── layer-2 read face: dimension deltas / meta / capabilities (READ-ONLY, facts only) ───
+# ── dimension-delta read face: dimension deltas / meta / capabilities (READ-ONLY, facts only) ─
 
 _DELTA_NOTE = (
     "Each row is a PROJECTION of two already-computed annotations, NOT a change/quality verdict. "

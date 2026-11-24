@@ -857,6 +857,8 @@ RENAMES = (
     ("When ``func`` resolves", "When ``function`` resolves"),
     ("func = a name OR an address", "function = a name OR an address"),
     ("When func is given", "When function is given"),
+    # the diff stages are named after what they do now, not "layer 0" / "layer 2"
+    ("SINK OVERLAY (Layer 0.5)", "SINK OVERLAY"),
 )
 # Sentences rewritten on purpose, each with why.
 REPLACED = {
@@ -1044,7 +1046,8 @@ def test_the_full_reference_keeps_every_sentence_the_docstrings_had(atlas: Path)
     renames_used += sum(_norm(frozen["instructions"]).count(_norm(old)) for old, _ in RENAMES)
     for sentence in _sentences(_renamed(frozen["instructions"])):
         assert sentence in guide, sentence
-    assert renames_used == 7  # 5 docstrings (one of them then replaced) + 2 in the guide
+    assert renames_used == 8  # 5 docstrings (one of them then replaced) + 2 in the guide
+    #                           + the sink overlay's dropped layer number
     for name, why in ((n, w) for d in REPLACED.values() for n, w in d.items()):
         assert why.strip(), name
 

@@ -481,7 +481,7 @@ CREATE INDEX IF NOT EXISTS idx_instance_run     ON instance(source_run_id);
 -- was a full scan of the instance table, so the listing slowed with every annotation recorded.
 CREATE INDEX IF NOT EXISTS idx_instance_evref  ON instance(evidence_ref);
 
--- ── layer-0 diff: function_alignment ─────────────────────────────────────────
+-- ── alignment: function_alignment ────────────────────────────────────────────
 -- One BinDiff-matched function pair (A-side <-> B-side), parsed from a .BinDiff
 -- SQLite. It is the substrate a version comparison aligns candidates on.
 --
@@ -525,7 +525,7 @@ CREATE INDEX IF NOT EXISTS idx_falign_diff ON function_alignment(diff_id);
 CREATE INDEX IF NOT EXISTS idx_falign_a    ON function_alignment(diff_id, addr_a);
 CREATE INDEX IF NOT EXISTS idx_falign_b    ON function_alignment(diff_id, addr_b);
 
--- ── layer-0 diff: function_presence ──────────────────────────────────────────
+-- ── alignment: function_presence ─────────────────────────────────────────────
 -- Per-side functions that are IN this run's function inventory but did NOT end
 -- up in a matched pair. Exists so the ABSENCE of a function from
 -- function_alignment is never the only way a consumer learns of it: an unmatched
@@ -585,7 +585,7 @@ CREATE TABLE IF NOT EXISTS function_presence (
 );
 CREATE INDEX IF NOT EXISTS idx_fpres ON function_presence(diff_id, side);
 
--- ── layer-0 diff: instruction_match (sink-overlay cross-side callsite bridge) ─
+-- ── alignment: instruction_match (sink-overlay cross-side callsite bridge) ────
 -- BinDiff's instruction table is PURELY positional: it pairs matched instruction addresses
 -- (address1 <-> address2) and carries NO mnemonic / operand / callee. So this table stores only
 -- the address pair, scoped by the containing A-side function, and ONLY for pairs where the A or
@@ -616,7 +616,7 @@ CREATE TABLE IF NOT EXISTS instruction_match (
 );
 CREATE INDEX IF NOT EXISTS idx_imatch_diff ON instruction_match(diff_id);
 
--- ── layer-0 diff: diff_meta ──────────────────────────────────────────────────
+-- ── alignment: diff_meta ─────────────────────────────────────────────────────
 -- One row per A-vs-B comparison: which runs, their analysis-tool versions, the
 -- honest coverage counts that turn the existence blind spot from invisible into
 -- quantifiable, and the version_skew flag.
@@ -754,7 +754,7 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- ── layer-2 diff: dimension_delta ────────────────────────────────────────────
+-- ── dimension delta: dimension_delta ─────────────────────────────────────────
 -- One dimension's difference for one subject between two runs. A row is a
 -- PROJECTION of two already-computed layer annotations, NEVER a fresh analysis
 -- and NEVER a quality judgement: this layer says "this annotation differs",
@@ -805,7 +805,7 @@ CREATE TABLE IF NOT EXISTS dimension_delta (
     capability_ref       TEXT,            -- the dimension, when scope='capability'
     alignment_confidence REAL,            -- carried when the delta relied on a function alignment
     -- ── sink-overlay candidate-level columns (subject_kind='candidate') ───────────────────────────────
-    -- All NULL for layer-2 edge rows. `presence` (two states plus undetermined) is the
+    -- All NULL for dimension-delta edge rows. `presence` (two states plus undetermined) is the
     -- authoritative candidate result; `delta_kind` above is only its CHECK-compatible projection
     -- (persisted -> layer_unchanged, presence_undetermined -> delta_undetermined), so existing
     -- delta_kind consumers keep working while the honest result lives here.
@@ -836,7 +836,7 @@ CREATE INDEX IF NOT EXISTS idx_dimdelta_dim  ON dimension_delta(diff_id, dimensi
 CREATE INDEX IF NOT EXISTS idx_dimdelta_kind ON dimension_delta(diff_id, delta_kind);
 CREATE INDEX IF NOT EXISTS idx_dimdelta_bin  ON dimension_delta(diff_id, binary);
 
--- ── layer-2 diff: dimension_capability_state ─────────────────────────────────
+-- ── dimension delta: dimension_capability_state ──────────────────────────────
 -- Per-dimension capability state on BOTH sides, recorded explicitly so a
 -- dimension neither side can delta is VISIBLE as a declared gap, never invisible
 -- by absence. TWO ORTHOGONAL facts:
@@ -862,7 +862,7 @@ CREATE TABLE IF NOT EXISTS dimension_capability_state (
     UNIQUE(diff_id, dimension)
 );
 
--- ── layer-2 diff: dimension_delta_full (visibility view) ─────────────────────
+-- ── dimension delta: dimension_delta_full (visibility view) ──────────────────
 -- The base dimension_delta stays honest: it writes NO per-subject placeholder
 -- rows for a dimension it never examined a subject of (that would fake "checked
 -- every subject, all undetermined"). But a consumer scanning only dimension_delta
