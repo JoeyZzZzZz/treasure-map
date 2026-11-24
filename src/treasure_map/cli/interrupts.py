@@ -17,8 +17,17 @@ starts children that way) is such a process. Taking SIGINT back would override a
 parent set on purpose, which is the one thing a child is asked not to do; the cost of not taking
 it is small, because an ignored SIGINT does not kill the process half-way — it does nothing at
 all, and whatever the command was supervising stays supervised. **Signal such a run with
-SIGTERM**: those two are rewritten unconditionally, so every guarantee that rests on an interrupt
-(``review run`` killing the agent it launched, a scan killing its JVMs) holds on that route.
+SIGTERM**: no standard tool hands a child an ignored SIGTERM, so that one is installed, and every
+guarantee that rests on an interrupt (``review run`` killing the agent it launched, a scan killing
+its JVMs) holds on that route.
+
+That same rule binds the two signals that ARE installed here, because it is a rule about ignores
+and not about SIGINT: one already set to ``SIG_IGN`` when the command starts is left alone. The
+whole mechanism of ``nohup`` is to set SIGHUP to ``SIG_IGN`` before it execs, so without the
+exception ``nohup tmap scan … &`` plus a closed terminal would end hours of Ghidra time with 129 —
+exactly the outcome nohup was reached for to prevent. A hangup nobody ignored is still routed into
+the cleanup, and ``restore_default_termination`` gives back only what was installed, so no ignore
+is undone by the back door either.
 
 The exit code follows the shell convention, 128 + the signal number: 130 for Ctrl-C, 143 for
 SIGTERM, 129 for SIGHUP.
@@ -35,6 +44,7 @@ _HANDLED: tuple[int, ...] = tuple(
     s for s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if s is not None
 )
 _INTERRUPT_EXITS = frozenset(128 + s for s in (signal.SIGINT, *_HANDLED))
+_INSTALLED: set[int] = set()  # the ones install actually took over, for restore to give back
 _received: int | None = None
 
 
@@ -47,19 +57,25 @@ def _to_interrupt(signum: int, _frame: FrameType | None) -> None:
 
 
 def install_termination_handlers() -> None:
-    """Route SIGTERM / SIGHUP into ``KeyboardInterrupt`` for the rest of this process."""
+    """Route SIGTERM / SIGHUP into ``KeyboardInterrupt`` for the rest of this process, except one
+    the parent already set to ``SIG_IGN`` (that ignore is deliberate: see the module docstring)."""
     for sig in _HANDLED:
         try:
+            if signal.getsignal(sig) is signal.SIG_IGN:
+                continue  # the parent ignored it on purpose: nohup does exactly this to SIGHUP
             signal.signal(sig, _to_interrupt)
         except (ValueError, OSError):  # not the main thread, or the platform refuses it
-            pass
+            continue
+        _INSTALLED.add(sig)
 
 
 def restore_default_termination() -> None:
-    """Give SIGTERM / SIGHUP back their default action (for a server its client stops)."""
-    for sig in _HANDLED:
+    """Give back the default action of the signals install actually took over (for a server its
+    client stops). A signal left ignored was never taken over, and handing IT the default action
+    would undo the parent's ignore by the back door, so it stays untouched."""
+    while _INSTALLED:
         try:
-            signal.signal(sig, signal.SIG_DFL)
+            signal.signal(_INSTALLED.pop(), signal.SIG_DFL)
         except (ValueError, OSError):
             pass
 
