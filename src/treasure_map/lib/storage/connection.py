@@ -9,7 +9,7 @@ _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 # Columns dropped by R-cleanup (LLM pre-judgment / dead placeholder fields). Each
 # entry is (table, column, index_on_that_column_or_None). The schema no longer
-# creates these; the migration removes them from databases built before this round.
+# creates these; the migration removes them from a database built while they did.
 # Idempotent: a column already absent is skipped, DROP INDEX/TABLE use IF EXISTS.
 _DROPPED_COLUMNS: tuple[tuple[str, str, str | None], ...] = (
     ("functions", "summary", "idx_functions_summary"),
@@ -127,8 +127,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("binaries", "promote_residual_ranges_truncated", "INTEGER"),
     ("functions", "decompile_error", "TEXT"),
     ("functions", "origin", "TEXT"),
-    # W11: executable bytes Ghidra never disassembled (undefined ranges >= 16 B + their total), and
-    # W14: pointer-reached recovery counts and its two guards. Back-fill NULL on older DBs: not
+    # The executable bytes Ghidra never disassembled (undefined ranges >= 16 B + their total),
+    # and the pointer-reached recovery counts with its two guards. Back-fill NULL on older DBs: not
     # recorded until a re-scan — never 0. Must match schema.sql.
     ("binaries", "promote_undefined_ranges", "TEXT"),
     ("binaries", "promote_undefined_ranges_truncated", "INTEGER"),
@@ -138,13 +138,14 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("binaries", "promote_recover_seeds", "INTEGER"),
     ("binaries", "promote_recover_lost_bytes", "INTEGER"),
     ("binaries", "promote_recover_noreturn_flips", "INTEGER"),
-    # W14 seeds refused because their bytes read as a C string, and the isolated re-run that still
+    # Recovery seeds refused because their bytes read as a C string, and the isolated re-run that
+    # still
     # left decompiles unfinished (pass, Ghidra, budget). Back-fill NULL on older DBs: not recorded
     # until a re-scan — never 0, and no re-run is skipped on it. Must match schema.sql.
     ("binaries", "promote_recover_rejected_string", "INTEGER"),
     ("binaries", "decompile_rerun", "TEXT"),
-    # W13: does stub_names cover every stub (1/0; NULL = no resolution), and the stub regions. W12:
-    # the thunks the export skipped. Back-fill NULL on older DBs (not determined until a re-scan —
+    # Does stub_names cover every stub (1/0; NULL = no resolution), the stub regions, and the
+    # thunks the export skipped. Back-fill NULL on older DBs (not determined until a re-scan —
     # NOT "no stubs"/"no thunks"). Must match schema.sql.
     ("binaries", "stub_table_complete", "INTEGER"),
     ("binaries", "stub_regions", "TEXT"),

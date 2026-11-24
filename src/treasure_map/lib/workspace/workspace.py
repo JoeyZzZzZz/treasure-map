@@ -19,9 +19,8 @@ class Workspace:
     """One analysis run's directory: the folder that holds its ``analysis.db``.
 
     A context manager so a run can ``with Workspace(path):`` and have the directory provisioned.
-    It no longer keeps a step-checkpoint database (``state.db``): a scan's resume is decided by
-    the per-binary pass_version in analysis.db, and the checkpoint table was only ever read by its
-    own tests.
+    The directory holds no checkpoint of its own: a scan's resume is decided by the per-binary
+    pass_version in analysis.db.
 
     Entering it takes an exclusive lock on the workspace, held until exit: two scans writing one
     analysis.db at once would each re-key the other's rows. A second scan of the same workspace is

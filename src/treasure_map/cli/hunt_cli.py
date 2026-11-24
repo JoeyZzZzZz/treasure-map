@@ -132,7 +132,7 @@ def _safe_string_delta(atlas: Any, diff_id: str) -> dict[str, Any]:
 
 
 def _string_line(sd: dict[str, Any]) -> str:
-    """How many string literals one side of the diff holds and the other does not (D25). A side
+    """How many string literals one side of the diff holds and the other does not. A side
     that could not be read prints no counts — the other side's whole list would read as one-sided;
     a truncated or unknown side keeps the counts but says they are unconfirmed. The caller names
     the line ("strings")."""
@@ -1259,7 +1259,7 @@ def _render_triage(
         if c.nvram_source_key:
             loc += f"   nvram_source_key={c.nvram_source_key}"
         # the orthogonal source=param signal (analyzer external_input) — surfaced here so the human
-        # list carries it too, not only the MCP compact row / explain (contract C6 guardrail 2).
+        # list carries it too, not only the MCP compact row / explain.
         if c.dim("source").value == "param":
             loc += "   source=param"
         click.echo(loc)
@@ -2425,9 +2425,10 @@ def scan(
         resolved_atlas = atlas_path if atlas_path is not None else cfg.atlas.db_path
 
         # Read-only overwrite check, before the atlas is opened for writing and before any Ghidra:
-        # confirm when this run id already records OTHER firmware (S1), or the workspace already
-        # holds a scan of other firmware (S2). A missing atlas is neither opened nor created — an
-        # unreadable one just skips S1. (A same-firmware re-scan and `tmap rescan` match and pass.)
+        # confirm when this run id already records OTHER firmware, or the workspace already
+        # holds a scan of other firmware. A missing atlas is neither opened nor created — an
+        # unreadable one just skips the run-id check. (A same-firmware re-scan and `tmap rescan`
+        # match and pass.)
         import sqlite3
 
         from treasure_map.cli.analyze_cli import confirm_overwrite

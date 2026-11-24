@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS instance (
                                           --   auto-filled from the source build so a candidate stays
                                           --   locatable when analysis.db is gone. REDACT ON EXPORT.
     binary_content_hash TEXT,             -- content hash of that binary (content-identity); auto-filled,
-                                          --   stored only this round (no metric consumes it yet). REDACT ON EXPORT.
+                                          --   stored, with no metric consuming it. REDACT ON EXPORT.
     -- Neutral STRUCTURAL fact: the function is a thin wrapper forwarding a parameter to a shell
     --   command sink, and which sink it forwards to. Recorded for a later analysis layer; NO
     --   recall/downweight/triage path reads these (a fact, not a verdict or a score input).

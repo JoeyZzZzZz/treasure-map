@@ -619,8 +619,9 @@ def _wrapper_key(c: _Call) -> str:
 
 def _group_counts(members: list[_Call], states: dict[str, _State]) -> dict[str, Any]:
     """Where a group's members landed, tallied from the view: per landing and subclass, those not
-    listed, those whose pair changed, and the unreadable ones by reason. The one place S5's group
-    object and S6's freshness snapshot both read these, so a group and the snapshot a judgement is
+    listed, those whose pair changed, and the unreadable ones by reason. The one place the group
+    object and the group-freshness snapshot both read these, so a group and the snapshot a
+    judgement is
     re-checked against can never disagree on the count."""
     by_landing: dict[str, Counter[str]] = {}
     unreadable: Counter[str] = Counter()

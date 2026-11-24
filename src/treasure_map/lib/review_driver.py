@@ -658,7 +658,7 @@ def drive(
     return out
 
 
-# ── the findings hand-off launch (B-5) ──────────────────────────────────────────────────────────
+# ── the findings hand-off launch ────────────────────────────────────────────────────────────────
 # A FINAL launch, run once the review is done (no unit left): one agent reads the whole findings
 # skeleton through the MCP tool get_diff_handoff and prints, as its final message, only its two
 # analysis texts per finding — a JSON object listing the findings, each naming its anchor_ref, held
@@ -675,7 +675,7 @@ HANDOFF_FIELDS = ("hypotheses", "device_checks")
 
 
 def handoff_prompt(run_pair: str) -> str:
-    """The hand-off agent's prompt (B-7): read the skeleton, write hypotheses and device checks per
+    """The hand-off agent's prompt: read the skeleton, write hypotheses and device checks per
     finding as one JSON object — and the boundary, never a working attack."""
     return (
         f"You are writing the findings hand-off for the firmware version diff {run_pair} with the "
@@ -767,7 +767,7 @@ def extract_handoff(
     prints ``--output-format json``: the launch must have exited 0 and its JSON say ``is_error``
     false and ``subtype`` "success"; its ``result`` (the agent's final message) is then read by
     parse_handoff_analysis. Other presets print it differently and are not supported this version
-    (B-5) — refused, never a silent miss."""
+    — refused, never a silent miss."""
     if preset.name not in HANDOFF_PRESETS:
         return None, (
             f"the hand-off reads the agent's analysis from the launch output, which only the "
@@ -919,7 +919,7 @@ def run_handoff(
     when there is one, is then kept beside it (agent_result_path) — headed as not a hand-off
     document — and the hand-off file is still not written. The launch carries the preset's
     handoff_argv (claude-code: --json-schema with HANDOFF_SCHEMA). An experimental preset is
-    refused before the launch (B-5)."""
+    refused before the launch."""
     from treasure_map.lib.atlas.connection import open_atlas
 
     if preset.name not in HANDOFF_PRESETS:

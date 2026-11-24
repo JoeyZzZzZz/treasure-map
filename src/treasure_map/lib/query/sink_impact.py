@@ -100,8 +100,8 @@ NVRAM_GETTERS: frozenset[str] = frozenset(
 
 # --- controllability markers (blocking_mechanism notes) -----------------------------------------
 # Notes that PROVE the sink's dangerous value is a compile-time constant (not attacker-influenced).
-# This is the ONLY 'proven-safe' controllability the map can assert this phase: it is
-# what lets the default lens sink constant command junk out of the first screen.
+# This is the ONLY 'proven-safe' controllability the map asserts: it is what lets the default
+# lens sink constant command junk out of the first screen.
 #
 # A member is a PROOF over every argument that carries the danger, every call it is read from and
 # every caller that could supply it — tests/unit/lib/test_provable_markers.py holds each one to

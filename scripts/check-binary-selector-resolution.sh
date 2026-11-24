@@ -27,4 +27,4 @@ if [ -n "$hits" ]; then
   echo "selector with its candidates instead of returning one of several rows." >&2
   exit 1
 fi
-echo "✓ binary-selector: every by-name binary lookup goes through lib/binary_id.py"
+echo "✓ binary-selector: no single-row by-name lookup matched outside lib/binary_id.py"

@@ -1536,7 +1536,7 @@ def run_analyzer2(
         )
 
     all_funcs = load_functions(db_path)
-    # Each binary's value-getter helper table (E-2a H8): which of its own FUN_<addr> functions hand
+    # Each binary's value-getter helper table: which of its own FUN_<addr> functions hand
     # on a known source's value, so a call to one reads as a WEAK source in that binary. Built from
     # the loaded functions once and handed to the scan and to every per-candidate reader below.
     helpers_by_binary = build_helper_tables(all_funcs)
@@ -1975,7 +1975,7 @@ def run_analyzer2(
                     # whose argument is a free_string source.
                     if _form_note_contradicts_source(blocking, path_ev.get("source_kind")):
                         blocking = None
-                    # No Ghidra def-use provenance for path sinks this phase — the writer layer
+                    # No Ghidra def-use provenance for path sinks — the writer layer
                     # stays not_traced (an honest '?', never sunk). Controllability comes from the
                     # text-level source_kind above.
                     _attach_edge_leads(
@@ -2033,7 +2033,7 @@ def run_analyzer2(
                 evidence_keys.update(
                     _source_names_keys(classify(callees, helpers, match.func_ref.func_name).source)
                 )
-                # Which KEYS the function asks those getters for (F-1): the field names a reader
+                # Which KEYS the function asks those getters for: the field names a reader
                 # needs to confirm the lead, carried beside the source names, never as a claim.
                 evidence_keys.update(
                     _source_keys_keys(
@@ -2369,7 +2369,7 @@ def run_analyzer2(
                             # The sources called in the body, by the same name check the wrapper
                             # reading above uses when a called source's flow is not fully traced.
                             | _source_names_keys(free_sources_called(f_pseudocode, wc_helpers))
-                            # Which KEYS the body asks its binary's getters for (F-1), by the same
+                            # Which KEYS the body asks its binary's getters for, by the same
                             # reading the direct candidate path above carries.
                             | _source_keys_keys(
                                 helper_keys_called(f_pseudocode, wc_helpers),

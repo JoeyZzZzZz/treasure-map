@@ -361,7 +361,7 @@ class FunctionPresenceRow:
     operand_markup_incomplete: int = 0
     # What the other side holds where this function maps through the nearest pair at or below it
     # (lib/diff/alignment.probe_counterparts): unpaired / occupied / uncovered / residual_code /
-    # undisassembled_bytes (W11) / coverage_unknown / unmappable; the other side's
+    # undisassembled_bytes / coverage_unknown / unmappable; the other side's
     # function or thunk there (counterpart_addr); the leftover-code or undisassembled ranges the
     # mapped span meets (JSON, counterpart_overlap); and why the probe made the state undetermined
     # (presence_reason). None = not probed (a diff written before).
@@ -484,7 +484,7 @@ class DiffMetaRow:
     stub_pair_mismatch: str | None = None
     # per side (binaries.stub_table_complete): 1 = the named table covers every stub, 0 = it does
     # not (a_only / b_only may miss a name called through another stub on that side), NULL = no
-    # resolution. W13.
+    # resolution.
     stub_complete_a: int | None = None
     stub_complete_b: int | None = None
     # Each side's export gaps split by whether the function is an accounted import stub; with the

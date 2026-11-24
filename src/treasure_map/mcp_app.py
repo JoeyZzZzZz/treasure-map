@@ -182,7 +182,7 @@ _RESPONSE_BYTE_BUDGET = 48_000
 _ECHO_RESERVE = 8_000
 
 # The findings hand-off blocks of a run pair, cached in the process so paging get_diff_handoff does
-# not rebuild every diff's view per page (B-4). Keyed by (the atlas's resolved path, the pair); the
+# not rebuild every diff's view per page. Keyed by (the atlas's resolved path, the pair); the
 # value is (digest, blocks), the digest a sha256 of the pair's findings as each page reads them
 # (verdict, rationale, basis, review state, source staleness, updated_at): any change to one —
 # a rewrite within the same second, a swapped judgement, a basis that moved — rebuilds the blocks.
@@ -201,7 +201,7 @@ def _echo(value: Any) -> Any:
     return value
 
 
-# D33: the default for a refusal's ``moved`` argument meaning "compute _server_code_moved here".
+# The default for a refusal's ``moved`` argument, meaning "compute _server_code_moved here".
 # A tool that already probed the disk for its ``server`` head passes the value in instead, so the
 # response probes once. Distinct from None, which is a real result ("the code has not moved").
 _MOVED_UNSET: Any = object()
@@ -1017,7 +1017,7 @@ _AGENT_INSTRUCTIONS = (
 # Dimension (e.g. a future source=param axis) joins the row automatically without editing this set.
 _SPINE_DIMENSIONS = frozenset({"controllability"})
 
-# The compact-list legend (C8-6): a compact row OMITS any dimension whose state is ``unknown``,
+# The compact-list legend: a compact row OMITS any dimension whose state is ``unknown``,
 # and an omitted dimension is a coverage gap — NEVER proven safe. Surfaced
 # once on the envelope so a careless reader does not misread "not shown" as "no problem"
 # (the per-row '?' reminder of the verbose view is gone; this restores it globally).
@@ -1122,7 +1122,7 @@ def _candidate_row(
     in_ledger: bool = False,
     coverage: str = "none",
 ) -> dict[str, Any]:
-    """One candidate as a COMPACT triage row (the compact-row carry contract C1-C3).
+    """One candidate as a COMPACT triage row (the compact-row carry contract).
 
     Spine facts (always present) + every non-spine dimension whose state is ESTABLISHED
     (``state != "unknown"``), each compressed to one ``state:value`` label with NO note — the full
@@ -1303,7 +1303,7 @@ def make_tools(
     _config = config if config is not None else load_config(None)
     _current = rescan_version.current_code_stamp(_config)
 
-    # D33: the server's own version fields, every one the IN-PROCESS loaded value, fixed once here
+    # The server's own version fields, every one the IN-PROCESS loaded value, fixed once here
     # at startup (``_current`` is this process's code stamp; _current_pass_version and
     # _diff_code_version are cached on first call, so calling them here pins them). The one thing
     # compared against disk is code_moved_on_disk, added per response below. Reported on list_runs,
@@ -1321,7 +1321,7 @@ def make_tools(
         """A hint to append to a refusal when this server's code stamp no longer matches the code on
         disk — so a reader who runs a rescan and still sees the refusal knows why: the rescan used
         the newer on-disk code, but the server is still grading against the code it started with.
-        Also the ``server`` block's ``code_moved_on_disk`` (D33: list_runs / start_diff_review /
+        Also the ``server`` block's ``code_moved_on_disk`` (list_runs / start_diff_review /
         get_diff_meta call it on every response, not only on a refusal). Reads the on-disk
         stamp (``on_disk_code_stamp``, rehashed only when a package file changed, the hash shared
         by every server in the process), at most once per tool call: a refusal on those three
@@ -1442,7 +1442,7 @@ def make_tools(
         """The refusal for a PROVABLY stale run, or None when it is servable.
 
         ``moved`` is the ``_server_code_moved`` hint; left at ``_MOVED_UNSET`` it is computed here
-        (one probe per refusal). A D33 tool that already probed the disk for its ``server`` head
+        (one probe per refusal). A tool that already probed the disk for its ``server`` head
         passes the value in, so the response probes the disk once.
 
         Only a proven mismatch gets here (see run_staleness): the stored run was demonstrably
@@ -2140,7 +2140,7 @@ def make_tools(
         ]
         envelope: dict[str, Any] = {
             "note": _DERIVED_SIGNAL_NOTE,
-            # ★ C8-6: rows are compact (spine + established dimensions only); an omitted dimension
+            # ★ Rows are compact (spine + established dimensions only); an omitted dimension
             # is state=unknown, NOT proven safe. Said once on the envelope, not per row.
             "legend": _COMPACT_ROW_LEGEND,
             # The active lens: a good default that does not lock the agent in. Switch it with
@@ -4496,7 +4496,7 @@ def make_tools(
         an ``a_only`` / ``b_only`` name may still be called through another stub (``.MIPS.stubs`` or
         an unnamed ``.plt`` entry) on the other side — not a determined one-sided add. Null on a
         diff written before.
-        ``server`` reports the running server's own build (D33; see list_runs).
+        ``server`` reports the running server's own build (see list_runs).
         ``upstream_version``: the upstream library the binary's file name names (matched as the
         dependency resolver matches names, libssl.so.1.1 -> libssl.so -> libssl; the binary's own
         DT_SONAME is not extracted), ``library`` null when it names none; otherwise per side
@@ -5646,7 +5646,7 @@ def make_tools(
         lineage row: visible but its analysis.db is not recorded — re-scan to enable fact tools).
         Use this to pick a ``run_id`` for the fact tools and to catch "auditing an old scan".
 
-        ``server`` reports the running server's own build (D33): its ``commit`` / ``version``, the
+        ``server`` reports the running server's own build: its ``commit`` / ``version``, the
         ``hunt_code`` / ``scan_code`` stamps and ``pass_version`` / ``diff_code_version`` it loaded,
         and ``code_moved_on_disk`` (the on-disk code has since changed — restart to serve it). Every
         value but that last flag is the IN-PROCESS value, so it is stable across a session."""

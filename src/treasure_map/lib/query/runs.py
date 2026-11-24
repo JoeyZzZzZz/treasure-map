@@ -145,7 +145,7 @@ def list_runs(conn: sqlite3.Connection) -> list[RunRow]:
 def run_recorded_elsewhere(
     conn: sqlite3.Connection, *, run_id: str, fs_root: Path
 ) -> RunRow | None:
-    """S1 overwrite check: the run named ``run_id`` when its recorded ``firmware_path`` names a
+    """The overwrite check: the run named ``run_id`` when its recorded ``firmware_path`` names a
     firmware OTHER than ``fs_root`` — the earlier scan that re-using this run id would overwrite.
 
     None when the run is absent from this atlas, records no firmware_path, or records this same

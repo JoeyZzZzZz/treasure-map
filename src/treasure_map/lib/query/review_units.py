@@ -1877,7 +1877,7 @@ def review_pair(
     )
     nav = None
     if navigation:
-        # F-3 / F-4: the dispatch groups (by the string-keyed edge that enumerates an entry's
+        # The dispatch groups (by the string-keyed edge that enumerates an entry's
         # function) and the upstream library groups. Moves nothing — units, ids and must_read are
         # already fixed above; this only annotates.
         from treasure_map.lib.query import review_navigation as _nav

@@ -174,7 +174,7 @@ def _h(text: str) -> str:
 
 def snapshot(group: CalleeGroup, entries: list[Any]) -> dict[str, Any]:
     """The group as a judgement stores it: its ref, X, each member's entry facts hashed, and one
-    summary hash (S6's shape, for a callee group)."""
+    summary hash (the group-freshness shape, for a callee group)."""
     by_id = {e.entry_id: e for e in entries}
     members = {
         _h(m): _h(json.dumps(dr.entry_facts(by_id[m]), sort_keys=True, default=str))

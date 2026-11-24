@@ -320,22 +320,22 @@ class BaselineDomain:
     # recorded by this analysis.db, unparseable, or truncated (a prefix cannot show a range is
     # absent).
     residual_ranges: tuple[tuple[int, int], ...] | None = None
-    # W11: the executable bytes Ghidra never disassembled at all, as inclusive (lo, hi) ranges
+    # The executable bytes Ghidra never disassembled at all, as inclusive (lo, hi) ranges
     # (binaries.promote_undefined_ranges). Same None rule as residual_ranges (NULL / not recorded /
     # unparseable / truncated). A function whose counterpart maps into one is code the other side
     # never built — a gap, not a determined "no such function".
     undefined_ranges: tuple[tuple[int, int], ...] | None = None
-    # W12: the thunks the export skipped, entry addr -> the thunk's body as inclusive (lo, hi)
+    # The thunks the export skipped, entry addr -> the thunk's body as inclusive (lo, hi)
     # ranges (binaries.thunk_spans). The functions table holds no thunk, so the counterpart probe
     # reads these to see an other-side thunk where a function maps. ``{}`` = recorded, none; None =
     # not known (NULL — an export that predates the column, or an extraction dropped since — or
     # unreadable), never read as "no thunk there".
     thunks: dict[str, tuple[tuple[int, int], ...]] | None = None
-    # W13: this binary's .plt / .MIPS.stubs regions as half-open [lo, hi) ranges
+    # This binary's .plt / .MIPS.stubs regions as half-open [lo, hi) ranges
     # (binaries.stub_regions). A point that maps into one is a stub-table slot — a taken spot, not
     # "no function". Empty = none recorded.
     stub_regions: tuple[tuple[int, int], ...] = ()
-    # W13: does stub_names cover EVERY stub this binary has (binaries.stub_table_complete)? 1 = yes,
+    # Does stub_names cover EVERY stub this binary has (binaries.stub_table_complete)? 1 = yes,
     # 0 = no (a .MIPS.stubs table or an unnamed .plt entry this path does not read), None = no
     # resolution / not recorded. Carried onto the diff so a one-sided stub name is flagged as
     # unconfirmed when a table is incomplete.
@@ -599,7 +599,7 @@ class SidePresence:
 #                    its extraction left outside a function) nor its undisassembled bytes reach it
 #   residual_code  — no function there, but leftover code does
 #   undisassembled_bytes — no function there, but bytes the other side's analysis never disassembled
-#                    at all do (W11): code it never built, a gap, not a determined "no function"
+#                    at all do: code it never built, a gap, not a determined "no function"
 #   coverage_unknown — no function there, and the other side's leftover code / undisassembled bytes
 #                    are not known, or its thunks are not (a thunk there could not be seen)
 #   unmappable     — no pair at or below the function to map it by
@@ -729,7 +729,7 @@ def probe_counterparts(
             out[addr] = CounterpartProbe(kind, addr=found)
             continue
         if _in_stub_region(other.stub_regions, y):
-            # W12: the mapped point lands in the other side's .plt / .MIPS.stubs table — a stub slot
+            # The mapped point lands in the other side's .plt / .MIPS.stubs table — a stub slot
             # is a taken spot, not "no function" (the import it jumps through has no tmap function).
             out[addr] = CounterpartProbe(PROBE_OCCUPIED)
             continue
@@ -739,7 +739,7 @@ def probe_counterparts(
         if not cov.thunks_known:
             out[addr] = CounterpartProbe(PROBE_COVERAGE_UNKNOWN)
             continue
-        # W11: with no function/thunk/stub there, the spot is still not empty if the other side's
+        # With no function/thunk/stub there, the spot is still not empty if the other side's
         # analysis left code it never turned into a function — leftover instructions (residual) or
         # bytes it never disassembled at all (undefined). Either is a gap, never "no such function".
         if other.residual_ranges is None or other.undefined_ranges is None:

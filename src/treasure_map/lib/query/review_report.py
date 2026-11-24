@@ -512,11 +512,11 @@ def html_page(review: ru.PairReview, *, header: dict[str, Any] | None = None) ->
 # an agent's text, a hunk) is fenced, and a firmware value on one of the block's own lines (a size
 # expression, a caller's name, a path) is inline code with its line breaks escaped.
 
-# Neutral section titles (B-6): the analysis a person fills, never a verdict in a tmap string.
+# Neutral section titles: the analysis a person fills, never a verdict in a tmap string.
 HANDOFF_HYPOTHESES_TITLE = "agent analysis — unverified hypotheses"
 HANDOFF_DEVICE_TITLE = "to check on a device"
 HANDOFF_STATUS = "awaiting human verification"
-# The boundary (B-7) lives outside this neutral layer (it spells what NOT to write); imported, not
+# The boundary lives outside this neutral layer (it spells what NOT to write); imported, not
 # spelled here, so the query layer stays neutral while the hand-off still carries it at runtime.
 HANDOFF_BOUNDARY = _handoff_boundary.HANDOFF_BOUNDARY
 # What an analysis section of the driver's document says when the agent wrote nothing for it.
@@ -580,7 +580,7 @@ _FENCE = "```"
 class HandoffStamp:
     """The staleness context same_shape_siblings needs (its ``build_hash`` / ``current`` /
     ``commit``). The MCP tool and the CLI build it the same way (CLI uses installed_commit() for
-    the same ``commit``), so a block reads the same either side — B-4(d)."""
+    the same ``commit``), so a block reads the same either side."""
 
     build_hash: str | None
     current: Any
@@ -939,7 +939,7 @@ def _siblings_lines(
     reads: SameShapeReads | None = None,
 ) -> list[str]:
     """The same-shape groups of the rows shown, one line per group (its size and by-landing counts,
-    and which rows fall in it); the member lists stay in same_shape_siblings' own pages (B-1). A row
+    and which rows fall in it); the member lists stay in same_shape_siblings' own pages. A row
     whose group cannot be read states why. ``reads`` (same_shape_siblings.SameShapeReads) is the
     hand-off pass's holder: each diff's view is built once for all its rows, not once per row."""
     from treasure_map.lib.query import same_shape_siblings as _sss
@@ -1141,7 +1141,7 @@ def _finding_change_kind(finding: dict[str, Any]) -> str:
 
 def _finding_basis_line(finding: dict[str, Any]) -> str:
     """Whether the facts the judgment rests on still hold — a moved basis is marked, not dropped,
-    and never read as the current conclusion (B-4). The reason names a subject no longer listed,
+    and never read as the current conclusion. The reason names a subject no longer listed,
     or one that no longer resolves (the judgement is dangling), apart; else it is the basis state
     when the basis itself moved, else why the source reads stale (the diff's or the runs')."""
     state = finding.get("review_state")
@@ -1317,7 +1317,7 @@ def handoff_findings(
     file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """The pair's changed_real findings, ordered by anchor_ref (a stable paging order), each with
-    its review_state and basis as list_overlays reads them (B-1 / B-4). Only this pair's judgements
+    its review_state and basis as list_overlays reads them. Only this pair's judgements
     are read and only their diffs' views built — no review_progress. ``file_staleness`` is the
     caller's reading of the two runs for the file and binary_presence judgements (the MCP server's
     stale-run gate, or local_handoff_context's); without it they read needs_recheck."""

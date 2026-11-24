@@ -355,7 +355,7 @@ def _charset_downweight(pseudocode: str, sink_arg: str, sink_name: str | None = 
     return True
 
 
-# ── R5: numeric_sanitized by "every write to the sink buffer is safe" ─────────────────────────
+# ── numeric_sanitized by "every write to the sink buffer is safe" ─────────────────────────────
 #
 # A command/path buffer is numeric-constrained only when EVERY write to it, in text order up to
 # the sink, is a safe write: a literal, a memset with a constant, a single inline converter, or a
@@ -648,7 +648,7 @@ def _value_is_constrained(
     sink_pos: int,
     helpers: SourceHelpers = NO_HELPERS,
 ) -> bool:
-    """The sink buffer is numeric-constrained (R5): a converter result is on its path (the range
+    """The sink buffer is numeric-constrained: a converter result is on its path (the range
     filter), AND every write to the buffer up to the sink is a safe write
     (:func:`_buffer_writes_all_safe`). The old SOURCE-name reasoning is gone — a path with no
     converter result is simply not checked (no new mark), and correctness rests on the write

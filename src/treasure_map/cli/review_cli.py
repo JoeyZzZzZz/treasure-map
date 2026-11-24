@@ -192,7 +192,7 @@ def report(
         if as_handoff:
             assert output is not None
             # The same staleness context and file-judgement reading the MCP get_diff_handoff
-            # builds, so the file and the tool's pages are the same text (B-4(d)).
+            # builds, so the file and the tool's pages are the same text.
             stamp, file_staleness = rr.local_handoff_context(conn)
             findings = rr.handoff_findings(conn, run_pair, file_staleness=file_staleness)
             open_items = rr.handoff_open_items(conn, run_pair, file_staleness=file_staleness)
@@ -763,7 +763,7 @@ def run(
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
     if handoff_out is not None and preset.name not in rd.HANDOFF_PRESETS:
-        # Fail before driving — B-5: an experimental preset's result is read differently and is not
+        # Fail before driving: an experimental preset's result is read differently and is not
         # supported this version, so the hand-off is refused, never attempted and silently empty.
         raise click.UsageError(
             f"--handoff can only write from the claude-code preset this version; {preset.name!r} "

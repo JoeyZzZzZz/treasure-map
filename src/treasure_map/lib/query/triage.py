@@ -477,7 +477,7 @@ def _source_web_settable_key(conn: sqlite3.Connection, source: Any) -> str | Non
 
 
 def _cr_web_settable_nvram(conn: sqlite3.Connection, source: dict[str, Any]) -> str | None:
-    """Class #1 (this phase): a const_args key that is web_settable='yes' -> controllable. The
+    """Class #1: a const_args key that is web_settable='yes' -> controllable. The
     getter's identity does not matter — the SaTC cross decides."""
     return "controllable" if _source_web_settable_key(conn, source) is not None else None
 
@@ -2431,7 +2431,7 @@ def _dim_reachability(
 
 
 def _dim_filtering(flow_evidence: Evidence) -> Dimension:
-    """Is there sanitization on the path? Near-always '?' this phase: tmap does a generic
+    """Is there sanitization on the path? Near-always '?': tmap does a generic
     name-match only and cannot prove a sanitizer covers the path, so it claims neither present
     or proven-absent — it does not save the agent from reading the filter code."""
     san = _sanitizer_records(flow_evidence)
@@ -3006,7 +3006,7 @@ def _reach_rank(reach: str) -> int:
     """Reachability SPINE rank: any found entry edge (2) ranks above ``unknown`` (1). Every entry:*
     is EQUAL — reachability does not tiebreak web above script (it is an orthogonal filter axis, not
     a verdict). This preserves the pre-split found>unknown ordering exactly, so reachability never
-    changes the default sort order (contract C5)."""
+    changes the default sort order."""
     return 2 if _reach_is_entry(reach) else 1
 
 

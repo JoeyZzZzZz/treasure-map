@@ -113,7 +113,7 @@ _TYPE_NAME_FORMS = re.compile(r"u?int(?:8|16|32|64)_t|u?int[35-7]|undefined[1-8]
 _SOURCE_RESOLVED_UNTRACED = ("free_string", "charset_safe")
 _REACHED = "reached_sink"
 # Forms whose recorded root is a base pointer / an operand, not the value itself: the access path,
-# not the base, is what a guard has to name (S7).
+# not the base, is what a guard has to name.
 _LOADED_FORMS = frozenset({"load", "const_addr"})
 _PATH_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
 

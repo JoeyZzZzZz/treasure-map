@@ -53,13 +53,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
             )
         except sqlite3.OperationalError:
             conn.execute("ALTER TABLE instance ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown'")
-    # Candidate locatability (added this round): nullable TEXT columns, so existing rows simply
+    # Candidate locatability: nullable TEXT columns, so existing rows simply
     # carry NULL until re-hunted. Idempotent — each ADD runs only while its column is missing.
     if inst_cols and "binary_path" not in inst_cols:
         conn.execute("ALTER TABLE instance ADD COLUMN binary_path TEXT")
     if inst_cols and "binary_content_hash" not in inst_cols:
         conn.execute("ALTER TABLE instance ADD COLUMN binary_content_hash TEXT")
-    # Neutral structural fact (added this round): thin command-forwarding wrapper + the sink it
+    # Neutral structural fact: thin command-forwarding wrapper + the sink it
     # forwards to. Existing rows take the default 0 / NULL until re-hunted. Idempotent.
     if inst_cols and "is_thin_cmd_wrapper" not in inst_cols:
         try:
@@ -73,22 +73,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
             )
     if inst_cols and "wrapped_sink" not in inst_cols:
         conn.execute("ALTER TABLE instance ADD COLUMN wrapped_sink TEXT")
-    # Structured flow evidence (added this round): nullable JSON TEXT; existing rows carry NULL
+    # Structured flow evidence: nullable JSON TEXT; existing rows carry NULL
     # until re-hunted. Idempotent — runs only while the column is missing.
     if inst_cols and "flow_evidence" not in inst_cols:
         conn.execute("ALTER TABLE instance ADD COLUMN flow_evidence TEXT")
-    # exposure_shape (added this round): an exposure SHAPE (e.g. bare_sink), moved out of
+    # exposure_shape: an exposure SHAPE (e.g. bare_sink), moved out of
     # blocking_mechanism so a danger form is never read as a mitigation. Nullable TEXT — old rows
     # carry NULL until re-hunted. Idempotent — runs only while the column is missing.
     if inst_cols and "exposure_shape" not in inst_cols:
         conn.execute("ALTER TABLE instance ADD COLUMN exposure_shape TEXT")
-    # function_origin (added this round): how the containing function's boundary was found
+    # function_origin: how the containing function's boundary was found
     # (functions.origin, copied at hunt). Nullable TEXT — old rows carry NULL ("not recorded")
     # until re-hunted. No index references it. Idempotent — runs only while the column is missing.
     if inst_cols and "function_origin" not in inst_cols:
         conn.execute("ALTER TABLE instance ADD COLUMN function_origin TEXT")
 
-    # public_cve_pattern.origin (added this round): marks rows as externally imported material (not
+    # public_cve_pattern.origin: marks rows as externally imported material (not
     # tmap deterministic extraction). NOT NULL DEFAULT 'external_import'; existing rows take the
     # default. Idempotent — runs only while the column is missing. CHECK falls back to plain column.
     pcp_cols = _column_names(conn, "public_cve_pattern")
@@ -129,7 +129,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if nvkf_cols and "via_wrapper" not in nvkf_cols:
         conn.execute("ALTER TABLE nvram_key_flow ADD COLUMN via_wrapper TEXT")
 
-    # diff_meta.micro_skipped_a/b (added this round): design-skipped micro-function counts, kept
+    # diff_meta.micro_skipped_a/b: design-skipped micro-function counts, kept
     # SEPARATE from functions_empty (which now means real failures only). An atlas that already
     # created diff_meta needs these columns; nullable INTEGER, existing rows carry NULL. Idempotent.
     dm_cols = _column_names(conn, "diff_meta")
@@ -138,7 +138,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if dm_cols and "micro_skipped_b" not in dm_cols:
         conn.execute("ALTER TABLE diff_meta ADD COLUMN micro_skipped_b INTEGER")
 
-    # diff_meta.binary_a/b (added this round): the diff's per-side TARGET binary (short name), so a
+    # diff_meta.binary_a/b: the diff's per-side TARGET binary (short name), so a
     # per-binary consumer (string_keyed_edge delta) filters to the diffed binary, not the whole
     # firmware. An atlas that already created diff_meta needs these columns; nullable TEXT, existing
     # rows carry NULL (the consumer refuses rather than silently skipping the filter). Idempotent.
@@ -147,7 +147,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if dm_cols and "binary_b" not in dm_cols:
         conn.execute("ALTER TABLE diff_meta ADD COLUMN binary_b TEXT")
 
-    # diff_meta per-binary status (added this round): the scan-side ghidra_ok/status/reason model
+    # diff_meta per-binary status: the scan-side ghidra_ok/status/reason model
     # ported to diff, so a FAILED binary persists a queryable blind-spot row and the next full diff
     # can skip already-ok binaries (incremental) and retry failed ones (self-healing). diff_ok /
     # diff_attempts are NOT NULL DEFAULT (a pre-feature row takes ok=0 / attempts=0, i.e. "failed /
@@ -265,7 +265,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if im_cols and _imcol not in im_cols:
             conn.execute(f"ALTER TABLE instruction_match ADD COLUMN {_imcol} TEXT")  # noqa: S608
 
-    # dimension_delta.binary (added this round): the diff's target binary (short name), parsed from
+    # dimension_delta.binary: the diff's target binary (short name), parsed from
     # subject_key at write time, so a per-binary consumer filters on a real column instead of a
     # brittle LIKE on the subject_key prefix. An atlas that already created dimension_delta needs
     # the column; nullable TEXT, existing rows carry NULL until re-diffed. Idempotent.
@@ -304,7 +304,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # The overlay's own migrations live with its schema (lib/atlas/overlay_schema), run by
     # open_atlas after the atlas schema: they are not part of what the hunt reads or writes.
 
-    # run.hunt_commit (added this round): which tmap commit produced this run's instances, so a
+    # run.hunt_commit: which tmap commit produced this run's instances, so a
     # re-hunt can be skipped when the code that would run is the same code that already ran.
     # Nullable on purpose — a run hunted before this column existed carries NULL, which compares
     # equal to no commit and therefore re-hunts. Idempotent; runs only while the column is missing.
@@ -312,7 +312,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if run_cols and "hunt_commit" not in run_cols:
         conn.execute("ALTER TABLE run ADD COLUMN hunt_commit TEXT")
 
-    # run.hunt_instances (added this round): how many instance rows that hunt actually committed.
+    # run.hunt_instances: how many instance rows that hunt actually committed.
     # The commit stamp alone says WHO produced the result, not that the result is still in the
     # table — delete the rows by any route and the stamp keeps vouching for them. Storing the count
     # makes "what was written" a comparable value, so the skip gate can check the rows are still
@@ -350,7 +350,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if run_cols and _rcol not in _column_names(conn, "run"):
             conn.execute(f"ALTER TABLE run ADD COLUMN {_rcol} INTEGER")  # noqa: S608
 
-    # binary_path columns (added this round). Every one of these tables scoped a row to a binary by
+    # binary_path columns. Every one of these tables scoped a row to a binary by
     # its SHORT NAME, which is a label: one firmware ships two files under the same name, so a
     # per-binary filter on the name matched both. The path is added beside the name rather than
     # replacing it — the name is still what a caller types and what the read side matches on, and

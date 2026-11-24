@@ -152,9 +152,9 @@ def promote_summary(conn: sqlite3.Connection) -> dict[str, Any]:
 
     ``created`` / ``residual_insns`` / ``recovered`` sum binaries.promote_created /
     promote_residual_insns / promote_recovered over the binaries that recorded them (``created`` is
-    the genuinely-new count — see PromoteUndefined; ``recovered`` is W14's pointer-reached
+    the genuinely-new count — see PromoteUndefined; ``recovered`` is the pointer-reached
     recovery); ``unowned_binaries`` names those with an instruction in no code block
-    (promote_residual_unowned > 0); ``guard_binaries`` names those whose W14 guard tripped
+    (promote_residual_unowned > 0); ``guard_binaries`` names those whose recovery guard tripped
     (promote_recover_lost_bytes or promote_recover_noreturn_flips > 0 — both 0 by design, so a name
     here means the no-return freeze did not hold and existing code may have been lost);
     ``unrecorded`` counts the extracted binaries with no record (NULL), whose numbers the sums

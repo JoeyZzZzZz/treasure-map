@@ -800,7 +800,7 @@ def get_diff_meta(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any]:
         "banners": banners,
         "binary_presence": binary_presence_counts(atlas, *runs) if runs is not None else None,
         "import_stubs": _import_stubs(atlas, diff_id),
-        # D25: how many string literals sit on one side only (list: get_diff_string_delta), with
+        # How many string literals sit on one side only (list: get_diff_string_delta), with
         # each side's truncation state so a capped / unknown side is not read as complete, and
         # ``unconfirmed`` when either side's state makes the two counts unconfirmable.
         "string_delta": {
@@ -824,7 +824,7 @@ def _import_stubs(atlas: sqlite3.Connection, diff_id: str) -> dict[str, Any] | N
     on stubs / on the rest. ``pairs`` etc. null: not accounted (a table unknown or none_named — the
     stubs then went through the pairing). None: a diff written before the accounting.
 
-    ``complete`` (W13) is each side's binaries.stub_table_complete (1 / 0 / null): the accounting
+    ``complete`` is each side's binaries.stub_table_complete (1 / 0 / null): the accounting
     only covers the two sides' NAMED .plt stubs, so when either side is not complete, a name in
     ``a_only`` / ``b_only`` may still be called through another stub (``.MIPS.stubs`` or an unnamed
     .plt entry) on the other side — flagged ``one_sided_unconfirmed`` rather than a determined
@@ -869,7 +869,7 @@ def get_diff_string_delta(
     limit: int = 200,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """D25: the string literals present on one side only between the diff's two runs (``a_only`` =
+    """The string literals present on one side only between the diff's two runs (``a_only`` =
     A\\B, ``b_only`` = B\\A), with the resolved reference anchors of each. ``side`` = ``a_only`` /
     ``b_only`` / ``both``; paged by ``limit`` / ``offset``. A projection of the two runs'
     ``strings`` tables, never a verdict."""

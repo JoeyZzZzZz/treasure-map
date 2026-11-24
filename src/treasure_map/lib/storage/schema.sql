@@ -394,7 +394,7 @@ CREATE TABLE IF NOT EXISTS string_tables (
     func_kind           TEXT,       -- direct | thunk. undefined_text only in a scan by an older
                                     --   detector, which also took an aligned .text address no
                                     --   function started at; a handler is now a defined function
-    completeness_status TEXT,       -- always 'incomplete' this phase (MVP absolute-2-field only)
+    completeness_status TEXT,       -- always 'incomplete': only the absolute 2-field reading
     completeness_reason TEXT,
     completeness_scope  TEXT,
     FOREIGN KEY(binary_id) REFERENCES binaries(id) ON DELETE CASCADE

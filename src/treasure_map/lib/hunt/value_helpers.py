@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Which of a binary's own functions hand on a known source's value (E-2a H8, criterion A).
+"""Which of a binary's own functions hand on a known source's value (criterion A).
 
 The mechanism layer (sink_vocabulary.SourceHelpers, threaded through the readers) is in place;
 this is the half that decides WHICH functions go in a binary's table. A firmware binary often reads
@@ -19,7 +19,7 @@ Two layers, kept apart on purpose:
   * ``build_helper_tables`` — the population gates plus criterion A, per binary. TWO admission
     rules, each with its own gate, and a function admitted by either is in the table:
 
-      - the MEASURED rule (M3): a stripped ``FUN_<addr>`` name, called with at least two distinct
+      - the MEASURED rule: a stripped ``FUN_<addr>`` name, called with at least two distinct
         string keys where its return is taken, and a body whose shape reads like a getter
         (``_body_shape_ok``). Only such a function is handed to ``helper_slots``, and only its
         ``RETURN_SLOT`` reading is admitted — the return slot's precision was measured on the built
@@ -379,7 +379,7 @@ def helper_slots(pseudocode: str, source_names: Iterable[str] = SOURCE) -> froze
     return frozenset(slots)
 
 
-# ── the population gate (M3), then criterion A ──────────────────────────────────────────────────
+# ── the population gate, then criterion A ───────────────────────────────────────────────────────
 
 
 def _return_type_is_bare_void(pseudocode: str) -> bool:
@@ -659,7 +659,8 @@ def helper_keys_called(pseudocode: str, helpers: SourceHelpers) -> tuple[dict[st
 
 def _binary_table(funcs: list[FuncRow]) -> SourceHelpers:
     """One binary's value-getter helpers: every ``FUN_<addr>`` function admitted by EITHER rule —
-    the measured one (the M3 gate, then criterion A, RETURN_SLOT only) or the keyed-lookup one (a
+    the measured one (the population gate, then criterion A, RETURN_SLOT only) or the keyed-lookup
+    one (a
     string-keyed lookup recognised on shape, both slots). A function may be admitted by both; the
     slots are a set, so one reading never doubles another."""
     call_keys, every_keys = _callsite_keys(funcs)

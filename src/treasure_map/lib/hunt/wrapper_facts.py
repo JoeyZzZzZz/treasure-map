@@ -212,11 +212,12 @@ def is_thin_cmd_wrapper(
     return True, wrapped
 
 
-# ── R7: two gates on recognising a thin FORMAT-STRING wrapper ────────────────────────────────
+# ── two gates on recognising a thin FORMAT-STRING wrapper ────────────────────────────────────
 #
 # A same-named C++ method, or a decompiler that dropped a va_list, can wear the shape of a thin
 # fmt wrapper without being one. Two gates on the call locate_format_arg selected, EITHER failing
-# means this sink is not a wrapper here — they narrow the H1 recall, never the by-name sink set.
+# means this sink is not a wrapper here — they narrow the wrapper recall, never the by-name sink
+# set.
 
 # Pointer bases that are "character-like": a format argument cast to one of these is still a
 # string. Any OTHER pointer cast (e.g. ``Log *``) is a different object, not a forwarded format.
@@ -309,10 +310,10 @@ def is_thin_fmt_wrapper(
         arg = ref.root
         if arg is None:
             continue
-        # R7 gate 1: a cast to a non-character pointer is a different object, not a format forward.
+        # Gate 1: a cast to a non-character pointer is a different object, not a format forward.
         if _fmt_cast_is_nonchar_ptr(ref.cast_type):
             continue
-        # R7 gate 2: a definite-argument v* call with MORE args than its fixed count is a same-named
+        # Gate 2: a definite-argument v* call with MORE args than its fixed count is a same-named
         # other function (the C++ ``this`` shape), not this sink.
         if _variadic_arg_count_rejects(sink, call_args):
             continue

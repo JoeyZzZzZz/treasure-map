@@ -15,7 +15,8 @@ path (patch_view.ViewReview), and a move folds into ``diff_review.judge``'s ``mo
 
 THE SNAPSHOT (``group_snapshot``) is the group as same_shape_siblings would count it now, reduced to
 what a later read can compare cheaply: the ``group_ref`` (which carries the fingerprint and recipe
-versions), the shape, the member count, the landing counts (same ``_group_counts`` S5 prints), a
+versions), the shape, the member count, the landing counts (the same ``_group_counts`` the
+siblings read prints), a
 short hash per member of its evidence_ref and of its own landing facts, and one summary hash over
 all of that. A member's facts are the five the view reads — ``landing``, ``subclass``, ``listed``,
 ``similarity``, ``unreadable`` — written for every member alike, ``unreadable`` null for a member

@@ -241,7 +241,7 @@ def entry_facts(e: _Entry) -> dict[str, Any]:
             "export_gap_b": p.export_gap_b,
             "bucket": e.bucket or None,
             "rows": rows,
-            # The read-face signals a judgement leans on (R9): whether the entry is listed as S
+            # The read-face signals a judgement leans on: whether the entry is listed as S
             # (bucket stays empty there), its subclass where it is listed, what the pair evidence
             # and the counterpart hint read, and which sinks are called a different number of
             # times. A snapshot written before these keys existed is compared on its own keys
@@ -515,7 +515,7 @@ def judge(
     group_delta: dict[str, Any] | None = None,
 ) -> DiffAnnotation:
     """One judgement read against its diff's current view. ``group_delta`` is what the caller found
-    moved in the same-shape group this judgement leaned on (S6, computed in the view read path
+    moved in the same-shape group this judgement leaned on (computed in the view read path
     where the diff is built), folded in under ``moved["group"]``: a group that moved re-checks the
     judgement exactly as a move in its own facts does."""
     moved: dict[str, Any] = {}
@@ -590,7 +590,7 @@ def judgements_for(
     group_review: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
 ) -> tuple[dict[str, DiffAnnotation], list[str]]:
     """The run pair's judgements that are about this diff, each read against its current view, and
-    the anchors among them whose subject is gone (dangling). ``group_review`` (S6), when given, is
+    the anchors among them whose subject is gone (dangling). ``group_review``, when given, is
     asked to re-derive the same-shape group a judgement recorded (its stored ``group`` block) and
     say what moved; the caller owns it because rebuilding a group needs the atlas and the build."""
     judged: dict[str, DiffAnnotation] = {}

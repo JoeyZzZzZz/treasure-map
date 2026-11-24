@@ -758,13 +758,13 @@ class _Fn:
     # What its decompile came to (ok / timeout / error / skipped_micro; an older analysis.db holds
     # error:<why> for error); None: not recorded.
     decompile: str | None = None
-    # D29: each SINK_CALLEE_NAMES callee's call count in this function's call_tokens (opcode-7 CALL
+    # Each SINK_CALLEE_NAMES callee's call count in this function's call_tokens (opcode-7 CALL
     # tokens, NOT deduplicated — repeated calls count). None: the call_tokens column is absent or
     # unparseable (an older analysis.db), so the count is unknown, never 0.
     sink_callsites: dict[str, int] | None = None
     # Whether the decompiler produced any pseudocode text for this function. False means the
     # call_tokens above are empty because there was nothing to read from, not because the function
-    # calls nothing — the D29 reader reports those sides unknown, never a 0 count.
+    # calls nothing — the callsite-count reader reports those sides unknown, never a 0 count.
     has_text: bool | None = None  # None: pseudocode column not recorded by that analysis.db
     size_bytes: int | None = None  # the function's byte size; < _DECOMPILE_MIN_SIZE = a micro-stub
     # The unresolved_external_calls column holds a value that does not read as a list: which stubs
@@ -976,7 +976,7 @@ def _read_side(atlas: sqlite3.Connection, run_id: str, sha: str | None) -> _Side
         select += ", callees_truncated" if has_t else ", NULL"
         select += ", unresolved_external_calls" if has_u else ", NULL"
         select += ", decompile_status" if "decompile_status" in cols else ", NULL"
-        # D29: call_tokens (parsed to per-sink counts), size_bytes, and whether there is any
+        # call_tokens (parsed to per-sink counts), size_bytes, and whether there is any
         # pseudocode text — the text itself is NOT selected (it is large and unneeded; only its
         # presence decides whether an empty call_tokens is a real 0 or an unreadable side).
         select += ", call_tokens" if has_ct else ", NULL"
@@ -1307,7 +1307,7 @@ class _Entry:
     body_status: dict[str, Any] | None = None
     sizes: tuple[int | None, int | None] | None = None
     line_number_form: dict[str, Any] | None = None
-    # The caller-set edge (S3): the A side's direct callers of the pair's function and the B side's
+    # The caller-set edge: the A side's direct callers of the pair's function and the B side's
     # reading of the same, attached to any pair entry (A/B/C/R or the new E) when the A side has a
     # caller and the B side has none or cannot prove none; None when there is no such signal. A
     # render/significance fact only — NEVER part of diff_review.entry_facts, so it moves no existing
@@ -1321,7 +1321,7 @@ class _Entry:
     # Each sink's hunt-candidate count in the two functions (``_sink_candidate_counts``): None for a
     # function with no counterpart, or when both sides count alike with nothing unknown.
     sink_candidate_counts: dict[str, Any] | None = None
-    # D29: each sink's per-CALLSITE count (from call_tokens, not hunt candidates) in the two
+    # Each sink's per-CALLSITE count (from call_tokens, not hunt candidates) in the two
     # functions (``_sink_callsite_counts``). An independent key, unit "callsite" — NEVER mixed into
     # sink_candidate_counts and NEVER read by significance / attention; _sort reads only whether it
     # is absent, to place a count-floated entry inside attention 0 (``_count_noise``). None when
@@ -1701,7 +1701,7 @@ class _Builder:
             "unknown": unknown,
         }
 
-    # ── sink_callsite_counts (D29): each sink's CALL count, from call_tokens ──
+    # ── sink_callsite_counts: each sink's CALL count, from call_tokens ──
 
     def _callsite_side(self, side: str, addr: str) -> tuple[str | None, dict[str, int]]:
         """``(unknown_reason, per-sink counts)`` for one side of a pair.
@@ -1709,7 +1709,7 @@ class _Builder:
         The reason is set, in this order, when the counts cannot be trusted: ``side_unreadable``
         (the analysis.db could not be opened), ``function_not_in_scan_inventory`` (that scan does
         not hold the function), ``call_tokens_unavailable`` (an older analysis.db with no
-        call_tokens column), then — the heart of D29 — no readable text: ``skipped_micro`` (empty
+        call_tokens column), then — the heart of it — no readable text: ``skipped_micro`` (empty
         pseudocode AND size < _DECOMPILE_MIN_SIZE, a stub the exporter skips by design) or
         ``text_unavailable`` (empty pseudocode at a real size: a decompile that did not complete).
         An empty call_tokens read off empty text is NOT a 0, it is unknown. Last, ``call_counts_
@@ -1815,7 +1815,7 @@ class _Builder:
             if any(n.startswith(prefixes) for n in names):
                 e.facts.append(f"source_gap:{family}")
 
-    # ── the caller-set edge (S3): callers_a / callers_b ──
+    # ── the caller-set edge: callers_a / callers_b ──
 
     def _reverse_index(self, side: str) -> tuple[dict[str, set[str]], bool]:
         """side -> (callee name -> the addresses that call it, whether that list may be incomplete).
@@ -3241,7 +3241,7 @@ def significance(
       * everything else -> 1, ordered by similarity, lowest first. ``identical_text_unverified``
         is never sunk outside C.
 
-    The caller-set edge (S3): a bucket-E entry is always attention 1 (basis
+    The caller-set edge: a bucket-E entry is always attention 1 (basis
     ``lost_every_direct_caller_never_sunk`` for a proven-none B side, else
     ``caller_signal_undetermined_never_sunk``) — read FIRST, since E is listed for that edge alone,
     so its basis never reads as the generic ``similarity`` fall-through. On a NON-E entry the edge
@@ -3296,7 +3296,7 @@ def significance(
             return ATTENTION_MIDDLE, "undetermined_never_sunk"
         if _held_up(item):
             return ATTENTION_MIDDLE, "judged_never_sunk"
-        # The caller-set edge (S3) holds a NON-E entry off the bottom too, LAST so it never replaces
+        # The caller-set edge holds a NON-E entry off the bottom too, LAST so it never replaces
         # a basis above, and only when the B side is a proven none — an undetermined edge on an
         # already-listed entry does not move it (E, which IS listed for the edge, is handled first).
         if e.callers_b is not None and e.callers_b["state"] == "none_found":
@@ -3490,7 +3490,7 @@ def _entry_json(e: _Entry) -> dict[str, Any]:
                 if e.sink_callsite_counts is not None
                 else {}
             ),
-            # The caller-set edge (S3): present only when it exists; a field on any pair entry,
+            # The caller-set edge: present only when it exists; a field on any pair entry,
             # never in diff_review.entry_facts, so it moves no existing judgement.
             **(
                 {"pairing": e.pairing, "callers_a": e.callers_a, "callers_b": e.callers_b}
@@ -3856,8 +3856,8 @@ def _clear_view_caches() -> None:
     _ENTRY_WORDS_IMAGE_CACHE.clear()
     _OVERLAY_CACHE.clear()
     _DIFFERS_CACHE.clear()
-    # S6's process-wide call-list cache and the pairing components' (in modules that import this
-    # one, so imported here).
+    # The group-freshness call-list cache and the pairing components', both process-wide (in
+    # modules that import this one, so imported here).
     from treasure_map.lib.query.diff_group_freshness import _clear_cache
     from treasure_map.lib.query.pairing_components import clear_cache as _clear_pairing_cache
 
@@ -6614,7 +6614,7 @@ class ViewReview:
             alternatives = corrections(atlas, built)[1] if d.binary else ()
         self.alternatives = alternatives
         subjects = diff_review.subjects_for(atlas, built, built.placed, alternatives=alternatives)
-        # S6: a judgement may have recorded the same-shape group it leaned on. Re-derive it here,
+        # A judgement may have recorded the same-shape group it leaned on. Re-derive it here,
         # where the build is in hand, and let judgements_for fold any move into needs_recheck. One
         # cache per review so several judgements on one group rebuild it once; the call list behind
         # it is cached process-wide (diff_group_freshness). Imported in the body: that module reads
@@ -6853,7 +6853,7 @@ def _count(keys: Any) -> dict[str, int]:
     return dict(sorted(out.items()))
 
 
-# ── D25: string_delta — the string literals one side of a diff holds and the other does not ──
+# ── string_delta — the string literals one side of a diff holds and the other does not ──
 
 
 def _trunc_state(t: Any) -> str:

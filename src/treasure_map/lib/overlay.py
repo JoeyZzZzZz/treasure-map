@@ -206,7 +206,7 @@ def _validate_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | No
 
     if verdict == "exploitable":
         if vb is None:
-            return None  # soft this round: recorded without a basis, by design
+            return None  # soft: recorded without a basis, by design
         chain = vb.get("chain")
         if not (isinstance(chain, str) and chain.strip()):
             raise ConfigError("exploitable.chain must be non-blank")

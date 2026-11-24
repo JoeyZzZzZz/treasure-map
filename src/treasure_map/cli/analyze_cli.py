@@ -119,11 +119,11 @@ def report_extraction_state(result: Any, reanalyze: str | None) -> None:
 
 
 def _report_promote(promote: dict[str, Any]) -> None:
-    """What the function-promotion pass came to: the functions it created, the functions W14
+    """What the function-promotion pass came to: the functions it created, the functions
     recovered through data pointers, and the instructions still in no function after it, summed
     over the binaries that recorded them — and, on stderr, the binaries holding instructions in no
     code block at all (the block model skipped part of them, so their function set may be short),
-    the binaries whose W14 guard tripped (the no-return freeze did not hold), and how many binaries
+    the binaries whose recovery guard tripped (the no-return freeze did not hold), and how many
     recorded nothing."""
     if not promote or not promote.get("binaries"):
         return
@@ -366,7 +366,7 @@ def analyze(
 
     # Read-only, before Workspace (no mkdir) and any Ghidra: when the workspace already holds a scan
     # of OTHER firmware, confirm before overwriting it. analyze has no atlas and no --run-id, so
-    # only the workspace check (S2) applies here.
+    # only the workspace check applies here.
     from treasure_map.lib.workspace.workspace import workspace_holds_other_firmware
 
     other_fw = workspace_holds_other_firmware(ws_path / "analysis.db", fs_root)
