@@ -64,7 +64,7 @@ from treasure_map.lib.diff.alignment import (
     _version_skew,
     make_diff_id,
     persist_instruction_matches,
-    run_layer0_parse,
+    run_alignment,
 )
 from treasure_map.lib.diff.binexport2 import BinExportDecodeError, decode_call_targets
 from treasure_map.lib.diff.callsite_facts import (
@@ -86,7 +86,7 @@ from treasure_map.lib.diff.currency import (
     stamps_equal,
     toolchain_columns,
 )
-from treasure_map.lib.diff.dimension_delta import run_layer2_delta
+from treasure_map.lib.diff.dimension_delta import run_dimension_delta
 from treasure_map.lib.diff.export_report import (
     ExportReport,
     ExportReportError,
@@ -1093,7 +1093,7 @@ def _persist_success(
             atlas.execute("BEGIN IMMEDIATE")
         had_baseline = _has_candidate_baseline(atlas, diff_id) or _marked_dropped(atlas, diff_id)
         stamps = _current_stamps(atlas, run_a_id, run_b_id, bin_a, bin_b, exports, toolchain)
-        l0 = run_layer0_parse(
+        l0 = run_alignment(
             atlas,
             bindiff_path=bindiff_path,
             run_a_id=run_a_id,
@@ -1109,7 +1109,7 @@ def _persist_success(
         )
         # Sink-overlay cross-side bridge: store this diff's candidate-callsite instruction matches
         # (either side's candidates) while the .BinDiff is still on disk (the caller rmtrees the
-        # temp dir only after this returns), AFTER run_layer0_parse's delete_diff cleared any prior
+        # temp dir only after this returns), AFTER run_alignment's delete_diff cleared any prior
         # rows; one txn with layer-2's commit.
         persist_instruction_matches(
             atlas,
@@ -1139,7 +1139,9 @@ def _persist_success(
             # below clears it to 0 on success. An interrupt between that commit and this one then
             # leaves an honest baseline_dropped=1 (re-stored next diff), not a silent 0.
             atlas.execute("UPDATE diff_meta SET baseline_dropped = 1 WHERE diff_id = ?", (diff_id,))
-        run_layer2_delta(atlas, diff_id=diff_id, run_a_id=run_a_id, run_b_id=run_b_id, commit=True)
+        run_dimension_delta(
+            atlas, diff_id=diff_id, run_a_id=run_a_id, run_b_id=run_b_id, commit=True
+        )
     except TreasureMapError as exc:
         _record_diff_failure(
             atlas,

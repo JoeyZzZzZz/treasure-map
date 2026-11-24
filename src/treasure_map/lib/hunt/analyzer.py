@@ -445,7 +445,10 @@ def _form_note_contradicts_source(blocking_mechanism: str | None, source_kind: s
 
 
 @dataclass(frozen=True)
-class Analyzer2Stats:
+class HuntStats:
+    # Named after the hunt, not the analyzer: ``AnalyzerStats`` was the retired grading analyzer's
+    # stats class, and tests/unit/lib/test_diff_command.py keeps that name unimportable so a caller
+    # of the old one is never handed this.
     scanned: int  # function rows the shape detector considered
     matches: int  # call-sequence shape matches found
     instances_written: int  # graded instances persisted into the atlas
@@ -1453,14 +1456,14 @@ def _load_web_form_fields(db_path: Path | str, source_run_id: str) -> list[WebFo
     ]
 
 
-def run_analyzer2(
+def run_analyzer(
     db_path: Path | str,
     atlas_path: Path | str,
     *,
     source_run_id: str,
     firmware_path: str | None = None,
     rehunt: bool = False,
-) -> Analyzer2Stats:
+) -> HuntStats:
     """Scan one analysis.db for shape candidates, grade them, and write atlas instances.
 
     source_run_id is the neutral per-run id (the device_spread unit). The analysis DB is
@@ -1526,7 +1529,7 @@ def run_analyzer2(
             )
         finally:
             relocate.close()
-        return Analyzer2Stats(
+        return HuntStats(
             scanned=0,
             matches=0,
             instances_written=0,
@@ -2416,7 +2419,7 @@ def run_analyzer2(
     finally:
         atlas.close()
 
-    return Analyzer2Stats(
+    return HuntStats(
         scanned=result.stats.functions_scanned,
         matches=len(result.matches),
         instances_written=instances_written,

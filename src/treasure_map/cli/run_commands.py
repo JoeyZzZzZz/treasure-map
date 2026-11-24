@@ -992,7 +992,7 @@ def hunt_pattern(
 
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.errors import WorkspaceError
-    from treasure_map.lib.hunt import run_analyzer2
+    from treasure_map.lib.hunt import run_analyzer
     from treasure_map.lib.last_run import write_last_run
     from treasure_map.lib.workspace.workspace import Workspace, workspace_of
 
@@ -1009,7 +1009,7 @@ def hunt_pattern(
                     held.enter_context(Workspace(ws_dir))
                 except WorkspaceError as exc:
                     raise click.ClickException(str(exc)) from exc
-            stats = run_analyzer2(db, resolved_atlas, source_run_id=run_id, rehunt=rehunt)
+            stats = run_analyzer(db, resolved_atlas, source_run_id=run_id, rehunt=rehunt)
     except KeyboardInterrupt:
         click.echo(
             "\nAborted — the hunt's write was rolled back (stored candidates unchanged); the run "
@@ -2395,7 +2395,7 @@ def scan(
         from treasure_map.lib.atlas.connection import open_atlas
         from treasure_map.lib.config.config import load_config
         from treasure_map.lib.errors import GhidraNotFoundError, TreasureMapError
-        from treasure_map.lib.hunt import run_analyzer2
+        from treasure_map.lib.hunt import run_analyzer
         from treasure_map.lib.query import DEFAULT_LENS_LABEL, PHASE1_CAVEATS
         from treasure_map.lib.query import triage as run_triage
         from treasure_map.lib.workspace.resolver import resolve_workspace
@@ -2523,7 +2523,7 @@ def scan(
             f"(run-id={effective_run_id}) …"
         )
         try:
-            h = run_analyzer2(
+            h = run_analyzer(
                 result.db_path,
                 resolved_atlas,
                 source_run_id=effective_run_id,

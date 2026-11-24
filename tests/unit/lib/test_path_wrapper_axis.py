@@ -24,7 +24,7 @@ from typing import TypeVar
 import pytest
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.hunt import run_analyzer2
+from treasure_map.lib.hunt import run_analyzer
 from treasure_map.lib.hunt import wrapper_propagation as wp
 from treasure_map.lib.hunt.function_rows import FuncRow
 from treasure_map.lib.hunt.wrapper_facts import is_thin_path_wrapper, path_wrapper_param_positions
@@ -481,7 +481,7 @@ def _hunt(tmp_path: Path, funcs: list[tuple[str, str, list[str]]]) -> Path:
     conn.commit()
     conn.close()
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db_path, atlas, source_run_id="run_p")
+    run_analyzer(db_path, atlas, source_run_id="run_p")
     return atlas
 
 

@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.hunt import run_analyzer2
+from treasure_map.lib.hunt import run_analyzer
 from treasure_map.lib.query import triage
 from treasure_map.lib.query.triage import TriageCandidate
 from treasure_map.lib.storage.connection import open_db
@@ -81,7 +81,7 @@ def _analysis_db(tmp_path: Path, *, with_column: bool = True) -> Path:
 def _hunt_and_triage(tmp_path: Path, db: Path) -> dict[str, TriageCandidate]:
     """Hunt ``db`` into a fresh atlas and triage it: the candidate per function name."""
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r")
+    run_analyzer(db, atlas, source_run_id="r")
     conn = open_atlas(atlas)
     try:
         return {c.function: c for c in triage(conn)}
@@ -116,7 +116,7 @@ def test_a_crashed_detector_reads_unknown_never_constant(
     provenance really would read as constant, and the carried list is what changes it).
 
     MUTATION (verified RED, each case on its own): drop the ``_detector_error_keys(...)`` merge for
-    that emission path in run_analyzer2 (the ``evidence_keys.update`` for a direct sink call, the
+    that emission path in run_analyzer (the ``evidence_keys.update`` for a direct sink call, the
     ``| _detector_error_keys(...)`` term for a wrapper candidate) -> the errored candidate carries
     no list, reads 'constant' like its twin, and the '?' assertion fails."""
     cands = _hunt_and_triage(tmp_path, _analysis_db(tmp_path))

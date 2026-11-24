@@ -371,6 +371,8 @@ def test_retired_symbols_are_unimportable() -> None:
     assert not hasattr(diffpkg, "run_diff")
     assert not hasattr(diffpkg, "Axis")
     assert not hasattr(huntpkg, "run_diff_analyzer")
+    # The grading analyzer's own stats class. The hunt's is HuntStats, named away from this one on
+    # purpose: a caller that imported the retired name must not be handed the current object.
     assert not hasattr(huntpkg, "AnalyzerStats")
 
 

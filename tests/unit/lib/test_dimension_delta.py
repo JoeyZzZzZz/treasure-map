@@ -25,7 +25,7 @@ from treasure_map.lib.atlas.writer import (
 )
 from treasure_map.lib.diff import dimension_delta
 from treasure_map.lib.diff.alignment import norm_hex
-from treasure_map.lib.diff.dimension_delta import DECLARED_DELTA_DIMENSIONS, run_layer2_delta
+from treasure_map.lib.diff.dimension_delta import DECLARED_DELTA_DIMENSIONS, run_dimension_delta
 from treasure_map.lib.query.triage import _CANONICAL_DIMENSION_NAMES  # the authoritative universe
 
 _SKE = "reachability.string_keyed_edge"
@@ -156,7 +156,7 @@ def test_capability_three_state_missing_row_is_registration_unknown(tmp_path: Pa
     _cap(con, "ra", "reachability.auth_boundary", 1)
     _cap(con, "rb", "reachability.auth_boundary", 0)
     _cap(con, "ra", _SKE, 1)  # rb has NO string_keyed_edge row -> registration_unknown
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     cs = _capstate(con, "d")
     assert cs["reachability.auth_boundary"][:2] == ("present", "declared_absent")  # 1 / 0
     assert cs[_SKE][:2] == ("present", "registration_unknown")  # present on ra, NO row on rb
@@ -197,7 +197,7 @@ def _seed_matched(con, *, b_callee="2100", a_complete="complete", b_complete="co
 def test_edge_unchanged_when_aligned_callees_equal(tmp_path: Path) -> None:
     con = _atlas(tmp_path)
     _seed_matched(con)  # A callee 2000 aligns to 2100 == B callee 2100
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_unchanged"
     con.close()
@@ -206,7 +206,7 @@ def test_edge_unchanged_when_aligned_callees_equal(tmp_path: Path) -> None:
 def test_edge_changed_when_callee_set_differs(tmp_path: Path) -> None:
     con = _atlas(tmp_path)
     _seed_matched(con, b_callee="9999")  # B points at a different function -> changed
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_changed"
     con.close()
@@ -218,7 +218,7 @@ def test_dimension_delta_carries_binary_parsed_from_subject_key(tmp_path: Path) 
     # a brittle subject_key LIKE. Break the derivation (or drop the column write) and this reds.
     con = _atlas(tmp_path)
     _seed_matched(con)
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     rows = con.execute(
         "SELECT subject_key, binary FROM dimension_delta WHERE diff_id='d' AND subject_kind='edge'"
     ).fetchall()
@@ -240,7 +240,7 @@ def test_binary_scope_unrecorded_marker_has_null_binary(tmp_path: Path) -> None:
     add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100")])
     _align(con, "d", [("1000", "1100", 0.98, "aligned")])
     _diff_meta(con, "d", binary=None)  # NULL scope -> the refusal marker
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     rows = con.execute(
         "SELECT subject_key, binary FROM dimension_delta WHERE diff_id='d'"
     ).fetchall()
@@ -256,7 +256,7 @@ def test_g1_aligns_by_address_not_by_name(tmp_path: Path) -> None:
     # unchanged. The name is never used for cross-version comparison.
     con = _atlas(tmp_path)
     _seed_matched(con)
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_unchanged"  # names differ, addresses align
     assert "FUN_x" not in row[0] and "FUN_y" not in row[0]  # subject_key uses addr, not name
@@ -293,7 +293,7 @@ def test_g1_gate_identity_includes_func_anchor_no_collision(tmp_path: Path) -> N
             ("4000", "4100", 0.98, "aligned"),
         ],
     )
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     rows = _deltas(con, "d")
     assert len(rows) == 2  # two distinct subjects, not one collapsed / not an error
     assert len({r[0] for r in rows}) == 2  # distinct subject_keys
@@ -335,7 +335,7 @@ def test_static_table_addr_drift_is_not_a_change(tmp_path: Path) -> None:
         ],
     )  # table moved
     _align(con, "d", [("2000", "2100", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_unchanged"  # table_addr not part of identity
     con.close()
@@ -358,7 +358,7 @@ def test_g2_callee_unalignable_is_structural_not_kind(tmp_path: Path) -> None:
         add_string_keyed_edges(con, [_edge("ra", "k", "1000", **kw)])  # type: ignore[arg-type]
         add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100")])
         _align(con, "d", [("1000", "1100", 0.98, "aligned")])  # func aligns; callee does not
-        run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+        run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
         (row,) = _deltas(con, "d")
         assert row[1] == "delta_undetermined", tag
         assert row[3] == "callee_unalignable", tag  # never layer_changed
@@ -380,7 +380,7 @@ def test_g2_partial_callee_unalignable_blocks_the_whole_edge(tmp_path: Path) -> 
     )
     add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100")])
     _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "delta_undetermined" and row[3] == "callee_unalignable"
     con.close()
@@ -398,7 +398,7 @@ def test_bug_d_raw_0x_callee_addr_aligns_after_norm(tmp_path: Path) -> None:
     add_string_keyed_edges(con, [_edge("ra", "k", "1000", "0x4129a8")])
     add_string_keyed_edges(con, [_edge("rb", "k", "1100", "0x4129b4")])
     _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("4129a8", "4129b4", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_unchanged"  # 0x4129a8 aligns to 0x4129b4 -> same callee
     con.close()
@@ -415,7 +415,7 @@ def test_bug_d_both_sides_symmetric_direct_callee_is_unchanged(tmp_path: Path) -
     add_string_keyed_edges(con, [_edge("ra", "k", "1000", "4129a8")])
     add_string_keyed_edges(con, [_edge("rb", "k", "1100", "4129b4")])
     _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("4129a8", "4129b4", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_unchanged"
     con.close()
@@ -433,7 +433,7 @@ def test_bug_d_subject_anchor_survives_dirty_from_func(tmp_path: Path) -> None:
     )  # dirty A anchor
     add_string_keyed_edges(con, [_edge("rb", "k", "29100", "2100")])  # clean B anchor (normalized)
     _align(con, "d", [("40c21c", "29100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     # ★ the assertion is about PAIRING, not the verdict: ONE subject means the dirty A anchor and
     # the clean B anchor resolved to the SAME canonical key. (Verdict = from_function_unaligned:
     # alignment pairs the host by the raw from_func_addr, a separate axis the three norm_hex points
@@ -467,7 +467,7 @@ def test_bug_b_thunk_name_is_the_stable_anchor(tmp_path: Path) -> None:
         con, [_edge("rb", "k", "1100", "9999", callee_name="snprintf", callee_kind="thunk")]
     )
     _align(con, "d", [("1000", "1100", 0.98, "aligned")])  # func aligns; NO callee alignment row
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_unchanged"  # name:snprintf == name:snprintf; addresses irrelevant
     con.close()
@@ -485,7 +485,7 @@ def test_bug_b_thunk_name_change_is_layer_changed(tmp_path: Path) -> None:
         con, [_edge("rb", "k", "1100", "2100", callee_name="snprintf_chk", callee_kind="thunk")]
     )
     _align(con, "d", [("1000", "1100", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_changed"
     con.close()
@@ -504,7 +504,7 @@ def test_bug_b_no_identity_is_honestly_unalignable(tmp_path: Path) -> None:
         add_string_keyed_edges(con, [_edge("ra", "k", "1000", **kw)])  # type: ignore[arg-type]
         add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100")])
         _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
-        run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+        run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
         (row,) = _deltas(con, "d")
         assert (row[1], row[3]) == ("delta_undetermined", "callee_unalignable"), tag
         con.close()
@@ -521,7 +521,7 @@ def test_bug_b_fun_name_never_used_as_a_name_anchor(tmp_path: Path) -> None:
     add_string_keyed_edges(con, [_edge("ra", "k", "1000", "2000", callee_name="FUN_00002000")])
     add_string_keyed_edges(con, [_edge("rb", "k", "1100", "2100", callee_name="FUN_00002100")])
     _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_unchanged"  # FUN names differ but addresses align -> same function
     con.close()
@@ -540,7 +540,7 @@ def test_bug_b_anchor_space_mismatch_is_undetermined_not_changed(tmp_path: Path)
         con, [_edge("rb", "k", "1100", "2100", callee_name="FUN_00002100")]
     )  # addr
     _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert (row[1], row[3]) == ("delta_undetermined", "anchor_space_mismatch")  # not layer_changed
     con.close()
@@ -562,7 +562,7 @@ def test_bug_a_edge_filter_scopes_to_the_diffed_binary(tmp_path: Path) -> None:
     add_string_keyed_edges(con, [_edge("ra", "x", "9000", "9100", binary="httpd")])
     add_string_keyed_edges(con, [_edge("rb", "x", "9200", "9300", binary="httpd")])
     _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     rows = _deltas(con, "d")
     assert len(rows) == 1  # ONLY the lib.so subject; httpd's edges are out of this diff's scope
     assert rows[0][1] == "layer_unchanged"
@@ -586,7 +586,7 @@ def test_bug_a_edge_filter_is_load_bearing(tmp_path: Path, monkeypatch) -> None:
     add_string_keyed_edges(con, [_edge("ra", "x", "9000", "9100", binary="httpd")])
     add_string_keyed_edges(con, [_edge("rb", "x", "9200", "9300", binary="httpd")])
     _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     assert len(_deltas(con, "d")) > 1  # httpd subjects flooded in -> the filter WAS load-bearing
     con.close()
 
@@ -604,7 +604,7 @@ def test_bug_a_null_binary_scope_is_refused_not_flooded(tmp_path: Path) -> None:
     _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
     con.execute("UPDATE diff_meta SET binary_a=NULL, binary_b=NULL WHERE diff_id='d'")
     con.commit()
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     rows = _deltas(con, "d")
     assert len(rows) == 1  # ONE refusal marker, not the whole-firmware flood
     assert rows[0][1] == "delta_undetermined" and rows[0][3] == "binary_scope_unrecorded"
@@ -660,7 +660,7 @@ def test_g3_completeness_partial_blocks_a_new_edge(tmp_path: Path) -> None:
                 ("5000", "5100", 0.98, "aligned"),
             ],
         )
-        run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+        run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
         kinds = {r[0]: (r[1], r[3]) for r in _deltas(con, "d")}
         # the k1 subject (A partial) is undetermined by completeness, never unchanged/changed
         k1 = next(v for k, v in kinds.items() if "k1" in k)
@@ -675,7 +675,7 @@ def test_layer2b_candidate_dims_are_capability_rows_not_delta_rows(tmp_path: Pat
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     cs = _capstate(con, "d")
     # controllability etc. present in capability_state with delta_supported=0
     assert cs["controllability"] == ("present", "present", 0)
@@ -696,7 +696,7 @@ def test_three_kinds_of_no_delta_are_distinguishable(tmp_path: Path) -> None:
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
     _cap(con, "ra", "reachability.auth_boundary", 0)  # declared_absent A
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     cs = _capstate(con, "d")
     assert cs[_SKE] == ("present", "present", 1)  # normal
     assert cs["reachability.entry_mechanism"] == ("present", "present", 0)  # analysis, no delta
@@ -719,7 +719,7 @@ def test_union_view_shows_full_universe_base_table_has_no_placeholder(tmp_path: 
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     view_dims = {
         r[0]
         for r in con.execute(
@@ -750,7 +750,7 @@ def test_capability_scope_is_constant_per_subject_no_mixing(tmp_path: Path) -> N
             _edge("ra", "k2", "3000", "4000"),
         ],
     )
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     rows = _deltas(con, "d")
     assert len(rows) == 2  # both present-side subjects surfaced (not vacuous)
     scopes = {r[2] for r in rows}
@@ -773,7 +773,7 @@ def test_reverse_callee_alignment_is_load_bearing(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(dimension_delta, "_aligned_callee_set", broken)
     con = _atlas(tmp_path)
     _seed_matched(con)  # would be layer_unchanged with real alignment
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_changed"  # broken -> flips; the real alignment step mattered
     con.close()
@@ -789,7 +789,7 @@ def test_reverse_completeness_guard_has_teeth(tmp_path: Path, monkeypatch) -> No
     add_string_keyed_edges(con, [_edge("ra", "k1", "1000", "2000", completeness="partial")])
     add_string_keyed_edges(con, [_edge("rb", "k1", "1100", "2100", completeness="complete")])
     _align(con, "d", [("1000", "1100", 0.98, "aligned"), ("2000", "2100", 0.98, "aligned")])
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] != "delta_undetermined"  # without G3 it is NOT undetermined -> G3 had teeth
     con.close()
@@ -821,7 +821,7 @@ def test_all_eight_triage_dimensions_are_visible(tmp_path: Path) -> None:
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     dims = frozenset(_capstate(con, "d"))
     missing = _uncovered(_CANONICAL_DIMENSION_NAMES, dims)
     assert missing is None, f"triage dimension {missing!r} is invisible in the layer-2 universe"
@@ -844,7 +844,7 @@ def test_source_dimension_visibility_is_load_bearing(tmp_path: Path, monkeypatch
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     assert "source" not in set(_capstate(con, "d"))
     con.close()
 
@@ -853,7 +853,7 @@ def test_writer_completeness_appear_in_view_as_delta_not_implemented(tmp_path: P
     con = _atlas(tmp_path)
     _cap(con, "ra", _SKE, 1)
     _cap(con, "rb", _SKE, 1)
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     view = {
         r[0]: r[1]
         for r in con.execute(
@@ -909,7 +909,7 @@ def test_version_skew_degrades_every_edge_subject(tmp_path: Path) -> None:
     # one layer_changed / layer_unchanged escapes.
     con = _atlas(tmp_path)
     _seed_matched(con, skew=1)
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     rows = _deltas(con, "d")
     assert rows and all(r[1] == "delta_undetermined" for r in rows)
     assert all(r[2] == "data" and r[3] == "version_skew" for r in rows)
@@ -921,7 +921,7 @@ def test_version_skew_zero_restores_the_verdict(tmp_path: Path) -> None:
     # skew guard genuinely gates the verdict, not that everything is always undetermined.
     con = _atlas(tmp_path)
     _seed_matched(con, skew=0)  # identical edges/alignment, only the skew flag differs
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "layer_unchanged"  # not undetermined -> the guard was the only difference
     con.close()
@@ -934,7 +934,7 @@ def test_missing_diff_meta_is_treated_as_skew(tmp_path: Path) -> None:
     _seed_matched(con, skew=0)
     con.execute("DELETE FROM diff_meta WHERE diff_id='d'")  # remove the row entirely
     con.commit()
-    run_layer2_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
+    run_dimension_delta(con, diff_id="d", run_a_id="ra", run_b_id="rb")
     (row,) = _deltas(con, "d")
     assert row[1] == "delta_undetermined" and row[3] == "version_skew"
     con.close()

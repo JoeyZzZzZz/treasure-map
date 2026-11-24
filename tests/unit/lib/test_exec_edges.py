@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.hunt import run_analyzer2
+from treasure_map.lib.hunt import run_analyzer
 from treasure_map.lib.hunt.exec_edges import (
     CLASSIFIER_RESOLUTIONS,
     EXEC_SINKS,
@@ -960,11 +960,11 @@ def test_hunt_writes_the_edge_and_the_consumer_reads_it_back(tmp_path: Path) -> 
     # the read tool must answer from it. A test of build_exec_edges alone stays green even if the
     # analyzer never calls it.
     #
-    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer2 comment out
+    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer comment out
     # `add_exec_edges(atlas, exec_edge_rows, commit=False)` -> launched_by returns 0 edges.
     db = _analysis_db(tmp_path)
     atlas_path = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas_path, source_run_id="run1")
+    run_analyzer(db, atlas_path, source_run_id="run1")
 
     conn = open_atlas(atlas_path)
     try:
@@ -1016,7 +1016,7 @@ def test_hunt_wires_the_script_inventory_end_to_end(tmp_path: Path) -> None:
     conn.close()
 
     atlas_path = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas_path, source_run_id="run1")
+    run_analyzer(db, atlas_path, source_run_id="run1")
 
     conn2 = open_atlas(atlas_path)
     try:
@@ -1036,7 +1036,7 @@ def test_hunt_registers_the_capability_unconditionally(tmp_path: Path) -> None:
     # No edges in this firmware, yet the capability is registered: the pass RAN. Absence of edges
     # is not absence of the capability, and a cross-version comparison relies on the difference.
     #
-    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer2 delete the
+    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer delete the
     # `RunCapabilityRow(... "reachability.exec_argv_edge" ...)` entry -> the capability is missing.
     db = tmp_path / "empty.db"
     conn = open_db(db)
@@ -1044,7 +1044,7 @@ def test_hunt_registers_the_capability_unconditionally(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     atlas_path = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas_path, source_run_id="run1")
+    run_analyzer(db, atlas_path, source_run_id="run1")
 
     conn2 = open_atlas(atlas_path)
     try:
@@ -1061,12 +1061,12 @@ def test_zero_edge_result_carries_a_visible_scan_status(tmp_path: Path) -> None:
     # ★ An empty answer must not read as "nothing launches this binary". The status row says the
     # pass ran and names what it cannot see — including the thin-wrapper gap.
     #
-    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer2 drop the
+    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer drop the
     # `detector_status_rows += _exec_scan_status(...)` line -> statuses come back empty, so an
     # empty result carries no honesty at all.
     db = _analysis_db(tmp_path)
     atlas_path = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas_path, source_run_id="run1")
+    run_analyzer(db, atlas_path, source_run_id="run1")
 
     conn = open_atlas(atlas_path)
     try:
@@ -1119,7 +1119,7 @@ def test_scan_status_covers_a_binary_that_produced_no_edges(tmp_path: Path) -> N
     conn.close()
 
     atlas_path = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas_path, source_run_id="run1")
+    run_analyzer(db, atlas_path, source_run_id="run1")
 
     conn2 = open_atlas(atlas_path)
     try:
@@ -1142,7 +1142,7 @@ def test_exec_edge_grants_an_entry_site_that_can_only_be_found_or_unknown(tmp_pa
     # ★ THE IRON LAW AT THE SEAM. A launch edge may raise a candidate's entry reading to
     # entry:exec — it may NEVER produce 'blocked'. The evidence layer only knows found/unknown.
     #
-    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer2 build the entry index without
+    # MUTATION (verified RED, 1 failed): in analyzer.run_analyzer build the entry index without
     # the edges — `entry_index = _load_entry_index(db_path)` -> the candidate reads 'unknown'.
     db = tmp_path / "analysis.db"
     conn = open_db(db)
@@ -1179,7 +1179,7 @@ def test_exec_edge_grants_an_entry_site_that_can_only_be_found_or_unknown(tmp_pa
     conn.close()
 
     atlas_path = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas_path, source_run_id="run1")
+    run_analyzer(db, atlas_path, source_run_id="run1")
 
     from treasure_map.lib.query import triage
 
@@ -1217,8 +1217,8 @@ def test_entry_reach_label_joins_several_kinds_in_a_stable_order() -> None:
 def test_replace_by_run_refreshes_instead_of_doubling(tmp_path: Path) -> None:
     db = _analysis_db(tmp_path)
     atlas_path = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas_path, source_run_id="run1")
-    run_analyzer2(db, atlas_path, source_run_id="run1")
+    run_analyzer(db, atlas_path, source_run_id="run1")
+    run_analyzer(db, atlas_path, source_run_id="run1")
 
     conn = open_atlas(atlas_path)
     try:
@@ -1239,7 +1239,7 @@ def test_missing_link_table_degrades_without_failing(tmp_path: Path) -> None:
     raw.close()
 
     atlas_path = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas_path, source_run_id="run1")
+    run_analyzer(db, atlas_path, source_run_id="run1")
     conn = open_atlas(atlas_path)
     try:
         rows = conn.execute("SELECT target_resolution FROM exec_edge").fetchall()

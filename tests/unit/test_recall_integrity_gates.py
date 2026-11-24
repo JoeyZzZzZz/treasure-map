@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from treasure_map.lib.hunt import run_analyzer2
+from treasure_map.lib.hunt import run_analyzer
 from treasure_map.lib.storage.connection import open_db
 
 _GATE_A_SQL = (
@@ -62,7 +62,7 @@ def test_the_analyzer_never_downweights_free_string_beside_a_constant(tmp_path: 
     )
     db = _make_analysis(tmp_path, "handle_msg", pc, ["json_object_get_string", "system"])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_msg")
+    run_analyzer(db, atlas, source_run_id="run_msg")
 
     conn = sqlite3.connect(atlas)
     try:

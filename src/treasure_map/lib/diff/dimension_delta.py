@@ -590,20 +590,20 @@ _DELTA_HANDLERS: dict[str, Callable[..., list[DimensionDeltaRow]]] = {
 
 
 @dataclass(frozen=True)
-class Layer2Result:
+class DimensionDeltaResult:
     diff_id: str
     delta_rows: int
     capability_rows: int
 
 
-def run_layer2_delta(
+def run_dimension_delta(
     atlas: sqlite3.Connection,
     *,
     diff_id: str,
     run_a_id: str,
     run_b_id: str,
     commit: bool = True,
-) -> Layer2Result:
+) -> DimensionDeltaResult:
     """Project every dimension in the universe (declared delta dimensions UNION the analysis
     sub-dimensions discovered in run_capability) into dimension_capability_state + dimension_delta.
 
@@ -688,4 +688,6 @@ def run_layer2_delta(
     add_dimension_deltas(atlas, delta_rows, commit=False)
     if commit:
         atlas.commit()
-    return Layer2Result(diff_id=diff_id, delta_rows=len(delta_rows), capability_rows=len(cap_rows))
+    return DimensionDeltaResult(
+        diff_id=diff_id, delta_rows=len(delta_rows), capability_rows=len(cap_rows)
+    )

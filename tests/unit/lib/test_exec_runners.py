@@ -24,7 +24,7 @@ from treasure_map.lib import rescan_version as rv
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.diff import code_version as dcv
 from treasure_map.lib.hunt import exec_runners as er
-from treasure_map.lib.hunt import run_analyzer2
+from treasure_map.lib.hunt import run_analyzer
 from treasure_map.lib.hunt.exec_edges import (
     EXEC_SINKS,
     ExecEdgeInventory,
@@ -1103,7 +1103,7 @@ def _runner_db(tmp_path: Path, *, import_gate: bool = True) -> Path:
 
 def _hunt(tmp_path: Path, **kw: Any) -> Path:
     atlas_path = tmp_path / "atlas.db"
-    run_analyzer2(_runner_db(tmp_path, **kw), atlas_path, source_run_id="run1")
+    run_analyzer(_runner_db(tmp_path, **kw), atlas_path, source_run_id="run1")
     return atlas_path
 
 

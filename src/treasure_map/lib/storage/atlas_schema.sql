@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS instance (
 );
 
 -- run: per-scan lineage + the run_id -> analysis.db RESOLVER. One row per source_run_id.
--- Written by the scan pipeline (run_analyzer2): scan_status='in_progress' at START, 'complete' at
+-- Written by the scan pipeline (run_analyzer): scan_status='in_progress' at START, 'complete' at
 -- END. A crash between leaves 'in_progress' — the honest "did not finish, do NOT trust this run"
 -- signal (a run whose instances exist but never resolved to a finished scan must stay VISIBLE, not
 -- silently look complete). This table is the AUTHORITY mapping a neutral run_id to its analysis.db:

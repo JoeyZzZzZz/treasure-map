@@ -19,9 +19,9 @@ from pathlib import Path
 
 import pytest
 
-import treasure_map.lib.hunt.analyzer as analyzer2_mod
+import treasure_map.lib.hunt.analyzer as analyzer_mod
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.hunt import run_analyzer2
+from treasure_map.lib.hunt import run_analyzer
 from treasure_map.lib.query import explain_candidate, get_run
 from treasure_map.lib.query.sink_impact import PROVABLY_CONSTANT_MARKERS
 from treasure_map.lib.query.triage import _CONTROLLABILITY_RANK, _controllability_rank
@@ -274,7 +274,7 @@ def test_writer_scans_widely_shipped_binary(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_cam")
+    stats = run_analyzer(db, atlas, source_run_id="run_cam")
 
     # Per class rather than a bare total: each function's snprintf is a command candidate AND a
     # buffer-formatter write candidate, so "how many matches" is no longer "how many cmd shapes".
@@ -310,7 +310,7 @@ def test_writer_scans_widely_shipped_binary(tmp_path: Path) -> None:
 # ── run lineage: the run_id -> analysis.db resolver + scan_status lifecycle ──────────
 
 
-def test_run_analyzer2_records_run_lineage(tmp_path: Path) -> None:
+def test_run_analyzer_records_run_lineage(tmp_path: Path) -> None:
     # A clean scan records its lineage row: scan_status='complete', the analysis.db resolver path,
     # the caller's firmware_path, the build hash (pass_version), and the analysis counts — this is
     # what a run-aware fact tool routes on and what list_runs / `tmap runs` shows.
@@ -322,7 +322,7 @@ def test_run_analyzer2_records_run_lineage(tmp_path: Path) -> None:
     stamp.commit()
     stamp.close()
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_lin", firmware_path="/fw/router")
+    run_analyzer(db, atlas, source_run_id="run_lin", firmware_path="/fw/router")
 
     conn = open_atlas(atlas)
     try:
@@ -343,7 +343,7 @@ def _boom(*_a: object, **_k: object) -> None:
     raise RuntimeError("boom")
 
 
-def test_run_analyzer2_crash_leaves_run_in_progress(
+def test_run_analyzer_crash_leaves_run_in_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A crash DURING the instance write must leave scan_status='in_progress' (the honest "did not
@@ -351,9 +351,9 @@ def test_run_analyzer2_crash_leaves_run_in_progress(
     # complete, and never half-written candidates behind a missing run row.
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    monkeypatch.setattr(analyzer2_mod, "add_instance", _boom)
+    monkeypatch.setattr(analyzer_mod, "add_instance", _boom)
     with pytest.raises(RuntimeError):
-        run_analyzer2(db, atlas, source_run_id="run_crash")
+        run_analyzer(db, atlas, source_run_id="run_crash")
 
     conn = open_atlas(atlas)
     try:
@@ -374,7 +374,7 @@ def test_data_gap_matches_are_counted_not_silent(tmp_path: Path) -> None:
     # incomplete — a real sink can hide in exactly such an un-decompilable function.
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_data_gap_cmd_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_gap")
+    stats = run_analyzer(db, atlas, source_run_id="run_gap")
 
     assert stats.matches == 1  # the shape scan saw the candidate
     assert stats.instances_written == 0  # but its body was un-decompilable -> not written
@@ -387,7 +387,7 @@ def test_decompile_error_body_is_a_counted_data_gap(tmp_path: Path) -> None:
     # be caught as a data gap (counted), not slip past the guard and read as an analyzed function.
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_decompile_error_cmd_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_err")
+    stats = run_analyzer(db, atlas, source_run_id="run_err")
 
     assert stats.matches == 1
     assert stats.instances_written == 0
@@ -456,7 +456,7 @@ def test_nvram_ops_flattened_cross_binary(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_nv")
+    stats = run_analyzer(db, atlas, source_run_id="run_nv")
 
     assert stats.nvram_flows_written == 4  # 3 writes + 1 read; the commit op is dropped
     rows = _nvram_rows(atlas)
@@ -513,7 +513,7 @@ def test_anchorless_parametric_reclassified_unresolved(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_anchor")
+    run_analyzer(db, atlas, source_run_id="run_anchor")
     rows = _nvram_rows(atlas)
     by_kind = {r["key_kind"] for r in rows}
     # the two anchorless templates -> unresolved (key NULL); only wl%d_ssid stays parametric
@@ -538,8 +538,8 @@ def test_nvram_flow_replace_by_run_is_idempotent(tmp_path: Path) -> None:
     ]
     db = _make_db(tmp_path, spec)
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_x")
-    run_analyzer2(db, atlas, source_run_id="run_x")
+    run_analyzer(db, atlas, source_run_id="run_x")
+    run_analyzer(db, atlas, source_run_id="run_x")
     assert len(_nvram_rows(atlas)) == 1  # not 2
 
 
@@ -586,7 +586,7 @@ def test_wrapper_indirect_edge_recovered_with_via_wrapper(tmp_path: Path) -> Non
         ],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_a2")
+    stats = run_analyzer(db, atlas, source_run_id="run_a2")
     assert stats.nvram_wrapper_edges == 1
     edge = next(r for r in _nvram_rows(atlas) if r["via_wrapper"] is not None)
     assert edge["key"] == "acct_link_code"
@@ -616,7 +616,7 @@ def test_call_to_non_wrapper_makes_no_edge(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_a2b")
+    stats = run_analyzer(db, atlas, source_run_id="run_a2b")
     assert stats.nvram_wrapper_edges == 0
     assert all(r["via_wrapper"] is None for r in _nvram_rows(atlas))
 
@@ -632,7 +632,7 @@ def test_wrapper_edge_does_not_cross_binaries(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_a2c")
+    stats = run_analyzer(db, atlas, source_run_id="run_a2c")
     assert stats.nvram_wrapper_edges == 0  # rc's wrapper is not httpd's
 
 
@@ -666,7 +666,7 @@ def test_router_defaults_flattened_to_atlas(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_rd")
+    stats = run_analyzer(db, atlas, source_run_id="run_rd")
     assert stats.nvram_defaults_written == 3  # resolved members + the unresolved one (not dropped)
     rows = _nvram_defaults_rows(atlas)
     hit = next(r for r in rows if r["key"] == "acct_link_code")
@@ -685,8 +685,8 @@ def test_router_defaults_replace_by_run_is_idempotent(tmp_path: Path) -> None:
     ]
     db = _make_db(tmp_path, spec)
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_rd2")
-    run_analyzer2(db, atlas, source_run_id="run_rd2")
+    run_analyzer(db, atlas, source_run_id="run_rd2")
+    run_analyzer(db, atlas, source_run_id="run_rd2")
     assert len(_nvram_defaults_rows(atlas)) == 1  # not 2
 
 
@@ -703,7 +703,7 @@ def test_web_form_fields_flattened_to_atlas(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_wff")
+    stats = run_analyzer(db, atlas, source_run_id="run_wff")
     assert stats.web_form_fields_written == 2
     conn = open_atlas(atlas)
     try:
@@ -726,8 +726,8 @@ def test_web_form_fields_replace_by_run_is_idempotent(tmp_path: Path) -> None:
         web_form_fields=[{"key": "rpt_comment", "rule": "textarea"}],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_wff2")
-    run_analyzer2(db, atlas, source_run_id="run_wff2")
+    run_analyzer(db, atlas, source_run_id="run_wff2")
+    run_analyzer(db, atlas, source_run_id="run_wff2")
     conn = open_atlas(atlas)
     try:
         n = conn.execute(
@@ -827,7 +827,7 @@ def test_string_keyed_edges_flattened_per_key_callee(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_ske")
+    run_analyzer(db, atlas, source_run_id="run_ske")
     rows = _ske_rows(atlas)
     assert len(rows) == 2
     by_key = {r["key"]: r for r in rows}
@@ -875,7 +875,7 @@ def test_string_keyed_edge_partial_gate_keeps_key_as_callee_less_row(tmp_path: P
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_partial")
+    run_analyzer(db, atlas, source_run_id="run_partial")
     rows = _ske_rows(atlas)
     assert len(rows) == 1
     r = rows[0]
@@ -920,7 +920,7 @@ def test_string_keyed_edge_switch_region_marked_incomplete(tmp_path: Path) -> No
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_switch")
+    run_analyzer(db, atlas, source_run_id="run_switch")
     rows = _ske_rows(atlas)
     assert len(rows) == 1
     r = rows[0]
@@ -953,8 +953,8 @@ def test_string_keyed_edges_replace_by_run_is_idempotent(tmp_path: Path) -> None
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_idem")
-    run_analyzer2(db, atlas, source_run_id="run_idem")
+    run_analyzer(db, atlas, source_run_id="run_idem")
+    run_analyzer(db, atlas, source_run_id="run_idem")
     conn = open_atlas(atlas)
     try:
         n = conn.execute(
@@ -971,7 +971,7 @@ def test_run_capability_registered_even_with_zero_edges(tmp_path: Path) -> None:
     # cross-version diff reads this to tell "no edges" apart from "this build cannot see edges".
     db = _make_db(tmp_path, [{"name": "rc", "funcs": [_nvram_fn("noop", [])]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_cap")
+    run_analyzer(db, atlas, source_run_id="run_cap")
     conn = open_atlas(atlas)
     try:
         assert _ske_rows(atlas) == []  # no edges at all
@@ -1019,7 +1019,7 @@ def test_string_keyed_edges_query_by_callee_and_by_run(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_q")
+    run_analyzer(db, atlas, source_run_id="run_q")
     conn = open_atlas(atlas)
     try:
         # by callee (reachability lookup): the callee's function is reached via a keyed edge
@@ -1103,7 +1103,7 @@ def test_one_hop_lead_reaches_the_sink_below_a_fat_edge_callee(tmp_path: Path) -
     # candidates) would kill exactly this lead, so this layer must not have one.
     db = _make_db(tmp_path, _fat_handler_fw())
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_lead")
+    run_analyzer(db, atlas, source_run_id="run_lead")
     leads = _leads_of(atlas, "run_cmd")
     assert len(leads) == 1
     assert leads[0] == {
@@ -1167,7 +1167,7 @@ def test_one_hop_lead_reaches_a_sink_of_every_axis_below_a_fat_edge_callee(
     fw[0]["funcs"] = [funcs[0], funcs[1], sink]  # type: ignore[index]
     db = _make_db(tmp_path, fw)
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_axes")
+    run_analyzer(db, atlas, source_run_id="run_axes")
     rows = _by_anchor(atlas, sink_class)
     assert sink["name"] in rows, sorted(rows)
     ev = json.loads(rows[sink["name"]]["flow_evidence"])
@@ -1186,7 +1186,7 @@ def test_fanout_edge_callee_hands_the_key_to_both_sinks_below(tmp_path: Path) ->
     # One pass over the edge-callee set: a fan-out handler hands its key to EVERY candidate below.
     db = _make_db(tmp_path, _fat_handler_fw())
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_fan")
+    run_analyzer(db, atlas, source_run_id="run_fan")
     for sink in ("run_cmd", "log_status"):
         leads = _leads_of(atlas, sink)
         assert [x["key"] for x in leads] == ["acct_link_code"], sink
@@ -1198,7 +1198,7 @@ def test_one_hop_leads_are_pure_annotation(tmp_path: Path) -> None:
     fw = _fat_handler_fw()
     db = _make_db(tmp_path, fw)
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_ann")
+    stats = run_analyzer(db, atlas, source_run_id="run_ann")
 
     # same firmware with the edge stripped out -> the candidate corpus must be identical
     bare = [{**fw[0], "funcs": [{**f} for f in fw[0]["funcs"]]}]  # type: ignore[index,dict-item]
@@ -1206,7 +1206,7 @@ def test_one_hop_leads_are_pure_annotation(tmp_path: Path) -> None:
     db2 = _make_db(tmp_path / "b", bare)
     (tmp_path / "b").mkdir(exist_ok=True)
     atlas2 = tmp_path / "atlas2.db"
-    stats2 = run_analyzer2(db2, atlas2, source_run_id="run_ann")
+    stats2 = run_analyzer(db2, atlas2, source_run_id="run_ann")
 
     assert stats.instances_written == stats2.instances_written  # corpus unchanged by the leads
     conn = open_atlas(atlas)
@@ -1223,8 +1223,8 @@ def test_one_hop_leads_are_pure_annotation(tmp_path: Path) -> None:
 
 def _lead_func(
     fid: int, path: str | None, name: str, address: str, callees: list[str]
-) -> analyzer2_mod.FuncRow:
-    return analyzer2_mod.FuncRow(
+) -> analyzer_mod.FuncRow:
+    return analyzer_mod.FuncRow(
         func_id=fid,
         binary_id=1 if path is None or path.startswith("/lib/") else 2,
         binary_name="libx.so",
@@ -1240,8 +1240,8 @@ def _lead_func(
 
 def _lead_edge(
     key: str, callee: str, addr: str | None, path: str | None, mechanism: str = "strcmp_gate"
-) -> analyzer2_mod.StringKeyedEdgeRow:
-    return analyzer2_mod.StringKeyedEdgeRow(
+) -> analyzer_mod.StringKeyedEdgeRow:
+    return analyzer_mod.StringKeyedEdgeRow(
         source_run_id="runA",
         binary="libx.so",
         from_function="dispatch",
@@ -1253,7 +1253,7 @@ def _lead_edge(
     )
 
 
-def _two_libx_funcs() -> list[analyzer2_mod.FuncRow]:
+def _two_libx_funcs() -> list[analyzer_mod.FuncRow]:
     """Two binaries share the short name libx.so at different paths. A holds two functions named
     ``_List``: an empty one at 0x100 (the edge's callee) and one at 0x200 that calls ``copy``. B
     holds a ``_List`` at 0x200 that calls ``copy`` too. Both hold a ``copy``."""
@@ -1274,11 +1274,11 @@ def test_one_hop_lead_follows_the_edge_callee_address_not_a_same_named_function(
     MUTATION (verified RED, 1 failed): edge callee looked up by (short binary name, callee name)
     instead of (binary path, callee address) -> RED (``copy`` in /opt/lib/libx.so got the lead)."""
     edges = [_lead_edge(".", "_List", "0x100", "/lib/libx.so")]
-    out = analyzer2_mod._one_hop_edge_leads(_two_libx_funcs(), edges)
+    out = analyzer_mod._one_hop_edge_leads(_two_libx_funcs(), edges)
     copy_leads = {k: v for k, v in out.items() if k[1] == "copy"}
     assert copy_leads == {}
     # the same edge at 0x200 in A reaches A's copy only, located by path + address (no basis mark)
-    out = analyzer2_mod._one_hop_edge_leads(
+    out = analyzer_mod._one_hop_edge_leads(
         _two_libx_funcs(), [_lead_edge(".", "_List", "0x200", "/lib/libx.so")]
     )
     assert out == {
@@ -1293,9 +1293,9 @@ def test_one_hop_lead_follows_the_edge_callee_address_not_a_same_named_function(
         ]
     }
     ev: dict[str, object] = {}
-    analyzer2_mod._attach_edge_leads(ev, out, "/opt/lib/libx.so", "libx.so", "copy")
+    analyzer_mod._attach_edge_leads(ev, out, "/opt/lib/libx.so", "libx.so", "copy")
     assert "reachability_leads" not in ev  # B's copy does not borrow A's lead
-    analyzer2_mod._attach_edge_leads(ev, out, "/lib/libx.so", "libx.so", "copy")
+    analyzer_mod._attach_edge_leads(ev, out, "/lib/libx.so", "libx.so", "copy")
     assert ev["reachability_leads"] == out[(("path", "/lib/libx.so"), "copy")]
 
 
@@ -1325,7 +1325,7 @@ def test_one_hop_leads_walk_down_from_a_settled_table_row_and_never_from_a_candi
         _lead_edge("set", "handler_b", "0x300", "/lib/libx.so", "static_string_table"),
         pairing_basis="undetermined",
     )
-    out = analyzer2_mod._one_hop_edge_leads(funcs, [settled, candidate])
+    out = analyzer_mod._one_hop_edge_leads(funcs, [settled, candidate])
     assert out.get((("path", "/lib/libx.so"), "leaf_a")) == [
         {
             "via": "string_keyed_edge",
@@ -1357,7 +1357,7 @@ def test_one_hop_leads_do_not_depend_on_the_order_rows_were_read_in() -> None:
         _lead_edge("alpha", "_List", "0x200", "/opt/lib/libx.so"),
         _lead_edge(".", "_List", "0x100", "/lib/libx.so"),
     ]
-    base = analyzer2_mod._one_hop_edge_leads(funcs, edges)
+    base = analyzer_mod._one_hop_edge_leads(funcs, edges)
     orders = [
         (list(reversed(funcs)), list(edges)),
         (list(funcs), list(reversed(edges))),
@@ -1370,7 +1370,7 @@ def test_one_hop_leads_do_not_depend_on_the_order_rows_were_read_in() -> None:
         rng.shuffle(e)
         orders.append((f, e))
     for f, e in orders:
-        assert analyzer2_mod._one_hop_edge_leads(f, e) == base
+        assert analyzer_mod._one_hop_edge_leads(f, e) == base
     # and the one output is the right one: B's copy holds the three leads in (key, mechanism) order
     assert list(base) == [(("path", "/opt/lib/libx.so"), "copy")]
     assert [(x["key"], x["mechanism"]) for x in base[(("path", "/opt/lib/libx.so"), "copy")]] == [
@@ -1391,13 +1391,13 @@ def test_one_hop_lead_from_a_pathless_edge_is_marked_and_never_guessed() -> None
         _lead_func(1, None, "handler", "00000100", ["copy"]),
         _lead_func(2, None, "copy", "00000200", []),
     ]
-    out = analyzer2_mod._one_hop_edge_leads(funcs, [_lead_edge("k", "handler", "0x100", None)])
+    out = analyzer_mod._one_hop_edge_leads(funcs, [_lead_edge("k", "handler", "0x100", None)])
     assert out[(("name", "libx.so"), "copy")][0].get("match_basis") == "name"
     # no callee address -> the name alone, still marked
-    out = analyzer2_mod._one_hop_edge_leads(funcs, [_lead_edge("k", "handler", None, None)])
+    out = analyzer_mod._one_hop_edge_leads(funcs, [_lead_edge("k", "handler", None, None)])
     assert out[(("name", "libx.so"), "copy")][0].get("match_basis") == "name"
     # a pathless edge to (libx.so, _List) at 0x200: both binaries hold one -> no lead
-    out = analyzer2_mod._one_hop_edge_leads(
+    out = analyzer_mod._one_hop_edge_leads(
         _two_libx_funcs(), [_lead_edge(".", "_List", "0x200", None)]
     )
     assert out == {}
@@ -1416,7 +1416,7 @@ def test_a_pathless_edge_is_narrowed_to_the_same_named_function_at_its_callee_ad
         _lead_func(3, "/lib/libx.so", "copy", "00000300", []),
         _lead_func(4, "/lib/libx.so", "move", "00000400", []),
     ]
-    out = analyzer2_mod._one_hop_edge_leads(funcs, [_lead_edge("k", "handler", "0x200", None)])
+    out = analyzer_mod._one_hop_edge_leads(funcs, [_lead_edge("k", "handler", "0x200", None)])
     assert out == {
         (("path", "/lib/libx.so"), "move"): [
             {
@@ -1445,7 +1445,7 @@ def test_wrapper_edge_binds_to_the_wrapper_in_the_callers_own_binary_path() -> N
     ]
     wrappers = {1: {"op": "read", "api": "nvram_get"}}
     call = [{"callee": "get_cfg", "key": "lan_ipaddr", "key_kind": "constant"}]
-    rows = analyzer2_mod._flatten_wrapper_edges(funcs, wrappers, {3: call, 4: call}, "runA")
+    rows = analyzer_mod._flatten_wrapper_edges(funcs, wrappers, {3: call, 4: call}, "runA")
     assert [(r.func, r.binary_path) for r in rows] == [("caller", "/lib/libx.so")]
 
 
@@ -1463,9 +1463,9 @@ def test_two_same_named_wrappers_in_one_path_that_disagree_bind_no_edge() -> Non
     ]
     call = [{"callee": "cfg", "key": "lan_ipaddr", "key_kind": "constant"}]
     disagree = {1: {"op": "read", "api": "nvram_get"}, 2: {"op": "write", "api": "nvram_set"}}
-    assert analyzer2_mod._flatten_wrapper_edges(funcs, disagree, {3: call}, "runA") == []
+    assert analyzer_mod._flatten_wrapper_edges(funcs, disagree, {3: call}, "runA") == []
     agree = {1: {"op": "read", "api": "nvram_get"}, 2: {"op": "read", "api": "nvram_get"}}
-    rows = analyzer2_mod._flatten_wrapper_edges(funcs, agree, {3: call}, "runA")
+    rows = analyzer_mod._flatten_wrapper_edges(funcs, agree, {3: call}, "runA")
     assert [(r.func, r.key, r.binary_path) for r in rows] == [
         ("caller", "lan_ipaddr", "/lib/libx.so")
     ]
@@ -1504,7 +1504,7 @@ def test_static_string_table_flattened_to_edges(tmp_path: Path) -> None:
     first = _key_first_table(img, ["cfg_dump", "sys_reboot", "net_ping", "dir_list"], handlers)
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_nvram_fn("noop", [])], "image": img}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_a")
+    run_analyzer(db, atlas, source_run_id="run_a")
     by_key = {r["key"]: r for r in _static_rows(atlas)}
     assert set(by_key) == {"cfg_dump", "sys_reboot", "net_ping", "dir_list"}
     dump = by_key["cfg_dump"]
@@ -1535,7 +1535,7 @@ def test_static_table_undefined_handler_cuts_the_table(tmp_path: Path) -> None:
     img.words(keys[4], undefined, 0x7FFF0003, 0x7FFF0004)
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_nvram_fn("noop", [])], "image": img}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_ut")
+    run_analyzer(db, atlas, source_run_id="run_ut")
     rows = _static_rows(atlas)
     assert {"one", "two", "three", "four"} <= {r["key"] for r in rows}
     assert rows and all(r["callee_addr"] != f"0x{undefined:x}" for r in rows)
@@ -1577,7 +1577,7 @@ def test_static_table_and_strcmp_gate_share_query_and_capability(tmp_path: Path)
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_ab")
+    run_analyzer(db, atlas, source_run_id="run_ab")
     conn = open_atlas(atlas)
     try:
         # the static-table handler is reachable-via-key like a strcmp callee (same lookup)
@@ -1643,12 +1643,12 @@ def test_evidence_ref_survives_a_rescan(tmp_path: Path) -> None:
     fw = _rc_dispatch_fw()
     db = _make_db(tmp_path, fw)
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_1")
     ref_before = _ref_of(atlas, "FUN_00408b2c")
     id_before = _func_id_of(db, "FUN_00408b2c")
 
     _rescan_funcs(db, fw)  # same firmware, same order — only the ingest bookkeeping moves
-    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_1")
     ref_after = _ref_of(atlas, "FUN_00408b2c")
     id_after = _func_id_of(db, "FUN_00408b2c")
 
@@ -1680,17 +1680,17 @@ def test_copy_callsite_refs_survive_a_rescan(tmp_path: Path) -> None:
     ]
     db = _make_db(tmp_path, fw)
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_1")
     before = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ReplySetup")]
     id_before = _func_id_of(db, "ReplySetup")
 
     _rescan_funcs(db, fw)  # same firmware, same order — only the ingest bookkeeping moves
-    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_1")
     assert _func_id_of(db, "ReplySetup") != id_before, "fixture did not reproduce id drift"
     assert [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ReplySetup")] == before
 
     _rescan_funcs(db, fw, reverse=True)  # enumeration order flipped too
-    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_1")
     after = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ReplySetup")]
 
     assert after == before
@@ -1703,11 +1703,11 @@ def test_evidence_ref_survives_enumeration_order_change(tmp_path: Path) -> None:
     fw = _rc_dispatch_fw()
     db = _make_db(tmp_path, fw)
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_1")
     ref_before = _ref_of(atlas, "FUN_00408b2c")
 
     _rescan_funcs(db, fw, reverse=True)  # enumeration order flipped
-    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_1")
 
     assert _ref_of(atlas, "FUN_00408b2c") == ref_before
 
@@ -1722,7 +1722,7 @@ def test_stored_judgement_keeps_its_anchor_across_a_rescan(tmp_path: Path) -> No
     fw = _rc_dispatch_fw()
     db = _make_db(tmp_path, fw)
     atlas_p = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas_p, source_run_id="run_1")
+    run_analyzer(db, atlas_p, source_run_id="run_1")
     ref = _ref_of(atlas_p, "FUN_00408b2c")
 
     conn = open_atlas(atlas_p)
@@ -1730,7 +1730,7 @@ def test_stored_judgement_keeps_its_anchor_across_a_rescan(tmp_path: Path) -> No
     conn.close()
 
     _rescan_funcs(db, fw, reverse=True)  # re-scan: func_ids climb AND the order flips
-    run_analyzer2(db, atlas_p, source_run_id="run_1")
+    run_analyzer(db, atlas_p, source_run_id="run_1")
 
     conn = open_atlas(atlas_p)
     try:
@@ -1777,7 +1777,7 @@ def test_evidence_ref_distinguishes_same_named_binaries(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_1")
 
     conn = open_atlas(atlas)
     try:
@@ -1797,7 +1797,7 @@ def test_evidence_ref_distinguishes_same_named_binaries(tmp_path: Path) -> None:
 def test_raw_evidence_is_not_persisted(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_cam")
+    run_analyzer(db, atlas, source_run_id="run_cam")
 
     (row,) = _instances_of(atlas, "cmd")
     # evidence_ref holds a neutral per-instance locator (run-scoped function id), not the
@@ -1816,7 +1816,7 @@ def test_evidence_ref_unique_per_instance(tmp_path: Path) -> None:
         [{"name": "webd", "funcs": [_cmd_injection_fn("h1"), _cmd_injection_fn("h2")]}],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_x")
+    run_analyzer(db, atlas, source_run_id="run_x")
 
     rows = _instances_of(atlas, "cmd")
     assert len(rows) == 2
@@ -1851,7 +1851,7 @@ def test_instance_carries_binary_location(tmp_path: Path) -> None:
         [{"name": "webd", "path": "usr/sbin/webd", "funcs": [_cmd_injection_fn("handle")]}],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_loc")
+    run_analyzer(db, atlas, source_run_id="run_loc")
 
     (row,) = _instances_of(atlas, "cmd")
     assert row["binary_path"] == "usr/sbin/webd"  # full path, not the bare name
@@ -1862,7 +1862,7 @@ def test_binary_path_falls_back_to_name_when_source_has_no_path(tmp_path: Path) 
     # A degraded source with no path still yields a locator (the bare name) rather than NULL.
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_np")
+    run_analyzer(db, atlas, source_run_id="run_np")
 
     (row,) = _instances_of(atlas, "cmd")
     assert row["binary_path"] == "webd"
@@ -1878,7 +1878,7 @@ def test_location_survives_source_db_removal(tmp_path: Path) -> None:
         [{"name": "webd", "path": "usr/sbin/webd", "funcs": [_cmd_injection_fn("handle")]}],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_gone")
+    run_analyzer(db, atlas, source_run_id="run_gone")
     db.unlink()  # the source build is gone
 
     conn = open_atlas(atlas)
@@ -1898,7 +1898,7 @@ def test_parameter_sourced_match_is_unknown_l0(tmp_path: Path) -> None:
     fn = _cmd_injection_fn("handle", param_sourced=True)
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="r")
+    stats = run_analyzer(db, atlas, source_run_id="r")
     assert stats.by_status["unknown"] == 2  # the cmd candidate and the snprintf write candidate
     (row,) = _instances_of(atlas, "cmd")
     assert row["reachability_status"] == "unknown"
@@ -1911,8 +1911,8 @@ def test_parameter_sourced_match_is_unknown_l0(tmp_path: Path) -> None:
 def test_second_run_appends_and_recomputes_breadth(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_1")
-    run_analyzer2(db, atlas, source_run_id="run_2")
+    run_analyzer(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_2")
 
     assert len(_instances_of(atlas, "cmd")) == 2  # one per run, on the axis this is about
     conn = open_atlas(atlas)
@@ -1945,9 +1945,9 @@ def _multi_sink_fn(name: str = "svc_utils_exec") -> dict[str, object]:
 def test_same_run_rerun_is_idempotent(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    s1 = run_analyzer2(db, atlas, source_run_id="run_rb")
+    s1 = run_analyzer(db, atlas, source_run_id="run_rb")
     after_one = len(_instances(atlas))
-    s2 = run_analyzer2(db, atlas, source_run_id="run_rb")  # same run-id again
+    s2 = run_analyzer(db, atlas, source_run_id="run_rb")  # same run-id again
 
     assert s2.instances_written == s1.instances_written
     assert len(_instances(atlas)) == after_one  # refreshed, NOT doubled
@@ -1958,10 +1958,10 @@ def test_same_run_rerun_is_idempotent(tmp_path: Path) -> None:
 def test_rerun_does_not_touch_other_runs(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_A")
+    run_analyzer(db, atlas, source_run_id="run_A")
     a_rows_before = [tuple(r) for r in _instances(atlas) if r["source_run_id"] == "run_A"]
-    run_analyzer2(db, atlas, source_run_id="run_B")
-    run_analyzer2(db, atlas, source_run_id="run_B")  # refresh B twice
+    run_analyzer(db, atlas, source_run_id="run_B")
+    run_analyzer(db, atlas, source_run_id="run_B")  # refresh B twice
     a_rows_after = [tuple(r) for r in _instances(atlas) if r["source_run_id"] == "run_A"]
 
     assert a_rows_before == a_rows_after  # run A untouched by B's replace-by-run
@@ -1972,11 +1972,11 @@ def test_rerun_failure_rolls_back_to_old_result(
 ) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_rb")
+    run_analyzer(db, atlas, source_run_id="run_rb")
     before = [tuple(r) for r in _instances(atlas)]
     assert before  # there is an old result to protect
 
-    real_add = analyzer2_mod.add_instance
+    real_add = analyzer_mod.add_instance
     calls = {"n": 0}
 
     def _boom(*args: object, **kwargs: object) -> int:
@@ -1985,9 +1985,9 @@ def test_rerun_failure_rolls_back_to_old_result(
             raise RuntimeError("write blew up mid-run")
         return real_add(*args, **kwargs)  # type: ignore[no-any-return]
 
-    monkeypatch.setattr(analyzer2_mod, "add_instance", _boom)
+    monkeypatch.setattr(analyzer_mod, "add_instance", _boom)
     with pytest.raises(RuntimeError):
-        run_analyzer2(db, atlas, source_run_id="run_rb")
+        run_analyzer(db, atlas, source_run_id="run_rb")
 
     after = [tuple(r) for r in _instances(atlas)]
     assert after == before  # rolled back to the old result — never a half-written run
@@ -1996,13 +1996,13 @@ def test_rerun_failure_rolls_back_to_old_result(
 def test_replace_by_run_keeps_pattern_rows(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_rb")
+    run_analyzer(db, atlas, source_run_id="run_rb")
     conn = open_atlas(atlas)
     try:
         patterns_before = conn.execute("SELECT COUNT(*) FROM pattern").fetchone()[0]
     finally:
         conn.close()
-    run_analyzer2(db, atlas, source_run_id="run_rb")  # replace-by-run
+    run_analyzer(db, atlas, source_run_id="run_rb")  # replace-by-run
     conn = open_atlas(atlas)
     try:
         patterns_after = conn.execute("SELECT COUNT(*) FROM pattern").fetchone()[0]
@@ -2017,7 +2017,7 @@ def test_replace_by_run_keeps_pattern_rows(tmp_path: Path) -> None:
 def test_multi_sink_function_has_unique_evidence_refs(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_multi_sink_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_ms")
+    run_analyzer(db, atlas, source_run_id="run_ms")
 
     rows = _instances(atlas)
     assert len(rows) >= 2  # one function, multiple sink hits -> multiple instances
@@ -2034,7 +2034,7 @@ def test_multi_sink_function_has_unique_evidence_refs(tmp_path: Path) -> None:
 def test_explain_anchors_the_right_sink_hit(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_multi_sink_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_ms")
+    run_analyzer(db, atlas, source_run_id="run_ms")
 
     conn = open_atlas(atlas)
     try:
@@ -2184,7 +2184,7 @@ def test_no_shell_exec_is_labelled_and_downweighted(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_a")
+    run_analyzer(db, atlas, source_run_id="run_a")
 
     rows = _by_anchor(atlas)
     assert rows["noshell"]["blocking_mechanism"] == "no_shell_exec"
@@ -2209,7 +2209,7 @@ def test_mixed_system_and_execl_anchors_system_not_no_shell(tmp_path: Path) -> N
     }
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [mixed]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_a")
+    run_analyzer(db, atlas, source_run_id="run_a")
 
     row = _by_anchor(atlas)["mixed_exec"]
     assert row["sink_anchor"] == "system"  # danger-anchored, not the alphabetically-first execl
@@ -2230,7 +2230,7 @@ def test_numeric_sanitized_is_labelled_and_downweighted(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_a")
+    run_analyzer(db, atlas, source_run_id="run_a")
 
     rows = _by_anchor(atlas)
     assert rows["num_sys"]["blocking_mechanism"] == "numeric_sanitized"
@@ -2261,7 +2261,7 @@ def test_a_library_looking_symbol_is_no_longer_guessed_to_be_library_code(
         [{"name": "customd", "funcs": [_cmd_injection_fn("real_handle"), lib_fn]}],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_a")
+    run_analyzer(db, atlas, source_run_id="run_a")
 
     rows = _by_anchor(atlas)
     assert rows["SSL_read"]["origin"] == "unknown"
@@ -2292,7 +2292,7 @@ def test_a_wrapper_recovered_candidate_is_not_guessed_either(tmp_path: Path) -> 
     caller["pseudocode"] = str(caller["pseudocode"]).replace("set_route", "SSL_read")
     db = _make_db(tmp_path, [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), caller]}])
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_w")
+    stats = run_analyzer(db, atlas, source_run_id="run_w")
 
     assert stats.wrapper_propagated == 1  # the wrapper path really ran (not a vacuous pass)
     conn = open_atlas(atlas)
@@ -2329,7 +2329,7 @@ def test_the_origin_column_keeps_its_four_values_with_nothing_writing_three(
     # ...and no hunt path reaches any of the other three.
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("h")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_a")
+    run_analyzer(db, atlas, source_run_id="run_a")
     conn = open_atlas(atlas)
     try:
         assert {r[0] for r in conn.execute("SELECT DISTINCT origin FROM instance")} == {"unknown"}
@@ -2342,7 +2342,7 @@ def test_plain_shell_candidate_is_not_downweighted(tmp_path: Path) -> None:
     # symbol, non-numeric, no constant caller keeps blocking_mechanism NULL (full score).
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("clean_handle")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_a")
+    run_analyzer(db, atlas, source_run_id="run_a")
     assert _by_anchor(atlas)["clean_handle"]["blocking_mechanism"] is None
 
 
@@ -2364,7 +2364,7 @@ def test_bare_sink_no_source_is_listed_not_sunk(tmp_path: Path) -> None:
         [{"name": "svcd", "funcs": [_cmd_injection_fn("real", param_sourced=False), bare]}],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_b")
+    run_analyzer(db, atlas, source_run_id="run_b")
 
     rows = _by_anchor(atlas)
     assert "do_exec" in rows  # not silently dropped
@@ -2404,7 +2404,7 @@ def test_cross_function_source_system_enters_candidates(tmp_path: Path) -> None:
         xrefs=[(2, 1)],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_8")
+    run_analyzer(db, atlas, source_run_id="run_8")
 
     rows = _by_anchor(atlas)
     assert "apply_mac" in rows  # the cross-function shell sink is a candidate (recall win)
@@ -2433,7 +2433,7 @@ def test_caller_constant_downweights_constant_supplied_sink(tmp_path: Path) -> N
     }
     db = _make_db(tmp_path, [{"name": "initd", "funcs": [run_cmd, boot]}], xrefs=[(2, 1)])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_cc")
+    run_analyzer(db, atlas, source_run_id="run_cc")
 
     rows = _by_anchor(atlas)
     assert rows["run_cmd"]["blocking_mechanism"] == "caller_constant"
@@ -2473,7 +2473,7 @@ def test_inline_charset_cmd_candidate_is_downweighted_end_to_end(tmp_path: Path)
     # candidate built from ether_ntoa is labelled charset_constrained (not bare_sink / None).
     db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_inline_cmd_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_cs")
+    run_analyzer(db, atlas, source_run_id="run_cs")
     row = _by_anchor(atlas)["arp_set"]
     assert row["blocking_mechanism"] == "charset_constrained"
     assert row["is_thin_cmd_wrapper"] == 0  # builds a command; not a verbatim forwarder
@@ -2484,7 +2484,7 @@ def test_thin_wrapper_fact_is_recorded_without_changing_score(tmp_path: Path) ->
     # (still bare_sink) — recording the fact does not change recall or rank.
     db = _make_db(tmp_path, [{"name": "initd", "funcs": [_thin_wrapper_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_w")
+    run_analyzer(db, atlas, source_run_id="run_w")
     row = _by_anchor(atlas)["exec_sh"]
     assert row["is_thin_cmd_wrapper"] == 1
     assert row["wrapped_sink"] == "system"
@@ -2497,7 +2497,7 @@ def test_wrapper_fact_does_not_add_candidates(tmp_path: Path) -> None:
     # The wrapper function yields exactly one instance (its bare_cmd_shape match), no extra row.
     db = _make_db(tmp_path, [{"name": "initd", "funcs": [_thin_wrapper_fn()]}])
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_w1")
+    stats = run_analyzer(db, atlas, source_run_id="run_w1")
     assert stats.instances_written == len(_instances(atlas)) == stats.matches == 1
 
 
@@ -2575,7 +2575,7 @@ def test_copy_size_bands_const_drops_variable_and_cmd_stay_high(tmp_path: Path) 
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_band")
+    run_analyzer(db, atlas, source_run_id="run_band")
 
     rows = _by_anchor(atlas, "copy")
     # Copy sinks never confirm; the constant length is downweighted, the unproven lengths are not.
@@ -2622,7 +2622,7 @@ def test_fmtstr_cve_recalled_and_literal_not_flooded(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_fmt")
+    run_analyzer(db, atlas, source_run_id="run_fmt")
     rows = _by_anchor(atlas, "fmt_string")
     # (1) recalled, as an fmt_string candidate anchored to syslog, with format evidence.
     assert "risky_log" in rows
@@ -2645,7 +2645,7 @@ def test_fmtstr_class_outranks_copy_when_same_status(tmp_path: Path) -> None:
 def test_cmd_candidate_carries_flow_evidence(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_fe")
+    run_analyzer(db, atlas, source_run_id="run_fe")
     ev = _evidence_of(atlas, "arp_run")
     assert set(ev) == {
         "source_kind",
@@ -2678,7 +2678,7 @@ def test_copy_candidate_has_size_evidence(tmp_path: Path) -> None:
     }
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_cp")
+    run_analyzer(db, atlas, source_run_id="run_cp")
     ev = json.loads(_by_anchor(atlas, "copy")["cp_fn"]["flow_evidence"])
     assert ev["size_kind"] == "source_len"
     assert "size_flow" in ev and "clamp_seen" in ev and "trace_boundary" in ev
@@ -2689,7 +2689,7 @@ def test_flow_evidence_records_entry_sites_from_script_calls(tmp_path: Path) -> 
     _add_script_call(db, "/etc/init.d/netd.sh", "/sbin/netd", 7, "var_expansion")
     _add_script_call(db, "/etc/init.d/netd.sh", "netd", 19, "literal")
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_er")
+    run_analyzer(db, atlas, source_run_id="run_er")
     er = _evidence_of(atlas, "arp_run")["entry_reach"]
     assert er["status"] == "found"
     # both call sites (path form + bare-name form) are listed with their arg source.
@@ -2703,7 +2703,7 @@ def test_flow_evidence_entry_unknown_when_no_script_calls(tmp_path: Path) -> Non
     # No invocation found is reported as unknown, NOT unreachable; the candidate is not dropped.
     db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_noer")
+    run_analyzer(db, atlas, source_run_id="run_noer")
     assert _evidence_of(atlas, "arp_run")["entry_reach"]["status"] == "unknown"
 
 
@@ -2711,7 +2711,7 @@ def test_flow_evidence_survives_source_db_removal(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
     _add_script_call(db, "/etc/init.d/netd.sh", "netd", 5, "var_expansion")
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_rm")
+    run_analyzer(db, atlas, source_run_id="run_rm")
     db.unlink()  # source analysis.db gone — atlas is the persistent store
     ev = _evidence_of(atlas, "arp_run")
     assert ev["source_kind"] == "charset_maybe"
@@ -2723,7 +2723,7 @@ def test_flow_evidence_does_not_add_candidates(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "netd", "funcs": [_charset_buffer_cmd_fn()]}])
     _add_script_call(db, "/etc/init.d/netd.sh", "netd", 5, "literal")
     atlas = tmp_path / "atlas.db"
-    s1 = run_analyzer2(db, atlas, source_run_id="run_n1")
+    s1 = run_analyzer(db, atlas, source_run_id="run_n1")
     # On the cmd axis, where the evidence is attached. The fixture's snprintf is separately a
     # buffer-formatter write candidate, which is a different shape being detected — not evidence
     # manufacturing a candidate, which is what this test guards.
@@ -2788,7 +2788,7 @@ def test_free_string_via_wrapper_becomes_high_band_candidate(tmp_path: Path) -> 
         [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), _free_via_wrapper_fn()]}],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_a")
+    stats = run_analyzer(db, atlas, source_run_id="run_a")
     assert stats.wrapper_propagated == 1
 
     row = _by_anchor(atlas)["set_route"]
@@ -2825,7 +2825,7 @@ def test_json_free_string_via_wrapper_floats_high(tmp_path: Path) -> None:
         [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), _json_free_via_wrapper_fn()]}],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_json")
+    run_analyzer(db, atlas, source_run_id="run_json")
     row = _by_anchor(atlas)["set_radio_cfg"]
     assert row["blocking_mechanism"] is None  # free string -> not downweighted
     ev = json.loads(row["flow_evidence"])
@@ -2870,7 +2870,7 @@ def test_safe_fanout_to_wrapper_is_suppressed_below_real_concat(tmp_path: Path) 
         ],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_b")
+    stats = run_analyzer(db, atlas, source_run_id="run_b")
     assert stats.wrapper_propagated == 3  # the three callers; the wrapper itself is a direct match
 
     rows = _by_anchor(atlas)
@@ -2901,7 +2901,7 @@ def test_wrapper_itself_kept_as_distinct_bare_sink_candidate(tmp_path: Path) -> 
         [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), _free_via_wrapper_fn()]}],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_c")
+    run_analyzer(db, atlas, source_run_id="run_c")
     rows = _by_anchor(atlas)
     assert rows["do_cmd"]["exposure_shape"] == "bare_sink"
     assert rows["do_cmd"]["blocking_mechanism"] is None
@@ -2916,8 +2916,8 @@ def test_wrapper_propagation_is_deterministic(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
     a1 = tmp_path / "a1.db"
     a2 = tmp_path / "a2.db"
-    run_analyzer2(db, a1, source_run_id="r")
-    run_analyzer2(db, a2, source_run_id="r")
+    run_analyzer(db, a1, source_run_id="r")
+    run_analyzer(db, a2, source_run_id="r")
 
     def _ev_by_fn(atlas: Path) -> dict[str, str]:
         return {r["source_anchor"]: (r["flow_evidence"] or "") for r in _instances(atlas)}
@@ -2962,7 +2962,7 @@ def test_free_string_via_fmt_wrapper_becomes_fmt_candidate(tmp_path: Path) -> No
         [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _free_via_fmt_wrapper_fn()]}],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_fmt")
+    stats = run_analyzer(db, atlas, source_run_id="run_fmt")
     assert stats.wrapper_propagated == 1
 
     row = _by_anchor(atlas, "fmt_string")["handle_req"]
@@ -3016,7 +3016,7 @@ def test_fmt_wrapper_unknown_source_is_demoted_and_counted_not_dropped(tmp_path:
         [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _unknown_via_fmt_wrapper_fn()]}],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_fmt_unk")
+    stats = run_analyzer(db, atlas, source_run_id="run_fmt_unk")
     assert stats.fmt_wrapper_unknown_source_demoted == 1  # counted as demoted
     assert "emit_state" in _by_anchor(atlas, "fmt_string")  # SURVIVES — corpus did not shrink
 
@@ -3031,7 +3031,7 @@ def test_fmt_wrapper_itself_kept_as_distinct_candidate(tmp_path: Path) -> None:
         [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _free_via_fmt_wrapper_fn()]}],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_fmt2")
+    run_analyzer(db, atlas, source_run_id="run_fmt2")
     rows = _by_anchor(atlas, "fmt_string")
     assert rows["log_msg"]["evidence_ref"].endswith("@fmt_string#0")
     assert rows["handle_req"]["evidence_ref"].endswith("@fmt_via_wrapper#0")
@@ -3061,7 +3061,7 @@ def test_unknown_source_fmt_wrapper_candidate_survives_in_corpus(tmp_path: Path)
         [{"name": "netd", "funcs": [_thin_fmt_wrapper_fn(), _unknown_via_fmt_wrapper_fn()]}],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_fmt_drop")
+    stats = run_analyzer(db, atlas, source_run_id="run_fmt_drop")
     assert stats.wrapper_propagated == 1  # recovered, not discarded
     anchors = set(_by_anchor(atlas, "fmt_string"))
     assert "emit_state" in anchors  # queryable: it has its own @fmt_via_wrapper instance
@@ -3086,7 +3086,7 @@ def test_fmt_wrapper_keeps_controllable_and_demotes_unknown(tmp_path: Path) -> N
         ],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_fmt_gate")
+    stats = run_analyzer(db, atlas, source_run_id="run_fmt_gate")
     assert stats.wrapper_propagated == 2  # BOTH recovered; the difference is rank, not presence
     assert stats.fmt_wrapper_unknown_source_demoted == 1
     anchors = set(_by_anchor(atlas, "fmt_string"))
@@ -3107,7 +3107,7 @@ def test_cmd_axis_unknown_source_wrapper_is_still_kept(tmp_path: Path) -> None:
         [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), _const_via_wrapper_fn()]}],
     )
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_cmd_unknown")
+    stats = run_analyzer(db, atlas, source_run_id="run_cmd_unknown")
     assert stats.wrapper_propagated == 1  # the const-forwarding cmd caller is still recovered
     row = _by_anchor(atlas)["reboot_now"]
     assert row["evidence_ref"].endswith("@cmd_via_wrapper#0")
@@ -3137,7 +3137,7 @@ def test_path_sink_class_generates_candidates(tmp_path: Path) -> None:
     # (recv-sourced) path is now recalled as sink_class=path_sink, anchored to the concrete callee.
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_path_sink_fn("open_free", path="free")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r")
+    run_analyzer(db, atlas, source_run_id="r")
     cand = _cand_of(atlas, "open_free")
     assert cand.sink_class == "path_sink"
     assert cand.sink_anchor == "fopen"
@@ -3161,7 +3161,7 @@ def test_path_sink_controllability_three_state(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r")
+    run_analyzer(db, atlas, source_run_id="r")
     assert _ctrl_of(atlas, "p_const") == "constant" and _is_safe(atlas, "p_const")
     assert _ctrl_of(atlas, "p_free") == "free" and not _is_safe(atlas, "p_free")
     assert _ctrl_of(atlas, "p_unknown") == "unknown" and not _is_safe(atlas, "p_unknown")
@@ -3179,7 +3179,7 @@ def test_path_sink_reads_per_sink_arg_position(tmp_path: Path) -> None:
     }
     db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r")
+    run_analyzer(db, atlas, source_run_id="r")
     assert _by_anchor(atlas, "path_sink")["oa"]["blocking_mechanism"] == "const_sink_arg"
     assert _ctrl_of(atlas, "oa") == "constant" and _is_safe(atlas, "oa")
 
@@ -3189,7 +3189,7 @@ def test_path_sink_writer_is_honestly_not_traced(tmp_path: Path) -> None:
     # honest 'not_traced' ('?') — never faked 'located', and a '?' never sinks the candidate.
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_path_sink_fn("p_free", path="free")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r")
+    run_analyzer(db, atlas, source_run_id="r")
     writer = _cand_of(atlas, "p_free").dim("writer")
     assert writer.value == "not_traced" and writer.state == "unknown"
 
@@ -3219,7 +3219,7 @@ def test_each_path_callsite_reaches_the_atlas_with_its_own_callee(tmp_path: Path
     }
     db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r")
+    run_analyzer(db, atlas, source_run_id="r")
     rows = _instances_of(atlas, "path_sink")
     assert [r["sink_anchor"] for r in rows] == ["unlink", "fopen"]
     assert len({r["evidence_ref"] for r in rows}) == 2  # distinct refs, one per callsite
@@ -3236,7 +3236,7 @@ def test_a_sink_class_without_a_detector_anchor_is_refused(
 
     MUTATION: restore a silent fallback (``sink_name = None``) for an unlisted class -> RED (the
     hunt completes and writes an unanchored row instead of raising)."""
-    real_scan = analyzer2_mod.scan
+    real_scan = analyzer_mod.scan
 
     def _scan_with_an_unanchored_class(db_path: Path, **kw: object):  # type: ignore[no-untyped-def]
         res = real_scan(db_path, **kw)  # type: ignore[arg-type]
@@ -3244,10 +3244,10 @@ def test_a_sink_class_without_a_detector_anchor_is_refused(
             res, matches=tuple(dataclasses.replace(m, sink_class="bogus") for m in res.matches)
         )
 
-    monkeypatch.setattr(analyzer2_mod, "scan", _scan_with_an_unanchored_class)
+    monkeypatch.setattr(analyzer_mod, "scan", _scan_with_an_unanchored_class)
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     with pytest.raises(ValueError, match="carries no detector sink anchor"):
-        run_analyzer2(db, tmp_path / "atlas.db", source_run_id="r")
+        run_analyzer(db, tmp_path / "atlas.db", source_run_id="r")
 
 
 def test_each_command_callsite_reaches_the_atlas_with_its_own_callee(tmp_path: Path) -> None:
@@ -3275,7 +3275,7 @@ def test_each_command_callsite_reaches_the_atlas_with_its_own_callee(tmp_path: P
     }
     db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r")
+    run_analyzer(db, atlas, source_run_id="r")
     rows = _instances_of(atlas, "cmd")
     assert [r["sink_anchor"] for r in rows] == ["execv", "system"]
     assert len({r["evidence_ref"] for r in rows}) == 2
@@ -3291,7 +3291,7 @@ def test_path_sink_impact_is_high_and_filterable(tmp_path: Path) -> None:
     assert impact_tier("path_sink") > impact_tier("copy")
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_path_sink_fn("p_free", path="free")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r")
+    run_analyzer(db, atlas, source_run_id="r")
     conn = open_atlas(atlas)
     try:
         only_path = filter_by_dimension(run_triage(conn), "sink_impact", "path_sink")
@@ -3314,7 +3314,7 @@ def test_path_sink_is_additive_no_regression(tmp_path: Path) -> None:
     }
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r")
+    run_analyzer(db, atlas, source_run_id="r")
     from treasure_map.lib.query import triage as run_triage
 
     conn = open_atlas(atlas)
@@ -3483,7 +3483,7 @@ def test_static_table_status_no_row_is_unknown_not_none(tmp_path: Path) -> None:
 # The shape is not hypothetical: firmware carries candidates with a literal argument 0 and a
 # NON-literal real format — exactly the shape below.
 #
-# The fixtures drive the whole live path (run_analyzer2 -> flow evidence -> triage), not a helper
+# The fixtures drive the whole live path (run_analyzer -> flow evidence -> triage), not a helper
 # in isolation, so a mutation that restores the argument-0 reading has to fail here.
 
 
@@ -3517,7 +3517,7 @@ def _caller_fmt_at_arg1(name: str, fmt_expr: str, *, callees: list[str] | None =
 def _fmt_atlas(tmp_path: Path, funcs: list[dict[str, object]], *, run: str = "run_cfmt") -> Path:
     db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id=run)
+    run_analyzer(db, atlas, source_run_id=run)
     return atlas
 
 
@@ -3674,7 +3674,7 @@ def test_fmt_binary_scope(tmp_path: Path) -> None:
         ],
     )
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_scope")
+    run_analyzer(db, atlas, source_run_id="run_scope")
     # binary B's caller: its real format is the variable at index 0 -> never proven
     assert _cand_of(atlas, "b_rep").dim("controllability").state != "proven"
     # binary A's caller is unaffected: its literal format at index 1 still reads constant
@@ -3888,7 +3888,7 @@ def test_a_copy_the_safe_one_stood_in_for_becomes_its_own_candidate(tmp_path: Pa
     three come back ``const_size`` and all three sink."""
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_multi_copy_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_copy")
+    run_analyzer(db, atlas, source_run_id="run_copy")
 
     rows = _copy_rows(atlas, "ReplySetup")
     assert len(rows) == 3
@@ -3934,7 +3934,7 @@ def test_sibling_copy_candidates_get_distinct_refs_that_each_resolve(tmp_path: P
     explain_candidate returns the same row three times."""
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_multi_copy_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_copy")
+    run_analyzer(db, atlas, source_run_id="run_copy")
 
     refs = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ReplySetup")]
     assert len(set(refs)) == 3
@@ -3960,7 +3960,7 @@ def test_each_copy_candidate_says_which_call_it_is_about(tmp_path: Path) -> None
     rather than the call (all three then read ``occurrence: 0``)."""
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_multi_copy_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_copy")
+    run_analyzer(db, atlas, source_run_id="run_copy")
 
     seen = []
     for row in _copy_rows(atlas, "ReplySetup"):
@@ -3997,7 +3997,7 @@ def test_a_copy_with_no_locatable_call_keeps_its_function_level_ref(tmp_path: Pa
     MUTATION (must go RED): give the fallback an ordinal, or drop the fallback candidate."""
     db = _make_db(tmp_path, [{"name": "libsnd.so", "funcs": [_pointer_copy_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_ptr")
+    run_analyzer(db, atlas, source_run_id="run_ptr")
 
     rows = _copy_rows(atlas, "elem_copy")
     assert len(rows) == 1
@@ -4024,7 +4024,7 @@ def test_per_callsite_copies_do_not_move_the_recurrence_ledgers(tmp_path: Path) 
     into three patterns and pattern_breadth is computed over three rows instead of one."""
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_multi_copy_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_copy")
+    run_analyzer(db, atlas, source_run_id="run_copy")
 
     conn = open_atlas(atlas)
     try:
@@ -4095,7 +4095,7 @@ def test_each_formatter_write_is_its_own_candidate_carrying_its_own_length(
     "format" from the evidence-anchored tuple); every candidate then reads one callee's position."""
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_formatter_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_f")
+    run_analyzer(db, atlas, source_run_id="run_f")
 
     rows = _format_rows(atlas, "build_reply")
     assert [r.rsplit("@", 1)[1] for r in [str(x["evidence_ref"]) for x in rows]] == [
@@ -4144,7 +4144,7 @@ def test_a_formatter_is_never_confirmed_and_never_demoted_on_its_length(
     )
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [reached]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_f")
+    run_analyzer(db, atlas, source_run_id="run_f")
 
     rows = _format_rows(atlas, "build_reply")
     assert len(rows) == 3
@@ -4190,7 +4190,7 @@ def test_a_formatter_candidate_says_how_much_of_its_format_could_be_read(
     fn["callees"] = ["snprintf", "strcat"]
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_f")
+    run_analyzer(db, atlas, source_run_id="run_f")
 
     ev = [json.loads(str(r["flow_evidence"])) for r in _format_rows(atlas, "build_reply")]
     assert [e["format_string"] for e in ev] == [
@@ -4225,7 +4225,7 @@ def test_the_command_axis_form_notes_do_not_run_on_a_formatter(tmp_path: Path) -
     fn["callees"] = ["sprintf", "inet_ntoa"]
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_f")
+    run_analyzer(db, atlas, source_run_id="run_f")
 
     rows = _format_rows(atlas, "build_reply")
     assert len(rows) == 1
@@ -4241,7 +4241,7 @@ def test_a_formatter_length_picture_reaches_the_reader(tmp_path: Path) -> None:
     MUTATION (must go RED): stop dispatching 'format' to the length surface."""
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_formatter_fn()]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_f")
+    run_analyzer(db, atlas, source_run_id="run_f")
 
     conn = open_atlas(atlas)
     try:
@@ -4308,14 +4308,14 @@ def test_a_stub_rendered_sink_call_is_recovered_end_to_end(tmp_path: Path) -> No
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [fn]}])
 
     blind = tmp_path / "blind.db"
-    run_analyzer2(db, blind, source_run_id="r_blind")
+    run_analyzer(db, blind, source_run_id="r_blind")
     rows = _instances_of(blind, "cmd")
     assert [r["evidence_ref"].rsplit("@", 1)[1] for r in rows] == ["cmd"]
     assert json.loads(rows[0]["flow_evidence"])["flow_path"]["sink_arg"] is None
 
     _store_stub_table(db, {"41eb38": "system"})
     seeing = tmp_path / "seeing.db"
-    run_analyzer2(db, seeing, source_run_id="r_seeing")
+    run_analyzer(db, seeing, source_run_id="r_seeing")
     rows = _instances_of(seeing, "cmd")
     assert [r["evidence_ref"].rsplit("@", 1)[1] for r in rows] == ["cmd#0", "cmd#1"]
     assert [r["sink_anchor"] for r in rows] == ["system", "system"]
@@ -4349,7 +4349,7 @@ def test_interleaved_textual_and_stub_calls_keep_the_reader_aligned(tmp_path: Pa
     db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
     _store_stub_table(db, {"41eb38": "system"})
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r_mix")
+    run_analyzer(db, atlas, source_run_id="r_mix")
     rows = _instances_of(atlas, "cmd")
     assert [r["evidence_ref"].rsplit("@", 1)[1] for r in rows] == ["cmd#0", "cmd#1", "cmd#2"]
     args = [json.loads(r["flow_evidence"])["flow_path"]["sink_arg"] for r in rows]
@@ -4380,7 +4380,7 @@ def test_a_recovered_copy_is_graded_on_its_own_length(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
     _store_stub_table(db, {"41e9d8": "memcpy"})
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r_cp")
+    run_analyzer(db, atlas, source_run_id="r_cp")
     rows = _instances_of(atlas, "copy")
     assert [r["evidence_ref"].rsplit("@", 1)[1] for r in rows] == ["copy#0", "copy#1"]
     assert [json.loads(r["flow_evidence"])["size_kind"] for r in rows] == ["const", "variable"]
@@ -4444,7 +4444,7 @@ def test_interleaved_sinks_get_their_own_address_offset_refs(tmp_path: Path) -> 
     )  # fmt: skip
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_b")
+    run_analyzer(db, atlas, source_run_id="run_b")
     refs = sorted(ref.split("@", 1)[1] for ref, _ in _rows_for(atlas, "Copier"))
     assert refs == ["copy@0x000010", "copy@0x000020", "copy@0x000030"]
     assert all("callsite_located" not in ev for _, ev in _rows_for(atlas, "Copier"))
@@ -4472,7 +4472,7 @@ def test_a_token_less_row_in_a_bridged_db_degrades_to_bare_never_index(tmp_path:
     }  # no call_tokens -> "[]"
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [bridged, gap]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_b")
+    run_analyzer(db, atlas, source_run_id="run_b")
     rows = _rows_for(atlas, "Runner")
     assert [ref.split("@", 1)[1] for ref, _ in rows] == ["cmd"]
     assert rows[0][1]["callsite_located"] is False
@@ -4496,7 +4496,7 @@ def test_out_of_body_siblings_each_get_the_anchor_of_their_call_and_say_so(tmp_p
     )  # fmt: skip
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_b")
+    run_analyzer(db, atlas, source_run_id="run_b")
     rows = _rows_for(atlas, "Inl")
     assert sorted(ref.split("@", 1)[1] for ref, _ in rows) == ["copy@0x008000", "copy@0x008010"]
     assert [ev.get("callsite_located") for _, ev in rows] == [True, True]
@@ -4534,7 +4534,7 @@ def test_a_call_only_bare_candidates_name_gets_one_formal_anchor(tmp_path: Path)
     )  # fmt: skip
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [holder, inl, late]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_b")
+    run_analyzer(db, atlas, source_run_id="run_b")
     holder_refs = [ref.split(":", 1)[1] for ref, _ in _rows_for(atlas, "Holder")]
     assert holder_refs == ["00409000@copy@0x000010"]
     inl_rows = {ev["callsite_addr"]: ref.split(":", 1)[1] for ref, ev in _rows_for(atlas, "Inl")}
@@ -4576,7 +4576,7 @@ def test_a_minted_anchor_takes_a_judgment_and_keeps_its_out_of_body_fact(tmp_pat
     )  # fmt: skip
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [inl, late]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_b")
+    run_analyzer(db, atlas, source_run_id="run_b")
     by_addr = {ev["callsite_addr"]: (ref, ev) for ref, ev in _rows_for(atlas, "Inl")}
     assert "0x409020" in by_addr
     minted_ref, minted_ev = by_addr["0x409020"]
@@ -4626,7 +4626,7 @@ def test_minting_parses_only_the_evidence_of_out_of_body_rows(
     )  # fmt: skip
     db = _make_db(tmp_path, [{"name": "httpd", "funcs": [holder, inl]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_b")
+    run_analyzer(db, atlas, source_run_id="run_b")
     parsed: list[str] = []
     real_loads = json.loads
 
@@ -4638,8 +4638,8 @@ def test_minting_parses_only_the_evidence_of_out_of_body_rows(
     try:
         n_rows = conn.execute("SELECT count(*) FROM instance").fetchone()[0]
         assert n_rows == 2
-        monkeypatch.setattr(analyzer2_mod.json, "loads", counting_loads)
-        analyzer2_mod._mint_out_of_body_anchors(conn, "run_b")
+        monkeypatch.setattr(analyzer_mod.json, "loads", counting_loads)
+        analyzer_mod._mint_out_of_body_anchors(conn, "run_b")
     finally:
         conn.close()
     assert len(parsed) == 1 and "out_of_body" in parsed[0]
@@ -4667,7 +4667,7 @@ def test_a_binary_whose_extraction_failed_marks_its_candidates_not_current(tmp_p
     conn.commit()
     conn.close()
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_b")
+    run_analyzer(db, atlas, source_run_id="run_b")
     (_, cur_ev), = _rows_for(atlas, "Copier")  # fmt: skip
     (_, old_ev), = _rows_for(atlas, "OldCopier")  # fmt: skip
     assert "extraction_current" not in cur_ev
@@ -4707,7 +4707,7 @@ def test_a_binary_left_on_an_older_pass_is_marked_not_current(tmp_path: Path) ->
     conn.commit()
     conn.close()
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_b")
+    run_analyzer(db, atlas, source_run_id="run_b")
     (_, ev_a), = _rows_for(atlas, "Fa")  # fmt: skip
     (_, ev_c), = _rows_for(atlas, "Fc")  # fmt: skip
     assert "extraction_current" not in ev_a
@@ -4759,7 +4759,7 @@ def test_wrapper_candidate_per_call_with_its_own_offset_ref(tmp_path: Path) -> N
     funcs = [_addressed(_thin_cmd_wrapper_fn(), "00410000"), run_sh, fn]
     db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_w")
+    run_analyzer(db, atlas, source_run_id="run_w")
     rows = _wrapper_rows(atlas, "Multi")
     assert [ref.split("@", 1)[1] for ref, _, _ in rows] == [
         "cmd_via_wrapper@0x000010",
@@ -4790,7 +4790,7 @@ def test_wrapper_call_out_of_body_degrades_like_a_direct_call(tmp_path: Path) ->
     funcs = [_addressed(_thin_cmd_wrapper_fn(), "00410000"), fn]
     db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_w")
+    run_analyzer(db, atlas, source_run_id="run_w")
     ((ref, ev, _),) = _wrapper_rows(atlas, "Inl")
     assert ref.endswith("@cmd_via_wrapper@0x008000")
     assert ev["callsite_located"] is True and ev["anchor_degraded"] == "out_of_body"
@@ -4824,7 +4824,7 @@ def test_wrapper_evidence_is_read_per_call(tmp_path: Path) -> None:
     ]
     db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_w")
+    run_analyzer(db, atlas, source_run_id="run_w")
     cmd_rows = _wrapper_rows(atlas, "Two")
     assert [r["blocking_mechanism"] for _, _, r in cmd_rows] == ["const_sink_arg", None]
     # each call's own first argument: a string literal is no variable (None), not its first word
@@ -4853,7 +4853,7 @@ def test_wrapper_called_through_a_pointer_keeps_the_function_level_candidate(
     funcs = [_addressed(_thin_cmd_wrapper_fn(), "00410000"), fn]
     db = _make_db(tmp_path, [{"name": "netd", "funcs": funcs}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_w")
+    run_analyzer(db, atlas, source_run_id="run_w")
     ((ref, ev, _),) = _wrapper_rows(atlas, "Ind")
     assert ref.endswith("@cmd_via_wrapper")
     assert "callsite_located" not in ev
@@ -4872,9 +4872,9 @@ def test_every_patterns_spread_is_its_live_count_after_runs_and_a_rehunt(tmp_pat
     MUTATION (verified RED): drop the end-of-run recount -> the spreads stay 0 -> RED."""
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("handle")]}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_1")
-    run_analyzer2(db, atlas, source_run_id="run_2")
-    run_analyzer2(db, atlas, source_run_id="run_1", rehunt=True)
+    run_analyzer(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_2")
+    run_analyzer(db, atlas, source_run_id="run_1", rehunt=True)
     conn = open_atlas(atlas)
     try:
         rows = conn.execute(
@@ -4901,9 +4901,9 @@ def test_the_spread_recount_is_part_of_the_runs_transaction(
     def boom(conn: sqlite3.Connection, pattern_ids: object) -> None:
         raise RuntimeError("recount failed")
 
-    monkeypatch.setattr(analyzer2_mod, "recompute_device_spread", boom)
+    monkeypatch.setattr(analyzer_mod, "recompute_device_spread", boom)
     with pytest.raises(RuntimeError, match="recount failed"):
-        run_analyzer2(db, atlas, source_run_id="run_1")
+        run_analyzer(db, atlas, source_run_id="run_1")
     conn = open_atlas(atlas)
     try:
         assert conn.execute("SELECT count(*) FROM instance").fetchone()[0] == 0
@@ -4932,7 +4932,7 @@ def test_a_runs_write_recounts_each_pattern_once_not_per_candidate(
         real(conn, pattern_id)
 
     monkeypatch.setattr(writer, "_recompute_device_spread", counting)
-    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_1")
     conn = open_atlas(atlas)
     try:
         per_pattern = conn.execute(
@@ -4977,7 +4977,7 @@ def test_the_four_recalled_gap_sinks_now_make_candidates(tmp_path: Path) -> None
     ]
     db = _make_db(tmp_path, [{"name": "svcd", "funcs": fns}])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_1")
+    run_analyzer(db, atlas, source_run_id="run_1")
     conn = open_atlas(atlas)
     try:
         rows = conn.execute(
@@ -5109,7 +5109,7 @@ def test_source_names_record_the_called_sources_on_every_axis(tmp_path: Path) ->
     the wrapper candidate's callee list instead of its body -> env_fwd's forwarded one loses it;
     write the wrapper key only on an external_input candidate -> cfg_reboot's loses it."""
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
+    stats = run_analyzer(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
     # cfg_fwd, env_fwd, cfg_reboot and reboot_now, all via do_cmd
     assert stats.wrapper_propagated == 4
     rows = _instances_by_key(atlas)
@@ -5188,7 +5188,7 @@ def test_explain_surfaces_the_recorded_source_names_and_none_when_absent(tmp_pat
     MUTATION (verified RED): the reader never takes the key (always None) -> the cfg_copy half
     fails; an absent key read as ``()`` -> the plain_ping half fails."""
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
+    run_analyzer(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
     conn = open_atlas(atlas)
     try:
         with_names = explain_candidate(conn, _direct_ref_of(atlas, "cfg_copy", "copy"))
@@ -5214,7 +5214,7 @@ def test_source_names_reach_the_cli_json_and_the_mcp_explain(tmp_path: Path) -> 
     from treasure_map.cli.run_commands import triage as triage_cmd
 
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
+    run_analyzer(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
     refs = {
         "with": _direct_ref_of(atlas, "cfg_copy", "copy"),
         "without": _direct_ref_of(atlas, "plain_ping", "cmd"),
@@ -5278,7 +5278,7 @@ def test_the_boundary_origin_reaches_the_instance_and_both_list_surfaces(tmp_pat
     from treasure_map.cli.run_commands import triage as triage_cmd
 
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(_origin_db(tmp_path), atlas, source_run_id="run_fo")
+    run_analyzer(_origin_db(tmp_path), atlas, source_run_id="run_fo")
     assert _origin_of_fn(atlas) == {fn: {o} for fn, o in _ORIGINS_BY_FN.items()}
     fn_of = {r["evidence_ref"]: r["source_anchor"] for r in _instances(atlas)}
 
@@ -5327,7 +5327,7 @@ def test_the_completeness_layer_is_the_same_on_the_mcp_and_cli_explain(tmp_path:
     from treasure_map.cli.run_commands import triage as triage_cmd
 
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(_origin_db(tmp_path), atlas, source_run_id="run_fo")
+    run_analyzer(_origin_db(tmp_path), atlas, source_run_id="run_fo")
     tools = mcp_app.make_tools(atlas)
     for fn in _ORIGINS_BY_FN:
         ref = _direct_ref_of(atlas, fn, "cmd")
@@ -5353,7 +5353,7 @@ def test_the_boundary_origin_never_moves_a_standing_judgement(tmp_path: Path) ->
 
     db = _origin_db(tmp_path, {"fn_x": None})
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_fb")
+    run_analyzer(db, atlas, source_run_id="run_fb")
     assert _origin_of_fn(atlas) == {"fn_x": {None}}
     ref = _direct_ref_of(atlas, "fn_x", "cmd")
     conn = open_atlas(atlas)
@@ -5365,7 +5365,7 @@ def test_the_boundary_origin_never_moves_a_standing_judgement(tmp_path: Path) ->
     adb.execute("UPDATE functions SET origin = 'promoted'")
     adb.commit()
     adb.close()
-    run_analyzer2(db, atlas, source_run_id="run_fb")
+    run_analyzer(db, atlas, source_run_id="run_fb")
     assert _origin_of_fn(atlas) == {"fn_x": {"promoted"}}  # the re-hunt recorded it
     conn = open_atlas(atlas)
     try:
@@ -5390,9 +5390,9 @@ def test_an_analysis_db_without_the_origin_column_records_not_recorded(tmp_path:
     adb.execute("ALTER TABLE functions DROP COLUMN origin")
     adb.commit()
     adb.close()
-    assert analyzer2_mod._load_function_origin(db) == {}
+    assert analyzer_mod._load_function_origin(db) == {}
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_nc")
+    run_analyzer(db, atlas, source_run_id="run_nc")
     assert set().union(*_origin_of_fn(atlas).values()) == {None}
     conn = open_atlas(atlas)
     try:
@@ -5416,7 +5416,7 @@ def test_the_wrapper_path_records_the_callers_boundary_origin(tmp_path: Path) ->
     caller = {**_free_via_wrapper_fn(), "origin": "promoted"}
     db = _make_db(tmp_path, [{"name": "netd", "funcs": [wrapper, caller]}])
     atlas = tmp_path / "atlas.db"
-    stats = run_analyzer2(db, atlas, source_run_id="run_fw")
+    stats = run_analyzer(db, atlas, source_run_id="run_fw")
     assert stats.wrapper_propagated == 1
     by_ref = {r["evidence_ref"]: r for r in _instances(atlas)}
     via = [r for ref, r in by_ref.items() if "@cmd_via_wrapper" in ref]
@@ -5435,7 +5435,7 @@ def test_the_mcp_list_still_refuses_an_only_completeness_prune(tmp_path: Path) -
     from treasure_map import mcp_app
 
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(_origin_db(tmp_path), atlas, source_run_id="run_fo")
+    run_analyzer(_origin_db(tmp_path), atlas, source_run_id="run_fo")
     assert None not in set().union(*_origin_of_fn(atlas).values())  # every origin recorded
     tools = mcp_app.make_tools(atlas)
     res = tools["list_candidates"](run_id="run_fo", only="completeness=promoted")

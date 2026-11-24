@@ -258,7 +258,7 @@ def persist_instruction_matches(
 ) -> int:
     """Parse + store the candidate-callsite instruction matches for one diff (the overlay's
     cross-side bridge). Runs in the persist phase while the .BinDiff is still on disk, AFTER
-    run_layer0_parse (whose delete_diff already cleared any prior instruction_match for this
+    run_alignment (whose delete_diff already cleared any prior instruction_match for this
     diff_id). Joins the caller's transaction (commit=False). A side with no sha contributes no
     candidate addresses; a no-op when neither side has any.
 
@@ -1099,14 +1099,14 @@ def _validate_bindiff_binaries(bindiff_path: Path, bin_a: BinaryRow, bin_b: Bina
 
 
 @dataclass(frozen=True)
-class Layer0Result:
+class AlignmentResult:
     diff_id: str
     matched_pairs: int
     alignment_undetermined: int
     meta: DiffMetaRow
 
 
-def run_layer0_parse(
+def run_alignment(
     atlas: sqlite3.Connection,
     *,
     bindiff_path: Path,
@@ -1121,7 +1121,7 @@ def run_layer0_parse(
     report_a: ExportReport | None = None,
     report_b: ExportReport | None = None,
     bindiff_vertex0_fallbacks: int | None = None,
-) -> Layer0Result:
+) -> AlignmentResult:
     """Parse a ``.BinDiff`` into the atlas (function_alignment + function_presence + diff_meta).
 
     Resolves each run's analysis.db via ``run.analysis_db_path`` (errors on an unresolved run, never
@@ -1302,7 +1302,7 @@ def run_layer0_parse(
     add_diff_meta(atlas, meta, commit=False)
     if commit:
         atlas.commit()
-    return Layer0Result(
+    return AlignmentResult(
         diff_id=did,
         matched_pairs=len(parsed.rows),
         alignment_undetermined=undetermined,

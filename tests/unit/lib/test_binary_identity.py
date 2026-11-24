@@ -664,7 +664,7 @@ def test_hunt_records_the_binary_path_beside_every_short_name(tmp_path: Path) ->
 
     MUTATION: drop ``binary_path=`` from any producer -> RED for that table.
     """
-    from treasure_map.lib.hunt import run_analyzer2
+    from treasure_map.lib.hunt import run_analyzer
 
     db = tmp_path / "analysis.db"
     conn = open_db(db)
@@ -699,7 +699,7 @@ def test_hunt_records_the_binary_path_beside_every_short_name(tmp_path: Path) ->
     conn.close()
 
     atlas_path = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas_path, source_run_id="run1")
+    run_analyzer(db, atlas_path, source_run_id="run1")
 
     from treasure_map.lib.atlas.connection import open_atlas
 

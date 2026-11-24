@@ -1044,7 +1044,7 @@ def test_candidate_rows_have_no_single_offset_when_two_readings(pairing: str) ->
 
 
 def _run_to_atlas(img: Image, tmp_path: Path, run_id: str = "r") -> Path:
-    from treasure_map.lib.hunt import run_analyzer2
+    from treasure_map.lib.hunt import run_analyzer
 
     db = tmp_path / "analysis.db"
     conn = open_db(db)
@@ -1061,7 +1061,7 @@ def _run_to_atlas(img: Image, tmp_path: Path, run_id: str = "r") -> Path:
     conn.commit()
     conn.close()
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id=run_id, rehunt=True)
+    run_analyzer(db, atlas, source_run_id=run_id, rehunt=True)
     return atlas
 
 

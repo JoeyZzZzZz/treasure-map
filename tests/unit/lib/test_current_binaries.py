@@ -138,10 +138,10 @@ def test_the_hunt_carries_only_the_current_scans_tables_into_the_atlas(
     back AND three status rows instead of one (a list, not a set, so the old webd's row is not
     folded into the new one's).
     """
-    from treasure_map.lib.hunt.analyzer import run_analyzer2
+    from treasure_map.lib.hunt.analyzer import run_analyzer
 
     db, atlas = _replaced_firmware_db(tmp_path), tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r", rehunt=True)
+    run_analyzer(db, atlas, source_run_id="r", rehunt=True)
     conn = open_atlas(atlas)
     try:
         rows = [tuple(r) for r in conn.execute(sql)]

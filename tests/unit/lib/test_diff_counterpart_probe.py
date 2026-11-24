@@ -30,7 +30,7 @@ from treasure_map.lib.diff.alignment import (
     COUNTERPART_SUSPECTED,
     BaselineDomain,
     probe_counterparts,
-    run_layer0_parse,
+    run_alignment,
 )
 from treasure_map.lib.diff.export_report import ExportReport
 from treasure_map.lib.query.diff_align import _GenerationCache, _partial_blindspots, get_diff_meta
@@ -131,7 +131,7 @@ def _diff(
     bin_a, _ = resolve_binary_in_db(str(dba), "lib.so")
     bin_b, _ = resolve_binary_in_db(str(dbb), "lib.so")
     assert bin_a is not None and bin_b is not None
-    r = run_layer0_parse(
+    r = run_alignment(
         con,
         bindiff_path=_bindiff(tmp_path / "t.BinDiff", pairs),
         run_a_id="run_a",
@@ -189,7 +189,7 @@ _RESIDUAL_B = json.dumps([["0x4110", "0x4113"], ["0x8000", "0x8003"]])
 
 
 def test_each_probe_outcome_lands_its_state(tmp_path: Path) -> None:
-    """The six outcomes of the probe table, end to end through run_layer0_parse.
+    """The six outcomes of the probe table, end to end through run_alignment.
 
     Mutations (verified red): every found function read unpaired (``kind = PROBE_UNPAIRED``)
     -> f_occupied reads suspected; the residual check dropped (no F -> uncovered) -> f_residual

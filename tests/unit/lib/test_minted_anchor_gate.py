@@ -28,7 +28,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
 )
 from treasure_map.cli.run_commands import triage as triage_cmd
 from treasure_map.lib.errors import ConfigError
-from treasure_map.lib.hunt.analyzer import run_analyzer2
+from treasure_map.lib.hunt.analyzer import run_analyzer
 from treasure_map.lib.query import sink_overlay as so
 
 _RUN = "runA"
@@ -50,7 +50,7 @@ def _hunt(tmp: Path) -> tuple[Path, tuple[str, dict[str, object]], tuple[str, di
     )  # fmt: skip
     db = _make_db(h, [{"name": "httpd", "funcs": [inl, late]}])
     atlas = h / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id=_RUN)
+    run_analyzer(db, atlas, source_run_id=_RUN)
     by_addr = {ev["callsite_addr"]: (ref, ev) for ref, ev in _rows_for(atlas, "Inl")}
     ((late_ref, late_ev),) = _rows_for(atlas, "Late")
     minted_ref, minted_ev = by_addr["0x409020"]

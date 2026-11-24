@@ -11,9 +11,9 @@ dimension_delta), which projects existing annotations and never grades.
 
 from __future__ import annotations
 
-from treasure_map.lib.hunt.analyzer import Analyzer2Stats, run_analyzer2
+from treasure_map.lib.hunt.analyzer import HuntStats, run_analyzer
 
 __all__ = [
-    "Analyzer2Stats",
-    "run_analyzer2",
+    "HuntStats",
+    "run_analyzer",
 ]

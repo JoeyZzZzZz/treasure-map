@@ -17,7 +17,7 @@ from click.testing import CliRunner
 from treasure_map.cli.run_commands import hunt_pattern
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.errors import WorkspaceError
-from treasure_map.lib.hunt.analyzer import Analyzer2Stats
+from treasure_map.lib.hunt.analyzer import HuntStats
 from treasure_map.lib.workspace.workspace import Workspace
 
 
@@ -30,8 +30,8 @@ def _try_workspace(path: Path) -> str:
         return "refused"
 
 
-def _stats() -> Analyzer2Stats:
-    return Analyzer2Stats(
+def _stats() -> HuntStats:
+    return HuntStats(
         scanned=0, matches=0, instances_written=0, by_status={"confirmed": 0, "unknown": 0}
     )
 
@@ -53,7 +53,7 @@ def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, db_dir: Path) -> dic
         seen["hunt"] = _try_workspace(Path(db).parent)
         return _stats()
 
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", _fake_hunt)
     return seen
 
 

@@ -568,13 +568,13 @@ def test_a_second_hunt_by_the_same_commit_skips_and_touches_nothing(
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
 
-    first = a2.run_analyzer2(db, atlas, source_run_id="r", firmware_path="/fw")
+    first = a2.run_analyzer(db, atlas, source_run_id="r", firmware_path="/fw")
     assert first.skipped is False
     assert first.instances_written == 2  # cmd + the snprintf's own write candidate
     before = _instances(atlas)
     assert before, "the fixture must actually write something, or the skip proves nothing"
 
-    second = a2.run_analyzer2(db, atlas, source_run_id="r", firmware_path="/fw")
+    second = a2.run_analyzer(db, atlas, source_run_id="r", firmware_path="/fw")
     assert second.skipped is True
     assert second.instances_written == 0
     assert _instances(atlas) == before
@@ -585,8 +585,8 @@ def test_rehunt_overrides_the_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
-    a2.run_analyzer2(db, atlas, source_run_id="r")
-    again = a2.run_analyzer2(db, atlas, source_run_id="r", rehunt=True)
+    a2.run_analyzer(db, atlas, source_run_id="r")
+    again = a2.run_analyzer(db, atlas, source_run_id="r", rehunt=True)
     assert again.skipped is False
     assert again.instances_written == 2  # cmd + the snprintf's own write candidate
 
@@ -594,7 +594,7 @@ def test_rehunt_overrides_the_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 def test_the_hunt_code_stamp_is_grabbed_once_so_the_skip_and_the_write_agree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``run_analyzer2`` reads the hunt code stamp ONCE at the start; the currency decision and the
+    """``run_analyzer`` reads the hunt code stamp ONCE at the start; the currency decision and the
     stamp ``finish_run`` records are the same value, so what is skipped and what is written cannot
     disagree.
 
@@ -609,7 +609,7 @@ def test_the_hunt_code_stamp_is_grabbed_once_so_the_skip_and_the_write_agree(
     monkeypatch.setattr(a2.rescan_version, "hunt_code_version", stand_in)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
 
-    a2.run_analyzer2(db, atlas, source_run_id="r", firmware_path="/fw")
+    a2.run_analyzer(db, atlas, source_run_id="r", firmware_path="/fw")
 
     assert stand_in.call_count == 1
     conn = open_atlas(atlas)
@@ -663,8 +663,8 @@ def test_either_input_changing_defeats_the_skip(
     )
     files.commit()
     files.close()
-    a2.run_analyzer2(db, atlas, source_run_id="r")
-    assert a2.run_analyzer2(db, atlas, source_run_id="r").skipped is True
+    a2.run_analyzer(db, atlas, source_run_id="r")
+    assert a2.run_analyzer(db, atlas, source_run_id="r").skipped is True
 
     if axis == "hunt_code":
         # The hunt code changed since this run was hunted (patched on the module the hunt reads
@@ -700,7 +700,7 @@ def test_either_input_changing_defeats_the_skip(
         stamp.execute("UPDATE fs_symlinks SET target_raw = 'bash', target_name = 'bash'")
         stamp.commit()
         stamp.close()
-    assert a2.run_analyzer2(db, atlas, source_run_id="r").skipped is False
+    assert a2.run_analyzer(db, atlas, source_run_id="r").skipped is False
 
 
 def test_a_completed_hunt_always_leaves_the_stamp_current(
@@ -717,7 +717,7 @@ def test_a_completed_hunt_always_leaves_the_stamp_current(
 
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
     for _ in range(2):  # the working pass, then the skipping one
-        a2.run_analyzer2(db, atlas, source_run_id="r")
+        a2.run_analyzer(db, atlas, source_run_id="r")
         conn = open_atlas(atlas)
         try:
             assert (
@@ -745,8 +745,8 @@ def test_an_editable_install_skips_when_the_code_stamp_matches(
 
     monkeypatch.setattr(a2, "installed_commit", lambda: UNKNOWN_VERSION)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
-    a2.run_analyzer2(db, atlas, source_run_id="r")
-    assert a2.run_analyzer2(db, atlas, source_run_id="r").skipped is True
+    a2.run_analyzer(db, atlas, source_run_id="r")
+    assert a2.run_analyzer(db, atlas, source_run_id="r").skipped is True
 
 
 # ------------------------------------------------------- the stamp must describe rows that exist
@@ -796,7 +796,7 @@ def test_the_stamp_records_how_many_rows_the_hunt_wrote(
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
-    stats = a2.run_analyzer2(db, atlas, source_run_id="r")
+    stats = a2.run_analyzer(db, atlas, source_run_id="r")
     assert stats.instances_written == 2  # cmd + the snprintf's own write candidate
     assert _run_column(atlas, "r", "hunt_instances") == 2
 
@@ -823,7 +823,7 @@ def test_rows_deleted_out_from_under_the_stamp_defeat_the_skip(
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
-    a2.run_analyzer2(db, atlas, source_run_id="r")
+    a2.run_analyzer(db, atlas, source_run_id="r")
     assert len(_instances(atlas)) == 2
 
     conn = open_atlas(atlas)
@@ -831,7 +831,7 @@ def test_rows_deleted_out_from_under_the_stamp_defeat_the_skip(
     conn.commit()
     conn.close()
 
-    again = a2.run_analyzer2(db, atlas, source_run_id="r")
+    again = a2.run_analyzer(db, atlas, source_run_id="r")
     assert again.skipped is False
     assert "stored candidate rows changed" in (again.hunt_currency or "")
     assert len(_instances(atlas)) == 2, "the re-hunt must restore what was deleted"
@@ -852,7 +852,7 @@ def test_extra_rows_under_the_stamp_also_defeat_the_skip(
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
-    a2.run_analyzer2(db, atlas, source_run_id="r")
+    a2.run_analyzer(db, atlas, source_run_id="r")
 
     conn = open_atlas(atlas)
     conn.execute(
@@ -863,7 +863,7 @@ def test_extra_rows_under_the_stamp_also_defeat_the_skip(
     conn.commit()
     conn.close()
 
-    again = a2.run_analyzer2(db, atlas, source_run_id="r")
+    again = a2.run_analyzer(db, atlas, source_run_id="r")
     assert again.skipped is False
     assert "stored candidate rows changed" in (again.hunt_currency or "")
 
@@ -880,14 +880,14 @@ def test_a_run_stamped_before_the_count_existed_re_hunts_once(
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
-    a2.run_analyzer2(db, atlas, source_run_id="r")
+    a2.run_analyzer(db, atlas, source_run_id="r")
 
     conn = open_atlas(atlas)
     conn.execute("UPDATE run SET hunt_instances = NULL WHERE run_id = 'r'")
     conn.commit()
     conn.close()
 
-    again = a2.run_analyzer2(db, atlas, source_run_id="r")
+    again = a2.run_analyzer(db, atlas, source_run_id="r")
     assert again.skipped is False
     assert "before the instance count was recorded" in (again.hunt_currency or "")
     assert _run_column(atlas, "r", "hunt_instances") == 2  # refilled by the re-hunt
@@ -911,11 +911,11 @@ def test_a_run_that_legitimately_found_nothing_still_skips(
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded_no_candidates(tmp_path), tmp_path / "atlas.db"
-    first = a2.run_analyzer2(db, atlas, source_run_id="quiet")
+    first = a2.run_analyzer(db, atlas, source_run_id="quiet")
     assert first.instances_written == 0, "this fixture must produce no candidates, or it proves it"
     assert _run_column(atlas, "quiet", "hunt_instances") == 0  # zero is STORED, not left NULL
 
-    second = a2.run_analyzer2(db, atlas, source_run_id="quiet")
+    second = a2.run_analyzer(db, atlas, source_run_id="quiet")
     assert second.skipped is True
 
 
@@ -1000,7 +1000,7 @@ def test_a_skipped_hunt_records_the_new_locations_and_nothing_else(
 
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
-    a2.run_analyzer2(db, atlas, source_run_id="r", firmware_path="/fw/OLD")
+    a2.run_analyzer(db, atlas, source_run_id="r", firmware_path="/fw/OLD")
     before = {
         col: _run_column(atlas, "r", col)
         for col in ("scan_status", "hunt_commit", "hunt_instances", "build_hash", "scanned_at")
@@ -1009,7 +1009,7 @@ def test_a_skipped_hunt_records_the_new_locations_and_nothing_else(
     moved = tmp_path / "moved" / "analysis.db"
     moved.parent.mkdir()
     shutil.copy(db, moved)
-    stats = a2.run_analyzer2(moved, atlas, source_run_id="r", firmware_path="/fw/NEW")
+    stats = a2.run_analyzer(moved, atlas, source_run_id="r", firmware_path="/fw/NEW")
 
     assert stats.skipped is True
     assert _run_column(atlas, "r", "firmware_path") == "/fw/NEW"

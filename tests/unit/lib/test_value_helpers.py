@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.hunt import run_analyzer2
+from treasure_map.lib.hunt import run_analyzer
 from treasure_map.lib.hunt.function_rows import FuncRow
 from treasure_map.lib.hunt.value_helpers import build_helper_tables, helper_slots
 from treasure_map.lib.pattern.sink_vocabulary import RETURN_SLOT, SOURCE
@@ -318,7 +318,7 @@ def _hunt_handle(tmp_path: Path, *, with_helper: bool) -> dict[str, object]:
     d = Path(tempfile.mkdtemp(dir=tmp_path))
     db = _make_db(d, [{"name": "svcd", "path": "usr/sbin/svcd", "funcs": funcs}])
     atlas = d / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_h8")
+    run_analyzer(db, atlas, source_run_id="run_h8")
     conn = open_atlas(atlas)
     try:
         row = conn.execute(
@@ -393,7 +393,7 @@ def test_the_moved_fingerprint_re_keys_both_b_class_readers(tmp_path: Path) -> N
         ],
     )
     atlas = d / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_h8")
+    run_analyzer(db, atlas, source_run_id="run_h8")
     conn = open_atlas(atlas)
     try:
         fingerprints = {r.structural_fingerprint for r in density(conn)}
@@ -448,7 +448,7 @@ def _hunt_three(
         ],
     )
     atlas = d / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_h8")
+    run_analyzer(db, atlas, source_run_id="run_h8")
     monkeypatch.undo()
     conn = open_atlas(atlas)
     try:

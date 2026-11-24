@@ -292,7 +292,7 @@ def test_run_version_diff_layer2_failure_no_dirty_ok1(
     def _layer2_boom(*a, **k):  # type: ignore[no-untyped-def]
         raise DiffToolchainError("layer2 boom")
 
-    monkeypatch.setattr(driver, "run_layer2_delta", _layer2_boom)
+    monkeypatch.setattr(driver, "run_dimension_delta", _layer2_boom)
 
     with pytest.raises(DiffToolchainError):
         driver.run_version_diff(con, "run_a", "run_b", "lib.so", config=_cfg())

@@ -432,11 +432,11 @@ def test_the_hunt_writes_the_rollup_onto_the_run_and_list_runs_returns_it(tmp_pa
 
     MUTATION (verified RED): leave the two keyword arguments out of analyzer's finish_run call ->
     the run row holds NULL -> RED; leave them out of _RUN_COLUMNS / _row_to_runrow -> RED."""
-    from treasure_map.lib.hunt.analyzer import run_analyzer2
+    from treasure_map.lib.hunt.analyzer import run_analyzer
 
     db = _rollup_db(tmp_path, [("a", 1, 7, 0), ("b", 1, 12, 4), ("c", 1, 0, 0)])
     atlas = tmp_path / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="r", rehunt=True)
+    run_analyzer(db, atlas, source_run_id="r", rehunt=True)
     conn = open_atlas(atlas)
     try:
         run = get_run(conn, "r")

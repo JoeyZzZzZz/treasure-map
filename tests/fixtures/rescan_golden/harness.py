@@ -31,7 +31,7 @@ THE FIXTURE, assembled fresh under ``--work`` on every run:
 THE RUN: ``pipeline.GhidraRunner`` is replaced by a stand-in whose ``run_all`` writes each binary's
 hand-written JSON (stamped with this pass, the binary's sha8 and its stub marker, as the extractor
 does) into the output directory, handing each result to ``on_final`` when the pipeline passes one;
-then the real ``run_analyze`` and ``run_analyzer2`` run, into a
+then the real ``run_analyze`` and ``run_analyzer`` run, into a
 fresh workspace and a fresh atlas.
 
 THE DIGEST covers every table of the analysis.db and every table of the atlas. The atlas is fresh
@@ -208,7 +208,7 @@ def run_fixture(work: Path) -> tuple[Path, Path]:
 
     from treasure_map.lib.analyze import pipeline
     from treasure_map.lib.config.config import Config
-    from treasure_map.lib.hunt.analyzer import run_analyzer2
+    from treasure_map.lib.hunt.analyzer import run_analyzer
     from treasure_map.lib.workspace.workspace import Workspace
 
     fs_root = work / "fs"
@@ -219,7 +219,7 @@ def run_fixture(work: Path) -> tuple[Path, Path]:
         with Workspace(ws_dir) as ws:
             pipeline.run_analyze(fs_root, ws, Config())
             db = ws.db_path
-    stats = run_analyzer2(db, atlas, source_run_id=RUN_ID, firmware_path=str(fs_root))
+    stats = run_analyzer(db, atlas, source_run_id=RUN_ID, firmware_path=str(fs_root))
     if stats.skipped:
         raise HarnessError(f"the hunt skipped on a fresh atlas: {stats.hunt_currency}")
     return db, atlas

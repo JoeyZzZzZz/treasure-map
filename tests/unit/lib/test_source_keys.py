@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from treasure_map.lib.atlas.connection import open_atlas
-from treasure_map.lib.hunt import run_analyzer2
+from treasure_map.lib.hunt import run_analyzer
 from treasure_map.lib.hunt.data_strings import DataStrings
 from treasure_map.lib.hunt.value_helpers import build_helper_tables, helper_keys_called
 from treasure_map.lib.pattern.sink_vocabulary import NO_HELPERS, RETURN_SLOT, SourceHelpers
@@ -211,7 +211,7 @@ def _hunt_with_keys(tmp_path: Path) -> dict[str, Any]:
     d = Path(tempfile.mkdtemp(dir=tmp_path))
     db = _make_db(d, [{"name": "cfgd", "path": "usr/sbin/cfgd", "funcs": funcs, "image": image}])
     atlas = d / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_f1")
+    run_analyzer(db, atlas, source_run_id="run_f1")
     conn = open_atlas(atlas)
     try:
         row = conn.execute(
@@ -488,7 +488,7 @@ def test_every_sink_in_an_admitted_helper_reads_it_as_a_weak_self_source(tmp_pat
     d = Path(tempfile.mkdtemp(dir=tmp_path))
     db = _make_db(d, [{"name": "cfgd", "path": "usr/sbin/cfgd", "funcs": funcs}])
     atlas = d / "atlas.db"
-    run_analyzer2(db, atlas, source_run_id="run_self")
+    run_analyzer(db, atlas, source_run_id="run_self")
     conn = open_atlas(atlas)
     try:
         rows = [

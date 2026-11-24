@@ -76,7 +76,7 @@ def _hunt_stats(written: int = 0) -> SimpleNamespace:
         by_status={"confirmed": 0, "unknown": written},
         data_gap_skipped=0,
         # Mirrors the real stats field-for-field ON PURPOSE (no getattr fallback, no **kwargs): a
-        # field added to Analyzer2Stats and not surfaced here shows up as a failure rather than as
+        # field added to HuntStats and not surfaced here shows up as a failure rather than as
         # a summary line nobody notices is missing.
         callee_parse_failed=0,
         nvram_flows_written=0,
@@ -160,7 +160,7 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
         *,
         source_run_id: str,
         firmware_path: str | None = None,
-        # Mirrors the real run_analyzer2 signature. A stub that silently swallowed **kwargs
+        # Mirrors the real run_analyzer signature. A stub that silently swallowed **kwargs
         # would keep passing after the real function's contract changed underneath it.
         rehunt: bool = False,
     ) -> Any:
@@ -175,7 +175,7 @@ def test_scan_runs_three_steps_in_order(tmp_path: Path, monkeypatch: pytest.Monk
         return []
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", _fake_hunt)
     monkeypatch.setattr("treasure_map.lib.query.triage", _fake_triage)
 
     result = CliRunner().invoke(
@@ -219,7 +219,7 @@ def test_scan_stores_absolute_firmware_path_from_relative_cwd(
         *,
         source_run_id: str,
         firmware_path: str | None = None,
-        # Mirrors the real run_analyzer2 signature. A stub that silently swallowed **kwargs
+        # Mirrors the real run_analyzer signature. A stub that silently swallowed **kwargs
         # would keep passing after the real function's contract changed underneath it.
         rehunt: bool = False,
     ) -> Any:
@@ -227,7 +227,7 @@ def test_scan_stores_absolute_firmware_path_from_relative_cwd(
         return _hunt_stats()
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", _fake_hunt)
     monkeypatch.setattr("treasure_map.lib.query.triage", lambda conn, *, run_id=None: [])
 
     result = CliRunner().invoke(
@@ -257,7 +257,7 @@ def test_scan_explicit_run_id_overrides_default(
         *,
         source_run_id: str,
         firmware_path: str | None = None,
-        # Mirrors the real run_analyzer2 signature. A stub that silently swallowed **kwargs
+        # Mirrors the real run_analyzer signature. A stub that silently swallowed **kwargs
         # would keep passing after the real function's contract changed underneath it.
         rehunt: bool = False,
     ) -> Any:
@@ -265,7 +265,7 @@ def test_scan_explicit_run_id_overrides_default(
         return _hunt_stats()
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", _fake_hunt)
     monkeypatch.setattr("treasure_map.lib.query.triage", lambda conn, *, run_id=None: [])
 
     result = CliRunner().invoke(
@@ -298,7 +298,7 @@ def test_scan_analyze_failure_short_circuits(
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _boom)
     monkeypatch.setattr(
-        "treasure_map.lib.hunt.run_analyzer2",
+        "treasure_map.lib.hunt.run_analyzer",
         lambda *a, **k: downstream.append("hunt"),
     )
     monkeypatch.setattr(
@@ -326,7 +326,7 @@ def test_scan_triage_segment_matches_triage_command(
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", lambda *a, **k: _hunt_stats(2))
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", lambda *a, **k: _hunt_stats(2))
     # triage + renderer are REAL here.
 
     scan_out = CliRunner().invoke(scan, [str(_mkfs(tmp_path)), "-w", "ws_x", "--atlas", str(atlas)])
@@ -355,7 +355,7 @@ def test_scan_passes_through_triage_options(
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", lambda *a, **k: _hunt_stats(3))
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", lambda *a, **k: _hunt_stats(3))
 
     base = [str(_mkfs(tmp_path)), "-w", "ws_x", "--atlas", str(atlas)]
     runner = CliRunner()
@@ -393,7 +393,7 @@ def test_scan_empty_candidates_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyP
         return _fake_analyze_result(tmp_path / "analysis.db")
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", lambda *a, **k: _hunt_stats(0))
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", lambda *a, **k: _hunt_stats(0))
 
     result = CliRunner().invoke(
         scan,
@@ -435,7 +435,7 @@ def test_scan_says_out_loud_when_the_hunt_was_skipped(
         return stats
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", _fake_hunt)
     monkeypatch.setattr("treasure_map.lib.query.triage", lambda *_a, **_k: [])
 
     result = CliRunner().invoke(
@@ -478,7 +478,7 @@ def test_scan_names_the_binaries_it_did_not_re_run_and_forwards_force_retry(
         return _hunt_stats()
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", _fake_hunt)
     monkeypatch.setattr("treasure_map.lib.query.triage", lambda conn, **_: [])
 
     result = CliRunner().invoke(
@@ -515,7 +515,7 @@ def test_an_interrupted_hunt_exits_like_any_other_interrupt(
         raise KeyboardInterrupt
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _interrupted_hunt)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", _interrupted_hunt)
     result = CliRunner().invoke(
         scan, [str(_mkfs(tmp_path)), "-w", "router_v1", "--atlas", str(tmp_path / "atlas.db")]
     )
@@ -569,7 +569,7 @@ def test_the_workspace_stays_locked_through_the_hunt(
         return _hunt_stats()
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", _fake_hunt)
     result = CliRunner().invoke(
         scan,
         [
@@ -618,7 +618,7 @@ def test_scan_says_what_its_extraction_left_behind(
         return res
 
     monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
-    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", lambda *a, **k: _hunt_stats())
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer", lambda *a, **k: _hunt_stats())
     monkeypatch.setattr("treasure_map.lib.query.triage", lambda conn, **_: [])
     result = CliRunner().invoke(
         scan, [str(_mkfs(tmp_path)), "-w", "router_v1", "--atlas", str(tmp_path / "atlas.db")]

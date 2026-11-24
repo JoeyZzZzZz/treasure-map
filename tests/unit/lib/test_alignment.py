@@ -33,9 +33,9 @@ from treasure_map.lib.diff.alignment import (
     make_diff_id,
     norm_hex,
     parse_bindiff,
-    run_layer0_parse,
+    run_alignment,
 )
-from treasure_map.lib.diff.dimension_delta import _load_alignment, run_layer2_delta
+from treasure_map.lib.diff.dimension_delta import _load_alignment, run_dimension_delta
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query.diff_align import align_by_function
 from treasure_map.lib.storage.connection import open_db
@@ -209,7 +209,7 @@ _CAT2 = frozenset({"00009999"})
 
 
 def _bins(atlas, run_a_id: str, run_b_id: str, sel_a: str, sel_b: str | None = None):  # type: ignore[no-untyped-def]
-    """``{"bin_a": …, "bin_b": …}`` — the two resolved rows run_layer0_parse now takes.
+    """``{"bin_a": …, "bin_b": …}`` — the two resolved rows run_alignment now takes.
 
     Resolves per side through each run's own analysis.db, which is what ``preflight`` does before
     calling it. Passing the selector straight through was how one short name got resolved eight
@@ -224,7 +224,7 @@ def _bins(atlas, run_a_id: str, run_b_id: str, sel_a: str, sel_b: str | None = N
         assert run is not None
         if not run.analysis_db_path:
             # A deliberately UNRESOLVED run: production never gets here (preflight blocks on it),
-            # and the test's point is that run_layer0_parse refuses on its own. Hand it the other
+            # and the test's point is that run_alignment refuses on its own. Hand it the other
             # side's row so the call is well-formed and the refusal comes from where it should.
             assert fallback is not None
             out[key] = fallback
@@ -444,7 +444,7 @@ def test_orchestrator_writes_all_three_tables_and_is_idempotent(tmp_path: Path) 
     atlas_path = _seed_two_runs(tmp_path)
     bd = _tiny_bindiff(tmp_path)
     con = open_atlas(atlas_path)
-    r1 = run_layer0_parse(
+    r1 = run_alignment(
         con,
         bindiff_path=bd,
         run_a_id="run_a",
@@ -455,7 +455,7 @@ def test_orchestrator_writes_all_three_tables_and_is_idempotent(tmp_path: Path) 
     q = "SELECT COUNT(*) FROM function_alignment WHERE diff_id=?"
     n1 = con.execute(q, (r1.diff_id,)).fetchone()[0]
     # ★ idempotent: re-parse the same diff -> same row count, no duplicate insert
-    run_layer0_parse(
+    run_alignment(
         con,
         bindiff_path=bd,
         run_a_id="run_a",
@@ -491,7 +491,7 @@ def test_diff_meta_functions_empty_is_failures_only_micro_skipped_separate(tmp_p
     con = open_atlas(tmp_path / "atlas.db")
     begin_run(con, "run_a", analysis_db_path=str(dba), tool_version="0.0.1")
     begin_run(con, "run_b", analysis_db_path=str(dbb), tool_version="0.0.1")
-    r = run_layer0_parse(
+    r = run_alignment(
         con,
         bindiff_path=_tiny_bindiff(tmp_path),
         run_a_id="run_a",
@@ -511,7 +511,7 @@ def test_presence_rows_expose_unmatched_both_sides(tmp_path: Path) -> None:
     # and B-side 0x3000 (new_b) are unmatched -> one presence row each; diff_meta counts show it.
     atlas_path = _seed_two_runs(tmp_path)
     con = open_atlas(atlas_path)
-    r = run_layer0_parse(
+    r = run_alignment(
         con,
         bindiff_path=_tiny_bindiff(tmp_path),
         run_a_id="run_a",
@@ -542,7 +542,7 @@ def test_unresolved_run_errors_not_silent_empty(tmp_path: Path) -> None:
     begin_run(con, "run_a", analysis_db_path=str(tmp_path / "a.db"), tool_version="0.0.1")
     begin_run(con, "run_b", analysis_db_path=None, tool_version="0.0.1")  # unresolved B
     with pytest.raises(ConfigError, match="no recorded analysis.db"):
-        run_layer0_parse(
+        run_alignment(
             con,
             bindiff_path=_tiny_bindiff(tmp_path),
             run_a_id="run_a",
@@ -556,7 +556,7 @@ def test_version_skew_uses_tool_version_not_firmware_hash(tmp_path: Path) -> Non
     # ★ version-skew source: A and B are different firmware (different sha by design) — skew comes
     # from the ANALYSIS-TOOL version, not the firmware hash. Same tool -> no skew; differ -> skew.
     con = open_atlas(_seed_two_runs(tmp_path, tool_a="0.0.1", tool_b="0.0.1"))
-    r = run_layer0_parse(
+    r = run_alignment(
         con,
         bindiff_path=_tiny_bindiff(tmp_path),
         run_a_id="run_a",
@@ -567,7 +567,7 @@ def test_version_skew_uses_tool_version_not_firmware_hash(tmp_path: Path) -> Non
     con.close()
 
     con2 = open_atlas(_seed_two_runs(tmp_path / "skew", tool_a="0.0.1", tool_b="0.0.2"))
-    r2 = run_layer0_parse(
+    r2 = run_alignment(
         con2,
         bindiff_path=_tiny_bindiff(tmp_path / "skew"),
         run_a_id="run_a",
@@ -639,7 +639,7 @@ def test_bindiff_binary_hash_mismatch_is_refused(tmp_path: Path) -> None:
     )
     con = open_atlas(atlas_path)
     with pytest.raises(ConfigError, match="does not correspond"):
-        run_layer0_parse(
+        run_alignment(
             con,
             bindiff_path=bad,
             run_a_id="run_a",
@@ -654,7 +654,7 @@ def test_bindiff_matching_hashes_proceed(tmp_path: Path) -> None:
     # ★ matching file-side hashes -> the parse runs normally (the guard is not a blanket block).
     atlas_path = _seed_two_runs(tmp_path)
     con = open_atlas(atlas_path)
-    r = run_layer0_parse(
+    r = run_alignment(
         con,
         bindiff_path=_tiny_bindiff(tmp_path),
         run_a_id="run_a",
@@ -676,10 +676,10 @@ def test_bindiff_matching_hashes_proceed(tmp_path: Path) -> None:
 
 
 def _parse_two_runs(tmp_path: Path, **seed_kw: str):  # type: ignore[no-untyped-def]
-    """Seed two runs with the given tool/ghidra versions, run layer-0, return the Layer0Result."""
+    """Seed two runs with the given tool/ghidra versions, run the alignment, return its result."""
     con = open_atlas(_seed_two_runs(tmp_path, **seed_kw))
     try:
-        return run_layer0_parse(
+        return run_alignment(
             con,
             bindiff_path=_tiny_bindiff(tmp_path),
             run_a_id="run_a",
@@ -761,12 +761,12 @@ def test_diff_meta_records_ghidra_version_not_null(tmp_path: Path) -> None:
 
 
 def test_diff_meta_binary_normalized_to_short_name(tmp_path: Path) -> None:
-    # ★ run_layer0_parse given a SHA256-form binary must STORE the short NAME in
+    # ★ run_alignment given a SHA256-form binary must STORE the short NAME in
     # diff_meta.binary_a/b -- layer-2 filters on string_keyed_edge.binary (short name), so a stored
     # sha would zero-match and silently drop every edge (over-filter). _seed_two_runs
     # gives lib.so the sha 'sha_a'/'sha_b'; passing those (the sha form) must still record 'lib.so'.
     con = open_atlas(_seed_two_runs(tmp_path))
-    r = run_layer0_parse(
+    r = run_alignment(
         con,
         bindiff_path=_tiny_bindiff(tmp_path),
         run_a_id="run_a",
@@ -860,7 +860,7 @@ def _seed_two_binaries(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 
 def _diff(con, bd, binary):  # type: ignore[no-untyped-def]
-    return run_layer0_parse(
+    return run_alignment(
         con,
         bindiff_path=bd,
         run_a_id="run_a",
@@ -871,7 +871,7 @@ def _diff(con, bd, binary):  # type: ignore[no-untyped-def]
 
 def _full_diff(con, bd, binary):  # type: ignore[no-untyped-def]
     r = _diff(con, bd, binary)
-    run_layer2_delta(con, diff_id=r.diff_id, run_a_id="run_a", run_b_id="run_b")
+    run_dimension_delta(con, diff_id=r.diff_id, run_a_id="run_a", run_b_id="run_b")
     return r
 
 
@@ -946,7 +946,7 @@ def test_a_diff_records_which_file_it_aligned(tmp_path: Path) -> None:
     """diff_meta stores the short name for the per-binary filter; the path says which of the files
     under that name was actually diffed.
 
-    ★ Driven through ``run_layer0_parse``, not through the writer: the writer only proves the
+    ★ Driven through ``run_alignment``, not through the writer: the writer only proves the
     column exists, while the claim is that the DIFF fills it in. A test that inserts the row itself
     passes just as well when layer 0 stops passing the paths.
 
@@ -954,7 +954,7 @@ def test_a_diff_records_which_file_it_aligned(tmp_path: Path) -> None:
     """
     atlas = open_atlas(_seed_two_runs(tmp_path))
     try:
-        res = run_layer0_parse(
+        res = run_alignment(
             atlas,
             bindiff_path=_tiny_bindiff(tmp_path),
             run_a_id="run_a",
