@@ -114,6 +114,7 @@ def edges_reaching_callee(
     func_name: str | None,
     *,
     binary_path: str | None = None,
+    cols: str | None = None,
 ) -> list[dict[str, Any]]:
     """Every string-keyed edge whose CALLEE is ``func_name`` in ``binary`` — the reachability
     layer's lookup ("is this candidate's function gated behind a string key?").
@@ -126,20 +127,26 @@ def edges_reaching_callee(
 
     A FACT lookup only — the caller must keep reachability=unknown; this returns the key lead(s),
     never a reachability verdict. Empty list when the function is no edge's callee (which is NOT
-    proof of unreachability — most functions simply are not string-key-dispatched)."""
+    proof of unreachability — most functions simply are not string-key-dispatched).
+
+    ``cols`` is this atlas's select list (``_cols``) when the caller already has it: working it out
+    costs a ``PRAGMA table_info``, and a caller that looks up one candidate after another (triage)
+    would otherwise pay that once per candidate — 37,461 times for one run of the live atlas.
+    Without it, it is worked out here as before."""
     if not func_name:
         return []
+    select = _cols(conn) if cols is None else cols
     if binary_path and binary:
         sql = (
-            f"SELECT {_cols(conn)} FROM string_keyed_edge WHERE callee_name = ? "
+            f"SELECT {select} FROM string_keyed_edge WHERE callee_name = ? "
             "AND (binary_path = ? OR (binary_path IS NULL AND binary = ?))"
         )
         params: tuple[str, ...] = (func_name, binary_path, binary)
     elif binary:
-        sql = f"SELECT {_cols(conn)} FROM string_keyed_edge WHERE callee_name = ? AND binary = ?"
+        sql = f"SELECT {select} FROM string_keyed_edge WHERE callee_name = ? AND binary = ?"
         params = (func_name, binary)
     else:
-        sql = f"SELECT {_cols(conn)} FROM string_keyed_edge WHERE callee_name = ?"
+        sql = f"SELECT {select} FROM string_keyed_edge WHERE callee_name = ?"
         params = (func_name,)
     try:
         rows = conn.execute(sql, params).fetchall()

@@ -113,3 +113,17 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(urllib.request, "urlopen", _refuse)
     monkeypatch.setattr(socket, "create_connection", _refuse)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_process_caches() -> None:
+    """The process-level readings start empty for every test. The product keys them by what they
+    were read from — a run's stamps and the live count and highest id of its instances for the
+    candidate reading, a diff's content hashes for the per-diff ones — so a scan, a re-hunt or a
+    re-diff is never served a stale one. A test is not bound by that: it reuses one run id and one
+    diff id across a new database per test, and rewrites rows in place (``UPDATE instance SET
+    function_origin = NULL``) to make a reading it then expects to be read afresh.
+    """
+    from treasure_map.lib.query.triage import clear_triage_cache
+
+    clear_triage_cache()

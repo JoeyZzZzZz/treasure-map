@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -37,6 +38,7 @@ from treasure_map.lib.query.sink_impact import (
     PROVABLY_CONSTANT_MARKERS,
     impact_tier,
 )
+from treasure_map.lib.query.string_edges import _cols as _edge_cols
 from treasure_map.lib.query.string_edges import edges_reaching_callee, is_candidate_edge
 
 logger = logging.getLogger(__name__)
@@ -2774,17 +2776,22 @@ def _candidate(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     wrapper_names: frozenset[str] = frozenset(),
+    edge_cols: str | None = None,
 ) -> TriageCandidate:
     """One candidate, read with ITS run's evidence only: whether an nvram key is user-settable is
-    a fact about that firmware's front end, never another image's in the same atlas."""
+    a fact about that firmware's front end, never another image's in the same atlas.
+
+    ``edge_cols`` is the string-keyed-edge select list for this atlas, worked out once by a caller
+    reading a whole run (see ``edges_reaching_callee``)."""
     with run_scope(row["source_run_id"]):
-        return _candidate_in_run(conn, row, wrapper_names)
+        return _candidate_in_run(conn, row, wrapper_names, edge_cols)
 
 
 def _candidate_in_run(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     wrapper_names: frozenset[str],
+    edge_cols: str | None = None,
 ) -> TriageCandidate:
     reach = row["reachability_status"]
     # Parsed ONCE for this candidate and handed to every reader below (none of them changes it). A
@@ -2824,7 +2831,7 @@ def _candidate_in_run(
     binary_path = row["binary_path"]
     binary_name = Path(binary_path).name if binary_path else None
     string_keyed_edges = tuple(
-        edges_reaching_callee(conn, binary_name, function, binary_path=binary_path)
+        edges_reaching_callee(conn, binary_name, function, binary_path=binary_path, cols=edge_cols)
     )
     return TriageCandidate(
         review_status=REVIEW_STATUS_BY_REACHABILITY.get(reach, reach),
@@ -3431,6 +3438,73 @@ def apply_view(
     return out
 
 
+# ── the whole reading, kept for the next page ────────────────────────────────────────────────
+#
+# A page of list_candidates is a slice of this reading, and every page asked for the reading again:
+# page 2 of a 37,461-candidate run re-read and re-ranked the whole run (5.9 s, 29.0 s from cold
+# disk). It is kept per scope instead, under everything it is read from, so paging slices one
+# reading. Four of them: a reader works one firmware at a time, and one entry is a whole run.
+#
+# THE KEY is the atlas file plus, for every run in scope, the run row's stamps AND the live count
+# and highest id of its instances. The stamps catch a re-scan or a re-hunt (which is what a
+# reader's stale gate reads); the two live numbers catch rows written or deleted without the row
+# being updated, so a reading is never served for instances that are no longer the ones there.
+# Nothing here reads the overlay, so no judgement can change this reading: list_candidates applies
+# the overlay band AFTER triage, outside this cache.
+_TRIAGE_RUNS = 4
+_TRIAGE_CACHE: OrderedDict[tuple[str, ...], tuple[TriageCandidate, ...]] = OrderedDict()
+
+_RUN_STAMP_COLS = (
+    "run_id",
+    "build_hash",
+    "hunt_commit",
+    "hunt_code_version",
+    "scan_stamp",
+    "hunt_instances",
+    "updated_at",
+)
+
+
+def _atlas_file(conn: sqlite3.Connection) -> str:
+    """The atlas this connection reads, so two atlases in one process never share an entry."""
+    for row in conn.execute("PRAGMA database_list"):
+        if row[1] == "main":
+            return str(row[2] or "")
+    return ""
+
+
+def _triage_key(conn: sqlite3.Connection, run_id: str | None) -> tuple[str, ...]:
+    cols = ", ".join(_RUN_STAMP_COLS)
+    where = " WHERE run_id = ?" if run_id is not None else ""
+    params = (run_id,) if run_id is not None else ()
+    rows = conn.execute(
+        f"SELECT {cols} FROM run{where} ORDER BY run_id",
+        params,  # noqa: S608 -- literal columns
+    ).fetchall()
+    key = [_atlas_file(conn), run_id or "*"]
+    for row in rows:
+        key += [str(v if v is not None else "") for v in tuple(row)]
+    # The rows the reading is of, for the scope as a whole — so a scope whose run table holds
+    # nothing (its runs deleted, or a fixture that registered none) is keyed by its instances and
+    # not by the atlas path alone.
+    live = conn.execute(
+        "SELECT COUNT(*), COALESCE(MAX(instance_id), 0) FROM instance"
+        + (" WHERE source_run_id = ?" if run_id is not None else ""),
+        params,
+    ).fetchone()
+    # data_version changes whenever ANOTHER connection commits to this file, so a scan, a hunt or
+    # a run deletion in another process is caught even where it rewrote rows in place without
+    # moving a stamp. It does not move for a write on this same connection.
+    data_version = conn.execute("PRAGMA data_version").fetchone()
+    key += [str(live[0]), str(live[1]), str(data_version[0] if data_version else "")]
+    return tuple(key)
+
+
+def clear_triage_cache() -> None:
+    """Drop the kept readings (a test reuses one run id across databases)."""
+    _TRIAGE_CACHE.clear()
+
+
 def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[TriageCandidate]:
     """Return the atlas candidate map — each candidate with its honest dimension layers — ordered by
     the DEFAULT lens: sink-impact spine, impact x controllability composite, only-up tertiary
@@ -3438,7 +3512,15 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
     with ``sort_candidates`` / ``apply_view``. Read-only; nothing is written back.
 
     run_id, if given, restricts to one firmware run (source_run_id); otherwise all runs.
+
+    The reading is kept per scope for the next page (see ``_TRIAGE_CACHE``); the list returned is
+    always a fresh one, so a caller may sort or filter it in place.
     """
+    key = _triage_key(conn, run_id)
+    kept = _TRIAGE_CACHE.get(key)
+    if kept is not None:
+        _TRIAGE_CACHE.move_to_end(key)
+        return list(kept)
     sql = (
         "SELECT i.reachability_status, i.blocking_mechanism, i.exposure_shape, i.origin, "
         "i.source_anchor, i.sink_anchor, i.source_run_id, i.evidence_ref, i.binary_path, "
@@ -3454,8 +3536,14 @@ def triage(conn: sqlite3.Connection, *, run_id: str | None = None) -> list[Triag
     # Compute the analyzer thin-nvram-wrapper set ONCE per run (not per candidate) and thread it
     # down — the candidate-layer source attribution reuses it to recognise wrapper-read keys.
     wrapper_names = _nvram_wrapper_names(conn)
-    candidates = [_candidate(conn, r, wrapper_names) for r in rows]
-    return sort_candidates(candidates, spine="impact")
+    # The string-keyed-edge select list, worked out once rather than per candidate.
+    edge_cols = _edge_cols(conn)
+    candidates = [_candidate(conn, r, wrapper_names, edge_cols) for r in rows]
+    ranked = sort_candidates(candidates, spine="impact")
+    _TRIAGE_CACHE[key] = tuple(ranked)
+    while len(_TRIAGE_CACHE) > _TRIAGE_RUNS:
+        _TRIAGE_CACHE.popitem(last=False)
+    return list(ranked)
 
 
 # ── single-candidate explanation (the dimension layers; honest bounds; where to verify) ──

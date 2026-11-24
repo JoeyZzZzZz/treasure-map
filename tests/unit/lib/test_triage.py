@@ -41,6 +41,7 @@ from treasure_map.lib.query.triage import (
     Dimension,
     TriageCandidate,
     _record_addr,
+    clear_triage_cache,
 )
 
 _FID = [0]
@@ -2214,6 +2215,10 @@ def test_the_boundary_origin_moves_no_candidates_rank(tmp_path: Path) -> None:
     default = [c.evidence_ref for c in with_origin]
     conn.execute("UPDATE instance SET function_origin = NULL")
     conn.commit()
+    # The reading is kept per scope, keyed by the run's stamps, its instance count and highest id,
+    # and the file's data_version — none of which an in-place rewrite on THIS connection moves. A
+    # hunt stamps the run row it rewrote; this test is a rewrite no hunt made, so it says so.
+    clear_triage_cache()
     cleared = triage(conn)
     conn.close()
     assert {c.dim("completeness").state for c in cleared} == {"unknown"}  # the clear took
@@ -2241,3 +2246,104 @@ def test_an_only_completeness_prune_is_still_refused(tmp_path: Path) -> None:
     assert recorded == {"analysis", "promoted", "recovered"}  # fragments beside analysis rows
     refusal = only_refusal([("completeness", "promoted")], full)
     assert refusal is not None and "completeness" in refusal
+
+
+# ── the kept reading: paging slices it, and it is never served for other rows ────────────────
+
+
+def _edge_world(tmp_path: Path, n: int) -> sqlite3.Connection:
+    """A run of ``n`` candidates, with the string-keyed-edge table in place (so the select list
+    the lookup needs is really worked out)."""
+    conn = _atlas(tmp_path)
+    conn.execute(
+        "INSERT INTO run (run_id, hunt_commit, build_hash, hunt_instances, hunt_code_version) "
+        "VALUES ('run_1', 'c', 'b', ?, 'src-1')",
+        (n,),
+    )
+    pid = _pattern(conn, "fp_keep")
+    for i in range(n):
+        _inst(conn, pid, fn=f"fn{i}", binary_path="bin/app")
+    conn.commit()
+    return conn
+
+
+def test_a_page_of_candidates_slices_one_reading_of_the_run(tmp_path: Path) -> None:
+    """★ M-7: a page of list_candidates is a slice of one reading of the run. Every page used to
+    ask for the reading again — page 2 of a 37,461-candidate run re-read and re-ranked the whole
+    run (5.9 s, 29.0 s from cold disk) — and the per-candidate string-keyed-edge lookup worked out
+    its select list with a ``PRAGMA table_info`` each time, 37,461 of them for that run.
+
+    So: one PRAGMA table_info for the whole reading, and a second reading of the same scope goes
+    back to the instance table not at all.
+
+    MUTATION (verified RED, ``1 failed`` each): drop the ``cols`` argument at the lookup -> one
+    PRAGMA per candidate -> RED; return without consulting ``_TRIAGE_CACHE`` -> the second
+    reading re-reads -> RED."""
+    conn = _edge_world(tmp_path, 40)
+    clear_triage_cache()
+    seen: list[str] = []
+    conn.set_trace_callback(seen.append)  # every statement SQLite really ran on this connection
+
+    def pragmas() -> list[str]:
+        return [q for q in seen if "table_info(string_keyed_edge)" in q]
+
+    def selects() -> list[str]:
+        return [q for q in seen if "FROM instance i JOIN pattern p" in q]
+
+    first = triage(conn, run_id="run_1")
+    assert len(first) == 40
+    assert len(pragmas()) == 1, f"{len(pragmas())} PRAGMA table_info for one reading"
+    assert len(selects()) == 1
+    second = triage(conn, run_id="run_1")
+    assert len(selects()) == 1, "the second reading went back to the instance table"
+    assert second == first  # every candidate, every field, in the same order
+    assert second is not first  # a fresh list: a caller may sort it in place
+    conn.set_trace_callback(None)
+    conn.close()
+
+
+def test_a_kept_reading_is_never_served_for_other_rows(tmp_path: Path) -> None:
+    """★ The kept reading is keyed by what it was read from, so a re-hunt is not served the old
+    one. Each half of the key is checked where only it can tell:
+
+    * the rows replaced with the SAME number of rows and the run row untouched (the highest
+      instance id is what moved) -> the new rows are read;
+    * the run's stamps moved with every row left as it was -> the reading is taken again, which is
+      only visible in the statements the connection ran.
+
+    MUTATION (verified RED, ``1 failed`` each): leave the instance count and highest id out of the
+    key -> the replaced rows are served from the old reading -> RED. Leave the run row's stamps
+    out -> a re-hunt that rewrote rows in place under the same count is served the old reading,
+    here seen as no second read -> RED."""
+    conn = _edge_world(tmp_path, 3)
+    clear_triage_cache()
+    seen: list[str] = []
+    conn.set_trace_callback(seen.append)
+
+    def reads() -> int:
+        return len([q for q in seen if "FROM instance i JOIN pattern p" in q])
+
+    before = triage(conn, run_id="run_1")
+    assert {c.function for c in before} == {"fn0", "fn1", "fn2"}
+    assert reads() == 1
+
+    # (1) three rows out, three different rows in; the run row says nothing happened.
+    conn.execute("DELETE FROM instance WHERE source_run_id = 'run_1'")
+    pid = _pattern(conn, "fp_keep")
+    for i in range(3):
+        _inst(conn, pid, fn=f"later{i}", binary_path="bin/app")
+    conn.commit()
+    after = triage(conn, run_id="run_1")
+    assert {c.function for c in after} == {"later0", "later1", "later2"}, (
+        "the kept reading was served for rows that are no longer there"
+    )
+    assert reads() == 2
+
+    # (2) the stamps move, every row stays: the reading is taken again.
+    conn.execute("UPDATE run SET hunt_code_version = 'src-2', hunt_commit = 'c2'")
+    conn.commit()
+    again = triage(conn, run_id="run_1")
+    assert {c.function for c in again} == {"later0", "later1", "later2"}
+    assert reads() == 3, "a stamp move left the old reading in place"
+    conn.set_trace_callback(None)
+    conn.close()
