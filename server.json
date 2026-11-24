@@ -6,14 +6,14 @@
   "websiteUrl": "https://tmap.tools/",
   "icons": [
     {
-      "src": "https://tmap.tools/favicon-32.png",
+      "src": "https://tmap.tools/icon-512.png",
       "mimeType": "image/png",
-      "sizes": ["32x32"]
+      "sizes": ["512x512"]
     },
     {
-      "src": "https://tmap.tools/apple-touch-icon.png",
-      "mimeType": "image/png",
-      "sizes": ["180x180"]
+      "src": "https://tmap.tools/icon.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": ["any"]
     }
   ],
   "repository": {
