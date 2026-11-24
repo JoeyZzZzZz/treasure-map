@@ -162,6 +162,48 @@ def test_ci_runs_the_gates_over_real_output_and_the_dead_code_gate() -> None:
     assert "scripts/check-dead-code.sh" in runs
 
 
+def test_the_dead_code_gate_cannot_pass_without_vulture(tmp_path: Path) -> None:
+    """The gate must not go green because the tool it runs is missing — the same false pass
+    TMAP_REQUIRE_GHIDRA closed for the decompiler. vulture lives in the dev extra, so CI has it;
+    a developer's venv without it printed ✓ on a repo nobody had checked.
+
+    Also the reason the two vulture calls no longer end in a bare ``|| true``: vulture exits 3 for
+    "found something" and 1 for "could not read a file", so a syntax error in src/ used to read as
+    an empty report.
+
+    MUTATION (verified RED, 1 failed): put the ``|| true`` script back -> the stripped-PATH run
+    exits 0 with ✓ -> RED. Same for treating every exit code as a verdict (``if false`` in place of
+    the ``$rc`` check) -> the exit-2 run passes -> RED. Removing only the ``command -v`` guard
+    stays GREEN, by design: the ``$rc`` check catches 127 too, and the guard is there for the
+    message that names what to install."""
+    root = _WORKFLOWS.parents[1]
+    stripped = subprocess.run(
+        ["bash", "scripts/check-dead-code.sh"],
+        cwd=root,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+    assert stripped.returncode != 0, stripped.stdout
+    assert "✓" not in stripped.stdout
+    assert "vulture" in stripped.stdout + stripped.stderr
+
+    # ... and a vulture that fails on its own terms is not a verdict either.
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "vulture").write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+    (fake / "vulture").chmod(0o755)
+    broken = subprocess.run(
+        ["bash", "scripts/check-dead-code.sh"],
+        cwd=root,
+        env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+    assert broken.returncode != 0, broken.stdout
+    assert "✓" not in broken.stdout
+
+
 def test_every_third_party_action_is_pinned_to_a_commit() -> None:
     """A tag can be moved to other code; a 40-character commit cannot. The release job holds
     id-token: write, so what runs there must be exactly what was reviewed.

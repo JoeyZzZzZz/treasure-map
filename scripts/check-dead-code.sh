@@ -31,7 +31,33 @@ EXEMPT=(
 
 names="$(IFS='|'; echo "${EXEMPT[*]}")"
 
-sure="$(vulture src/treasure_map --min-confidence 80 || true)"
+# This gate must never pass by not running. vulture 2.16's exit codes (measured, not guessed):
+# 0 found nothing, 3 found something, 1 could not read a file (a missing path, a syntax error),
+# 2 bad arguments. So only 0 and 3 are verdicts, and a bare `|| true` turned every other outcome
+# — including vulture not being installed at all — into an empty report and a ✓.
+# The same false green as a Ghidra job that passes by skipping: see TMAP_REQUIRE_GHIDRA in
+# tests/integration/conftest.py.
+command -v vulture >/dev/null || {
+    echo "❌ dead-code gate: vulture is not on PATH, so this gate did not run." >&2
+    echo "   pip install -e \".[dev]\"" >&2
+    exit 1
+}
+
+VULTURE_OUT=""
+# Deliberately not called inside a command substitution: in a subshell its `exit` would only end
+# that subshell, and the `|| true` on the pipeline below would then swallow the failure.
+run_vulture() {  # run_vulture <args...> -> findings in $VULTURE_OUT, or the gate fails
+    local rc=0
+    VULTURE_OUT="$(vulture "$@")" || rc=$?
+    if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then
+        echo "❌ dead-code gate: vulture itself failed (exit $rc), so its verdict means nothing." >&2
+        echo "   0 = nothing found, 3 = findings; 1 = a file it could not read, 2 = bad arguments." >&2
+        exit 1
+    fi
+}
+
+run_vulture src/treasure_map --min-confidence 80
+sure="$VULTURE_OUT"
 if [ -n "$sure" ]; then
     echo "$sure"
     echo "❌ dead code: the above is unused with no doubt (an import or a local)."
@@ -39,8 +65,10 @@ if [ -n "$sure" ]; then
 fi
 
 # @field_validator / @click.command and friends: called by the framework, not from our code.
-callable_dead="$(vulture src/treasure_map --min-confidence 60 \
-    --ignore-decorators "@*.command,@*.group,@*.setter,@field_validator,@*.validator" \
+# grep exits 1 on no match, which here means "nothing left to report" — that `|| true` is right.
+run_vulture src/treasure_map --min-confidence 60 \
+    --ignore-decorators "@*.command,@*.group,@*.setter,@field_validator,@*.validator"
+callable_dead="$(printf '%s\n' "$VULTURE_OUT" \
     | grep -E "unused (function|method)" \
     | grep -Ev "'($names)'" || true)"
 if [ -n "$callable_dead" ]; then
