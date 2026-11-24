@@ -308,8 +308,6 @@ def test_read_helpers_require_explicit_atlas_no_default_fallback() -> None:
         diff_align.get_diff_meta,
         diff_align.get_diff_capabilities,
         diff_align.list_diffs,
-        diff_align.align_by_a,
-        diff_align.align_by_b,
         diff_align.align_by_function,
     ):
         src = inspect.getsource(fn)
@@ -330,8 +328,6 @@ def test_diff_read_helpers_have_no_write_sql() -> None:
         diff_align.get_diff_meta,
         diff_align.get_diff_capabilities,
         diff_align.list_diffs,
-        diff_align.align_by_a,
-        diff_align.align_by_b,
         diff_align.align_by_function,
     ):
         assert not write.search(inspect.getsource(fn)), f"{fn.__name__} carries a write statement"

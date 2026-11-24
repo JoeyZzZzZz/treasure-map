@@ -588,11 +588,6 @@ def _run_id_from_ref(anchor_ref: str) -> str | None:
     return head or None
 
 
-# Where a write came from (overlay_history.channel): the MCP tools, the command line's human
-# channels (judge, the worksheet), another command-line write, a library caller.
-CHANNELS = ("mcp", "judge", "worksheet", "cli", "api")
-
-
 @dataclass(frozen=True)
 class WriteContext:
     """What overlay_history records about a write besides the row itself: its channel, the work

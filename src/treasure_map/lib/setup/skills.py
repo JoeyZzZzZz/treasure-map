@@ -104,12 +104,6 @@ def default_claude_root(home: Path) -> Path:
     return home / ".claude" / "skills"
 
 
-def cursor_roots(home: Path) -> tuple[Path, ...]:
-    """The personal skills directories Cursor reads (fixed paths; no environment variable moves
-    them)."""
-    return tuple(home / d / "skills" for d in (".agents", ".cursor", ".claude", ".codex"))
-
-
 def dsh_root(home: Path, environ: Mapping[str, str]) -> Path:
     """dsh's own skills directory, ``$DSH_HOME/skills`` (``~/.dsh/skills``): dsh prefers it to
     ``~/.agents/skills``."""

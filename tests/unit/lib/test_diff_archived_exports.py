@@ -183,7 +183,7 @@ def test_a_degraded_operand_is_an_additional_fact_that_changes_nothing(
     ).fetchone()[0]
     assert gone == 1
     assert [k for _s, k, _r in _edges(w)] == ["layer_unchanged"]  # determined, no gap reason
-    found = diff_align.align_by_a(w.atlas, _DID, "0x1000")
+    found = diff_align.align_by_function(w.atlas, _DID, "0x1000", "a")
     assert found["pairs"][0]["operand_markup_incomplete_a"] == 1
     view = pv.get_diff_patch_view(w.atlas, _DID, limit=50)
     marked = [e for e in view["entries"] if e.get("operand_markup_incomplete")]

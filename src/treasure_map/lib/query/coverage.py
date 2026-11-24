@@ -59,10 +59,6 @@ CONCLUDED = "concluded"  # a verdict in the current vocabulary was reached
 NEEDS_RELABEL = "needs_relabel"  # the verdict word is retired; re-state it in current terms
 NEEDS_RECHECK = "needs_recheck"  # the facts it rested on have moved, though the anchor still holds
 
-# Not a row state: a dangling annotation has no current candidate to sit on, so it can only be
-# reported on the envelope.
-DANGLING = "dangling"
-
 # The verdicts that count as a conclusion reached. ``inconclusive`` is deliberately NOT here: it is
 # an honest "looked, cannot say", and counting it as done would make it the cheap way to clear a
 # page.

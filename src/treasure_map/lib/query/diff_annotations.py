@@ -7,7 +7,7 @@ one, and what lists them. Each of these rebuilds the diff's view (patch_view.bui
 same build get_diff_patch_view reads — so a judgement is always checked against exactly the entries
 a reader was shown.
 
-  * ``capture_diff_basis`` — the anchor a judgement is written on must name an entry, or a
+  * ``capture_diff_basis_on`` — the anchor a judgement is written on must name an entry, or a
     candidate row of one, that the view lists now; what it rests on is snapshotted from it.
   * ``check_promotion`` — whether a judgement on an entry may be carried onto one of its
     candidates (see its docstring for the rules and why each exists).
@@ -130,15 +130,6 @@ def _check_anchor(anchor_ref: str, meta: dict[str, Any]) -> tuple[str, str]:
     return kind, key
 
 
-def capture_diff_basis(atlas: sqlite3.Connection, diff_id: str, anchor_ref: str) -> dict[str, Any]:
-    """The snapshot a judgement on ``anchor_ref`` is stored with, or a refusal when the anchor does
-    not name something the view lists now: a listed entry, or a candidate row of one."""
-    meta = _binary_diff(atlas, diff_id)
-    _check_anchor(anchor_ref, meta)
-    built = _built(atlas, diff_id)
-    return capture_diff_basis_on(atlas, built, meta, diff_id, anchor_ref)
-
-
 def capture_diff_basis_on(
     atlas: sqlite3.Connection,
     built: BuiltDiff,
@@ -146,10 +137,11 @@ def capture_diff_basis_on(
     diff_id: str,
     anchor_ref: str,
 ) -> dict[str, Any]:
-    """``capture_diff_basis`` against an already-built view and ``_binary_diff`` meta — the batch
-    builds both once and reuses them. Same anchor check, same refusal, same snapshot. The pair
-    evidence is attached first, as the view's reading attaches it, so the facts stored are the
-    ones a later re-check reads."""
+    """The snapshot a judgement on ``anchor_ref`` is stored with, or a refusal when the anchor does
+    not name something the view lists now: a listed entry, or a candidate row of one. It takes the
+    view and the ``_binary_diff`` meta already built, so one write and a batch of them build both
+    once and reuse them. The pair evidence is attached first, as the view's reading attaches it, so
+    the facts stored are the ones a later re-check reads."""
     _check_anchor(anchor_ref, meta)
     _attach_pair_evidence(atlas, built)
     entries = listed_view(atlas, built).entries

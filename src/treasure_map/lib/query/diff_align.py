@@ -30,7 +30,6 @@ from treasure_map.lib.binexport_archive import (
     StoredExport,
     read_all_stored_exports,
 )
-from treasure_map.lib.diff.alignment import norm_hex
 from treasure_map.lib.diff.code_version import diff_code_version
 from treasure_map.lib.diff.currency import (
     diff_toolchain,
@@ -446,46 +445,6 @@ def _row_to_pair(r: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _align_by_side(atlas: sqlite3.Connection, diff_id: str, addr: str, side: str) -> dict[str, Any]:
-    col = "addr_a" if side == "a" else "addr_b"
-    norm = norm_hex(addr)
-    rows = atlas.execute(
-        f"SELECT addr_a, addr_b, name_a, name_b, alignment_confidence, similarity, "  # noqa: S608
-        f"alignment_state, basicblocks, edges, instructions, export_gap_a, export_gap_b, "
-        f"operand_markup_incomplete_a, operand_markup_incomplete_b "
-        f"FROM function_alignment WHERE diff_id = ? AND {col} = ?",  # noqa: S608 -- col is a literal
-        (diff_id, norm),
-    ).fetchall()
-    if not rows:
-        gap = atlas.execute(
-            "SELECT export_gap, operand_markup_incomplete FROM function_presence "
-            "WHERE diff_id = ? AND side = ? AND addr = ?",
-            (diff_id, side, norm),
-        ).fetchone()
-        return {
-            "found": False,
-            "diff_id": diff_id,
-            "query": {"side": side, "addr": norm},
-            # non-null when the function is unmatched because its export did not hold it as it is
-            "export_gap": gap[0] if gap is not None else None,
-            "operand_markup_incomplete": gap[1] if gap is not None else None,
-            **diff_source_staleness(atlas, diff_id),
-            "note": (
-                "no matched pair for this address in this diff. That is NOT proof the function was "
-                "added/removed -- an unmatched function is listed in function_presence, and a diff "
-                "covers only the tool's view, never all changes. " + _ALIGN_NOTE
-            ),
-        }
-    return {
-        "found": True,
-        "diff_id": diff_id,
-        "query": {"side": side, "addr": norm},
-        "pairs": [_row_to_pair(r) for r in rows],
-        **diff_source_staleness(atlas, diff_id),
-        "note": _ALIGN_NOTE,
-    }
-
-
 _ALIGN_COLUMNS = (
     "addr_a, addr_b, name_a, name_b, alignment_confidence, similarity, alignment_state, "
     "basicblocks, edges, instructions, export_gap_a, export_gap_b, operand_markup_incomplete_a, "
@@ -604,17 +563,6 @@ def align_by_function(
         **diff_source_staleness(atlas, diff_id),
         "note": miss + _NOT_PROOF + _ALIGN_NOTE,
     }
-
-
-def align_by_a(atlas: sqlite3.Connection, diff_id: str, addr: str) -> dict[str, Any]:
-    """Given an A-side (before) address, its aligned B-side counterpart(s) with confidence +
-    similarity + state. The forward direction of the "did B patch what I found in A?" workflow."""
-    return _align_by_side(atlas, diff_id, addr, "a")
-
-
-def align_by_b(atlas: sqlite3.Connection, diff_id: str, addr: str) -> dict[str, Any]:
-    """Given a B-side (after) address, its aligned A-side counterpart(s). The reverse direction."""
-    return _align_by_side(atlas, diff_id, addr, "b")
 
 
 # ── layer-2 read face: dimension deltas / meta / capabilities (READ-ONLY, facts only) ───

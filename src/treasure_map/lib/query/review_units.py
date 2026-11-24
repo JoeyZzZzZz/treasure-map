@@ -142,7 +142,6 @@ ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE, PAIRING = (
     "reduce",
     "pairing_component",
 )
-UNIT_KINDS = (ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE, PAIRING)
 # Where a unit of a kind sorts among the units at the same place: a group or a pairing component
 # first (its members read together), an audit after the unit its member came from.
 _KIND_RANK = {GROUP: -1, PAIRING: -1, AUDIT: 1}
@@ -1020,12 +1019,11 @@ def read_reduce(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
 
 @dataclass(frozen=True)
 class Audit:
-    """A judgement owed a blind second reading: why (``sources``), the write it reads (its history
-    row and session; None for a write older than the history), and its unit."""
+    """A judgement owed a blind second reading: why (``sources``), the session of the write it
+    reads (None for a write older than the history), and its unit."""
 
     member: Member
     sources: tuple[str, ...]
-    write_id: int | None
     write_session: str | None
     unit: Unit
 
@@ -1218,9 +1216,7 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
                 position=m.position,
                 stream_index=index.get(m.stream, u.stream_index),
             )
-            out.open.append(
-                Audit(audited, tuple(sources), wid, last["session"] if last else None, unit)
-            )
+            out.open.append(Audit(audited, tuple(sources), last["session"] if last else None, unit))
     out.disagreements += _earlier_changed_real(facts, current, history)
     return out
 

@@ -35,8 +35,6 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "storage" / "overlay_schema.sql"
-# The values attributed_to accepts (the schema's CHECK; lib/overlay validates writes against it).
-ATTRIBUTIONS = ("agent", "agent-via-mcp", "human", "human-via-agent")
 _OVERLAY_CREATE = re.compile(r"^CREATE TABLE IF NOT EXISTS overlay \(", re.I)
 _VERDICT_CHECK = re.compile(r"CHECK\s*\(\s*verdict\b", re.I)
 

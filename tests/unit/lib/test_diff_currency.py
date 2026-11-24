@@ -675,7 +675,7 @@ def _surfaces(w: _World) -> dict[str, tuple[Any, Any]]:
     take("list_diffs", diff_align.list_diffs(w.atlas)["diffs"][0])
     take("get_diff_deltas", diff_align.get_diff_deltas(w.atlas, did))
     take("get_diff_meta", diff_align.get_diff_meta(w.atlas, did))
-    take("get_function_alignment", diff_align.align_by_a(w.atlas, did, "0x1000"))
+    take("get_function_alignment", diff_align.align_by_function(w.atlas, did, "0x1000", "a"))
     take("get_diff_capabilities", diff_align.get_diff_capabilities(w.atlas, did))
     tools = make_tools(w.tmp / "atlas.db")
     take("get_diff_sink_overlay", tools["get_diff_sink_overlay"](diff_id=did))

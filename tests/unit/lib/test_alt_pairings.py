@@ -705,11 +705,12 @@ def test_the_same_body_readings_are_no_fact_of_a_judgement(tmp_path: Path) -> No
     assert built is not None
     pv.listed_view(w.atlas, built)  # the S cache, read from the pseudocode readings
     pv._TWIN_CACHE.clear()
-    first = da.capture_diff_basis(w.atlas, DIFF, anchor)["facts"]
+    meta = da._binary_diff(w.atlas, DIFF)
+    first = da.capture_diff_basis_on(w.atlas, built, meta, DIFF, anchor)["facts"]
     assert len(pv._TWIN_CACHE) == 0  # the write path read no pseudocode
     assert _alts(_drill(w, f"a:{X}")) == [("twin", "to_b", Y)]
     assert len(pv._TWIN_CACHE) == 1
-    second = da.capture_diff_basis(w.atlas, DIFF, anchor)["facts"]
+    second = da.capture_diff_basis_on(w.atlas, built, meta, DIFF, anchor)["facts"]
     assert first == second
     assert "alt_pairings" in second and second["alt_pairings"] is None
 

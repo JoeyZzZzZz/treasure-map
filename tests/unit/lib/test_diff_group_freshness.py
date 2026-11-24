@@ -829,8 +829,10 @@ def test_batch_builds_the_diff_view_once(world: World, monkeypatch: pytest.Monke
     """M-2: a whole batch builds the diff view once — a group-leaning item reuses the batch's built
     view, it does not rebuild it.
 
-    MUTATION (verified RED): have the group path rebuild the view per item (annotate_group instead
-    of annotate_group_on) -> build_diff_view runs more than once."""
+    MUTATION (verified RED): have the group path build its own view per item (build_diff_view
+    inside annotate_group_on) -> build_diff_view runs more than once. The group module holding no
+    build_diff_view of its own is the structural half of the same guard: a rebuild it reached for
+    directly would not be counted here."""
     pv._clear_view_caches()
     calls = {"n": 0}
     real = pv.build_diff_view
@@ -839,8 +841,8 @@ def test_batch_builds_the_diff_view_once(world: World, monkeypatch: pytest.Monke
         calls["n"] += 1
         return real(atlas, diff_id, *a, **k)
 
+    assert not hasattr(gf, "build_diff_view")  # it is handed the built view, it never builds one
     monkeypatch.setattr(pv, "build_diff_view", counting)
-    monkeypatch.setattr(gf, "build_diff_view", counting)
     monkeypatch.setattr(da, "build_diff_view", counting)
     tools = mcp_app.make_tools(world.path)
     a1 = _entry_anchor(world, "00001000")
@@ -868,8 +870,11 @@ def test_a_group_ref_counts_as_a_checked_anchor_even_for_another_entry(world: Wo
     tools = mcp_app.make_tools(world.path)
     gref = _group_ref(world, LISTED)
     other = _entry_anchor(world, "00018000")  # a wrapper call's entry: no call or shape of GROUP_A
+    built = pv.build_diff_view(world.atlas, DIFF)
+    assert built is not None
+    side_meta = ss._meta(world.atlas, DIFF)
     with pytest.raises(ConfigError, match="not about this entry"):
-        gf.annotate_group(world.atlas, DIFF, other, gref)
+        gf.annotate_group_on(world.atlas, built, side_meta, DIFF, other, gref)
     out = tools["annotate_diff_batch"](
         [
             {

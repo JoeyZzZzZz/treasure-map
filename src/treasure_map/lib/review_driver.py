@@ -652,11 +652,11 @@ def drive(
 # analysis texts per finding — a JSON object listing the findings, each naming its anchor_ref, held
 # to HANDOFF_SCHEMA by the launch's own option (the preset's handoff_argv). The schema keeps the
 # message JSON; the parse is never loosened to dig JSON out of prose. The driver writes the document
-# itself: handoff_document (the CLI's function) with those texts under each block's placeholders,
-# so every fact line, the basis and the status are tmap's own text, never the agent's retyping. Its
-# full output is kept and read out of it — the agent, with every built-in tool off, cannot write a
-# file. Only claude-code's result is read this version; an experimental preset is refused, never
-# served a silent miss.
+# itself: compose_handoff, from the same blocks the command line's file and get_diff_handoff's
+# pages are built from, with those texts under each block's placeholders, so every fact line, the
+# basis and the status are tmap's own text, never the agent's retyping. Its full output is kept and
+# read out of it — the agent, with every built-in tool off, cannot write a file. Only claude-code's
+# result is read this version; an experimental preset is refused, never served a silent miss.
 HANDOFF_PRESETS = frozenset({"claude-code"})
 # The two texts the agent writes per finding, under the block's two placeholders.
 HANDOFF_FIELDS = ("hypotheses", "device_checks")

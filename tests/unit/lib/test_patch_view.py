@@ -4218,7 +4218,9 @@ def test_the_judgement_basis_rests_on_every_row_of_the_entry(
             ),
         },
     }
-    got = dann.capture_diff_basis(w.atlas, DIFF, _WIN_ANCHOR)
+    got = dann.capture_diff_basis_on(
+        w.atlas, dann._built(w.atlas, DIFF), dann._binary_diff(w.atlas, DIFF), DIFF, _WIN_ANCHOR
+    )
     # R9's read-face facts ride beside these; this test is about the rows.
     for key in (
         "listed_as",

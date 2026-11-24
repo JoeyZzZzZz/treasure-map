@@ -503,7 +503,7 @@ def html_page(review: ru.PairReview, *, header: dict[str, Any] | None = None) ->
 # the word "blocked". The whole pair is far larger than one MCP response, so get_diff_handoff pages
 # the blocks and the CLI `review report --handoff` writes them all to a file; the two are the same
 # text byte for byte. The batch driver writes the same document with an agent's two texts filled in
-# under each block's placeholders (handoff_document's ``analysis``).
+# under each block's placeholders (handoff_blocks' ``analysis``).
 #
 # Every fact is read through the lib call its MCP tool makes (get_diff_patch_view, get_xrefs,
 # get_file_diff, same_shape_siblings), so a cell states what that tool would answer.
@@ -1421,29 +1421,6 @@ def handoff_blocks(
         )
         for f in findings
     ]
-
-
-def handoff_document(
-    atlas: Any,
-    run_pair: str,
-    *,
-    stamp: HandoffStamp | None = None,
-    file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
-    analysis: dict[str, dict[str, str]] | None = None,
-) -> str:
-    """The whole findings hand-off as one markdown document — the header (read with the pair's
-    report at the default k, ``handoff_report``), every finding block in anchor order, then every
-    open item block (handoff_open_items) in anchor order. The concatenation of get_diff_handoff's
-    pages is this same text (B-4); with ``analysis`` it is the driver's document, the agent's texts
-    under each finding block's placeholders (an open item block has none)."""
-    findings = handoff_findings(atlas, run_pair, file_staleness=file_staleness)
-    open_items = handoff_open_items(atlas, run_pair, file_staleness=file_staleness)
-    rep = handoff_report(atlas, run_pair, file_staleness=file_staleness)
-    return (
-        handoff_header(run_pair, len(findings), rep, open_items=len(open_items))
-        + "".join(handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=analysis))
-        + "".join(handoff_open_blocks(atlas, run_pair, open_items))
-    )
 
 
 # ── the open items: the change_inconclusive judgements, after the findings ─────────────────────

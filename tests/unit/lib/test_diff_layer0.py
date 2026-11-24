@@ -37,7 +37,7 @@ from treasure_map.lib.diff.alignment import (
 )
 from treasure_map.lib.diff.dimension_delta import _load_alignment, run_layer2_delta
 from treasure_map.lib.errors import ConfigError
-from treasure_map.lib.query.diff_align import align_by_a, align_by_b
+from treasure_map.lib.query.diff_align import align_by_function
 from treasure_map.lib.storage.connection import open_db
 from treasure_map.version import UNKNOWN_VERSION
 
@@ -599,14 +599,14 @@ def test_query_face_bidirectional_carries_confidence_and_similarity(tmp_path: Pa
             )
         ],
     )
-    fwd = align_by_a(con, "d", "0x1000")  # accepts any address form
+    fwd = align_by_function(con, "d", "0x1000", "a")  # accepts any address form
     assert fwd["found"] and fwd["pairs"][0]["addr_b"] == "00001100"
     assert fwd["pairs"][0]["alignment_confidence"] == 0.97
     assert fwd["pairs"][0]["similarity"] == 0.6  # change-magnitude carried, not only the state
-    rev = align_by_b(con, "d", "00001100")
+    rev = align_by_function(con, "d", "00001100", "b")
     assert rev["found"] and rev["pairs"][0]["addr_a"] == "00001000"
     # ★ MATCHED-PAIRS-ONLY: a miss is an honest 'not proof added/removed', not a delete verdict
-    miss = align_by_a(con, "d", "0xdead")
+    miss = align_by_function(con, "d", "0xdead", "a")
     assert miss["found"] is False and "added/removed" in miss["note"]
     con.close()
 
@@ -936,7 +936,7 @@ def test_read_side_scopes_to_one_binary_despite_shared_addr(tmp_path: Path) -> N
     a2b_a, _ = _load_alignment(con, "run_a::run_b::liba")
     a2b_b, _ = _load_alignment(con, "run_a::run_b::libb")
     # both have a mapping for 0x1000, but each to its OWN diff's data (no cross-pollution)
-    fwd = align_by_a(con, "run_a::run_b::liba", "0x1000")
+    fwd = align_by_function(con, "run_a::run_b::liba", "0x1000", "a")
     assert fwd["found"] and fwd["pairs"][0]["name_a"] == "func_liba"  # liba's row, not libb's
     assert "00001000" in a2b_a and "00001000" in a2b_b  # each diff has its own 0x1000 mapping
     con.close()

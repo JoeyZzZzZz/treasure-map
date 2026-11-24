@@ -768,8 +768,8 @@ def test_a_view_with_its_own_readings_never_reads_the_differs_cache(
 
 
 def test_every_reader_of_the_view_lists_s_the_same_way(tmp_path: Path) -> None:
-    """The cheap readers — ViewReview (list_overlays' progress), capture_diff_basis, the checked-
-    anchor rule, promote's entry lookup — all see the S entries get_diff_patch_view lists.
+    """The cheap readers — ViewReview (list_overlays' progress), capture_diff_basis_on, the
+    checked-anchor rule, promote's entry lookup — all see the S entries get_diff_patch_view lists.
 
     MUTATION (verified RED, 1 failed): read ``built.entries`` in capture_diff_basis_on -> a
     judgement on S is refused -> RED."""

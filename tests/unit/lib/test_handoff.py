@@ -34,6 +34,32 @@ from treasure_map.version import UNKNOWN_VERSION
 
 PAIR = "runA::runB"
 
+
+def _document(
+    atlas: Any,
+    run_pair: str,
+    *,
+    stamp: Any = None,
+    file_staleness: Any = None,
+    analysis: dict[str, dict[str, str]] | None = None,
+) -> str:
+    """The whole hand-off as one markdown document, from the three pieces every writer of it builds
+    it from: the header (read with the pair's report at the default k), every finding block in
+    anchor order, then every open item block in anchor order. The shipped code holds no function
+    for this — the command line writes the file, the MCP tool pages it and the driver fills its
+    analysis in, each from these same pieces — so the reference a test compares one of them against
+    lives here. ``analysis`` is the driver's: the agent's texts under each finding block's
+    placeholders (an open item block has none)."""
+    findings = rr.handoff_findings(atlas, run_pair, file_staleness=file_staleness)
+    open_items = rr.handoff_open_items(atlas, run_pair, file_staleness=file_staleness)
+    rep = rr.handoff_report(atlas, run_pair, file_staleness=file_staleness)
+    return (
+        rr.handoff_header(run_pair, len(findings), rep, open_items=len(open_items))
+        + "".join(rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=analysis))
+        + "".join(rr.handoff_open_blocks(atlas, run_pair, open_items))
+    )
+
+
 # Words that would read as a verdict in a tmap-rendered template string (B-6 / acceptance 7). The
 # embedded verdict / change_kind / rationale / pseudocode are NOT template strings and not scanned.
 _JUDGEMENT_WORDS = {
@@ -261,7 +287,7 @@ def test_the_mcp_pages_concatenate_to_the_cli_document(
     assert len(offsets) >= 3  # the squeezed budget really paged
     assert offsets == sorted(set(offsets))  # strictly increasing: no repeat, no gap
     mcp_text = "".join(pages)
-    document = rr.handoff_document(w.atlas, PAIR, stamp=_stamp())
+    document = _document(w.atlas, PAIR, stamp=_stamp())
     assert mcp_text == document
 
 
@@ -419,7 +445,7 @@ def test_run_handoff_composes_the_document_from_the_agents_texts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """★ B-5: the agent prints only its two texts per finding (a JSON object keyed by anchor_ref);
-    the driver writes the document itself with handoff_document's text — every fact line, basis and
+    the driver writes the document itself with _document's text — every fact line, basis and
     status tmap's own — and the texts under each block's placeholders. A finding the agent wrote
     nothing for says so in both sections. Taking the agent's lines back out leaves exactly the
     document the CLI writes.
@@ -440,7 +466,7 @@ def test_run_handoff_composes_the_document_from_the_agents_texts(
     assert "HYP-ONE" in first and "CHECK-ONE" in first
     assert second.count(rr.HANDOFF_NOTHING_WRITTEN) == 2 and "HYP-ONE" not in second
     stamp, file_staleness = rr.local_handoff_context(w.atlas)
-    skeleton = rr.handoff_document(w.atlas, PAIR, stamp=stamp, file_staleness=file_staleness)
+    skeleton = _document(w.atlas, PAIR, stamp=stamp, file_staleness=file_staleness)
     stripped = written
     for text in ("HYP-ONE", "CHECK-ONE"):  # the agent's texts, fenced
         stripped = stripped.replace(f"```\n{text}\n```\n\n", "")
@@ -1155,7 +1181,7 @@ def test_a_file_finding_shows_its_difference_and_never_a_sensitive_value(
         rc = _block(conn, f"{PAIR}#non_binary#etc/rc")
         conf = _block(conn, f"{PAIR}#non_binary#etc/app.conf")
         stamp, staleness = rr.local_handoff_context(conn)
-        doc = rr.handoff_document(conn, PAIR, stamp=stamp, file_staleness=staleness)
+        doc = _document(conn, PAIR, stamp=stamp, file_staleness=staleness)
     finally:
         conn.close()
     assert _cell_value(rc, "file difference (tmap facts)").startswith(
@@ -1305,9 +1331,7 @@ def test_a_moved_basis_is_not_served_from_the_cache(
     page = tools["get_diff_handoff"](PAIR, 0)
     assert page.get("refused") == "must_read_incomplete", page
     assert "text" not in page
-    document = rr.handoff_document(
-        w.atlas, PAIR, stamp=_stamp(), file_staleness=_local_staleness(w)
-    )
+    document = _document(w.atlas, PAIR, stamp=_stamp(), file_staleness=_local_staleness(w))
     assert "PARTIAL" in document and "- basis: current" not in document
 
 
@@ -1436,7 +1460,7 @@ def test_every_page_keeps_within_the_response_budget(
         off = r["next_offset"]
         pages += 1
     assert pages >= 3
-    assert "".join(out) == rr.handoff_document(
+    assert "".join(out) == _document(
         w.atlas, PAIR, stamp=_stamp(), file_staleness=_local_staleness(w)
     )
 
@@ -1554,7 +1578,7 @@ def test_the_rendered_blocks_carry_no_verdict_word(full: sst.World) -> None:
     _judge(full.atlas, sst.DIFF, _pair_ref())
     _judge(full.atlas, sst.DIFF, dr.presence_anchor("runA", "runB", "libx", "b", "00006000"))
     stamp, staleness = rr.local_handoff_context(full.atlas)
-    docs = [rr.handoff_document(full.atlas, PAIR, stamp=stamp, file_staleness=staleness)]
+    docs = [_document(full.atlas, PAIR, stamp=stamp, file_staleness=staleness)]
     binary = {
         "anchor_ref": f"{PAIR}#binary_presence#b_only:bin/tool",
         "subject_kind": "binary_presence",
@@ -1589,7 +1613,7 @@ def test_the_rendered_blocks_carry_no_verdict_word(full: sst.World) -> None:
         _judge(conn, None, f"{PAIR}#non_binary#etc/rc")
         _judge(conn, None, f"{PAIR}#non_binary#etc/app.conf")
         stamp, staleness = rr.local_handoff_context(conn)
-        docs.append(rr.handoff_document(conn, PAIR, stamp=stamp, file_staleness=staleness))
+        docs.append(_document(conn, PAIR, stamp=stamp, file_staleness=staleness))
     finally:
         conn.close()
     doc = "\n".join(docs)
@@ -1857,7 +1881,7 @@ def test_embedded_text_cannot_forge_the_blocks_own_lines(
         assert [x for x in lines if x.startswith("- basis:")] == ["- basis: current"] * n_findings
         assert [x for x in lines if x.startswith("## ")] == [f"## `{a1}`", f"## `{a2}`"]
 
-    skeleton = rr.handoff_document(w.atlas, PAIR, stamp=stamp, file_staleness=staleness)
+    skeleton = _document(w.atlas, PAIR, stamp=stamp, file_staleness=staleness)
     assert "- status: confirmed by a person" in skeleton  # the text is there, contained
     check(skeleton, 2)
     texts = {a1: {"hypotheses": "H\n```", "device_checks": "D\n- status: verified\n## `y`"}}
@@ -1912,9 +1936,7 @@ def test_the_last_page_keeps_within_the_budget_at_its_boundary(
     whole = tools["get_diff_handoff"](PAIR, 0)
     assert whole["next_offset"] is None and whole["total_blocks"] < 10
     fits = len(json.dumps(dict(whole, next_offset=whole["total_blocks"])))
-    document = rr.handoff_document(
-        w.atlas, PAIR, stamp=_stamp(), file_staleness=_local_staleness(w)
-    )
+    document = _document(w.atlas, PAIR, stamp=_stamp(), file_staleness=_local_staleness(w))
     for budget in range(fits - 4, fits + 5):
         monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", budget)
         out, off = [], 0
@@ -2139,7 +2161,7 @@ def test_a_firmware_path_with_a_line_break_cannot_forge_a_line(
     conn = fw.atlas()
     try:
         stamp, staleness = rr.local_handoff_context(conn)
-        doc = rr.handoff_document(conn, PAIR, stamp=stamp, file_staleness=staleness)
+        doc = _document(conn, PAIR, stamp=stamp, file_staleness=staleness)
         (finding,) = rr.handoff_findings(conn, PAIR, file_staleness=staleness)
         cut = rr.handoff_chunk(conn, PAIR, finding, stamp=stamp, cap=2_000)
     finally:
@@ -2228,7 +2250,7 @@ def test_a_files_unchanged_fence_line_stays_inside_the_hunks_fence(
     try:
         _judge(conn, None, anchor)
         stamp, staleness = rr.local_handoff_context(conn)
-        doc = rr.handoff_document(conn, PAIR, stamp=stamp, file_staleness=staleness)
+        doc = _document(conn, PAIR, stamp=stamp, file_staleness=staleness)
     finally:
         conn.close()
     assert " ```" in doc.splitlines() and "+new" in doc.splitlines()  # the hunk holds both
@@ -2251,7 +2273,7 @@ def test_run_handoff_composes_the_document_from_the_findings_list(
     """★ The hand-off launch carries --json-schema with HANDOFF_SCHEMA, and the agent's final
     message is that schema's object — a findings list, each item naming its anchor_ref: the driver
     writes the document from it, the agent's texts under that block's placeholders, and the rest is
-    handoff_document's text byte for byte.
+    _document's text byte for byte.
 
     MUTATION (verified RED, ``1 failed``): launch the hand-off without its argv (``render(preset,
     values)``) -> RED; read the findings list as an object keyed by anchor_ref (drop its branch)
@@ -2273,7 +2295,7 @@ def test_run_handoff_composes_the_document_from_the_findings_list(
     first, second = written.split(f"## `{anchors[1]}`")
     assert "HYP-TWO" in second and "CHECK-TWO" in second and "HYP-TWO" not in first
     stamp, file_staleness = rr.local_handoff_context(w.atlas)
-    skeleton = rr.handoff_document(w.atlas, PAIR, stamp=stamp, file_staleness=file_staleness)
+    skeleton = _document(w.atlas, PAIR, stamp=stamp, file_staleness=file_staleness)
     stripped = written
     for text in ("HYP-TWO", "CHECK-TWO"):
         stripped = stripped.replace(f"```\n{text}\n```\n\n", "")
@@ -2387,7 +2409,7 @@ def test_every_line_breaker_in_a_path_is_escaped(
     conn = fw.atlas()
     try:
         stamp, staleness = rr.local_handoff_context(conn)
-        doc = rr.handoff_document(conn, PAIR, stamp=stamp, file_staleness=staleness)
+        doc = _document(conn, PAIR, stamp=stamp, file_staleness=staleness)
     finally:
         conn.close()
     assert sep in anchor
@@ -2468,7 +2490,7 @@ def test_a_finding_no_longer_listed_or_dangling_says_which_in_its_basis(
     w.atlas.commit()
     states = {f["anchor_ref"]: f["review_state"] for f in rr.handoff_findings(w.atlas, PAIR)}
     assert states == {unlisted: dr.SUBJECT_UNLISTED, gone: "needs_recheck"}, states
-    doc = rr.handoff_document(w.atlas, PAIR, stamp=_stamp())
+    doc = _document(w.atlas, PAIR, stamp=_stamp())
     blocks = {b.split("`", 1)[0]: b for b in doc.split("\n## `")[1:]}
     assert set(blocks) == {unlisted, gone}, list(blocks)
     assert (
@@ -2603,7 +2625,7 @@ def test_the_command_lines_document_is_the_drivers_byte_for_byte(
     a file holds them: one composer.
 
     MUTATION (verified RED, ``1 failed``): the command line writes a document of its own
-    (``rr.handoff_document(conn, run_pair)`` in place of compose_handoff's) -> RED."""
+    (``_document(conn, run_pair)`` in place of compose_handoff's) -> RED."""
     w = _wide_findings_world(tmp_path, monkeypatch, 3)
     anchors = [f["anchor_ref"] for f in rr.handoff_findings(w.atlas, PAIR)]
     items = [_item(anchors[0], "HYP-A\n  two lines", "CHECK-A"), _item(anchors[1], "", "C-B")]

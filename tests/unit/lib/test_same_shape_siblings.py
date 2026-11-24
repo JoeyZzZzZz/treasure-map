@@ -961,7 +961,10 @@ def test_a_member_carries_the_handles_that_take_it(world: World) -> None:
     by_ref = {m["evidence_ref"]: m for m in _members(world, LISTED)}
     listed = by_ref[LISTED]
     assert (listed["entry_id"], listed["row_ref"]) == ("pair:00001000:00002000", LISTED)
-    da.capture_diff_basis(world.atlas, DIFF, listed["candidate_anchor"])
+    meta = da._binary_diff(world.atlas, DIFF)
+    da.capture_diff_basis_on(
+        world.atlas, da._built(world.atlas, DIFF), meta, DIFF, listed["candidate_anchor"]
+    )
     origin = da.check_promotion(
         world.atlas, diff_id=DIFF, entry_id=listed["entry_id"], row_ref=listed["row_ref"]
     )
@@ -973,7 +976,9 @@ def test_a_member_carries_the_handles_that_take_it(world: World) -> None:
     assert built is not None
     row = next(r for e in built.placed for r in e.rows if r.a_ref == UNLISTED[1])
     with pytest.raises(Exception, match="names nothing get_diff_patch_view lists"):
-        da.capture_diff_basis(world.atlas, DIFF, f"runA::runB#candidate#{_subject_key(row)}")
+        da.capture_diff_basis_on(
+            world.atlas, built, meta, DIFF, f"runA::runB#candidate#{_subject_key(row)}"
+        )
 
 
 def test_a_page_is_cut_to_the_byte_budget_with_its_paging_fields_measured_first() -> None:

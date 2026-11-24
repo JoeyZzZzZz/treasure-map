@@ -748,36 +748,6 @@ def test_members_are_not_narrowed_by_granularity_or_sink_class(world: PairWorld)
         assert one.get("member_count") == 14 and g["f2_key"] in one["group_ref"], one
 
 
-# ── the summary prepared for a write answer ─────────────────────────────────────────────────
-
-
-def test_the_summary_is_compact_and_names_the_members_outside_the_input_diff(
-    world: PairWorld,
-) -> None:
-    """run_pair_group_summary: the key, the per-side counts and the first members outside the
-    input's diff in the run-pair order, small enough to ride on another answer.
-
-    MUTATION (verified RED, 1 failed): list the first members without leaving out the input's
-    diff -> the input itself is listed -> RED."""
-    s = rp.run_pair_group_summary(world.atlas, "runA", "runB", evidence_ref=INPUT)
-    g = _sib(world, evidence_ref=INPUT)
-    assert s["f2_key"] == g["f2_key"]
-    assert s["member_count"] == {"a": 16, "b": 18}
-    assert s["not_diffed_members"] == {"a": 0, "b": 1}
-    assert s["members_outside_input_diff"] == g["members_outside_input_diff"]
-    assert s["shared_literal_members_outside_input_diff"] == 4
-    assert s["binaries_calls_unreadable"] == 2
-    assert [m["evidence_ref"] for m in s["first_outside_input_diff"]] == [
-        TARGET,
-        TWO_COMMON,
-        TARGET_A,
-    ]
-    assert s["members"] == (
-        f"same_shape_siblings(diff_id='{PAIR}', evidence_ref='{INPUT}', members_offset=0)"
-    )
-    assert len(json.dumps(s)) < 1200
-
-
 # ── through the MCP tool ────────────────────────────────────────────────────────────────────
 
 
@@ -832,7 +802,6 @@ def test_nothing_it_says_is_a_judgement(world: PairWorld) -> None:
     texts = [
         json.dumps(_sib(world, evidence_ref=INPUT)),
         json.dumps(_all_members(world, INPUT)),
-        json.dumps(rp.run_pair_group_summary(world.atlas, "runA", "runB", evidence_ref=INPUT)),
         rp.__doc__ or "",
     ]
     for text in texts:

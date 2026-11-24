@@ -45,8 +45,6 @@ from treasure_map.lib.query.runs import get_run
 
 KINDS = ("shell_script", "config_file", "credential", "web_asset", "kernel_module")
 CHANGES = ("a_only", "b_only", "content_differs", "same", "undetermined")
-# The changes a page lists by default; ``same`` is counted, and listed only when asked for.
-LISTED_CHANGES = ("a_only", "b_only", "content_differs", "undetermined")
 DETAILS = ("full", "summary")
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
@@ -316,7 +314,6 @@ def read_pair(atlas: sqlite3.Connection, run_a: str, run_b: str) -> PairFiles:
 STATUSES = ("same", "content_differs", "renamed", "a_only", "b_only", "undetermined")
 # A changed subject is one of these — a member of the completion denominator; ``same`` is not.
 CHANGED_STATUSES = ("content_differs", "renamed", "a_only", "b_only", "undetermined")
-PAIRED_BY = ("path", "path_normalized", "sha")
 _MODULES_PREFIX = "lib/modules/"
 _MODULE_VER = "\x00"  # internal placeholder for a normalised version-dir segment (never displayed)
 

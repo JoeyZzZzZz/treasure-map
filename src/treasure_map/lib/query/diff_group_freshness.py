@@ -29,10 +29,10 @@ left members by count and stored hash only (their refs were never stored in the 
 raises and never reads a failure as "unchanged": a group it cannot rebuild is ``group_unreadable``,
 which is itself a move.
 
-THE RELATION CHECK (``annotate_group``) refuses a ``group_ref`` that is not actually about the entry
-being judged: the group must either contain a call of the judged entry (``own_call``) or be a shape
-the judged function-level candidate has (``same_shape``). A group_ref that is well-formed but about
-some other entry is refused, with the groups the judged subject does belong to.
+THE RELATION CHECK (``annotate_group_on``) refuses a ``group_ref`` that is not actually about the
+entry being judged: the group must either contain a call of the judged entry (``own_call``) or be a
+shape the judged function-level candidate has (``same_shape``). A group_ref that is well-formed but
+about some other entry is refused, with the groups the judged subject does belong to.
 """
 
 from __future__ import annotations
@@ -50,7 +50,6 @@ from treasure_map.lib.query.patch_view import (
     BuiltDiff,
     _atlas_identity,
     _BoundedCache,
-    build_diff_view,
     listed_view,
     split_subject_key,
 )
@@ -305,24 +304,6 @@ def _subject_side_refs(
     return {r for r in refs if r}, False
 
 
-def annotate_group(
-    atlas: sqlite3.Connection, diff_id: str, anchor_ref: str, group_ref: str
-) -> dict[str, Any]:
-    """Validate a ``group_ref`` for a judgement on ``anchor_ref`` and return the ``group`` block to
-    store (the snapshot plus the ``relation`` by which it is about this entry). Raises ConfigError,
-    naming the one check that failed, when the ref is not this diff's, its versions are not current,
-    its shape is no current group, or the group is about some other entry.
-
-    A thin wrapper that builds the view and the side meta once; ``annotate_group_on`` holds the
-    checks, so a batch write that has already built both can reuse them."""
-    built = build_diff_view(atlas, diff_id)
-    if built is None:
-        raise ConfigError(f"no diff {diff_id!r} in this atlas (see list_diffs)")
-    side_meta = sss._meta(atlas, diff_id)
-    assert side_meta is not None  # the diff view just built
-    return annotate_group_on(atlas, built, side_meta, diff_id, anchor_ref, group_ref)
-
-
 def annotate_group_on(
     atlas: sqlite3.Connection,
     built: BuiltDiff,
@@ -333,8 +314,12 @@ def annotate_group_on(
     *,
     cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """``annotate_group`` against an already-built view and side meta (``_meta`` — run / sha per
-    side, NOT the ``_binary_diff`` dict). Same checks, same errors.
+    """Validate a ``group_ref`` for a judgement on ``anchor_ref`` and return the ``group`` block to
+    store (the snapshot plus the ``relation`` by which it is about this entry). Raises ConfigError,
+    naming the one check that failed, when the ref is not this diff's, its versions are not current,
+    its shape is no current group, or the group is about some other entry. It takes the view and
+    the side meta already built (``_meta`` — run / sha per side, NOT the ``_binary_diff`` dict), so
+    one write and a batch of them build both once and reuse them.
 
     ``cache`` (a batch passes one dict for the whole batch) keeps, per ``group_ref``, everything
     that depends on the group alone — the ref checks, the grouping and the snapshot — so several

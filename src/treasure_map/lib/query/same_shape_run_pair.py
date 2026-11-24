@@ -55,9 +55,6 @@ candidates of this sink name and kind, per granularity; ``recall_gaps`` — not 
 SOURCE STALENESS: ``source_stale_diffs`` counts the pair's diffs by their ``source_stale`` as
 list_diffs gives each (diff_align.diffs_source_staleness / staleness_summary); a member row does
 not repeat its diff's.
-
-``run_pair_group_summary`` returns a compact summary of one candidate's run-pair group for another
-answer to carry; nothing calls it yet.
 """
 
 from __future__ import annotations
@@ -848,61 +845,4 @@ def run_pair_siblings(
         "members_offset": members_offset,
         "members": [_member_row(m, names) for m in page],
         "members_next_offset": end if end < total else None,
-    }
-
-
-def run_pair_group_summary(
-    atlas: sqlite3.Connection,
-    run_a: str,
-    run_b: str,
-    *,
-    evidence_ref: str | None = None,
-    candidate_anchor: str | None = None,
-    first: int = 3,
-) -> dict[str, Any]:
-    """A compact summary of one candidate call's run-pair same-shape group (the ``f2_key`` group
-    across every binary of the pair's two runs), for another answer to carry beside a judgement: the
-    key, the member count per side (and how many of them no diff covers), how many members sit
-    outside the input's diff and how many of
-    those share a literal with it, the binaries whose calls could not be read, the first ``first``
-    members outside the input's diff in PAIR_MEMBERS_ORDER, and the call that pages the rest. The
-    caller checks a stale run first, as same_shape_siblings does. A refusal or a function-level
-    input comes back as same_shape_siblings would give it (``error`` / ``not_a_member``)."""
-    pair = diff_review.run_pair(run_a, run_b)
-    g = _build(atlas, pair, run_a, run_b, evidence_ref, candidate_anchor)
-    if isinstance(g, dict):
-        return g
-    outside = _outside(g)
-    arg = (
-        f"candidate_anchor={candidate_anchor!r}"
-        if candidate_anchor is not None
-        else f"evidence_ref={g.inp_ref!r}"
-    )
-    return {
-        "scope": RUN_PAIR_SCOPE,
-        "f2_key": g.key,
-        "input_diff_id": g.inp_diff.diff_id,
-        "member_count": {s: sum(1 for m in g.members if m.side == s) for s in ("a", "b")},
-        "not_diffed_members": {
-            s: sum(1 for m in g.members if m.side == s and m.diff_id is None) for s in ("a", "b")
-        },
-        "members_outside_input_diff": len(outside),
-        "shared_literal_members_outside_input_diff": sum(
-            1 for m in outside if m.literal is not None and m.literal[0] > 0
-        ),
-        "binaries_calls_unreadable": sum(
-            len(names) for s in g.sides.values() for names in s.unreadable.values()
-        ),
-        "first_outside_input_diff": [
-            {
-                "diff_id": m.diff_id,
-                "diffed": m.diff_id is not None,
-                **({} if m.diff_id is not None else {"binary": m.binary}),
-                "side": m.side,
-                "evidence_ref": m.call.ref,
-                "shared_literals": None if m.literal is None else m.literal[0],
-            }
-            for m in outside[: max(first, 0)]
-        ],
-        "members": f"same_shape_siblings(diff_id={pair!r}, {arg}, members_offset=0)",
     }

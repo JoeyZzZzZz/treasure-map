@@ -687,10 +687,11 @@ def test_partial_blind_spots_list_a_diff_that_succeeded_with_gaps(
     assert (row["export_flow_graphs_dropped_a"], row["export_degenerate_functions_a"]) == (1, 1)
     assert row["bindiff_vertex0_fallbacks"] == 2
     assert diff_align.get_diff_meta(w.atlas, _DID)["meta"]["export_builder_a"] == "fallback"
-    pair = diff_align.align_by_a(w.atlas, _DID, "0x1000")["pairs"][0]
+    pair = diff_align.align_by_function(w.atlas, _DID, "0x1000", "a")["pairs"][0]
     assert pair["export_gap_a"] == "degenerate_block"
-    gone = diff_align.align_by_a(w.atlas, _DID, "0x3000")
-    assert gone["found"] is False and gone["export_gap"] == "flow_graph_dropped"
+    gone = diff_align.align_by_function(w.atlas, _DID, "0x3000", "a")
+    assert gone["found"] is False
+    assert [p["export_gap"] for p in gone["presence"]] == ["flow_graph_dropped"]
 
 
 def test_an_unreadable_report_fails_the_diff_as_no_file(
