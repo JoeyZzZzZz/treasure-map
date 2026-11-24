@@ -105,6 +105,12 @@ jobs:
         run: ruff check src/ tests/
       - name: ruff format check
         run: ruff format --check src/ tests/
+      # The MCP registry resolves server.json against the PUBLISHED PyPI package and reads the
+      # mcp-name marker out of its description, so a disagreement between these four files only
+      # surfaces at the last step of a release — after the PyPI version is spent. Same spirit as
+      # the release's "the tag matches __version__" gate, one push earlier.
+      - name: server.json agrees with version.py, pyproject.toml and the README marker
+        run: python scripts/check_server_json.py
 
   typecheck:
     name: Type Check

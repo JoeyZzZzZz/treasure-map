@@ -55,12 +55,21 @@ def test_pyproject_declares_package_data() -> None:
 
 
 def test_one_command_and_one_version_source() -> None:
-    """``tmap`` is the only entry point (``treasure-map-mcp`` bound a relative atlas.db and is
-    gone), and the version is read from treasure_map/version.py, not written twice."""
+    """``tmap`` is the only command, under two names: the MCP registry publishes
+    ``uvx tmap-agents mcp`` and uvx runs the command named after the package, so the distribution
+    name is an ALIAS of the same callable. What this holds out is a second entry point with its
+    OWN behaviour — ``treasure-map-mcp`` was one, it bound a relative atlas.db, and it is gone.
+    The version is read from treasure_map/version.py, not written twice.
+
+    MUTATION (verified RED): point the alias at another callable, or add a third name -> RED."""
     data = tomllib.loads(_PYPROJECT.read_text())
     project = data["project"]
     assert project["name"] == "tmap-agents"
-    assert project["scripts"] == {"tmap": "treasure_map.cli.main:main"}
+    assert project["scripts"] == {
+        "tmap": "treasure_map.cli.main:main",
+        project["name"]: "treasure_map.cli.main:main",
+    }
+    assert len(set(project["scripts"].values())) == 1  # one callable, whatever it is called
     assert "version" not in project and "version" in project["dynamic"]
     attr = data["tool"]["setuptools"]["dynamic"]["version"]["attr"]
     assert attr == "treasure_map.version.__version__"

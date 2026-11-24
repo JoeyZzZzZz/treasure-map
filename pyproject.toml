@@ -42,6 +42,9 @@ dev = [
 
 [project.scripts]
 tmap = "treasure_map.cli.main:main"
+# Same entry point under the DISTRIBUTION name: a client that reads this server from the MCP
+# registry runs `uvx tmap-agents mcp`, and uvx runs the command named after the package.
+tmap-agents = "treasure_map.cli.main:main"
 
 [project.urls]
 Homepage = "https://tmap.tools/"
