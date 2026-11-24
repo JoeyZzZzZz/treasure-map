@@ -104,7 +104,11 @@ class Component:
 # withholds every alternative pairing) and a digest of every placed entry's string / key readings:
 # those come from the build (a re-hunt rewrites the dispatch keys), which the readings key does not
 # hold.
-_PAIRING_CACHE: pv._BoundedCache[tuple[str, ...], tuple[Component, ...]] = pv._BoundedCache(32)
+# The bound is per diff, for the same reason as patch_view's (``_PER_DIFF``): a whole run pair is
+# read diff by diff, and 32 of 126 evicted what the next pass wanted.
+_PAIRING_CACHE: pv._BoundedCache[tuple[str, ...], tuple[Component, ...]] = pv._BoundedCache(
+    pv._PER_DIFF
+)
 
 
 def clear_cache() -> None:

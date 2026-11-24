@@ -1098,19 +1098,28 @@ def _atlas_identity(atlas: sqlite3.Connection) -> str:
     return ""
 
 
+# How many DIFFS a per-diff cache holds. One run pair is read diff by diff in a fixed order --
+# list_overlays over a pair, the findings hand-off, `tmap review report` -- and a pair has 51 or
+# 126 diffs here, so a bound of 16 or 32 meant each pass evicted exactly what the next one wanted:
+# the hit rate over a whole pair was zero and every diff was read from the databases again. These
+# entries are each pair's or binary's small reading -- never a function body, never the skeleton
+# index -- so holding one per diff of the largest pair costs about 100MB of resident memory
+# (measured: 718 -> 813MB over a whole pair) and halves the second pass.
+_PER_DIFF = 512
+
 _SIZE_FACT_CACHE: _BoundedCache[tuple[str, ...], dict[str, tuple[str, str | None]]] = _BoundedCache(
-    16
+    _PER_DIFF
 )
 # A diff's overlay as computed in memory when its stored baseline is not current, per everything it
 # is read from (_overlay_key): rows and coverage, never stored in the atlas.
 _OverlayHit = tuple[tuple[SinkOverlayRow, ...], dict[str, Any]]
-_OVERLAY_CACHE: _BoundedCache[tuple[str, ...], _OverlayHit] = _BoundedCache(16)
+_OVERLAY_CACHE: _BoundedCache[tuple[str, ...], _OverlayHit] = _BoundedCache(_PER_DIFF)
 # evidence_ref function-entries that hold a candidate, per (run, binary): the caller-set edge's
 # one-hop relevance lands on these. Keyed by the run's stamps so a re-hunt is not served stale.
-_CANDIDATE_ENTRY_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(16)
+_CANDIDATE_ENTRY_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(_PER_DIFF)
 # One side's pair-evidence anchors (_AnchorSide), per (run, binary). Keyed by the run's stamps so a
 # re-extraction is not served stale anchors.
-_ANCHOR_SIDE_CACHE: _BoundedCache[tuple[str, ...], _AnchorSide] = _BoundedCache(32)
+_ANCHOR_SIDE_CACHE: _BoundedCache[tuple[str, ...], _AnchorSide] = _BoundedCache(_PER_DIFF)
 
 
 def _run_key(atlas: sqlite3.Connection, run_id: str) -> tuple[str, ...]:
@@ -3797,8 +3806,8 @@ class _Readings:
 # build_hash_b): each pair's small reading — never the bodies or the skeleton index. The callee-set
 # state a reading folds with comes from the build and is re-read each call. The pseudocode_delta
 # cache adds the pair's two addresses to that key.
-_PSEUDO_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(32)
-_UNDETERMINED_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(32)
+_PSEUDO_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(_PER_DIFF)
+_UNDETERMINED_READING_CACHE: _BoundedCache[tuple[str, ...], _PairReads] = _BoundedCache(_PER_DIFF)
 _DELTA_CACHE: _BoundedCache[tuple[Any, ...], dict[str, Any]] = _BoundedCache(4096)
 # The guard scan of each pair (sameness.pseudocode_delta_and_guards), on the delta cache's key: the
 # two are computed in one pass and written together, and a pair missing from EITHER is recomputed
@@ -3815,10 +3824,10 @@ _SINK_AXIS_CACHE: _BoundedCache[tuple[str, ...], tuple[diff_sink_axes.RowAxes, .
 # The no-mention index of the caller-set edge, on the pseudocode readings' key PLUS the E entries it
 # covers (they move with the candidate rows, which that key does not hold): computed when the B
 # bodies are read, so every page of one diff reads the same set in the same order.
-_B_MENTIONS_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(32)
+_B_MENTIONS_CACHE: _BoundedCache[tuple[str, ...], frozenset[str]] = _BoundedCache(_PER_DIFF)
 # Every function's same-body reading (alt_pairings.twin_readings), on the pseudocode readings' key:
 # it reads the diff's pairs and both sides' bodies, which that key holds; never the entries.
-_TWIN_CACHE: _BoundedCache[tuple[str, ...], alt_pairings.TwinReadings] = _BoundedCache(32)
+_TWIN_CACHE: _BoundedCache[tuple[str, ...], alt_pairings.TwinReadings] = _BoundedCache(_PER_DIFF)
 # An alternative pairing's text reading (its delta as counts and its line ratio), and a current
 # pairing's line ratio, per (the readings' key, addr_a, addr_b): read for one entry at a time.
 _ALT_TEXT_CACHE: _BoundedCache[tuple[str, ...], dict[str, Any]] = _BoundedCache(4096)

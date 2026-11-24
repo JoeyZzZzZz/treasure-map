@@ -1041,3 +1041,89 @@ def test_count_noise_moves_nothing_but_the_order_inside_attention_0(
         o = got[_pair_id(*k)]
         assert (o.attention, o.basis) == (0, "sink_candidate_counts"), k
         assert "attention_0" in ru.entry_reasons(o.entry, o.position, o.attention, o.lift_basis, 0)
+
+
+def _many_diff_pair(tmp_path: Path, n: int) -> tuple[Path, sqlite3.Connection]:
+    """One run pair of ``n`` small diffs, each one aligned similarity-1 pair whose two texts
+    differ (so each diff really has a pseudocode reading to compute)."""
+    from treasure_map.lib.analyze.ghidra_runner import current_pass_version
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.storage.connection import open_db
+
+    atlas_path = tmp_path / "atlas.db"
+    atlas = open_atlas(atlas_path)
+    atlas.execute("PRAGMA synchronous = OFF")
+    build = current_pass_version()
+    for side, run in (("a", "runA"), ("b", "runB")):
+        db = tmp_path / f"analysis_{side}.db"
+        conn = open_db(db)
+        conn.execute("PRAGMA synchronous = OFF")
+        for i in range(n):
+            conn.execute(
+                "INSERT INTO binaries (id, name, sha256, thunk_spans) VALUES (?, ?, ?, '[]')",
+                (i + 1, f"lib{i}", f"{side}{i:063d}"),
+            )
+            conn.execute(
+                "INSERT INTO functions (binary_id, address, name, pseudocode, callees) "
+                "VALUES (?, '00001000', 'fn', ?, '[]')",
+                (i + 1, f"x = foo({side});"),
+            )
+        conn.commit()
+        conn.close()
+        atlas.execute(
+            "INSERT INTO run (run_id, hunt_commit, build_hash, hunt_instances, analysis_db_path) "
+            "VALUES (?, 'facade', ?, 10, ?)",
+            (run, build, str(db)),
+        )
+    for i in range(n):
+        diff_id = f"runA::runB::lib{i}"
+        atlas.execute(
+            "INSERT INTO diff_meta (diff_id, run_a_id, run_b_id, binary_a, binary_b, sha256_a, "
+            "sha256_b, diff_ok, version_skew, callsite_facts_a, callsite_facts_b, "
+            "callsite_facts_hash_a, callsite_facts_hash_b) VALUES (?, 'runA', 'runB', ?, ?, ?, ?, "
+            "1, 0, 'read', 'read', ?, ?)",
+            (diff_id, f"lib{i}", f"lib{i}", f"a{i:063d}", f"b{i:063d}", build, build),
+        )
+        atlas.execute(
+            "INSERT INTO function_alignment (diff_id, addr_a, addr_b, alignment_confidence, "
+            "similarity, alignment_state) VALUES (?, '00001000', '00001000', 0.97, 1.0, 'aligned')",
+            (diff_id,),
+        )
+    atlas.commit()
+    return atlas_path, atlas
+
+
+def test_a_second_reading_of_a_whole_run_pair_recomputes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ M-6: a run pair is read diff by diff — list_overlays over the pair, the findings hand-off,
+    `tmap review report` — and the per-diff caches must hold a whole pair. With a bound of 32 and
+    a pair of 40 (the live pairs have 51 and 126), each pass evicted exactly what the next wanted,
+    so the hit rate over a pair was zero and every diff's pseudocode was read from the analysis
+    databases again: measured 30.0 s then 30.0 s on a pair of 51, now 51.8 s then 11.8 s.
+
+    The second reading of the same pair reads no function body at all, and answers byte for byte
+    what the first did.
+
+    MUTATION (verified RED, 1 failed): put ``_PER_DIFF`` back to 32 -> the second pass reads the
+    bodies again -> RED."""
+    n = 40  # more than the old bound of 32, fewer than a live pair's 51 and 126
+    path, atlas = _many_diff_pair(tmp_path, n)
+    pv._clear_view_caches()
+    reads: list[str] = []
+    real = pv.sameness.read_function_bodies
+
+    def counting(db: Any, sha: str) -> Any:
+        reads.append(sha)
+        return real(db, sha)
+
+    monkeypatch.setattr(pv.sameness, "read_function_bodies", counting)
+    first = dann.list_diff_overlays(atlas, run_id="runA::runB")
+    assert len(reads) == 2 * n, len(reads)  # both sides of every diff, once
+    reads.clear()
+    second = dann.list_diff_overlays(atlas, run_id="runA::runB")
+    assert reads == [], f"the second reading went back to the databases: {len(reads)} reads"
+    assert second == first
+    assert second["review_progress"]["diffs"] == n
+    atlas.close()
+    assert path.is_file()

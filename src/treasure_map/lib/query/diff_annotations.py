@@ -755,10 +755,13 @@ def list_diff_overlays(
 
     With ``run_id`` it also carries ``review_progress`` over EVERY diff of that pair — which
     rebuilds every one of their views and, the first time in a process, reads each diff's
-    pseudocode once (which pairs are bucket S): measured on a pair of 126 diffs whose stored
-    overlay baselines all had to be recomputed, about 80 s the first time and 50 s after; less when
-    the baselines are current. The binaries no diff covers are read straight from the atlas, not
-    by recomputing the pair's sink overlay. ``progress=False`` leaves ``review_progress`` out and
+    pseudocode once (which pairs are bucket S). Measured on the live atlas, every stored overlay
+    baseline needing recomputation: a pair of 126 diffs 71 s the first time in a process and 17 s
+    after, a pair of 51 diffs 52 s then 12 s; less when the baselines are current. What the second
+    reading still costs is the per-diff view build (build_diff_view), which is not cached; the
+    per-diff readings are (patch_view ``_PER_DIFF``), which is what makes the second reading
+    cheaper than the first. The binaries no diff covers are read straight from the atlas, not by
+    recomputing the pair's sink overlay. ``progress=False`` leaves ``review_progress`` out and
     builds only the views the listed judgements are read against (the findings hand-off).
 
     ``limit`` pages the rows as overlay.list_overlays does (by id; every count, and
