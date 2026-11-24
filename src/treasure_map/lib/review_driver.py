@@ -324,6 +324,7 @@ def run_agent(argv: Sequence[str], *, cwd: Path, timeout: float, keep_full: bool
         text=True,
         start_new_session=True,
     )
+
     def kill_whole_group() -> None:
         try:
             os.killpg(proc.pid, signal.SIGKILL)

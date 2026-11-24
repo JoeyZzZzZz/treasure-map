@@ -42,8 +42,10 @@ Gate E — a provably-constant marker holds on the function it was read from (ne
     checked here: such instances are counted as unverifiable, never as violations.
 
 Usage:
-    check_recall_integrity.py --atlas ATLAS.db --analysis ANALYSIS.db   # check real databases
+    check_recall_integrity.py --atlas ATLAS.db --analysis ANALYSIS.db [--run-id RUN]
     check_recall_integrity.py --self-test                              # CI: synthetic clean+dirty
+
+Gate E reads one run: ``--run-id``, or the run that registered the analysis database as its own.
 
 Exit code 0 when every checked invariant holds (count 0); 1 on any violation or a self-test miss.
 """
@@ -136,30 +138,64 @@ def gate_d_violations(analysis_db: Path) -> int:
     return stats.functions_scanned - stats.functions_with_callees - stats.callee_parse_failed
 
 
+# One run's const_sink_arg instances. Without the run condition this read every run of the atlas
+# and then asked the analysis database for each one's function: on a live atlas that is minutes of
+# "another run's function, or one this database does not hold" per database checked.
 _GATE_E_SQL = (
     "SELECT i.evidence_ref, i.sink_anchor, p.sink_class FROM instance i "
-    "JOIN pattern p ON p.pattern_id = i.pattern_id WHERE i.blocking_mechanism = 'const_sink_arg'"
+    "JOIN pattern p ON p.pattern_id = i.pattern_id WHERE i.blocking_mechanism = 'const_sink_arg' "
+    "AND i.source_run_id = ?"
 )
 
 
-def _function_text(analysis: sqlite3.Connection, evidence_ref: str) -> str | None:
+def _run_of_analysis(atlas: sqlite3.Connection, analysis_db: Path) -> str | None:
+    """The run this analysis database belongs to, by the path the scan registered. Either spelling
+    of it (as given, and with symlinks resolved) is tried; None when no run names it."""
+    spellings = {str(analysis_db), str(analysis_db.resolve())}
+    for spelling in spellings:
+        row = atlas.execute(
+            "SELECT run_id FROM run WHERE analysis_db_path = ?", (spelling,)
+        ).fetchone()
+        if row is not None:
+            return str(row[0])
+    return None
+
+
+def _binary_ids(analysis: sqlite3.Connection) -> dict[str, int]:
+    """``{sha8: binary id}``, read once. The per-instance lookup used to match ``b.sha256 LIKE
+    ?``, which no index can serve; ``functions`` is indexed by (binary_id, address)."""
+    return {
+        str(sha)[:8]: int(bid)
+        for bid, sha in analysis.execute("SELECT id, sha256 FROM binaries").fetchall()
+        if sha
+    }
+
+
+def _function_text(
+    analysis: sqlite3.Connection, binaries: dict[str, int], evidence_ref: str
+) -> str | None:
     """The pseudocode of the function ``run#<sha8>:<entry>@…`` names, or None."""
     try:
         ident = evidence_ref.split("#", 1)[1].split("@", 1)[0]
         sha8, addr = ident.split(":", 1)
     except (IndexError, ValueError):
         return None
+    binary_id = binaries.get(sha8)
+    if binary_id is None:
+        return None
     row = analysis.execute(
-        "SELECT f.pseudocode FROM functions f JOIN binaries b ON b.id = f.binary_id "
-        "WHERE b.sha256 LIKE ? AND f.address = ? LIMIT 1",
-        (sha8 + "%", addr),
+        "SELECT pseudocode FROM functions WHERE binary_id = ? AND address = ? LIMIT 1",
+        (binary_id, addr),
     ).fetchone()
     return row[0] if row is not None and row[0] else None
 
 
-def gate_e_violations(atlas_db: Path, analysis_db: Path) -> tuple[int, int]:
-    """(violations, unverifiable) of Gate E over the instances whose function is in this
-    analysis database."""
+def gate_e_violations(
+    atlas_db: Path, analysis_db: Path, run_id: str | None = None
+) -> tuple[int, int]:
+    """(violations, unverifiable) of Gate E over one run's instances: ``run_id``, or the run that
+    registered ``analysis_db`` as its own. A database no run names is checked against every
+    instance, as it was before the run condition existed."""
     from treasure_map.lib.hunt.downweight import _SHELL_RUN_SINKS, _sink_arg_is_literal
     from treasure_map.lib.pattern.sink_vocabulary import all_path_calls_literal, call_offsets
 
@@ -167,10 +203,16 @@ def gate_e_violations(atlas_db: Path, analysis_db: Path) -> tuple[int, int]:
     analysis = ro_connect(analysis_db)
     violations = unverifiable = 0
     try:
-        for ref, sink, sink_class in atlas.execute(_GATE_E_SQL).fetchall():
-            text = _function_text(analysis, ref)
+        run = run_id if run_id is not None else _run_of_analysis(atlas, analysis_db)
+        if run is None:
+            rows = atlas.execute(_GATE_E_SQL.replace("AND i.source_run_id = ?", "")).fetchall()
+        else:
+            rows = atlas.execute(_GATE_E_SQL, (run,)).fetchall()
+        binaries = _binary_ids(analysis)
+        for ref, sink, sink_class in rows:
+            text = _function_text(analysis, binaries, ref)
             if text is None:
-                continue  # another run's function, or one this database does not hold
+                continue  # a function this database does not hold
             n = len(call_offsets(text, sink)) if sink else 0
             if n == 0:
                 unverifiable += 1
@@ -186,7 +228,7 @@ def gate_e_violations(atlas_db: Path, analysis_db: Path) -> tuple[int, int]:
     return violations, unverifiable
 
 
-def _check_real(atlas_db: Path | None, analysis_db: Path | None) -> int:
+def _check_real(atlas_db: Path | None, analysis_db: Path | None, run_id: str | None = None) -> int:
     fail = 0
     if atlas_db is not None:
         n = gate_a_violations(atlas_db)
@@ -215,7 +257,7 @@ def _check_real(atlas_db: Path | None, analysis_db: Path | None) -> int:
         else:
             print("✓ Gate D: every function with callees was scanned or counted as a parse failure")
     if atlas_db is not None and analysis_db is not None:
-        n, unread = gate_e_violations(atlas_db, analysis_db)
+        n, unread = gate_e_violations(atlas_db, analysis_db, run_id)
         if n:
             print(f"❌ Gate E: {n} const_sink_arg marker(s) the function's own text contradicts")
             fail = 1
@@ -365,6 +407,17 @@ def _self_test() -> int:
             "violating Gate C > 0": gate_c_violations(bad_atlas) > 0,
             "clean Gate E == 0": gate_e_violations(clean_atlas, clean_analysis)[0] == 0,
             "violating Gate E > 0": gate_e_violations(bad_atlas, bad_analysis)[0] > 0,
+            # Gate E answers for ONE run. The seeded violation belongs to run_selftest, so asked
+            # about any other run it reports nothing: another run's instances are not this run's
+            # to answer for, and a scan is checked against the functions it produced.
+            "violating Gate E, asked about this run": gate_e_violations(
+                bad_atlas, bad_analysis, "run_selftest"
+            )[0]
+            > 0,
+            "violating Gate E, asked about another run == 0": gate_e_violations(
+                bad_atlas, bad_analysis, "run_elsewhere"
+            )[0]
+            == 0,
             # Gate D is a pure arithmetic property of the stats, so it is exercised as one: a
             # partition that adds up, and one that does not. Stubbing the scan body to fake a
             # skip would test the stub. The real scan is what `--analysis` checks.
@@ -403,6 +456,11 @@ def main(argv: list[str] | None = None) -> int:
         "--analysis", type=Path, default=None, help="analysis.db to check (Gate B)."
     )
     parser.add_argument(
+        "--run-id",
+        default=None,
+        help="The run whose instances Gate E checks; read from the analysis path when omitted.",
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Build synthetic clean + violating databases and assert the gates catch them (CI).",
@@ -413,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
         return _self_test()
     if args.atlas is None and args.analysis is None:
         parser.error("provide --atlas and/or --analysis, or --self-test")
-    return _check_real(args.atlas, args.analysis)
+    return _check_real(args.atlas, args.analysis, args.run_id)
 
 
 if __name__ == "__main__":

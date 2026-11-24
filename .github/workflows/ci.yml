@@ -55,14 +55,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-      # The checker's self-test: it proves the gates tell a clean database from a seeded violation.
-      # It checks the checker, not the product — the product's own red lines are unit tests.
-      - name: Recall-integrity checker self-test
-        run: python scripts/check_recall_integrity.py --self-test
+      # The five gates over real output: the rescan fixture runs the actual scan and hunt (no
+      # decompiler, seconds) and the gates read the atlas and analysis database it wrote. The
+      # checker's own --self-test is not repeated here — tests/unit/test_recall_integrity_gates.py
+      # runs it on both Python versions, and it checks the checker, not the product.
+      - name: The five recall-integrity gates over the rescan fixture's output
+        run: python scripts/gates_on_fixture.py
       - name: Binary-selector gate (one resolver; an ambiguous name is refused, never picked)
         run: bash scripts/check-binary-selector-resolution.sh
       - name: OSS-exclusion gate (the shape scan skips no binary by name)
         run: bash scripts/check-oss-exclusion-retired.sh
+      - name: Dead-code gate (every function in src/ has a caller in src/)
+        run: bash scripts/check-dead-code.sh
 
   # Equal code stamps must mean equal output. The rescan fixture runs against this tree and against
   # HEAD~1 — on a pull request the merge commit's first parent, i.e. the base branch tip; on a push
@@ -132,8 +136,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+      # No --cov: the coverage number was printed into the log, with no threshold and no
+      # artifact, and measuring it cost about 60% more wall clock on the heaviest files.
+      # pytest-cov stays in the dev extra for a local run.
       - name: Run unit tests
-        run: python -m pytest tests/unit/ -v --cov=src/treasure_map --cov-report=term-missing
+        run: python -m pytest tests/unit/ -q
 
   # The real decompiler: every Ghidra-backed integration test, which also compiles the shipped
   # ExportFunctions.java the way a user's scan does (a Java error is otherwise invisible until a
@@ -191,8 +198,12 @@ jobs:
           echo "$BE_SHA  binexport.zip" | sha256sum -c -
           unzip -q binexport.zip -d "$GHIDRA_HOME/Ghidra/Extensions"
           test -f "$GHIDRA_HOME/Ghidra/Extensions/$BE_ROOT/lib/BinExport.jar"
+      # TMAP_REQUIRE_GHIDRA: without the decompiler and the BinExport a scan loads, every test
+      # here would skip and the job would be green (tests/integration/conftest.py).
       - name: Run integration tests
-        run: python -m pytest tests/integration/ -v
+        run: python -m pytest tests/integration/ -q
+        env:
+          TMAP_REQUIRE_GHIDRA: "1"
 
   # The wheel a user installs: built, installed into a fresh venv (never editable — an editable
   # install resolves every asset from the source tree and so cannot miss one), and checked there.

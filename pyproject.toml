@@ -35,6 +35,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=4.1",
     "ruff==0.16.0",  # pinned: CI lints with this exact version
+    "vulture==2.16",  # pinned for the same reason: a newer one reports more, with no code change
     "mypy>=1.10,<2.0",
     "types-PyYAML>=6.0",
 ]

@@ -41,6 +41,9 @@ whole, autoincrement ids included. Each table is reduced to its rows, values nor
 directory, which holds every absolute path the run wrote, becomes ``<WORK>``) and sorted, then
 hashed; ``EXCLUDED_COLUMNS`` below lists every column left out, and why.
 
+THE OUTPUT (``--out``): the whole digest and the per-table ones, the package that was imported,
+and the paths of the two databases the run wrote with the run id the hunt used.
+
 Usage: python harness.py --work DIR --out FILE [--expect-package DIR]
 """
 
@@ -350,6 +353,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"harness: {exc}", file=sys.stderr)
         return 2
     result["package"] = str(package)
+    # The two databases the run wrote, for a caller that wants to read them and not only their
+    # digest (scripts/gates_on_fixture.py runs the recall-integrity gates over them). They live
+    # under --work, which the caller owns and removes.
+    result["analysis"] = str(db)
+    result["atlas"] = str(atlas)
+    result["run_id"] = RUN_ID
     args.out.write_text(json.dumps(result, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 

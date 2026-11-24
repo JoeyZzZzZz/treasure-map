@@ -170,3 +170,86 @@ def test_a_database_path_holding_a_hash_sign_is_the_one_checked(tmp_path: Path) 
     )
     assert result.returncode == 1, result.stdout + result.stderr
     assert "Gate A: 1 const_sink_arg" in result.stdout
+
+
+def test_gate_e_reads_one_run_and_stays_quick_on_a_crowded_atlas(tmp_path: Path) -> None:
+    """Gate E answers for the run whose analysis database it was given, and an atlas holding ten
+    thousand other runs' const_sink_arg instances does not slow it: it never asks the analysis
+    database about them. Before the run condition one small run took 5–6 minutes on the live
+    atlas, because every run's instances were looked up in every database checked.
+
+    MUTATION (verified RED): drop ``AND i.source_run_id = ?`` from _GATE_E_SQL -> every one of the
+    10,000 foreign instances is looked up and the bound fails (and the clean run reports the
+    foreign violations as its own)."""
+    import importlib.util
+    import time
+
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.atlas.models import InstanceRow
+    from treasure_map.lib.atlas.writer import add_instance, begin_run, upsert_pattern
+
+    spec = importlib.util.spec_from_file_location(
+        "_cri", _ROOT / "scripts" / "check_recall_integrity.py"
+    )
+    assert spec is not None and spec.loader is not None
+    cri = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cri)
+
+    analysis = tmp_path / "analysis.db"
+    conn = open_db(analysis)
+    sha = "c" * 64
+    conn.execute(
+        "INSERT INTO binaries (id, name, path, sha256, ghidra_status, last_seen_at) "
+        "VALUES (1, 'mover', 'bin/mover', ?, 'ok', '2026-01-01')",
+        (sha,),
+    )
+    conn.execute(
+        "INSERT INTO functions (binary_id, name, address, pseudocode) VALUES "
+        "(1, 'FUN_00001000', '00001000', ?)",
+        ('void FUN_00001000(char *param_1){ rename("/tmp/a", param_1); }',),
+    )
+    conn.commit()
+    conn.close()
+
+    atlas_path = tmp_path / "atlas.db"
+    atlas = open_atlas(atlas_path)
+    begin_run(atlas, "mine", analysis_db_path=str(analysis))
+    begin_run(atlas, "theirs", analysis_db_path=str(tmp_path / "other.db"))
+    pid = upsert_pattern(
+        atlas,
+        source_class="unknown",
+        sink_class="path_sink",
+        call_sequence_shape="path_sink",
+        structural_fingerprint="fp_load",
+        fingerprint_algo_version="callseq-v1",
+    )
+    ref = f"theirs#{sha[:8]}:00001000@path_sink@"
+    for i in range(10_000):
+        add_instance(
+            atlas,
+            InstanceRow(
+                pattern_id=pid,
+                pseudocode_hash="h",
+                source_anchor="FUN_00001000",
+                sink_anchor="rename",
+                source_run_id="theirs",
+                reachability_status="unknown",
+                blocking_mechanism="const_sink_arg",
+                provenance_level="L0",
+                evidence_ref=f"{ref}{i:#08x}",
+                scope_origin="intra",
+                origin="unknown",
+                binary_path="bin/mover",
+            ),
+        )
+    atlas.close()
+
+    start = time.monotonic()
+    violations, _ = cri.gate_e_violations(atlas_path, analysis)
+    elapsed = time.monotonic() - start
+    # 'mine' holds no instance at all, and the 10,000 that would each contradict their function's
+    # text belong to 'theirs'.
+    assert violations == 0
+    assert elapsed < 5, f"Gate E took {elapsed:.1f}s over 10,000 foreign instances"
+    # asked about the run they do belong to, every one of them is a violation
+    assert cri.gate_e_violations(atlas_path, analysis, "theirs")[0] == 10_000

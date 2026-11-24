@@ -27,7 +27,9 @@ _INTERRUPT_EXITS = frozenset(128 + s for s in (signal.SIGINT, *_HANDLED))
 _received: int | None = None
 
 
-def _to_interrupt(signum: int, frame: FrameType | None) -> None:
+def _to_interrupt(signum: int, _frame: FrameType | None) -> None:
+    # _frame: the signal module passes the interrupted stack frame positionally; nothing here
+    # reads it.
     global _received
     _received = signum
     raise KeyboardInterrupt

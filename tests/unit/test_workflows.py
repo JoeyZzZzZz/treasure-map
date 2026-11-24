@@ -105,6 +105,63 @@ def test_ci_runs_the_rescan_stamp_backstop_on_a_checkout_holding_its_base() -> N
     assert any("scripts/rescan_same_stamp_check.py" in s.get("run", "") for s in steps)
 
 
+def test_the_integration_job_cannot_pass_by_skipping_the_decompiler() -> None:
+    """The one job that runs the real decompiler says so to the suite: with TMAP_REQUIRE_GHIDRA=1
+    a missing analyzeHeadless or BinExport is a failure, where before every Ghidra test skipped
+    and the job went green — and release.yml publishes on "CI passed".
+
+    MUTATION (verified RED, 1 failed): drop the env from the step -> RED. The conftest honouring
+    it is checked below by really running pytest both ways."""
+    ci = yaml.safe_load((_WORKFLOWS / "ci.yml").read_text())
+    steps = ci["jobs"]["integration"]["steps"]
+    run = next(s for s in steps if "pytest tests/integration" in s.get("run", ""))
+    assert (run.get("env") or {}).get("TMAP_REQUIRE_GHIDRA") == "1"
+    assert (_WORKFLOWS.parents[1] / "tests" / "integration" / "conftest.py").is_file()
+
+
+def test_the_required_toolchain_decides_the_integration_suite_exit_code(tmp_path: Path) -> None:
+    """tests/integration/conftest.py, run for real with no Ghidra on PATH: the session refuses to
+    start under TMAP_REQUIRE_GHIDRA=1 and exits non-zero, and without the variable it collects as
+    before (so a developer's run still skips what it cannot do). Collection only — the point is
+    the session hook, not the tests.
+
+    MUTATION (verified RED, 1 failed): return from pytest_sessionstart before the check -> the
+    stripped-PATH run exits 0 -> RED."""
+    root = _WORKFLOWS.parents[1]
+    bare = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "PYTHONPATH": str(root / "src")}
+    argv = [sys.executable, "-m", "pytest", "tests/integration", "--collect-only", "-q"]
+    with_var = subprocess.run(
+        argv, cwd=root, env={**bare, "TMAP_REQUIRE_GHIDRA": "1"}, capture_output=True, text=True
+    )
+    without = subprocess.run(argv, cwd=root, env=bare, capture_output=True, text=True)
+    assert with_var.returncode != 0, with_var.stdout
+    assert "analyzeHeadless is not on PATH" in with_var.stdout
+    assert without.returncode == 0, without.stdout
+
+
+def test_the_unit_test_job_measures_no_coverage() -> None:
+    """Coverage was measured on both Python versions and then only printed into the log: no
+    threshold, no artifact, and about 60% more wall clock on the heaviest files. pytest-cov stays
+    in the dev extra for a local run.
+
+    MUTATION (verified RED, 1 failed): put --cov back on the step -> RED."""
+    ci = yaml.safe_load((_WORKFLOWS / "ci.yml").read_text())
+    for step in ci["jobs"]["test"]["steps"]:
+        assert "--cov" not in step.get("run", "")
+
+
+def test_ci_runs_the_gates_over_real_output_and_the_dead_code_gate() -> None:
+    """The five recall-integrity gates read what a real scan and hunt stored (the rescan fixture),
+    not only the checker's own synthetic pair, and every function in src/ must have a caller in
+    src/.
+
+    MUTATION (verified RED, 1 failed): drop either step -> RED."""
+    ci = yaml.safe_load((_WORKFLOWS / "ci.yml").read_text())
+    runs = " ".join(s.get("run", "") for s in ci["jobs"]["recall-integrity"]["steps"])
+    assert "scripts/gates_on_fixture.py" in runs
+    assert "scripts/check-dead-code.sh" in runs
+
+
 def test_every_third_party_action_is_pinned_to_a_commit() -> None:
     """A tag can be moved to other code; a 40-character commit cannot. The release job holds
     id-token: write, so what runs there must be exactly what was reviewed.

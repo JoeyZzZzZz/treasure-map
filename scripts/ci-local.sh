@@ -50,14 +50,17 @@ ruff format --check src/ tests/
 echo "==> mypy strict"
 mypy src/
 
-echo "==> recall-integrity checker self-test"
-python scripts/check_recall_integrity.py --self-test
+echo "==> recall-integrity gates over the rescan fixture's output"
+python scripts/gates_on_fixture.py
 
 echo "==> binary-selector gate"
 bash scripts/check-binary-selector-resolution.sh
 
 echo "==> oss-exclusion gate"
 bash scripts/check-oss-exclusion-retired.sh
+
+echo "==> dead-code gate"
+bash scripts/check-dead-code.sh
 
 echo "==> vendor neutrality (this branch against origin/main)"
 if base="$(git merge-base HEAD origin/main 2>/dev/null)" && [ "$base" != "$(git rev-parse HEAD)" ]; then
@@ -73,7 +76,7 @@ echo "==> pytest unit"
 python -m pytest tests/unit/ -q
 
 echo "==> pytest integration"
-python -m pytest tests/integration/ -q
+python -m pytest tests/integration/ -q -rs
 
 echo ""
 echo "All local checks passed (CI additionally builds and installs the wheel, and tests the"
