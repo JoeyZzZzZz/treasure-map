@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from treasure_map.cli import hunt_cli
-from treasure_map.cli.hunt_cli import _complete_run_id, runs, triage
+from treasure_map.cli import run_commands
+from treasure_map.cli.run_commands import _complete_run_id, runs, triage
 from treasure_map.lib import rescan_version
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
@@ -155,7 +155,7 @@ def test_the_human_listing_carries_no_provenance(
     """
     # A commit the stamps can differ FROM. Without it the editable install records none and every
     # run lands on the same "cannot be confirmed" reason, before the reason under test is reached.
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: "c" * 40)
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
     begin_run(conn, "stamped", analysis_db_path="/ws/a.db", build_hash="pv_a")
@@ -277,7 +277,7 @@ def test_an_unmapped_reason_passes_through_verbatim() -> None:
 
     MUTATION: return a catch-all sentence instead of the reason -> RED.
     """
-    from treasure_map.cli.hunt_cli import _reason_human
+    from treasure_map.cli.run_commands import _reason_human
 
     novel = "the moon was in the wrong phase"
     assert _reason_human("hunt", novel) == novel
@@ -384,7 +384,7 @@ def test_an_unfinished_run_is_its_own_tier_not_a_fast_re_hunt(
 
     MUTATION: return ``("hunt", …)`` from the scan_status branch again -> RED.
     """
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: "c" * 40)
     out = CliRunner().invoke(runs, ["--atlas", str(_unfinished_atlas(tmp_path))])
     assert out.exit_code == 0, out.output
     assert "needs a full re-scan (1):" in out.output
@@ -411,7 +411,7 @@ def test_a_run_with_no_lineage_row_is_in_the_same_tier(
 
     MUTATION: drop the ``not run.resolved`` half -> RED (the tier reason becomes "did not finish").
     """
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: "c" * 40)
     atlas = tmp_path / "atlas.db"
     conn = open_atlas(atlas)
     pid = upsert_pattern(
@@ -453,7 +453,7 @@ def test_the_unfinished_tier_is_decided_before_the_unknown_commit_branch(
 
     MUTATION: move the unfinished check below the code-stamp-missing branch -> RED.
     """
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: UNKNOWN_VERSION)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: UNKNOWN_VERSION)
     # 'fine' kept as an OLD run (no code stamp), so it IS caught by the catch-all branch — the one
     # the unfinished check must be ordered ahead of.
     out = CliRunner().invoke(
@@ -476,7 +476,7 @@ def test_the_unfinished_tier_reaches_the_json_contract(
 
     MUTATION: build ``axis_reason`` from the extraction and hunt tiers only -> RED.
     """
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: "c" * 40)
     out = CliRunner().invoke(runs, ["--atlas", str(_unfinished_atlas(tmp_path)), "--json"])
     assert out.exit_code == 0, out.output
     by_id = {r["run_id"]: r for r in json.loads(out.output)["runs"]}
@@ -495,7 +495,7 @@ def test_the_closing_line_counts_the_unfinished_tier_too(
     MUTATION: build ``stale_runs`` from the extraction and hunt tiers only -> RED (the output
     promises `tmap rescan` refreshes them, when the only stale run has no firmware root at all).
     """
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: "c" * 40)
     out = CliRunner().invoke(runs, ["--atlas", str(_unfinished_atlas(tmp_path, firmware=None))])
     assert out.exit_code == 0, out.output
     assert "readable via `tmap fact pseudocode <func> --analysis-db" in out.output
@@ -515,7 +515,7 @@ def test_read_only_commands_never_create_the_atlas(tmp_path: Path) -> None:
     """MUTATION: open (and so create) the atlas before checking it exists -> RED."""
     from click.testing import CliRunner
 
-    from treasure_map.cli.hunt_cli import atlas_view, runs, triage
+    from treasure_map.cli.run_commands import atlas_view, runs, triage
 
     atlas = tmp_path / "none" / "atlas.db"
     for cmd, args in ((runs, []), (triage, []), (atlas_view, ["density"])):

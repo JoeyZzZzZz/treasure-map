@@ -34,7 +34,7 @@ from treasure_map.lib.query.triage import (
 )
 
 from .dispatch_image import RODATA_BASE, Image
-from .test_analyzer2 import _make_db
+from .test_analyzer import _make_db
 from .test_value_helpers import _fn
 
 # The keyed-lookup getter the rule admits (see test_value_helpers): it searches its own input, so

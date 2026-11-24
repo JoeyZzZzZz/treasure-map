@@ -5,7 +5,7 @@
 Pure functions over synthetic, vendor-neutral pseudocode, plus an atlas round-trip proving the
 fact persists (and is readable once the source analysis.db is gone). The fact is structural —
 it does NOT claim the forwarded value is attacker-controlled — and conservative under doubt.
-This round NO recall/downweight/triage path consumes it; a guard test asserts that.
+NO recall/downweight/triage path consumes it; a guard test asserts that.
 """
 
 from __future__ import annotations
@@ -374,10 +374,10 @@ def test_both_instance_writers_store_the_function_origin(tmp_path: Path) -> None
 def test_no_recall_or_score_path_reads_the_fact() -> None:
     # ★ The fact must never drive recall or a reading. The blanket ban stands for the recall and
     # downweight paths, and for the wrapper PREDICATE everywhere.
-    for rel in ("lib/hunt/downweight.py", "lib/query/triage.py", "lib/query/views.py"):
+    for rel in ("lib/hunt/downweight.py", "lib/query/triage.py", "lib/query/atlas_aggregates.py"):
         text = (_SRC / rel).read_text()
         assert "is_thin_cmd_wrapper" not in text, f"{rel} unexpectedly references the fact"
-    for rel in ("lib/hunt/downweight.py", "lib/query/views.py"):
+    for rel in ("lib/hunt/downweight.py", "lib/query/atlas_aggregates.py"):
         text = (_SRC / rel).read_text()
         assert "wrapped_sink" not in text, f"{rel} unexpectedly references the fact"
     # analyzer writes the fact but must not READ it back to alter recall/score: the only

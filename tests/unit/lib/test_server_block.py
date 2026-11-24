@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""D33: list_runs / start_diff_review / get_diff_meta report a ``server`` block — the running
+"""list_runs / start_diff_review / get_diff_meta report a ``server`` block — the running
 server's own build. Every version field is the IN-PROCESS value, fixed at startup; only
 ``code_moved_on_disk`` is compared against the disk, and the disk is probed at most ONCE per
 response (head and any refusal share the one probe). Zero real data: the test world of

@@ -7,7 +7,8 @@ that also carries argv and paths), the report a BinExport run leaves beside its 
 layer 0, layer 2 and the sink overlay treat the functions that report lists: undetermined, never
 aligned, unmatched-complete, changed, unchanged or persisted. A diff itself runs only BinDiff; the
 export side is driven here through the standalone export the fixture builder keeps
-(tests/fixtures/layer0/binexport.py), which raises the same failure kinds a stored diff records.
+(tests/fixtures/bindiff_output/binexport.py), which raises the same failure kinds a stored diff
+records.
 The Java side (the flow-graph repair and the fallback builder) runs only against a real Ghidra and
 is not exercised here.
 """
@@ -23,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from tests.fixtures.layer0 import binexport as fixture_export
+from tests.fixtures.bindiff_output import binexport as fixture_export
 from tests.unit.lib.binexport_seed import archive_exports
 from treasure_map.lib.analyze import ghidra_runner
 from treasure_map.lib.atlas.connection import open_atlas

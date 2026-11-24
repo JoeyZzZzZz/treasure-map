@@ -64,7 +64,7 @@ jobs:
       - name: Binary-selector gate (one resolver; an ambiguous name is refused, never picked)
         run: bash scripts/check-binary-selector-resolution.sh
       - name: OSS-exclusion gate (the shape scan skips no binary by name)
-        run: bash scripts/check-oss-exclusion-retired.sh
+        run: bash scripts/check-no-scan-time-binary-exclusion.sh
       - name: Dead-code gate (every function in src/ has a caller in src/)
         run: bash scripts/check-dead-code.sh
 

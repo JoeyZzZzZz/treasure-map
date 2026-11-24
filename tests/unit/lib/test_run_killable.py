@@ -279,7 +279,7 @@ def test_the_standalone_export_names_its_language_and_starts_in_its_project(
     MUTATION (verified RED): leave -processor out -> RED; start in the current directory -> RED."""
     import subprocess
 
-    from tests.fixtures.layer0.binexport import _run_binexport
+    from tests.fixtures.bindiff_output.binexport import _run_binexport
     from treasure_map.lib.config.config import Config
     from treasure_map.lib.diff.driver import DiffToolchainError
 
@@ -312,7 +312,7 @@ def test_an_architecture_ghidra_has_no_language_for_is_not_passed_as_one(
     MUTATION (verified RED, 1 failed): pass any detected arch as -processor again."""
     import subprocess
 
-    from tests.fixtures.layer0.binexport import _run_binexport
+    from tests.fixtures.bindiff_output.binexport import _run_binexport
     from treasure_map.lib.config.config import Config
     from treasure_map.lib.diff.driver import DiffToolchainError
 

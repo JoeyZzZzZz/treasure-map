@@ -118,7 +118,7 @@ def test_triage_exits_on_interrupt_with_the_signal_code(monkeypatch: pytest.Monk
 
     MUTATION (verified RED): drop ``cls=InterruptCommand`` from the triage command -> click's
     standalone mode turns the KeyboardInterrupt into an Abort and exit_code is 1."""
-    from treasure_map.cli.hunt_cli import triage as triage_cmd
+    from treasure_map.cli.run_commands import triage as triage_cmd
     from treasure_map.lib.config import config as cfgmod
 
     monkeypatch.setattr(interrupts, "_received", None)
@@ -131,7 +131,7 @@ def test_diff_exits_on_interrupt_with_the_signal_code(monkeypatch: pytest.Monkey
     """``tmap diff`` interrupted returns 128 + signal, not 1.
 
     MUTATION (verified RED): drop ``cls=InterruptCommand`` from the diff command -> exit_code 1."""
-    from treasure_map.cli.hunt_cli import hunt_diff
+    from treasure_map.cli.run_commands import hunt_diff
     from treasure_map.lib.config import config as cfgmod
 
     monkeypatch.setattr(interrupts, "_received", None)

@@ -4011,7 +4011,7 @@ def test_the_diff_command_line_counts_the_read_first_and_micro_pairs(
     reading; both print even at zero, so an absent count never reads as 'not computed'.
 
     MUTATION: drop the counts from ``_function_line`` -> RED."""
-    from treasure_map.cli.hunt_cli import _function_line
+    from treasure_map.cli.run_commands import _function_line
 
     w = _banner_world(tmp_path, "both")
     line = _function_line(pv.function_states(w.atlas, DIFF))

@@ -18,7 +18,7 @@ import pytest
 from click.testing import CliRunner
 
 from treasure_map.cli.analyze_cli import confirm_overwrite
-from treasure_map.cli.hunt_cli import _render_diff_pairs, runs
+from treasure_map.cli.run_commands import _render_diff_pairs, runs
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import DiffMetaRow, InstanceRow
 from treasure_map.lib.atlas.writer import (
@@ -645,7 +645,7 @@ def _firmware(tmp_path: Path, name: str) -> Path:
 
 
 def test_scan_s1_refuses_when_run_id_recorded_other_firmware(tmp_path: Path) -> None:
-    from treasure_map.cli.hunt_cli import scan
+    from treasure_map.cli.run_commands import scan
 
     fw_b = _firmware(tmp_path, "fwB")
     atlas = tmp_path / "atlas.db"
@@ -671,7 +671,7 @@ def test_scan_no_s1_prompt_when_firmware_matches(
 ) -> None:
     # The recorded firmware IS the one being scanned: run_recorded_elsewhere returns None, so the
     # scan proceeds (and here fails later for lack of Ghidra, never at the overwrite check).
-    from treasure_map.cli.hunt_cli import scan
+    from treasure_map.cli.run_commands import scan
 
     fw = _firmware(tmp_path, "fw")
     atlas = tmp_path / "atlas.db"
@@ -687,7 +687,7 @@ def test_scan_no_s1_prompt_when_firmware_matches(
 def test_scan_s2_refuses_when_workspace_holds_other_firmware(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from treasure_map.cli.hunt_cli import scan
+    from treasure_map.cli.run_commands import scan
 
     base = tmp_path / "workspaces"
     # a workspace 'dev' already holding a scan of fwA
@@ -720,7 +720,7 @@ def test_scan_does_not_prompt_s1_when_atlas_is_missing(
     # No atlas yet: the S1 check is guarded by resolved_atlas.exists() and ro_connect opens read
     # only (mode=ro cannot create), so it neither prompts nor creates the atlas. The scan opens it
     # to WRITE its results is a separate act, outside the check.
-    from treasure_map.cli.hunt_cli import scan
+    from treasure_map.cli.run_commands import scan
 
     fw = _firmware(tmp_path, "fw")
     monkeypatch.setenv("TM_WORKSPACE_DIR", str(tmp_path / "ws"))

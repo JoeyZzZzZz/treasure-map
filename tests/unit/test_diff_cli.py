@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner, Result
 
-from treasure_map.cli import hunt_cli
+from treasure_map.cli import run_commands
 from treasure_map.cli.main import main
 from treasure_map.lib.analyze import ghidra_runner
 from treasure_map.lib.atlas.connection import open_atlas
@@ -57,7 +57,7 @@ class Env:
         self.diff_raises: Exception | None = None
         self.full_cancelled = False
         self.running(build=BUILD, commit=COMMIT)
-        monkeypatch.setattr(hunt_cli, "rescan", self._rescan)
+        monkeypatch.setattr(run_commands, "rescan", self._rescan)
         monkeypatch.setattr(driver, "run_full_diff", self._full)
         monkeypatch.setattr(driver, "run_version_diff", self._single)
 
@@ -66,7 +66,7 @@ class Env:
         read them."""
         self.mp.setattr(ghidra_runner, "current_pass_version", lambda: build)
         self.mp.setattr(driver, "_current_pass_version", lambda: build)
-        self.mp.setattr(hunt_cli, "installed_commit", lambda: commit)
+        self.mp.setattr(run_commands, "installed_commit", lambda: commit)
         self.mp.setattr(driver, "_installed_commit", lambda: commit)
         self.commit = commit
 
@@ -274,7 +274,9 @@ def test_the_diff_plan_judges_new_stamp_runs_by_their_code_stamp(
     rescanned/refused though its stamps match, and the no-rescan assert goes RED.
     """
     monkeypatch.setattr(
-        hunt_cli.rescan_version, "current_code_stamp", lambda _cfg: CodeStamp(hunt=_HC, scan=_SC)
+        run_commands.rescan_version,
+        "current_code_stamp",
+        lambda _cfg: CodeStamp(hunt=_HC, scan=_SC),
     )
     env.run("old")
     env.run("new")
@@ -546,13 +548,13 @@ def test_a_stale_hunt_is_rescanned_once_and_said_in_full(env: Env) -> None:
     ]
     out = res.output
     assert "run 'new' (--after) is out of date" in out
-    assert hunt_cli._TIER_LABEL["hunt"] in out and hunt_cli._TIER_COST["hunt"] in out
+    assert run_commands._TIER_LABEL["hunt"] in out and run_commands._TIER_COST["hunt"] in out
     # An old run (no recorded code stamp) is offered for rescan with the generic code-stamp reason;
     # the human wording that `tmap diff`'s rescan plan prints for it.
     assert "hunted before tmap recorded what it ran" in out
     assert "will have their stored baseline read as stale" in out
     assert "will read as source_stale" not in out
-    assert hunt_cli._REKEY_WARNING not in out
+    assert run_commands._REKEY_WARNING not in out
     assert out.index("is out of date") < out.index("Atlas:")
     assert env.diffs == [("old", "new")]
 
@@ -563,8 +565,8 @@ def test_a_stale_extraction_says_refs_may_be_rekeyed(env: Env) -> None:
     env.run("new", build=OLD_BUILD)
     res = env.diff()
     assert res.exit_code == 0, res.output
-    assert hunt_cli._TIER_LABEL["extraction"] in res.output
-    assert hunt_cli._REKEY_WARNING in res.output
+    assert run_commands._TIER_LABEL["extraction"] in res.output
+    assert run_commands._REKEY_WARNING in res.output
     assert "other diffs involving this run will read as source_stale" in res.output
     assert [r["run_ids"] for r in env.rescans] == [("new",)]
 
@@ -574,12 +576,14 @@ def test_a_whole_scan_says_refs_may_be_rekeyed(env: Env) -> None:
     env.run("old")
     _stale_hunt(env, "new")
     env.mp.setattr(
-        hunt_cli, "_rescan_reason", lambda run, **kw: ("incomplete", "the scan has to run again")
+        run_commands,
+        "_rescan_reason",
+        lambda run, **kw: ("incomplete", "the scan has to run again"),
     )
     res = env.diff()
     assert res.exit_code == 0, res.output
-    assert hunt_cli._TIER_LABEL["incomplete"] in res.output
-    assert hunt_cli._REKEY_WARNING in res.output
+    assert run_commands._TIER_LABEL["incomplete"] in res.output
+    assert run_commands._REKEY_WARNING in res.output
 
 
 def test_a_hunt_with_no_stored_extraction_says_the_decompiler_runs(env: Env) -> None:
@@ -590,8 +594,8 @@ def test_a_hunt_with_no_stored_extraction_says_the_decompiler_runs(env: Env) -> 
     _stale_hunt(env, "new", binaries=())
     res = env.diff()
     assert res.exit_code == 0, res.output
-    assert hunt_cli._TIER_LABEL["hunt"] in res.output
-    assert hunt_cli._REKEY_WARNING in res.output
+    assert run_commands._TIER_LABEL["hunt"] in res.output
+    assert run_commands._REKEY_WARNING in res.output
     assert "will read as source_stale" in res.output
     assert "stored baseline read as stale" not in res.output
 
@@ -691,8 +695,8 @@ def test_a_partial_rescan_does_not_stop_the_diff(env: Env) -> None:
     MUTATION: treat RESCAN_PARTIAL_EXIT like any other exit (re-raise it) -> RED."""
     env.run("old")
     _stale_hunt(env, "new")
-    env.rescan_does = SystemExit(hunt_cli.RESCAN_PARTIAL_EXIT)
+    env.rescan_does = SystemExit(run_commands.RESCAN_PARTIAL_EXIT)
     res = env.diff()
     assert "Rescan interrupted" not in res.output
     assert "after the rescan" in res.output, res.output  # the recheck ran and named what is stale
-    assert res.exit_code != hunt_cli.RESCAN_PARTIAL_EXIT, res.output
+    assert res.exit_code != run_commands.RESCAN_PARTIAL_EXIT, res.output

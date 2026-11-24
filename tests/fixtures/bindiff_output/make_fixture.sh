@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate the committed layer-0 .BinDiff fixture from the synthetic sources next to it.
+# Regenerate the committed .BinDiff fixture from the synthetic sources next to it.
 #
 # The fixture is REAL BinDiff runtime output — the parse tests are meant to read what the tool
 # actually emits, not a hand-built SQLite table that agrees with our own reading of it. What is
@@ -10,7 +10,7 @@
 #   Ghidra 11.4.3 (GHIDRA_HOME, or ~/ghidra/ghidra_11.4.3_PUBLIC) with the BinExport extension,
 #   the `bindiff` CLI, and gcc.
 #
-# Usage:  tests/fixtures/layer0/make_fixture.sh
+# Usage:  tests/fixtures/bindiff_output/make_fixture.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -46,8 +46,8 @@ from pathlib import Path
 
 repo, work, out = (Path(a) for a in sys.argv[1:4])
 sys.path.insert(0, str(repo / "src"))
-sys.path.insert(0, str(repo))  # for tests.fixtures.layer0, where the standalone export lives
-from tests.fixtures.layer0.binexport import _run_binexport
+sys.path.insert(0, str(repo))  # for tests.fixtures.bindiff_output, where the standalone export lives
+from tests.fixtures.bindiff_output.binexport import _run_binexport
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.diff.driver import _run_bindiff
 

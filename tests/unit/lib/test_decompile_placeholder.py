@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.unit.lib.test_d29_callsite import _pair, _scc
 from tests.unit.lib.test_patch_view import DIFF, SHA_A, World
+from tests.unit.lib.test_sink_callsite_counts import _pair, _scc
 from treasure_map.lib import facts
 from treasure_map.lib.diff.alignment import _decompile_status
 from treasure_map.lib.query import patch_view as pv

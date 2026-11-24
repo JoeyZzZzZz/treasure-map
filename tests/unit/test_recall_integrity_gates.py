@@ -48,7 +48,7 @@ def _make_analysis(tmp_path: Path, name: str, pseudocode: str, callees: list[str
     return db
 
 
-def test_analyzer2_never_downweights_free_string_beside_a_constant(tmp_path: Path) -> None:
+def test_the_analyzer_never_downweights_free_string_beside_a_constant(tmp_path: Path) -> None:
     # ★ Red-line regression, end to end: the function has a free-string system(cmd) FIRST (so it is
     # the anchored candidate) and a constant system("…") after. The old whole-function regex tagged
     # it const_sink_arg and buried it; the parameter-specific downweight + write-side reconciliation

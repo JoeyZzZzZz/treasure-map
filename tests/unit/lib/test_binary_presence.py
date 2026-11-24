@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from treasure_map import mcp_app
-from treasure_map.cli import hunt_cli
+from treasure_map.cli import run_commands
 from treasure_map.lib import overlay
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
@@ -525,7 +525,7 @@ def test_the_cli_prints_what_each_side_holds_alone(
     """The diff command's coverage lines say what each run holds alone.
 
     MUTATION (verified RED, 1 failed): drop the only-in lines -> RED."""
-    hunt_cli._echo_coverage(da.list_diffs(world.atlas, "runA", "runB")["coverage"], "x")
+    run_commands._echo_coverage(da.list_diffs(world.atlas, "runA", "runB")["coverage"], "x")
     out = capsys.readouterr().out
     assert "only in A     : 3 binaries / 4 candidates, 3 not looked at — " in out
     assert "web/app/app.cgi" in out and "only in B     : 6 binaries / 6 candidates" in out

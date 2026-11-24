@@ -18,8 +18,8 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from treasure_map.cli import hunt_cli
-from treasure_map.cli.hunt_cli import (
+from treasure_map.cli import run_commands
+from treasure_map.cli.run_commands import (
     _recorded_workspace_name,
     _rescan_reason,
     rescan,
@@ -125,7 +125,7 @@ def test_the_page_header_shows_code_stamps_not_a_commit_warning(
     so its runs CAN be shown current.
 
     MUTATION: restore the unstamped-commit branch in the rescan page header -> RED."""
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: UNKNOWN_VERSION)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: UNKNOWN_VERSION)
     db = _atlas_with(tmp_path, [{"run_id": "r", "scan_status": "complete"}])
     out = CliRunner().invoke(rescan, ["--atlas", str(db), "--dry-run"])
     assert out.exit_code == 0, out.output
@@ -398,7 +398,7 @@ def test_rescan_invokes_scan_per_runnable_run(
             }
         )
 
-    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    monkeypatch.setattr(run_commands, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(db)])
     assert out.exit_code == 0, out.output
     assert [c["run_id"] for c in calls] == ["one", "two"]
@@ -439,7 +439,7 @@ def test_every_run_of_a_rescan_scans_inside_one_shared_block(
     ) -> None:
         seen.append(pipeline._SHARE.get())
 
-    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    monkeypatch.setattr(run_commands, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(db)])
     assert out.exit_code == 0, out.output
     assert len(seen) == 2
@@ -473,10 +473,10 @@ def test_one_failing_firmware_does_not_abandon_the_rest(
         if run_id == "one":
             raise click.ClickException("ghidra exploded")
 
-    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    monkeypatch.setattr(run_commands, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(db)])
     # Partial: every run was attempted, one failed — said in the exit code, not just the text.
-    assert out.exit_code == hunt_cli.RESCAN_PARTIAL_EXIT, out.output
+    assert out.exit_code == run_commands.RESCAN_PARTIAL_EXIT, out.output
     assert seen == ["one", "two"], "a failure must not abandon the runs after it"
     assert "rescanned 1/2" in out.output
     assert "one: ghidra exploded" in out.output
@@ -506,7 +506,7 @@ def test_force_rescans_a_run_that_is_confirmed_current(
     fw.mkdir()
     ws_dir = tmp_path / "workspaces"
     monkeypatch.setenv("TM_WORKSPACE_DIR", str(ws_dir))
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: COMMIT)
     db = _atlas_with(
         tmp_path,
         [
@@ -541,7 +541,7 @@ def test_force_rescans_a_run_that_is_confirmed_current(
     ) -> None:
         scanned.append((run_id, workspace, rehunt))
 
-    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    monkeypatch.setattr(run_commands, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(db), "--force"])
     assert out.exit_code == 0, out.output
     assert scanned == [("fresh", "fresh_ws", True)]
@@ -558,7 +558,7 @@ def test_rescan_lists_an_unfinished_run_in_its_own_tier(
     differently and both quietly: without the axis the run is counted by "to rescan (N)" and
     matches no tier below it, so the header says N over a list of N-1.
     """
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: COMMIT)
     fw = tmp_path / "fw"
     fw.mkdir()
     db = _atlas_with(
@@ -711,7 +711,7 @@ def test_a_custom_named_run_is_rescanned_in_place_rebuilding_without_the_decompi
     db_file = _seeded_analysis_db(ws_dir / "my_device" / "analysis.db").resolve()
     _stale_xref_sentinel(db_file)
     assert _has_sentinel(db_file), "the fixture must start with the stale row it claims to remove"
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: COMMIT)
     atlas = _atlas_with(
         tmp_path,
         [
@@ -812,7 +812,7 @@ def test_an_auto_named_run_is_re_scanned_into_the_very_same_auto_workspace(
     ) -> None:
         seen.append(workspace)
 
-    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    monkeypatch.setattr(run_commands, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(atlas)])
     assert out.exit_code == 0, out.output
     assert seen == [auto]
@@ -932,7 +932,7 @@ def test_a_hunt_tier_run_with_no_stored_facts_is_announced_before_it_decompiles(
     fw.mkdir()
     ws_dir = tmp_path / "workspaces"
     monkeypatch.setenv("TM_WORKSPACE_DIR", str(ws_dir))
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: COMMIT)
     recorded, ws_name = _unusable(kind, ws_dir)
     atlas = _atlas_with(
         tmp_path,
@@ -962,7 +962,7 @@ def test_a_hunt_tier_run_with_no_stored_facts_is_announced_before_it_decompiles(
     ) -> None:
         seen.append(workspace)
 
-    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    monkeypatch.setattr(run_commands, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(atlas)])
     assert out.exit_code == 0, out.output
     assert says in out.output, out.output
@@ -981,7 +981,7 @@ def test_a_run_that_recorded_no_database_is_announced_too(
     fw = tmp_path / "fw"
     fw.mkdir()
     monkeypatch.setenv("TM_WORKSPACE_DIR", str(tmp_path / "workspaces"))
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: COMMIT)
     atlas = _atlas_with(
         tmp_path,
         [
@@ -1009,7 +1009,7 @@ def test_a_run_that_recorded_no_database_is_announced_too(
     ) -> None:
         seen.append(workspace)
 
-    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    monkeypatch.setattr(run_commands, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(atlas)])
     assert out.exit_code == 0, out.output
     assert "this run recorded no analysis.db" in out.output
@@ -1049,7 +1049,7 @@ def test_a_file_that_is_not_a_database_fails_one_run_and_is_left_untouched(
     fw.mkdir()
     ws_dir = tmp_path / "workspaces"
     monkeypatch.setenv("TM_WORKSPACE_DIR", str(ws_dir))
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: COMMIT)
     (ws_dir / "junk_ws").mkdir(parents=True)
     junk = ws_dir / "junk_ws" / "analysis.db"
     payload = b"\x00\xffthis is not a database at all" * 40
@@ -1096,9 +1096,9 @@ def test_a_file_that_is_not_a_database_fails_one_run_and_is_left_untouched(
     ) -> None:
         seen.append(run_id)
 
-    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    monkeypatch.setattr(run_commands, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(atlas)])
-    assert out.exit_code == hunt_cli.RESCAN_PARTIAL_EXIT, out.output
+    assert out.exit_code == run_commands.RESCAN_PARTIAL_EXIT, out.output
     assert "rescanned 1/2" in out.output
     assert "a_junk: recorded analysis.db is not a readable database" in out.output
     assert seen == ["b_good"], "the unreadable path must not be scanned over"
@@ -1165,7 +1165,7 @@ def test_a_rescan_reports_two_stages_and_renders_no_triage_list(
     fw.mkdir()
     ws_dir = tmp_path / "workspaces"
     db_file = _cache_hit_scan(monkeypatch, ws_dir, "my_device")
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: COMMIT)
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: COMMIT)
     atlas = _atlas_with(
         tmp_path,
         [
@@ -1325,8 +1325,8 @@ def test_a_binary_the_running_pass_failed_on_does_not_hold_its_run_stale(
 
     MUTATION (verified RED): drop the attempt check (a differing hash is extraction again) -> the
     run lands in the extraction tier."""
-    from treasure_map.cli.hunt_cli import runs
     from treasure_map.cli.init_cli import runs_currency
+    from treasure_map.cli.run_commands import runs
     from treasure_map.lib.config.config import AtlasConfig, Config
 
     db = _attempts_db(
@@ -1370,7 +1370,7 @@ def test_a_binary_the_running_pass_never_attempted_is_extraction_work(tmp_path: 
     line both say.
 
     MUTATION (verified RED): count every binary as work again -> "[4 binaries]"."""
-    from treasure_map.cli.hunt_cli import _tier_line
+    from treasure_map.cli.run_commands import _tier_line
 
     db = _attempts_db(tmp_path / "ws" / "analysis.db", failed=[("svc_x", "timeout", _OLD_PASS)])
     run = _attempt_run(tmp_path, db, "mixed:2", binaries=4)
@@ -1429,7 +1429,7 @@ def test_an_extraction_redone_since_the_hunt_is_a_rehunt(tmp_path: Path) -> None
 
     MUTATION (verified RED): fall through to the hunt checks without comparing the hashes -> None.
     """
-    from treasure_map.cli.hunt_cli import _reason_human
+    from treasure_map.cli.run_commands import _reason_human
 
     db = _attempts_db(tmp_path / "ws" / "analysis.db")
     res = _reason_now(_attempt_run(tmp_path, db, "mixed:2"))
@@ -1517,7 +1517,7 @@ def test_rescan_leaves_the_last_run_pointer_as_it_found_it(
     ) -> None:
         last_run.write_last_run(tmp_path / f"{workspace}.db", Path(str(atlas_path)), str(run_id))
 
-    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    monkeypatch.setattr(run_commands, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(db)])
     assert out.exit_code == 0, out.output
     assert pointer.is_file()
@@ -1555,7 +1555,7 @@ def test_an_interrupted_rescan_puts_the_pointer_back(
         if run_id == "two":
             raise KeyboardInterrupt
 
-    monkeypatch.setattr(hunt_cli, "scan", _fake_scan)
+    monkeypatch.setattr(run_commands, "scan", _fake_scan)
     out = CliRunner().invoke(rescan, ["--atlas", str(db)])
     assert out.exit_code != 0
     assert pointer.read_bytes() == before

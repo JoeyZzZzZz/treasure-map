@@ -361,13 +361,13 @@ def test_the_cli_triage_refuses_a_stale_run_like_the_mcp_does(
     MUTATION: drop the _refuse_stale_triage_run call in triage -> RED (exit 0, a listing)."""
     from click.testing import CliRunner
 
-    from treasure_map.cli import hunt_cli
+    from treasure_map.cli import run_commands
 
-    monkeypatch.setattr(hunt_cli, "installed_commit", lambda: "c" * 40)
-    stale = CliRunner().invoke(hunt_cli.triage, ["run_stale", "--atlas", str(atlas), "--json"])
+    monkeypatch.setattr(run_commands, "installed_commit", lambda: "c" * 40)
+    stale = CliRunner().invoke(run_commands.triage, ["run_stale", "--atlas", str(atlas), "--json"])
     assert stale.exit_code != 0, stale.output
     assert "STALE scan" in stale.output and "tmap rescan run_stale" in stale.output
-    ok = CliRunner().invoke(hunt_cli.triage, ["run_ok", "--atlas", str(atlas), "--json"])
+    ok = CliRunner().invoke(run_commands.triage, ["run_ok", "--atlas", str(atlas), "--json"])
     assert ok.exit_code == 0, ok.output
 
 

@@ -26,6 +26,7 @@ cd "$(dirname "$0")/.."
 EXEMPT=(
     "format_commands"      # click calls it to render --help (a Group method we override)
     "_clear_view_caches"   # the test suite's handle on the process-level view caches
+    "clear_triage_cache"   # the same, for the per-run candidate reading (tests/conftest.py)
 )
 
 names="$(IFS='|'; echo "${EXEMPT[*]}")"

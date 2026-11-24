@@ -17,7 +17,7 @@ import pytest
 
 from tests.unit.lib.binexport_seed import archive_exports, export_meta
 from tests.unit.test_diff_cli import Env, env  # noqa: F401 -- the fixture
-from treasure_map.cli import hunt_cli
+from treasure_map.cli import run_commands
 from treasure_map.lib import rescan_version
 from treasure_map.lib.atlas.models import RunRow
 from treasure_map.lib.binexport_archive import archive_dir
@@ -147,8 +147,8 @@ def _current_run(tmp_path: Path, statuses: list[tuple[str | None, str | None]]) 
     )
 
 
-def _reason(run: RunRow, tools: hunt_cli._ScanTools | None) -> tuple[str, str] | None:
-    return hunt_cli._rescan_reason(
+def _reason(run: RunRow, tools: run_commands._ScanTools | None) -> tuple[str, str] | None:
+    return run_commands._rescan_reason(
         run,
         current_build=None,
         current=rescan_version.current_code_stamp(Config()),
@@ -166,19 +166,19 @@ def test_the_tiers_name_an_upgraded_ghidra_and_out_of_date_exports(tmp_path: Pat
     MUTATION (verified RED): leave the export tier out of _rescan_reason -> None -> RED; order the
     export tier before the toolchain -> RED."""
     run = _current_run(tmp_path / "a", [("ok", "H"), ("ok", "OLD")])
-    assert _reason(run, hunt_cli._ScanTools("11.4.3", "H")) == (
+    assert _reason(run, run_commands._ScanTools("11.4.3", "H")) == (
         "export",
         "BinExport exports out of date: 1 of 2 binaries' exports were made by other export "
         "scripts or another BinExport build, or not at all",
     )
-    upgraded = hunt_cli._ScanTools("11.5.0", "H")
+    upgraded = run_commands._ScanTools("11.5.0", "H")
     axis, why = _reason(run, upgraded) or ("", "")
     assert axis == "toolchain" and "11.4.3" in why and "11.5.0" in why
     clean = _current_run(tmp_path / "b", [("ok", "H"), ("extension_missing", None)])
-    assert _reason(clean, hunt_cli._ScanTools("11.4.3", None)) is None
-    assert _reason(clean, hunt_cli._ScanTools("11.4.3", "H")) is not None  # extension now here
-    assert {"toolchain", "export"} <= set(hunt_cli._TIER_ORDER)
-    assert hunt_cli._TIER_ORDER.index("toolchain") < hunt_cli._TIER_ORDER.index("export")
+    assert _reason(clean, run_commands._ScanTools("11.4.3", None)) is None
+    assert _reason(clean, run_commands._ScanTools("11.4.3", "H")) is not None  # extension now here
+    assert {"toolchain", "export"} <= set(run_commands._TIER_ORDER)
+    assert run_commands._TIER_ORDER.index("toolchain") < run_commands._TIER_ORDER.index("export")
 
 
 # ── `tmap diff`: exports out of date are re-made first ────────────────────────────────────────
@@ -204,17 +204,17 @@ def test_a_diff_rescans_a_run_whose_exports_are_out_of_date(env: Env) -> None:  
     env.run("new")
     _exported(env, "old", "NEW")
     _exported(env, "new", "OLD")
-    env.mp.setattr(hunt_cli, "_scan_tools", lambda cfg: hunt_cli._ScanTools(None, "NEW"))
+    env.mp.setattr(run_commands, "_scan_tools", lambda cfg: run_commands._ScanTools(None, "NEW"))
     refused = env.diff("old", "new", "--no-rescan")
     assert refused.exit_code != 0 and "out of date (export)" in refused.output
     assert env.rescans == []
     res = env.diff()
     assert res.exit_code == 0, res.output
     assert [r["run_ids"] for r in env.rescans] == [("new",)]
-    assert hunt_cli._TIER_LABEL["export"] in res.output
-    assert hunt_cli._TIER_COST["export"] in res.output
+    assert run_commands._TIER_LABEL["export"] in res.output
+    assert run_commands._TIER_COST["export"] in res.output
     env.rescans.clear()
-    env.mp.setattr(hunt_cli, "_scan_tools", lambda cfg: hunt_cli._ScanTools(None, None))
+    env.mp.setattr(run_commands, "_scan_tools", lambda cfg: run_commands._ScanTools(None, None))
     _exported(env, "new", "OLD")
     assert env.diff().exit_code == 0
     assert env.rescans == []

@@ -375,7 +375,7 @@ def test_retired_symbols_are_unimportable() -> None:
 
 
 def test_diff_command_uses_the_map_pipeline_not_the_grading_analyzer() -> None:
-    src = (_SRC / "cli" / "hunt_cli.py").read_text()
+    src = (_SRC / "cli" / "run_commands.py").read_text()
     assert "run_version_diff" in src  # new map-model driver
     assert "run_diff_analyzer" not in src  # the retired grading path
     assert "_complete_run_ids" not in src.replace(  # merged away (docstring mention aside)

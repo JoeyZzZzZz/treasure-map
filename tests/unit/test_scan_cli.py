@@ -19,8 +19,8 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from treasure_map.cli.hunt_cli import scan
-from treasure_map.cli.hunt_cli import triage as triage_cmd
+from treasure_map.cli.run_commands import scan
+from treasure_map.cli.run_commands import triage as triage_cmd
 from treasure_map.lib.analyze.pipeline import AnalyzeResult
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow

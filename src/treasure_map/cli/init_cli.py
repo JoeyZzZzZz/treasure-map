@@ -30,7 +30,7 @@ def runs_currency(cfg: Config | None) -> RunsCurrency:
     """How many runs in the atlas the installed tmap's code would scan differently — the same
     classifier ``tmap rescan`` uses, read through a READ-ONLY connection (init never migrates the
     atlas)."""
-    from treasure_map.cli.hunt_cli import (
+    from treasure_map.cli.run_commands import (
         _kept_earlier_lines,
         _live_instance_counts,
         _scan_tools,

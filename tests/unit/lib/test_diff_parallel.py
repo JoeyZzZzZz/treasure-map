@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.fixtures.layer0 import binexport as fixture_export
+from tests.fixtures.bindiff_output import binexport as fixture_export
 from tests.unit.lib.binexport_seed import stored_export
 from tests.unit.lib.test_run_killable import _fake_bindiff, _reap
 from treasure_map.lib.analyze.ghidra_runner import adaptive_heap_mb

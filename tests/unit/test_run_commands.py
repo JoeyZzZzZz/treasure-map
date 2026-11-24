@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from treasure_map.cli.hunt_cli import hunt_pattern
+from treasure_map.cli.run_commands import hunt_pattern
 from treasure_map.lib.config.config import Config
 from treasure_map.lib.errors import WorkspaceError
 from treasure_map.lib.hunt.analyzer import Analyzer2Stats

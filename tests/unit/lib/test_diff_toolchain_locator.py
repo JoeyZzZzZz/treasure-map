@@ -5,9 +5,10 @@
 Ghidra 11.4 loads extensions from its own ``Ghidra/Extensions`` and from the user settings
 directory (``$XDG_CONFIG_HOME`` or ``~/.config`` / ``~/Library``, then ``[<user>-]ghidra/
 ghidra_<version>_<release>``) — NOT from the old ``~/.ghidra/.ghidra_<version>`` one. The fixture
-builder's presence check (tests/fixtures/layer0/binexport._binexport_present) and the toolchain
-stamp read the same locator, and the stamp carries a digest of the jars so two builds of one
-version stamp apart. A diff reads the exports the scans archived and loads no extension itself."""
+builder's presence check (tests/fixtures/bindiff_output/binexport._binexport_present) and the
+toolchain stamp read the same locator, and the stamp carries a digest of the jars so two builds of
+one version stamp apart. A diff reads the exports the scans archived and loads no extension
+itself."""
 
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.fixtures.layer0 import binexport as fixture_export
+from tests.fixtures.bindiff_output import binexport as fixture_export
 from treasure_map.lib.config.config import Config, GhidraConfig, GhidraLocalConfig
 from treasure_map.lib.diff import toolchain as tc
 

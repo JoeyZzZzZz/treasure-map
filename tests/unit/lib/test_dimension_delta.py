@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for layer-2 dimension delta (project A/B layer annotations, never judge quality).
+"""Unit tests for the dimension delta (project A/B layer annotations, never judge quality).
 
 Hermetic: a synthetic atlas with run_capability + string_keyed_edge + function_alignment rows.
 ★ Fixture rule (else guards are un-testable): aligned callees have DIFFERENT A/B addresses, so a

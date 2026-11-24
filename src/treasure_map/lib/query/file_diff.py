@@ -576,7 +576,7 @@ def whole_pair_page(pf: PairFiles, offset: int, limit: int) -> dict[str, Any]:
     """One ``ko_offset`` page of the whole-pair lists: the .ko modules (content_differs — each one
     parsed —, renamed, undetermined, a_only, b_only) and the symbolic links (a_only, b_only,
     target_differs), every list cut at the same item, as many as fit the page."""
-    from treasure_map.lib.query import ko_changes as kc
+    from treasure_map.lib.query import kernel_module_changes as kc
 
     groups, same = kc._groups(pf)
     links = symlink_changes(pf)
@@ -1558,7 +1558,7 @@ def file_diff(
         "read_one_with": f'get_file_diff(run_pair={json.dumps(pair)}, path="<path>")',
     }
     if offset == 0:  # whole-pair information lines, given once with the first page
-        from treasure_map.lib.query.ko_changes import ko_counts
+        from treasure_map.lib.query.kernel_module_changes import ko_counts
 
         result["ko_changes"] = ko_counts(pf)
         result["symlink_changes"] = symlink_first_page(pf)

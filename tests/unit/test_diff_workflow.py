@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from treasure_map import mcp_app
-from treasure_map.cli import hunt_cli
+from treasure_map.cli import run_commands
 from treasure_map.lib.diff.driver import DiffSummary, FullDiffPlan, FullDiffSummary
 from treasure_map.lib.query import diff_align
 from treasure_map.lib.query.diff_workflow import DIFF_WORKFLOW
@@ -76,7 +76,7 @@ def test_the_single_binary_diff_closes_with_the_workflow(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """MUTATION (verified RED, 1 failed): close with a sentence of its own instead -> RED."""
-    hunt_cli._echo_single_diff(_summary(), Path("atlas.db"), None)
+    run_commands._echo_single_diff(_summary(), Path("atlas.db"), None)
     out = capsys.readouterr().out
     assert DIFF_WORKFLOW in out
     assert "get_diff_capabilities" in out  # the tools it names beside it stay
@@ -88,7 +88,9 @@ def test_the_full_diff_closes_with_the_workflow(capsys: pytest.CaptureFixture[st
     plan = FullDiffPlan(
         changed=("libx",), unchanged=(), only_in_a=(), only_in_b=(), to_diff=("libx",)
     )
-    hunt_cli._echo_full_diff(FullDiffSummary(plan=plan, outcomes=(), cancelled=False), Path("a.db"))
+    run_commands._echo_full_diff(
+        FullDiffSummary(plan=plan, outcomes=(), cancelled=False), Path("a.db")
+    )
     out = capsys.readouterr().out
     assert DIFF_WORKFLOW in out
     assert "list_diff_blindspots for un-diffed binaries" in out
@@ -121,7 +123,7 @@ def test_an_interrupted_full_diff_counts_only_what_it_finished_as_new(
         return BinaryDiffOutcome(name, summary, None)
 
     outcomes = tuple(ok(n) for n in names[:5])
-    hunt_cli._echo_full_diff(
+    run_commands._echo_full_diff(
         FullDiffSummary(plan=plan, outcomes=outcomes, cancelled=True), Path("a.db")
     )
     out = capsys.readouterr().out

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from treasure_map.cli.hunt_cli import _complete_run_id, _complete_workspace
+from treasure_map.cli.run_commands import _complete_run_id, _complete_workspace
 
 
 def _fake_config(monkeypatch: pytest.MonkeyPatch, *, workspace_dir: Path, atlas: Path) -> None:

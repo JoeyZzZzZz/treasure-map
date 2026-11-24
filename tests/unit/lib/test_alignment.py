@@ -1,14 +1,14 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for layer-0 parse (.BinDiff -> atlas function_alignment / function_presence).
+"""Unit tests for the alignment parse (.BinDiff -> function_alignment / function_presence).
 
-Fingerprint tests read the COMMITTED fixture (tests/fixtures/layer0/*.BinDiff), which is REAL
-BinDiff runtime output — what the tool actually emits, not a hand-built SQLite table that agrees
-with our own reading of it. Its SUBJECT is synthetic: two variants of a C file written for this
-repository, built stripped so BinDiff meets the same nameless, structurally-repetitive code it
+Fingerprint tests read the COMMITTED fixture (tests/fixtures/bindiff_output/*.BinDiff), which is
+REAL BinDiff runtime output — what the tool actually emits, not a hand-built SQLite table that
+agrees with our own reading of it. Its SUBJECT is synthetic: two variants of a C file written for
+this repository, built stripped so BinDiff meets the same nameless, structurally-repetitive code it
 meets in the firmware this tool reads. Nothing in it derives from any firmware or third-party
-binary. tests/fixtures/layer0/make_fixture.sh regenerates it from those sources; the counts below
-are fingerprints OF THE COMMITTED FILE, so regenerating on a different toolchain moves them.
+binary. tests/fixtures/bindiff_output/make_fixture.sh regenerates it from those sources; the counts
+below are fingerprints OF THE COMMITTED FILE, so regenerating on a different toolchain moves them.
 
 Domain / orchestrator tests use a tiny crafted .BinDiff + a synthetic analysis.db to exercise the
 presence + write logic hermetically.
@@ -44,7 +44,7 @@ from treasure_map.version import UNKNOWN_VERSION
 FIXTURE = (
     Path(__file__).resolve().parents[2]
     / "fixtures"
-    / "layer0"
+    / "bindiff_output"
     / "shapes_before_vs_shapes_after.BinDiff"
 )
 
@@ -670,9 +670,9 @@ def test_bindiff_matching_hashes_proceed(tmp_path: Path) -> None:
 # The consumer side (layer2) is already correct; these anchor the PRODUCER. The tool_version
 # cases (tool_version drives skew, forward+reverse) are covered by
 # test_version_skew_uses_tool_version_not_firmware_hash above and, on the consumer side, by
-# test_diff_layer2.test_version_skew_degrades_every_edge_subject / _zero_restores. The tests here
-# cover the Ghidra criterion, the both-unknown conservative direction, anchor
-# independence (reverse), and the end-to-end visibility sanity.
+# test_dimension_delta.test_version_skew_degrades_every_edge_subject / _zero_restores. The tests
+# here cover the Ghidra criterion, the both-unknown conservative direction, anchor independence
+# (reverse), and the end-to-end visibility sanity.
 
 
 def _parse_two_runs(tmp_path: Path, **seed_kw: str):  # type: ignore[no-untyped-def]

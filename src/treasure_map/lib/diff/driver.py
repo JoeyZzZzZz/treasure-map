@@ -21,7 +21,7 @@ unit-tested; the BinDiff subprocess step is exercised by the maintainer's end-to
 pinned toolchain (BinDiff 8, over exports made by Ghidra 11.4.3 + the prebuilt BinExport). Its
 command line is isolated in ``_run_bindiff`` so a toolchain revision touches only that function. A
 diff starts no export of its own; the standalone export this module used to hold is now
-``tests/fixtures/layer0/binexport.py``, which only the fixture builder runs.
+``tests/fixtures/bindiff_output/binexport.py``, which only the fixture builder runs.
 """
 
 from __future__ import annotations

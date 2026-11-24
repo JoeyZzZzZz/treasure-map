@@ -8,6 +8,13 @@ nothing here scores, ranks, or judges.
 
 from __future__ import annotations
 
+from treasure_map.lib.query.atlas_aggregates import (
+    FINE_FP_ALGO_VERSION,
+    DensityRow,
+    LedgerRow,
+    density,
+    ledger,
+)
 from treasure_map.lib.query.coverage import (
     DEFAULT_PAGE_SIZE,
     CoverageIndex,
@@ -64,13 +71,6 @@ from treasure_map.lib.query.triage import (
     state_value_label,
     triage,
     unknown_dimension_refusal,
-)
-from treasure_map.lib.query.views import (
-    FINE_FP_ALGO_VERSION,
-    DensityRow,
-    LedgerRow,
-    density,
-    ledger,
 )
 
 __all__ = [

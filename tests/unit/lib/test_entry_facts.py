@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""R9: the read-face signals a diff judgement leans on are part of its facts (entry_facts) —
+"""The read-face signals a diff judgement leans on are part of its facts (entry_facts) —
 pair_evidence, counterpart_hint, the per-sink call-count delta, listed_as and the subclass — read
 on the write and on the re-check alike, and a one-sided (P) entry's hint targets; a snapshot is
 compared on the keys it holds; the predicate version is no fact of a judgement.

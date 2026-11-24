@@ -57,7 +57,7 @@ echo "==> binary-selector gate"
 bash scripts/check-binary-selector-resolution.sh
 
 echo "==> oss-exclusion gate"
-bash scripts/check-oss-exclusion-retired.sh
+bash scripts/check-no-scan-time-binary-exclusion.sh
 
 echo "==> dead-code gate"
 bash scripts/check-dead-code.sh

@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from tests.unit.lib.test_analyzer2 import _bridged, _make_db, _rows_for
+from tests.unit.lib.test_analyzer import _bridged, _make_db, _rows_for
 from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cache fixture
     DX,
     World,
@@ -26,7 +26,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
     _row,
     world,
 )
-from treasure_map.cli.hunt_cli import triage as triage_cmd
+from treasure_map.cli.run_commands import triage as triage_cmd
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.hunt.analyzer import run_analyzer2
 from treasure_map.lib.query import sink_overlay as so

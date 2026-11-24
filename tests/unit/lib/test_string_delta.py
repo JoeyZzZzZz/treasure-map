@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""D25: string_delta — the string literals one side of a diff holds and the other does not
+"""string_delta — the string literals one side of a diff holds and the other does not
 (a_only / b_only), taken as the set difference of each side's ``strings`` values, with each value's
 resolved reference anchors read from the per-run ``string_refs`` table (NOT
 get_functions_referencing_string's substring match, and NOT string_edges' strcmp_gate counts).

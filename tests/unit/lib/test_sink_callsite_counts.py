@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""D29: get_diff_patch_view's per-CALLSITE sink counts (``sink_callsite_counts``), built from a
+"""get_diff_patch_view's per-CALLSITE sink counts (``sink_callsite_counts``), built from a
 function's ``call_tokens`` — each SINK_CALLEE_NAMES callee's CALL count in the two sides, NOT
 deduplicated. An independent key (unit ``callsite``) that NEVER mixes into sink_candidate_counts
 and NEVER moves an entry's bucket or significance.

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the fmt-wrapper call-site reader (lib/hunt/fmt_provenance).
 
-The end-to-end behaviour lives in test_analyzer2's C-FMT block; these pin the two pieces of
+The end-to-end behaviour lives in test_analyzer's C-FMT block; these pin the two pieces of
 mechanics that are easy to get subtly wrong and whose breakage would be invisible there:
 argument SPLITTING (get it wrong and index N is not argument N) and what counts as a literal.
 """

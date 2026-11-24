@@ -20,10 +20,10 @@ from typing import Any
 import pytest
 
 from tests.unit.lib.test_file_diff import FW, PAIR
-from treasure_map.cli import hunt_cli
+from treasure_map.cli import run_commands
 from treasure_map.lib.query import extraction_gaps as gaps
 from treasure_map.lib.query import file_diff as fd
-from treasure_map.lib.query import ko_changes as kc
+from treasure_map.lib.query import kernel_module_changes as kc
 from treasure_map.lib.storage.connection import open_db
 
 
@@ -634,10 +634,10 @@ def test_the_hunt_summaries_name_them(tmp_path: Path, capsys: pytest.CaptureFixt
 
     MUTATION (verified RED): drop the call from either summary -> fewer than two calls -> RED."""
     db, _atlas = _gap_world(tmp_path)
-    hunt_cli._name_unfinished_decompiles(db, None, None, "  ")
+    run_commands._name_unfinished_decompiles(db, None, None, "  ")
     out = capsys.readouterr().out
     assert "Decompile unfinished: 2 function(s)" in out and "big_fn" in out and "huge_fn" in out
-    src = inspect.getsource(hunt_cli)
+    src = inspect.getsource(run_commands)
     assert src.count("_name_unfinished_decompiles(") == 3  # the definition and two summaries
 
 

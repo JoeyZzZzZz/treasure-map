@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for lib/query/views — neutral atlas aggregations (density / ledger).
+"""Unit tests for lib/query/atlas_aggregates — neutral atlas aggregations (density / ledger).
 
 Builds atlas instances directly (no analyzer) to isolate the view logic, then asserts the
 group-by counts and the two derived recurrence ledgers.

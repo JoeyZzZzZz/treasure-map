@@ -54,7 +54,7 @@ _SCHEMA = (
 _FIXTURE = (
     Path(__file__).resolve().parents[2]
     / "fixtures"
-    / "layer0"
+    / "bindiff_output"
     / "shapes_before_vs_shapes_after.BinDiff"
 )
 _NEW_DIFF_META_COLS = (

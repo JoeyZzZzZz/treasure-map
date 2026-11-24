@@ -15,7 +15,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from treasure_map.cli.hunt_cli import triage as triage_cmd
+from treasure_map.cli.run_commands import triage as triage_cmd
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
@@ -266,7 +266,7 @@ def test_explain_is_read_only(tmp_path: Path) -> None:
 
 def test_render_sources_carry_no_self_verdict() -> None:
     src = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
-    targets = [src / "cli" / "hunt_cli.py", src / "lib" / "query" / "triage.py"]
+    targets = [src / "cli" / "run_commands.py", src / "lib" / "query" / "triage.py"]
     for path in targets:
         text = path.read_text().lower()
         for phrase in _SELF_VERDICT:

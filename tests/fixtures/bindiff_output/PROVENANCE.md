@@ -1,4 +1,4 @@
-# layer-0 fixture provenance
+# BinDiff-output fixture provenance
 
 `shapes_before_vs_shapes_after.BinDiff` is **real BinDiff output over a synthetic subject.**
 
@@ -7,7 +7,7 @@
 | Subject | `src/shapes_before.c` and `src/shapes_after.c`, written for this repository |
 | Derived from firmware or third-party binaries | **No** |
 | Produced by | gcc → strip → Ghidra + BinExport → `bindiff` CLI |
-| Regenerate with | `tests/fixtures/layer0/make_fixture.sh` |
+| Regenerate with | `tests/fixtures/bindiff_output/make_fixture.sh` |
 
 ## Why real tool output rather than a crafted SQLite file
 

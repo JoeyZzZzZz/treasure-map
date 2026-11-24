@@ -10,7 +10,11 @@ import click
 from treasure_map.cli.analyze_cli import analyze
 from treasure_map.cli.doctor_cli import doctor
 from treasure_map.cli.exploit_cli import exploit
-from treasure_map.cli.hunt_cli import (
+from treasure_map.cli.init_cli import init
+from treasure_map.cli.interrupts import install_termination_handlers
+from treasure_map.cli.mcp_cli import fact, mcp_serve
+from treasure_map.cli.review_cli import review
+from treasure_map.cli.run_commands import (
     atlas_view,
     hunt_diff,
     hunt_pattern,
@@ -19,10 +23,6 @@ from treasure_map.cli.hunt_cli import (
     scan,
     triage,
 )
-from treasure_map.cli.init_cli import init
-from treasure_map.cli.interrupts import install_termination_handlers
-from treasure_map.cli.mcp_cli import fact, mcp_serve
-from treasure_map.cli.review_cli import review
 from treasure_map.cli.uninstall_cli import uninstall
 from treasure_map.cli.update_cli import update
 from treasure_map.lib.errors import ConfigError

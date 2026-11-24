@@ -72,8 +72,9 @@ def test_compute_decompresses_the_two_archives_and_runs_only_bindiff(
     art = driver.compute_diff(a, b, td, Config())
     assert seen == {"a": b"export A", "b": b"export B"}
     assert art.report_a is not None and art.report_a.builder == "fallback"
-    # the standalone export lives with the fixture builder (tests/fixtures/layer0/binexport.py),
-    # which is not part of the package: a diff has nothing to export with.
+    # the standalone export lives with the fixture builder
+    # (tests/fixtures/bindiff_output/binexport.py), which is not part of the package: a diff has
+    # nothing to export with.
     assert not hasattr(driver, "_run_binexport")
 
 

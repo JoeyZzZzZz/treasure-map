@@ -1,6 +1,6 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Analyzer-2 (A2) — the pattern-driven atlas writer.
+"""Unit tests for the hunt analyzer — the pattern-driven atlas writer.
 
 Synthetic, vendor-neutral analysis.db (incl. one widely-shipped stock binary) + temp atlas;
 hermetic (no LLM). Proves the R-pattern -> R2 -> atlas write, that every binary is scanned, the
@@ -5211,7 +5211,7 @@ def test_source_names_reach_the_cli_json_and_the_mcp_explain(tmp_path: Path) -> 
     from click.testing import CliRunner
 
     from treasure_map import mcp_app
-    from treasure_map.cli.hunt_cli import triage as triage_cmd
+    from treasure_map.cli.run_commands import triage as triage_cmd
 
     atlas = tmp_path / "atlas.db"
     run_analyzer2(_source_names_db(tmp_path), atlas, source_run_id="run_srcn")
@@ -5275,7 +5275,7 @@ def test_the_boundary_origin_reaches_the_instance_and_both_list_surfaces(tmp_pat
     from click.testing import CliRunner
 
     from treasure_map import mcp_app
-    from treasure_map.cli.hunt_cli import triage as triage_cmd
+    from treasure_map.cli.run_commands import triage as triage_cmd
 
     atlas = tmp_path / "atlas.db"
     run_analyzer2(_origin_db(tmp_path), atlas, source_run_id="run_fo")
@@ -5324,7 +5324,7 @@ def test_the_completeness_layer_is_the_same_on_the_mcp_and_cli_explain(tmp_path:
     from click.testing import CliRunner
 
     from treasure_map import mcp_app
-    from treasure_map.cli.hunt_cli import triage as triage_cmd
+    from treasure_map.cli.run_commands import triage as triage_cmd
 
     atlas = tmp_path / "atlas.db"
     run_analyzer2(_origin_db(tmp_path), atlas, source_run_id="run_fo")

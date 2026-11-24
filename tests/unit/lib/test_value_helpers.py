@@ -26,7 +26,7 @@ from treasure_map.lib.hunt.function_rows import FuncRow
 from treasure_map.lib.hunt.value_helpers import build_helper_tables, helper_slots
 from treasure_map.lib.pattern.sink_vocabulary import RETURN_SLOT, SOURCE
 
-from .test_analyzer2 import _make_db
+from .test_analyzer import _make_db
 
 R = RETURN_SLOT
 
@@ -367,8 +367,8 @@ def test_the_moved_fingerprint_re_keys_both_b_class_readers(tmp_path: Path) -> N
 
     MUTATION (verified RED): leave the candidate's source_class unlabelled (the criterion builds no
     table) -> the fingerprint does not move -> the keys are equal -> RED."""
+    from treasure_map.lib.query.atlas_aggregates import density
     from treasure_map.lib.query.same_shape_siblings import f2_key
-    from treasure_map.lib.query.views import density
 
     with_helper = _hunt_handle(tmp_path, with_helper=True)
     without = _hunt_handle(tmp_path, with_helper=False)

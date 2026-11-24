@@ -29,7 +29,7 @@ from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.writer import begin_run, finish_run
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import file_diff as fd
-from treasure_map.lib.query import ko_changes as kc
+from treasure_map.lib.query import kernel_module_changes as kc
 from treasure_map.lib.storage.connection import open_db
 
 PAIR = "runA::runB"
