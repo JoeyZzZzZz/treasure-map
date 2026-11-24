@@ -2347,3 +2347,80 @@ def test_a_kept_reading_is_never_served_for_other_rows(tmp_path: Path) -> None:
     assert reads() == 3, "a stamp move left the old reading in place"
     conn.set_trace_callback(None)
     conn.close()
+
+
+def test_an_in_place_rewrite_by_the_writing_process_is_not_served_from_the_kept_reading(
+    tmp_path: Path,
+) -> None:
+    """★ The shape the shipped in-place write really has: another process rewrites a column of
+    rows that are already there, leaving the run row, the row count and the highest instance id
+    exactly as they were. Only ``PRAGMA data_version`` moves for that, and only because the write
+    came from another connection — SQLite does not move it for a connection's own writes.
+
+    That is the hunt's anchor minting (``_mint_out_of_body_anchors``, the one ``UPDATE instance``
+    in the package, pinned by the test below), and the reader is the long-lived MCP server, in its
+    own process. A stale map is the dangerous side of this feature, so it is read back here.
+
+    MUTATION (verified RED, ``1 failed``): drop ``PRAGMA data_version`` from ``_triage_key`` ->
+    the old reading is served and the refs below are the pre-write ones -> RED."""
+    conn = _edge_world(tmp_path, 3)
+    clear_triage_cache()
+    before = triage(conn, run_id="run_1")
+    assert all((c.evidence_ref or "").startswith("run_1#") for c in before)
+    assert not any("@minted" in (c.evidence_ref or "") for c in before)
+
+    writer = sqlite3.connect(tmp_path / "atlas.db")  # the hunt: another connection, another process
+    writer.execute(
+        "UPDATE instance SET evidence_ref = evidence_ref || '@minted' WHERE source_run_id = 'run_1'"
+    )
+    writer.commit()
+    writer.close()
+
+    after = triage(conn, run_id="run_1")
+    assert len(after) == len(before)
+    assert all("@minted" in (c.evidence_ref or "") for c in after), (
+        "the kept reading was served after another connection rewrote the rows it was read from"
+    )
+    conn.close()
+
+
+def test_the_only_in_place_instance_write_is_the_hunts_anchor_minting() -> None:
+    """★ The premise the kept reading rests on. An ``UPDATE instance`` that moves neither a stamp
+    nor the row count nor the highest id is invisible to the key when it comes from the reader's
+    OWN connection, and the key cannot be fixed to see it (``PRAGMA data_version`` is defined not
+    to move for a connection's own writes). What makes that sound is WHERE such a write lives:
+    one place, inside the hunt, which runs in its own process and stamps the run row as it ends.
+
+    So the set is pinned here rather than left as a sentence. A new write path that only rewrites
+    instance rows would have to come past this test, and the author then has to say how a reader
+    learns of it — not discover later that the map quietly went stale.
+
+    MUTATION (verified RED, ``1 failed``): add an ``UPDATE instance SET …`` anywhere else in
+    src/treasure_map -> the new site is listed -> RED."""
+    import ast
+
+    root = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
+    assert (root / "lib" / "hunt" / "analyzer.py").is_file(), f"not the package: {root}"
+    pattern = re.compile(r"UPDATE\s+instance\b", re.IGNORECASE)
+    sites: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if not pattern.search(text):
+            continue
+        tree = ast.parse(text)
+        defs = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        ]
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if not pattern.search(line):
+                continue
+            holding = [d for d in defs if d.lineno <= lineno <= (d.end_lineno or d.lineno)]
+            name = max(holding, key=lambda d: d.lineno).name if holding else "<module>"
+            sites.add(f"{path.relative_to(root).as_posix()}:{name}")
+
+    assert sites == {"lib/hunt/analyzer.py:_mint_out_of_body_anchors"}, (
+        "an in-place instance write outside the hunt: the candidate reading is kept per scope and "
+        f"keyed by the run's stamps, the row count and the highest id — {sorted(sites)}"
+    )

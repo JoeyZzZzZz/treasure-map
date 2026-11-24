@@ -3443,7 +3443,15 @@ def apply_view(
 # A page of list_candidates is a slice of this reading, and every page asked for the reading again:
 # page 2 of a 37,461-candidate run re-read and re-ranked the whole run (5.9 s, 29.0 s from cold
 # disk). It is kept per scope instead, under everything it is read from, so paging slices one
-# reading. Four of them: a reader works one firmware at a time, and one entry is a whole run.
+# reading.
+#
+# TWO of them, because an entry is a whole run and a run is big: one reading of the largest run
+# here (37,461 candidates) is about 173MB of objects -- 4.6KB per candidate, the dimension layers
+# and the refs -- so each entry costs that, in a server that stays up for a session. Two is what
+# the only reader that needs more than one asks for: a diff review reads candidates for both
+# sides of a run pair (review_units, per binary, alternating between the two runs). Four entries
+# measured 670MB over the live library's four biggest runs (+625MB resident against the same
+# reads keeping nothing), for a third and fourth run nothing reads in one breath.
 #
 # THE KEY is the atlas file plus, for every run in scope, the run row's stamps AND the live count
 # and highest id of its instances. The stamps catch a re-scan or a re-hunt (which is what a
@@ -3451,7 +3459,7 @@ def apply_view(
 # being updated, so a reading is never served for instances that are no longer the ones there.
 # Nothing here reads the overlay, so no judgement can change this reading: list_candidates applies
 # the overlay band AFTER triage, outside this cache.
-_TRIAGE_RUNS = 4
+_TRIAGE_RUNS = 2
 _TRIAGE_CACHE: OrderedDict[tuple[str, ...], tuple[TriageCandidate, ...]] = OrderedDict()
 
 _RUN_STAMP_COLS = (
