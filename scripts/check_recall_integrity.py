@@ -47,6 +47,9 @@ Usage:
 
 Gate E reads one run: ``--run-id``, or the run that registered the analysis database as its own.
 
+Every gate reports the population it judged, and ``--require-population`` makes an empty one a
+failure — see ``GateResult``.
+
 Exit code 0 when every checked invariant holds (count 0); 1 on any violation or a self-test miss.
 """
 
@@ -58,11 +61,34 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.pattern import scanner
 from treasure_map.lib.pattern.models import PatternStats
 from treasure_map.lib.ro_db import ro_connect
+
+
+class GateResult(NamedTuple):
+    """How one gate came out: the violations it found, and how many rows it judged.
+
+    ``scanned`` is the POPULATION the gate's own predicate was applied to, never the size of the
+    table it read. A gate whose population is 0 asserted nothing: it passes however wrong the
+    predicate is. That is not hypothetical — on the rescan fixture Gates A and E read 0 rows,
+    because its only shell-sink call passes a variable, so inverting the whole const_sink_arg
+    judgement left both of them reporting ✓. ``--require-population`` turns an empty population
+    into a failure, which is how the fixture's caller keeps every gate load-bearing.
+
+    ``unverifiable`` is Gate E's third class — a row the gate reached and could not judge: the
+    function's text does not show the sink call (a stub-rendered ``FUN_<addr>(…)``), or its sink
+    class has no rule here. Those are neither violations nor scanned. For a gate written as one
+    SQL predicate there is no such class, so it stays 0.
+    """
+
+    violations: int
+    scanned: int
+    unverifiable: int = 0
+
 
 # Gate A: const_sink_arg must never coexist with a free_string sink argument.
 _GATE_A_SQL = (
@@ -70,6 +96,8 @@ _GATE_A_SQL = (
     "WHERE blocking_mechanism = 'const_sink_arg' "
     "AND json_extract(flow_evidence, '$.source_kind') = 'free_string'"
 )
+# ... out of every candidate carrying the note, which is the population it judges.
+_GATE_A_POPULATION_SQL = "SELECT COUNT(*) FROM instance WHERE blocking_mechanism = 'const_sink_arg'"
 
 # Gate B: a binary marked ghidra_status='ok' must hold at least one function row.
 _GATE_B_SQL = (
@@ -77,6 +105,7 @@ _GATE_B_SQL = (
     "WHERE b.ghidra_status = 'ok' "
     "AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.binary_id = b.id)"
 )
+_GATE_B_POPULATION_SQL = "SELECT COUNT(*) FROM binaries WHERE ghidra_status = 'ok'"
 
 
 # Gate C: every candidate's run must be a registered run. An instance whose source_run_id has no
@@ -89,28 +118,31 @@ _GATE_C_SQL = (
     "SELECT COUNT(*) FROM instance WHERE source_run_id IS NOT NULL "
     "AND source_run_id NOT IN (SELECT run_id FROM run)"
 )
+_GATE_C_POPULATION_SQL = "SELECT COUNT(*) FROM instance WHERE source_run_id IS NOT NULL"
 
 
-def _count(db_path: Path, sql: str) -> int:
-    """Run a COUNT(*) invariant query against a database opened read-only."""
+def _count(db_path: Path, sql: str, population_sql: str) -> GateResult:
+    """Run a COUNT(*) invariant query and its population query against one read-only database."""
     conn = ro_connect(db_path)
     try:
-        return int(conn.execute(sql).fetchone()[0])
+        return GateResult(
+            int(conn.execute(sql).fetchone()[0]), int(conn.execute(population_sql).fetchone()[0])
+        )
     finally:
         conn.close()
 
 
-def gate_a_violations(atlas_db: Path) -> int:
+def gate_a_violations(atlas_db: Path) -> GateResult:
     """Count const_sink_arg candidates whose sink argument is a free_string source (must be 0)."""
-    return _count(atlas_db, _GATE_A_SQL)
+    return _count(atlas_db, _GATE_A_SQL, _GATE_A_POPULATION_SQL)
 
 
-def gate_b_violations(analysis_db: Path) -> int:
+def gate_b_violations(analysis_db: Path) -> GateResult:
     """Count binaries claiming ghidra_status='ok' with 0 functions (must be 0)."""
-    return _count(analysis_db, _GATE_B_SQL)
+    return _count(analysis_db, _GATE_B_SQL, _GATE_B_POPULATION_SQL)
 
 
-def gate_c_violations(atlas_db: Path) -> int:
+def gate_c_violations(atlas_db: Path) -> GateResult:
     """Count instances whose source_run_id names no registered run (must be 0).
 
     ★ This does not CLEAN anything, and it is not how the current leftovers get removed — a
@@ -122,20 +154,24 @@ def gate_c_violations(atlas_db: Path) -> int:
     Deliberately read-only, and deliberately not a write-side foreign key: the path that produced
     these rows — instances written before their run row — is already closed by the writer, which
     registers the run first. A constraint there would be risk spent on a route nothing takes."""
-    return _count(atlas_db, _GATE_C_SQL)
+    return _count(atlas_db, _GATE_C_SQL, _GATE_C_POPULATION_SQL)
 
 
-def gate_d_violations(analysis_db: Path) -> int:
+def gate_d_violations(analysis_db: Path) -> GateResult:
     """Count functions the shape scan admitted but neither scanned nor counted (must be 0).
 
     Re-derives the invariant by RUNNING the scan, so this measures what the code actually did
     rather than re-implementing the rule. ``scan`` raises when the invariant fails, which is the
-    same finding — reported as one violation rather than by reading the exception's prose."""
+    same finding — reported as one violation rather than by reading the exception's prose. The
+    population is what the SQL pre-filter admitted: with nothing admitted the equation is 0 = 0."""
     try:
         stats = scanner.scan(analysis_db).stats
     except ConfigError:
-        return 1
-    return stats.functions_scanned - stats.functions_with_callees - stats.callee_parse_failed
+        return GateResult(1, 0)
+    return GateResult(
+        stats.functions_scanned - stats.functions_with_callees - stats.callee_parse_failed,
+        stats.functions_scanned,
+    )
 
 
 # One run's const_sink_arg instances. Without the run condition this read every run of the atlas
@@ -190,18 +226,17 @@ def _function_text(
     return row[0] if row is not None and row[0] else None
 
 
-def gate_e_violations(
-    atlas_db: Path, analysis_db: Path, run_id: str | None = None
-) -> tuple[int, int]:
-    """(violations, unverifiable) of Gate E over one run's instances: ``run_id``, or the run that
-    registered ``analysis_db`` as its own. A database no run names is checked against every
-    instance, as it was before the run condition existed."""
+def gate_e_violations(atlas_db: Path, analysis_db: Path, run_id: str | None = None) -> GateResult:
+    """Gate E over one run's instances: ``run_id``, or the run that registered ``analysis_db`` as
+    its own. A database no run names is checked against every instance, as it was before the run
+    condition existed. ``scanned`` counts the markers actually judged — a row whose function text
+    is missing, or whose sink call that text does not show, is unverifiable instead."""
     from treasure_map.lib.hunt.downweight import _SHELL_RUN_SINKS, _sink_arg_is_literal
     from treasure_map.lib.pattern.sink_vocabulary import all_path_calls_literal, call_offsets
 
     atlas = ro_connect(atlas_db)
     analysis = ro_connect(analysis_db)
-    violations = unverifiable = 0
+    violations = unverifiable = checked = 0
     try:
         run = run_id if run_id is not None else _run_of_analysis(atlas, analysis_db)
         if run is None:
@@ -217,52 +252,88 @@ def gate_e_violations(
             if n == 0:
                 unverifiable += 1
             elif sink_class == "path_sink":
+                checked += 1
                 violations += not all_path_calls_literal(text, sink)
             elif sink in _SHELL_RUN_SINKS:
+                checked += 1
                 violations += not any(
                     _sink_arg_is_literal(text, sink, None, None, k) for k in range(n)
                 )
+            else:
+                unverifiable += 1  # a sink class this gate has no rule for
     finally:
         atlas.close()
         analysis.close()
-    return violations, unverifiable
+    return GateResult(violations, checked, unverifiable)
 
 
-def _check_real(atlas_db: Path | None, analysis_db: Path | None, run_id: str | None = None) -> int:
+def _report(letter: str, result: GateResult, bad: str, good: str, *, require: bool) -> int:
+    """Print one gate's line — with the population it judged — and return 1 when it failed.
+
+    An empty population is reported as its own failure, never as a pass with a note: a reader who
+    sees ✓ has been told the invariant holds, and a gate that judged nothing has not checked it."""
+    unverified = f", {result.unverifiable} unverifiable" if result.unverifiable else ""
+    counted = f"({result.scanned} rows scanned{unverified})"
+    if result.violations:
+        print(f"❌ Gate {letter}: {result.violations} {bad} {counted}")
+        return 1
+    if require and result.scanned == 0:
+        print(
+            f"❌ Gate {letter}: nothing to check — none of the rows it judges are in this "
+            f"database, so it would pass however wrong its rule is {counted}"
+        )
+        return 1
+    print(f"✓ Gate {letter}: {good} {counted}")
+    return 0
+
+
+def _check_real(
+    atlas_db: Path | None,
+    analysis_db: Path | None,
+    run_id: str | None = None,
+    *,
+    require_population: bool = False,
+) -> int:
     fail = 0
+    kw = {"require": require_population}
     if atlas_db is not None:
-        n = gate_a_violations(atlas_db)
-        if n:
-            print(f"❌ Gate A: {n} const_sink_arg candidate(s) with a free_string sink argument")
-            fail = 1
-        else:
-            print("✓ Gate A: no const_sink_arg / free_string contradiction")
-        n = gate_c_violations(atlas_db)
-        if n:
-            print(f"❌ Gate C: {n} instance(s) whose source_run_id names no registered run")
-            fail = 1
-        else:
-            print("✓ Gate C: every instance names a registered run")
+        fail |= _report(
+            "A",
+            gate_a_violations(atlas_db),
+            "const_sink_arg candidate(s) with a free_string sink argument",
+            "no const_sink_arg / free_string contradiction",
+            **kw,
+        )
+        fail |= _report(
+            "C",
+            gate_c_violations(atlas_db),
+            "instance(s) whose source_run_id names no registered run",
+            "every instance names a registered run",
+            **kw,
+        )
     if analysis_db is not None:
-        n = gate_b_violations(analysis_db)
-        if n:
-            print(f"❌ Gate B: {n} binary(ies) marked ghidra_status='ok' with 0 functions")
-            fail = 1
-        else:
-            print("✓ Gate B: every ghidra_status='ok' binary has functions")
-        n = gate_d_violations(analysis_db)
-        if n:
-            print(f"❌ Gate D: {n} function(s) with callees skipped by the shape scan")
-            fail = 1
-        else:
-            print("✓ Gate D: every function with callees was scanned or counted as a parse failure")
+        fail |= _report(
+            "B",
+            gate_b_violations(analysis_db),
+            "binary(ies) marked ghidra_status='ok' with 0 functions",
+            "every ghidra_status='ok' binary has functions",
+            **kw,
+        )
+        fail |= _report(
+            "D",
+            gate_d_violations(analysis_db),
+            "function(s) with callees skipped by the shape scan",
+            "every function with callees was scanned or counted as a parse failure",
+            **kw,
+        )
     if atlas_db is not None and analysis_db is not None:
-        n, unread = gate_e_violations(atlas_db, analysis_db, run_id)
-        if n:
-            print(f"❌ Gate E: {n} const_sink_arg marker(s) the function's own text contradicts")
-            fail = 1
-        else:
-            print(f"✓ Gate E: every checkable const_sink_arg holds ({unread} unverifiable)")
+        fail |= _report(
+            "E",
+            gate_e_violations(atlas_db, analysis_db, run_id),
+            "const_sink_arg marker(s) the function's own text contradicts",
+            "every checkable const_sink_arg holds",
+            **kw,
+        )
     return fail
 
 
@@ -399,14 +470,25 @@ def _self_test() -> int:
         bad_atlas, bad_analysis = _build_self_test_dbs(root, violating=True)
 
         checks = {
-            "clean Gate A == 0": gate_a_violations(clean_atlas) == 0,
-            "clean Gate B == 0": gate_b_violations(clean_analysis) == 0,
-            "clean Gate C == 0": gate_c_violations(clean_atlas) == 0,
-            "violating Gate A > 0": gate_a_violations(bad_atlas) > 0,
-            "violating Gate B > 0": gate_b_violations(bad_analysis) > 0,
-            "violating Gate C > 0": gate_c_violations(bad_atlas) > 0,
+            "clean Gate A == 0": gate_a_violations(clean_atlas).violations == 0,
+            "clean Gate B == 0": gate_b_violations(clean_analysis).violations == 0,
+            "clean Gate C == 0": gate_c_violations(clean_atlas).violations == 0,
+            "violating Gate A > 0": gate_a_violations(bad_atlas).violations > 0,
+            "violating Gate B > 0": gate_b_violations(bad_analysis).violations > 0,
+            "violating Gate C > 0": gate_c_violations(bad_atlas).violations > 0,
             "clean Gate E == 0": gate_e_violations(clean_atlas, clean_analysis)[0] == 0,
             "violating Gate E > 0": gate_e_violations(bad_atlas, bad_analysis)[0] > 0,
+            # A pass means nothing from a gate with nothing to judge, so the clean fixture has to
+            # give each of them rows. (Gate D is the arithmetic property below, not a query.)
+            "the clean fixture gives A / B / C / E rows to judge": all(
+                result.scanned > 0
+                for result in (
+                    gate_a_violations(clean_atlas),
+                    gate_b_violations(clean_analysis),
+                    gate_c_violations(clean_atlas),
+                    gate_e_violations(clean_atlas, clean_analysis),
+                )
+            ),
             # Gate E answers for ONE run. The seeded violation belongs to run_selftest, so asked
             # about any other run it reports nothing: another run's instances are not this run's
             # to answer for, and a scan is checked against the functions it produced.
@@ -461,6 +543,12 @@ def main(argv: list[str] | None = None) -> int:
         help="The run whose instances Gate E checks; read from the analysis path when omitted.",
     )
     parser.add_argument(
+        "--require-population",
+        action="store_true",
+        help="Fail a gate that judged 0 rows: on a database meant to exercise all of them, an "
+        "empty population is a hole in the database, not a pass.",
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Build synthetic clean + violating databases and assert the gates catch them (CI).",
@@ -471,7 +559,9 @@ def main(argv: list[str] | None = None) -> int:
         return _self_test()
     if args.atlas is None and args.analysis is None:
         parser.error("provide --atlas and/or --analysis, or --self-test")
-    return _check_real(args.atlas, args.analysis, args.run_id)
+    return _check_real(
+        args.atlas, args.analysis, args.run_id, require_population=args.require_population
+    )
 
 
 if __name__ == "__main__":

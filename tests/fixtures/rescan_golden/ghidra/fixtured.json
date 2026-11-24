@@ -62,6 +62,14 @@
       "pseudocode": "void report_status(char *param_1,int param_2)\n\n{\n  ulong uVar1;\n  char local_58 [72];\n  \n  uVar1 = fx_checksum((long)param_2,param_1,8);\n  sprintf(local_58,\"%s:%lu\",param_1,uVar1);\n  puts(local_58);\n  return;\n}\n"
     },
     {
+      "name": "fx_const_cmd",
+      "address": "00101300",
+      "size": 48,
+      "is_exported": 0,
+      "callees": ["system"],
+      "pseudocode": "void fx_const_cmd(void)\n\n{\n  system(\"/bin/echo fixture\");\n  return;\n}\n"
+    },
+    {
       "name": "FUN_00101000",
       "address": "00101000",
       "size": 27,

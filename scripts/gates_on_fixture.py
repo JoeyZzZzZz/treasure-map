@@ -47,7 +47,12 @@ def run(work: Path) -> int:
         )
         return 2
     result = json.loads(out.read_text(encoding="utf-8"))
-    print(f"gates on fixture: scanned and hunted the fixture (digest {result['digest'][:16]})")
+    # flushed: the checker below writes to the same stdout from its own process, and an unflushed
+    # line here lands after everything it printed.
+    print(
+        f"gates on fixture: scanned and hunted the fixture (digest {result['digest'][:16]})",
+        flush=True,
+    )
     gates = subprocess.run(  # noqa: S603 -- our own checker, fixed argv
         [
             sys.executable,
@@ -58,6 +63,10 @@ def run(work: Path) -> int:
             result["analysis"],
             "--run-id",
             result["run_id"],
+            # Every gate has to find rows of its own here. The fixture is the one database whose
+            # contents we choose, so "this gate judged nothing" is a hole in the fixture to fill,
+            # not a pass to collect — and it is how Gates A and E came to read 0 rows unnoticed.
+            "--require-population",
         ],
         check=False,
     )

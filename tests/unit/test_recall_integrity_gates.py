@@ -13,6 +13,7 @@ regressed in the field — a function with both a constant system("…") and a s
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -112,6 +113,26 @@ def test_help_text_does_not_miscount_the_gates() -> None:
         assert gate in help_text, gate
     # and the opening line's range names all of them (argparse rewraps, so compare on one line)
     assert "(Gates A-E)" in " ".join(help_text.split())
+
+
+def test_no_gate_on_the_fixture_judges_an_empty_population() -> None:
+    """All five gates have to find rows of their own in the fixture's output. A gate whose
+    population is 0 passes however wrong its rule is: with no const_sink_arg row in the fixture,
+    Gates A and E reported ✓ while the whole judgement was inverted — they were reading nothing.
+
+    MUTATION (verified RED): drop ``fx_const_cmd`` from tests/fixtures/rescan_golden/ghidra/
+    fixtured.json -> Gates A and E judge 0 rows -> the script exits 1 and the scanned counts below
+    are 0."""
+    result = subprocess.run(
+        [sys.executable, str(_ROOT / "scripts" / "gates_on_fixture.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    scanned = dict(re.findall(r"Gate ([A-E]):.*?\((\d+) rows scanned", result.stdout))
+    assert sorted(scanned) == ["A", "B", "C", "D", "E"], result.stdout
+    assert [g for g, n in scanned.items() if int(n) == 0] == [], result.stdout
 
 
 def _atlas_with_gate_a(path: Path, *, violating: bool) -> None:
@@ -245,11 +266,13 @@ def test_gate_e_reads_one_run_and_stays_quick_on_a_crowded_atlas(tmp_path: Path)
     atlas.close()
 
     start = time.monotonic()
-    violations, _ = cri.gate_e_violations(atlas_path, analysis)
+    mine = cri.gate_e_violations(atlas_path, analysis)
     elapsed = time.monotonic() - start
     # 'mine' holds no instance at all, and the 10,000 that would each contradict their function's
     # text belong to 'theirs'.
-    assert violations == 0
+    assert mine.violations == 0
+    assert mine.scanned == 0  # and it says so: nothing of this run's was there to judge
     assert elapsed < 5, f"Gate E took {elapsed:.1f}s over 10,000 foreign instances"
-    # asked about the run they do belong to, every one of them is a violation
-    assert cri.gate_e_violations(atlas_path, analysis, "theirs")[0] == 10_000
+    # asked about the run they do belong to, every one of them is judged, and violates
+    theirs = cri.gate_e_violations(atlas_path, analysis, "theirs")
+    assert (theirs.violations, theirs.scanned) == (10_000, 10_000)
