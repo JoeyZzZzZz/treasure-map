@@ -9,11 +9,11 @@
 ### Treasure Map draws the map; your agent finds the treasure.
 
 [![PyPI](https://img.shields.io/pypi/v/tmap-agents?style=flat-square&color=3775a9)](https://pypi.org/project/tmap-agents/)
+[![MCP registry](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fregistry.modelcontextprotocol.io%2Fv0%2Fservers%3Fsearch%3Dio.github.JoeyZzZzZz%2Ftreasure-map%26limit%3D1&query=%24.servers%5B0%5D.server.version&prefix=v&label=MCP%20registry&color=5c4ee5&style=flat-square)](https://registry.modelcontextprotocol.io/?q=io.github.JoeyZzZzZz%2Ftreasure-map)
 [![Python](https://img.shields.io/pypi/pyversions/tmap-agents?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/tmap-agents/)
-[![MCP server](https://img.shields.io/badge/MCP-server-5c4ee5?style=flat-square)](https://github.com/JoeyZzZzZz/treasure-map#connect-your-agent)
 [![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square)](https://github.com/JoeyZzZzZz/treasure-map/blob/main/LICENSE)
 
-[**Website**](https://tmap.tools/) · [**Showcase**](https://tmap.tools/showcase/) · [**Blog**](https://tmap.tools/blog/) · [**Quick start**](#quick-start)
+[**Quick start**](#quick-start) · [**Website**](https://tmap.tools/) · [**Showcase**](https://tmap.tools/showcase/) · [**Blog**](https://tmap.tools/blog/)
 
 </div>
 
