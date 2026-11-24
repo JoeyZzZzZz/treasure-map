@@ -5,6 +5,186 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-24
+
+This release registers the MCP server with the official MCP registry, so a client can install it
+by name, and carries a cycle of review, hunt and performance work. **No firmware is decompiled
+again**: the extraction pass is byte-identical to 0.2.0, so one `tmap rescan` reuses what is
+already on disk (see Upgrading from 0.2.0).
+
+### Highlights
+
+- **Installable from the MCP registry.** The server is published as
+  `io.github.JoeyZzZzZz/treasure-map`; a client that reads the registry runs `uvx tmap-agents
+  mcp`. `server.json` lives in the repository, and CI keeps it agreeing with the version, the
+  distribution name and the README marker the registry verifies ownership with.
+- **`tmap runs` covers diffs and deletes.** Every version diff is listed beside the scans,
+  grouped by run pair, and a run, a pair's diffs or one binary diff can be deleted from the atlas.
+- **A judgment says where it landed.** A `changed_real` cites the rows its change touched — also
+  for a function only one side of the pair has — and an alternative pairing between two entries is
+  read as an entry of its own rather than folded into one of them.
+- **More of the firmware reads as reachable, honestly.** A configuration getter that parses its
+  own input reads as a source and names the key it was asked for; a CGI placed in a served tree
+  reads as web-reachable, with the reading marked `inferred` and its basis given.
+- **An interrupt stops everything it started.** BinDiff runs in a killable process group,
+  `tmap review run` kills the agent it launched and leaves no working directory, and a hangup that
+  `nohup` ignored on purpose is left ignored — a closed terminal no longer ends a long scan.
+- **Less memory and less disk**: a page of candidates slices one reading of the run instead of
+  one per page, a diff keeps its run pair's facts once, and a scan deletes raw extractor output
+  once it is ingested.
+
+### Upgrading from 0.2.0
+
+- Run `tmap update`, then `tmap rescan`. **Nothing is extracted again** — the extraction pass and
+  both export hashes are unchanged, so the scan reuses every stored extraction and rebuilds only
+  the facts above it. `tmap runs` lists what the upgrade left out of date; `tmap rescan --dry-run`
+  lists what it would re-run.
+- Run `tmap diff --before A --after B` again for each pair you diffed: the diff code changed, so
+  a stored diff reads out of date until it is re-run.
+- Run `tmap init` again — the `tmap-diff-review` agent skill changed.
+- Restart your MCP client (or reconnect the `treasure-map` server) so it reads the current tool
+  descriptions.
+
+### Added
+
+MCP registry
+
+- `server.json` at the repository root, the `mcp-name` marker in the README (which becomes the
+  PyPI description the registry reads to verify ownership), and a `tmap-agents` console script
+  beside `tmap`, because a client told `runtimeHint: uvx` runs the command named after the
+  package. One CI gate holds all four together, and the release validates and publishes the
+  server after PyPI has the version.
+
+Runs and atlas housekeeping
+
+- `tmap runs` lists every version diff beside the scans, grouped by run pair with each pair's
+  current / stale / unverified / failed counts (`--diffs` shows every binary under its pair).
+- `--delete` removes the atlas records of a run, of a run pair's diffs, or of one binary diff.
+  Repeatable and applied atomically; firmware files and workspaces are never touched.
+- `tmap scan` asks before it overwrites a workspace that already holds a different firmware.
+
+Diff review
+
+- An alternative pairing between two entries of a pair is read as an entry of its own, and
+  alternative entries join their dispatch group.
+- A `changed_real` cites the rows its change landed on; the citation gate holds for a function
+  only one side has. Two fact-layer gaps are named instead of passing silently.
+- The findings hand-off carries open items, each with its basis, and `earlier_changed_real`.
+- `clear_overlay` states in the MCP server what it is about to clear.
+
+Hunt
+
+- A configuration-store getter that parses its own input reads as a weak source, and the key it
+  reports comes from its key argument only; a value-getter helper's own body reads it as a weak
+  source too.
+- A CGI placed in a served tree reads as web-reachable. The reading is marked `inferred`, and its
+  note, source and evidence say what it was inferred from.
+
+### Changed
+
+- A page of candidates slices one reading of the run, and at most two readings are kept at a time
+  (measured: 173 MB per reading on a large image).
+- A per-diff cache holds the whole run pair instead of 16 or 32 entries of it.
+- A scan deletes raw extractor output once it is ingested; the literal-span check is
+  binary-searched and the two keyed-call passes are merged into one.
+- The MCP server keeps the on-disk code hash for the process instead of re-reading it per tool
+  listing.
+- Internal names only: the modules, the hunt and the two diff stages are named after what they do
+  (alignment, dimension delta). No response field, stored value or stage label changed.
+- Retired code paths and read-layer helpers nothing reaches were removed.
+
+### Fixed
+
+- A hangup the parent ignored on purpose is left ignored: `nohup tmap scan … &` and a closed
+  terminal no longer turn into an interrupt that ends hours of Ghidra time with exit 129.
+- An interrupt kills the agent `tmap review run` launched, and the run leaves no working
+  directory behind.
+- BinDiff runs in a killable process group, so an interrupt stops a diff sweep at once instead of
+  after the current binary.
+- `tmap runs` prints one line per diff pair, with the pair's reasons on it once.
+- A word that two dispatch tables of different strides both read no longer costs the wider table
+  a column or a record.
+- A `dsh` profile whose header mentions `!!js` is read, and one `tmap` that cannot be read no
+  longer fails an uninstall.
+
+### 亮点
+
+- **可以从 MCP 官方 Registry 安装。** 服务器以 `io.github.JoeyZzZzZz/treasure-map` 发布；读
+  Registry 的客户端运行 `uvx tmap-agents mcp`。`server.json` 放在仓库里，CI 保证它与版本号、
+  发布包名、以及 Registry 用来验证归属的 README 标记始终一致。
+- **`tmap runs` 管得到对比，也能删。** 每个版本对比都与扫描并列列出、按 run 对分组；一个 run、
+  一对的全部对比、或单个二进制的对比都可以从 atlas 删掉。
+- **判断会说清落在哪。** `changed_real` 会引用它的改动落在哪些行上 —— 只有一侧有的函数也一样 ——
+  一对里两个条目之间的替代配对会作为独立条目来读，不再并进其中一个。
+- **更多固件代码被读成可达，且诚实。** 自己解析输入的配置读取函数会读成 source，并说出被问的是
+  哪个 key；放在对外目录树里的 CGI 读成 web 可达，该判读标为 `inferred` 并给出依据。
+- **中断会停掉它启动的一切。** BinDiff 跑在可被杀掉的进程组里，`tmap review run` 会杀掉它启动的
+  agent 且不留工作目录，而 `nohup` 故意忽略的挂断信号不再被夺回 —— 关掉终端不会再终止长扫描。
+- **更省内存和磁盘**：一页候选只切一份 run 读数（不再每页一份），一个对比只保留一份 run 对事实，
+  扫描在数据入库后删掉提取器的原始输出。
+
+### 从 0.2.0 升级
+
+- 运行 `tmap update`，然后 `tmap rescan`。**不会重新提取** —— 提取阶段和两个导出哈希都没变，所以
+  扫描会复用已存的提取结果，只重建它上面的事实层。`tmap runs` 列出升级后哪些已过期，
+  `tmap rescan --dry-run` 列出它将重跑哪些。
+- 对每一对比过的版本重新运行 `tmap diff --before A --after B`：对比代码变了，已存的对比在重跑前
+  读作过期。
+- 再运行一次 `tmap init` —— `tmap-diff-review` agent skill 有改动。
+- 重启 MCP 客户端（或重连 `treasure-map` 服务器），让它读到当前的工具说明。
+
+### 新增
+
+MCP Registry
+
+- 仓库根目录的 `server.json`、README 里的 `mcp-name` 标记（它会成为 PyPI 上的包描述，Registry
+  读它来验证归属），以及 `tmap` 之外新增的 `tmap-agents` 命令 —— 因为读到 `runtimeHint: uvx` 的
+  客户端会运行与包同名的命令。一道 CI 闸把这四处钉在一起，发版流程在 PyPI 拿到该版本之后才校验
+  并发布服务器条目。
+
+Run 与 atlas 管理
+
+- `tmap runs` 把每个版本对比与扫描并列列出，按 run 对分组，给出每对的 current / stale /
+  unverified / failed 计数（`--diffs` 展开每对下的每个二进制）。
+- `--delete` 删除一个 run、一对的全部对比、或单个二进制对比的 atlas 记录。可重复传入、原子生效；
+  固件文件和工作目录绝不触碰。
+- `tmap scan` 在覆盖一个已装着别的固件的工作目录前会先询问。
+
+对比评审
+
+- 一对里两个条目之间的替代配对会作为独立条目来读，替代条目会归入它所属的分发组。
+- `changed_real` 会引用改动落在哪些行上；只有一侧有的函数也受这道引用闸约束。两处事实层缺口会被
+  点名，而不是静默通过。
+- 发现交接件带上未决项（各自带依据）和 `earlier_changed_real`。
+- `clear_overlay` 在 MCP 服务器里说明它将要清掉什么。
+
+Hunt
+
+- 自己解析输入的配置读取函数读成弱 source，它报出的 key 只来自它的 key 实参；取值辅助函数自己的
+  函数体也把它读成弱 source。
+- 放在对外目录树里的 CGI 读成 web 可达。该判读标为 `inferred`，其 note、source 和 evidence 都说明
+  是据什么推断的。
+
+### 变更
+
+- 一页候选只切一份 run 读数，同时最多保留两份（实测：大镜像上每份 173 MB）。
+- 每个对比的缓存改为容纳整个 run 对，而不是其中 16 或 32 个条目。
+- 扫描在数据入库后删掉提取器的原始输出；字面量区间检查改为二分，两遍 keyed-call 合为一遍。
+- MCP 服务器把磁盘上的代码哈希按进程保留，不再每次列工具时重读。
+- 只改内部名字：各模块、hunt 和两个对比阶段都按它们做的事命名（alignment、dimension delta）。
+  没有任何响应字段、存储值或阶段标签改变。
+- 删掉了已退休的代码路径和读层里没人用的辅助函数。
+
+### 修复
+
+- 父进程故意忽略的挂断信号保持被忽略：`nohup tmap scan … &` 加上关闭终端，不再变成中断、把几个
+  小时的 Ghidra 时间以退出码 129 结束。
+- 中断会杀掉 `tmap review run` 启动的 agent，并且该次运行不留下工作目录。
+- BinDiff 跑在可被杀掉的进程组里，中断会立刻停下整轮对比，而不是等当前二进制跑完。
+- `tmap runs` 每个对比对只打一行，该对的原因在这一行上只说一次。
+- 两个不同步长的分发表都读到的某个词，不再让更宽的那张表损失一列或一条记录。
+- 头部出现 `!!js` 的 `dsh` 配置能被读取；某一个读不了的 `tmap` 不再让卸载失败。
+
 ## [0.2.0] - 2026-11-17
 
 This release reviews a whole version diff unit by unit and reads much more of each firmware image.
