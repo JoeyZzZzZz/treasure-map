@@ -674,7 +674,8 @@ CREATE TABLE IF NOT EXISTS diff_meta (
     -- skipped next full diff (incremental); an ok=0 binary is retried (self-healing for a flaky
     -- toolchain failure). A failed row carries NO coverage counts (there is no usable output).
     diff_ok                 INTEGER NOT NULL DEFAULT 0,  -- 1 = usable output (BinExport x2 + BinDiff
-                                             --   + layer0/2 all succeeded); 0 = this diff failed
+                                             --   + alignment and dimension delta all succeeded);
+                                             --   0 = this diff failed
     diff_status             TEXT,            -- tri-state outcome: ok / failed / NULL (pre-feature)
     diff_status_reason      TEXT,            -- WHY a failed diff failed: binexport_ghidra_crash /
                                              --   binexport_no_file / bindiff_flowgraph /

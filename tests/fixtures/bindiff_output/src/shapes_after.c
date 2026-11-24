@@ -11,7 +11,7 @@
  *   * functions whose body differs between the two variants (similarity below 1.0).
  *   * exported, individually distinguishable functions that do not change (high confidence).
  *
- * Build both variants with tests/fixtures/layer0/make_fixture.sh.
+ * Build both variants with tests/fixtures/bindiff_output/make_fixture.sh.
  */
 #include <stdlib.h>
 #include <string.h>

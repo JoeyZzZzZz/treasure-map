@@ -683,8 +683,10 @@ def _handoff_held(
     required=True,
     help=(
         "A preset (claude-code; experimental: codex, cursor) or a command template holding "
-        "{prompt} (also {mcp_config}, {workdir}, {atlas}, {unit_id}, {run_pair}). A template or "
-        "an experimental preset runs only after its probe passes."
+        "{prompt} (also {mcp_config}, {workdir}, {atlas}, {unit_id}, {run_pair}). {workdir} is a "
+        "temporary directory removed when the command exits — a template that writes anything "
+        "worth keeping must put it elsewhere. A template or an experimental preset runs only "
+        "after its probe passes."
     ),
 )
 @click.option("--probe", "probe_only", is_flag=True, help="Only check the agent's tool set.")
