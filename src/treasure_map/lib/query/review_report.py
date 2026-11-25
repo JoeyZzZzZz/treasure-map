@@ -1163,6 +1163,11 @@ def _presence_facts(
     runs = _fd.split_run_pair(atlas, run_pair)
     if runs is None:
         return None
+    # ``sqlite3.Error`` ONLY: a store this read cannot reach is what "unavailable" means, and the
+    # cell says exactly that. ``ValueError`` / ``KeyError`` used to be caught here too, which made
+    # a parse bug or a missing key in the presence reading indistinguishable from an unreadable
+    # atlas — a BUG rendered as a coverage note, which is the one direction this cell must not
+    # fail in. Those now raise, and a caller that wants them survivable has to say so.
     try:
         presence = (
             reads.presence(atlas, runs[0], runs[1])
@@ -1170,31 +1175,36 @@ def _presence_facts(
             else bp.find_presence(atlas, runs[0], runs[1])
         )
         found = presence.resolve(anchor)
-    except (sqlite3.Error, ValueError, KeyError):
+    except sqlite3.Error:
         return None
     if found is None:
         return None
     b, addr = found
     per_ref = b.function_facts(addr) if addr is not None else dict(b.facts_by_ref)
     classes: dict[str, int] = {}
-    cmd_sinks: list[dict[str, Any]] = []
-    cmd_candidates = 0
+    # One entry PER COMMAND CANDIDATE, keyed by the callee at its own callsite — never a flat list
+    # of the def-use records, which is what the gate's required set is NOT. A candidate whose
+    # callsite has no record is an entry with no records, so the cell still names its callee: the
+    # gate asks for every command candidate's callee (``characterization_gap``), and a callee the
+    # hand-off never prints is one the writer cannot restate.
+    cmd: dict[str, list[dict[str, Any]]] = {}
     for f in per_ref.values():
         cls = f.get("sink_class")
         classes[str(cls)] = classes.get(str(cls), 0) + 1
         if cls == bp.CMD_CLASS:
-            cmd_candidates += 1
-            cmd_sinks += [dict(r) for r in f.get("arg_provenance") or ()]
+            callee = str(f.get("sink_anchor") or "?")
+            cmd.setdefault(callee, []).extend(dict(r) for r in f.get("arg_provenance") or ())
     return {
         "side": b.tag,
         "functions": len(b.functions),
         "candidates": len(per_ref),
         "sink_classes": dict(sorted(classes.items())),
         "reachability": bp.reachability_of(per_ref),
-        "cmd_sinks": cmd_sinks,
-        # How many command candidates the subject holds, so the cell can say "none traced" apart
-        # from "holds none" without naming the sink class again here.
-        "cmd_candidates": cmd_candidates,
+        # callee -> its def-use records (possibly none). The KEYS are the set the gate
+        # requires. NOT spelled ``cmd_sinks``: that name belongs to what the WRITER supplies
+        # (a list of records, each naming its callee), and two shapes under one name is how a
+        # reader comes to believe this dict is the write shape.
+        "cmd_by_callee": {k: cmd[k] for k in sorted(cmd)},
         "scope": "function" if addr is not None else "binary",
     }
 
@@ -1215,27 +1225,31 @@ def _presence_fact_cells(facts: dict[str, Any]) -> list[str]:
     if reach["kinds"]:
         shape += f" ({', '.join(reach['kinds'])}, basis {reach['basis']})"
     shape += f" — {reach['note']}"
-    cmd = facts["cmd_sinks"]
+    cmd = facts["cmd_by_callee"]
     out = [
         _cell(_CHANGE, f"whole-binary {gone}: {scope}; by sink class: {spread}"),
         _cell(_SHAPE, shape),
     ]
     if cmd:
-        shown = [
-            f"{c.get('callee') or '?'}(arg {c.get('arg_kind') or 'not traced'}, source "
-            f"{c.get('source_kind') or 'unknown'})"
-            for c in cmd[:_CMD_SINKS_SHOWN]
-        ]
-        more = f" (+{len(cmd) - len(shown)} more)" if len(cmd) > len(shown) else ""
-        out.append(_cell("command sinks (tmap facts)", "; ".join(shown) + more))
-    elif facts["cmd_candidates"]:
-        out.append(
-            _cell(
-                "command sinks (tmap facts)",
-                "no def-use record for the anchored sink of any command candidate — not traced, "
-                "which is not a statement that the argument is constant",
-            )
-        )
+        # EVERY callee, always. The cap limits how many records ONE callee shows, never how many
+        # callees are named: a callee left out is one the gate requires and the hand-off never
+        # mentioned, which is the one thing this cell must not do.
+        parts = []
+        for callee, records in cmd.items():
+            if not records:
+                parts.append(
+                    f"{callee}(arg not traced — no def-use record at its own callsite, which is "
+                    "not a statement that the argument is constant)"
+                )
+                continue
+            shown = [
+                f"arg {r.get('arg_kind') or 'not traced'}, "
+                f"source {r.get('source_kind') or 'unknown'}"
+                for r in records[:_CMD_SINKS_SHOWN]
+            ]
+            more = f", +{len(records) - len(shown)} more" if len(records) > len(shown) else ""
+            parts.append(f"{callee}({'; '.join(shown)}{more})")
+        out.append(_cell("command sinks (tmap facts)", "; ".join(parts)))
     return out
 
 

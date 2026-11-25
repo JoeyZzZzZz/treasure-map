@@ -546,56 +546,88 @@ def function_subject_facts(b: PresentBinary, addr: str, refs: tuple[str, ...]) -
     }
 
 
-# ── the removal characterisation gate: what a changed_real on the signal class must state ─────
+# ── the one-sided characterisation gate: what a changed_real on the signal class must state ─────
 
 # The sink class the gate is about. A command-execution candidate is the one whose disappearance a
 # reader cannot settle with "the function is gone": what the removed code could run, and from what
 # argument, is the whole of what was lost.
 CMD_CLASS = "cmd"
-# The entry site kind the gate asks for. A WEAK reading (reachability_of): an edge of this kind
+# The entry site kinds the gate asks for: every kind the evidence layer RECORDS (lib/hunt
+# evidence, exec_edges) — a web endpoint naming the binary, a rootfs script calling it, another
+# binary exec'ing it. A WEAK reading either way (reachability_of): an edge of one of these kinds
 # REFERENCES the binary. It is not a claim that the entry is reachable without authenticating —
 # the gate asks the writer to state what was there, never to conclude what could be done with it.
-WEB_KIND = "web_endpoint"
+#
+# ★ Why the set and not ``web_endpoint`` alone, which is where this started: the web kind is the
+# one that can rest on INFERENCE (a CGI placed in a served tree, ``basis: inferred``), and the
+# other two are references in the record. Asking only for web therefore took in the WEAKEST
+# reading and left the stronger ones out — measured on two corpora: all 19 subjects the gate held
+# read ``(web_endpoint,) basis inferred``, while 5 one-sided functions holding a command candidate
+# read ``(exec_edge,) basis reference`` and were not held at all. Spelled as a SET rather than as
+# "any kind at all" so that a kind added later which is not an entry edge does not silently
+# qualify; a reading with no kind (``status: unknown``) is still out, which is the point — the gate
+# asks for a recorded edge, and ``unknown`` is a coverage gap, never "unreachable".
+ENTRY_SITE_KINDS: frozenset[str] = frozenset({"web_endpoint", "script_call", "exec_edge"})
 
 
 def characterization_applies(facts: dict[str, dict[str, Any]]) -> bool:
-    """Whether the removal characterisation gate holds a ``changed_real`` on the subject whose
-    candidates are ``facts``: it holds a command-execution candidate AND a web entry edge
-    references its binary.
+    """Whether the one-sided characterisation gate holds a ``changed_real`` on the subject whose
+    candidates are ``facts``: it holds a command-execution candidate AND a recorded entry edge
+    (``ENTRY_SITE_KINDS``) references its binary.
 
     ★ The ONE predicate — the report's ``presence_characterization_short``, which decides whether
     a stored judgement reads disposed, and anything that tells a writer what it still owes, read
     THIS. Two spellings of the question is how a write comes back saying it reads needs_recheck on
     a subject the report never holds, or the reverse (entry_citation_applies' ★).
 
+    ★ SIDE-BLIND, deliberately: it holds a binary only one run has, whichever run that is. A
+    command-execution entry that APPEARS is a new way in and is read the same way one that
+    disappears is; the facts the writer is asked for are the same facts either way. That is why
+    the key is ``one_sided_characterized`` and not ``removal_characterized`` — the earlier name
+    described half of what the predicate does, and every reader of it said "removed" while the
+    change line beside it said "added".
+
     Both halves are tmap's own recorded facts — a sink class and an entry edge — not a score, a
-    rank or a verdict. The gate asks the writer to STATE what the removed code held; it never asks
-    what could be done with it, and it never asks which free-input source fed it."""
+    rank or a verdict. The gate asks the writer to STATE what the one-sided code held; it never
+    asks what could be done with it, and it never asks which free-input source fed it."""
     if not any(f.get("sink_class") == CMD_CLASS for f in facts.values()):
         return False
     reach = reachability_of(facts)
-    return reach["status"] == "found" and WEB_KIND in reach["kinds"]
+    return reach["status"] == "found" and bool(set(reach["kinds"]) & ENTRY_SITE_KINDS)
 
 
 def characterization_gap(
     facts: dict[str, dict[str, Any]], verdict_basis: Any
 ) -> dict[str, Any] | None:
-    """How far a judgement's ``removal_characterized`` characterises the subject whose candidates
+    """How far a judgement's ``one_sided_characterized`` characterises the subject whose candidates
     are ``facts`` — None when it characterises it fully (the judgement counts as disposed).
 
-    Three questions, all three answered from the LIVE facts: the key is there and well formed; its
-    ``sink_classes`` names exactly the classes the subject's candidates carry (class NAMES as a
-    set — the counts are recorded, never gated, so a recount does not re-open a judgement); and
-    every command candidate's callee appears in ``cmd_sinks``. A command candidate whose own
-    callsite has no def-use record still has to be stated — "not traced" is the honest answer and
-    the writer gives it, rather than the candidate quietly having no row."""
+    Four questions, every one of them answered from the LIVE facts:
+
+    * the key is there and well formed;
+    * its ``sink_classes`` names exactly the classes the subject's candidates carry (class NAMES as
+      a set — the counts are recorded, never gated, so a recount does not re-open a judgement);
+    * its ``reachability`` states what ``reachability_of`` reads — ``status``, the ``kinds`` as a
+      set, and ``basis``;
+    * every command candidate's callee appears in ``cmd_sinks``. A command candidate whose own
+      callsite has no def-use record still has to be stated — "not traced" is the honest answer and
+      the writer gives it, rather than the candidate quietly having no row.
+
+    ★ The reachability question is COMPARED, not merely required to be present. A field that must
+    be given and is never checked is the worst of both: it reads as though the judgement engaged
+    with the entry reading while allowing the one answer that would be read as reassurance — a
+    stored "nothing reached it" on a web-referenced removal, disposed. The other two content
+    questions were always comparisons (a set of class names, a set of callees), and this one is
+    now consistent with them: the writer restates tmap's own reading and the gate holds it to it.
+    ``note`` is prose and is NOT compared; the three machine-readable parts are, and they are
+    exactly what the hand-off's ``reachable shape`` cell prints, so the writer can copy them."""
     vb = verdict_basis
     if isinstance(vb, str) or vb is None:
         try:
             vb = json.loads(vb) if vb else {}
         except (TypeError, ValueError):
             vb = {}
-    rc = vb.get("removal_characterized") if isinstance(vb, dict) else None
+    rc = vb.get("one_sided_characterized") if isinstance(vb, dict) else None
     want_classes = {str(f.get("sink_class")) for f in facts.values() if f.get("sink_class")}
     want_callees = sorted(
         {
@@ -604,15 +636,18 @@ def characterization_gap(
             if f.get("sink_class") == CMD_CLASS and f.get("sink_anchor")
         }
     )
+    want_reach = _gated_reachability(reachability_of(facts))
     if not isinstance(rc, dict):
         return {
-            "missing": "removal_characterized",
+            "missing": "one_sided_characterized",
             "required_sink_classes": sorted(want_classes),
+            "required_reachability": want_reach,
             "required_cmd_callees": want_callees,
             "why": (
-                "a whole-binary removal of a web-referenced binary holding a command-execution "
-                "candidate states what was removed: removal_characterized with sink_classes, "
-                "reachability and cmd_sinks"
+                "a one-sided binary that a recorded entry edge references and that holds a "
+                "command-execution candidate states what the code on that side held: "
+                "one_sided_characterized with sink_classes, reachability (tmap's own reading, "
+                "restated) and cmd_sinks"
             ),
         }
     got_classes = {str(k) for k in (rc.get("sink_classes") or {})}
@@ -623,14 +658,34 @@ def characterization_gap(
         else set()
     )
     missing_callees = [c for c in want_callees if c not in got_callees]
-    if got_classes == want_classes and not missing_callees:
+    got_reach = _gated_reachability(rc.get("reachability"))
+    if got_classes == want_classes and not missing_callees and got_reach == want_reach:
         return None
     return {
         "missing": "characterisation does not match the subject's candidates",
         "required_sink_classes": sorted(want_classes),
         "stated_sink_classes": sorted(got_classes),
+        "required_reachability": want_reach,
+        "stated_reachability": got_reach,
         "required_cmd_callees": want_callees,
         "missing_cmd_callees": missing_callees,
+    }
+
+
+def _gated_reachability(reach: Any) -> dict[str, Any]:
+    """The parts of an entry reading the gate compares, normalised so the two sides are comparable.
+
+    ``status``, the ``kinds`` as a sorted set and ``basis`` — the three machine-readable parts, and
+    exactly what the hand-off cell prints. ``note`` is left out on purpose: it is prose, it carries
+    the caveats (``unknown`` is a coverage gap, never "unreachable"), and holding a writer to its
+    wording would be holding them to a sentence rather than to a fact."""
+    r = reach if isinstance(reach, dict) else {}
+    status = r.get("status")
+    basis = r.get("basis")
+    return {
+        "status": str(status) if status is not None else None,
+        "kinds": sorted({str(k) for k in (r.get("kinds") or ()) if isinstance(k, str)}),
+        "basis": str(basis) if basis is not None else None,
     }
 
 

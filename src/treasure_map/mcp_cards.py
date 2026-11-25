@@ -893,7 +893,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "current view; Plain-text notes are kept but do not count) or change_inconclusive. "
             "rationale is required except for no_real_change (it defaults to why_unchanged). "
             "group_ref records a same-shape group the judgment leaned on; change_kind what a "
-            "changed_real does; removal_characterized what a removed binary held, when asked. "
+            "changed_real does; one_sided_characterized what a one-sided binary held, when asked. "
             "unit_id (a start_diff_review(run_pair) work unit) returns "
             "the next one, read at the session's k. One judgment per "
             "anchor: re-annotating OVERWRITES. Many entries at once: annotate_diff_batch."
@@ -912,7 +912,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "Record YOUR judgments on many entries of one diff at once — all of them or none. "
             "annotations is 1..200 objects with annotate_diff's per-entry fields and no diff_id: "
             "anchor_ref + verdict, optionally rationale, checked, why_unchanged, evidence, "
-            "group_ref, change_kind, removal_characterized. Only those nine keys. "
+            "group_ref, change_kind, one_sided_characterized. Only those nine keys. "
             "unit_id as in annotate_diff. Every item is "
             "validated first; if any fails nothing is written and the failures come back merged "
             "by message with their indexes. The same anchor_ref twice refuses the batch."
@@ -1191,8 +1191,8 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
         _SINGLE,
     ),
     _param(
-        "removal_characterized",
-        "what a removed binary held (sink_classes, reachability, cmd_sinks)",
+        "one_sided_characterized",
+        "what a one-sided binary held (sink_classes, reachability, cmd_sinks)",
         ("annotate_diff",),
         _SINGLE,
     ),

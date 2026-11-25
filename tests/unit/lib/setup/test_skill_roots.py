@@ -37,11 +37,12 @@ _V5138 = _FIXTURES / "legacy_diff_review_5138.md"
 _V6022 = _FIXTURES / "legacy_diff_review_6022.md"
 _V6362 = _FIXTURES / "legacy_diff_review_6362.md"
 _V6822 = _FIXTURES / "legacy_diff_review_6822.md"
+_V6956 = _FIXTURES / "legacy_diff_review_6956.md"
 _SRC = Path(__file__).parents[4] / "src"
 
 # The text this tmap ships. Changing it means adding this value to LEGACY_SHA256 and the new one
 # here.
-SHIPPED_SHA256 = "e0e986ba4995ee0caf659ca64f095032a743de18c3977e119df75ce92080b643"
+SHIPPED_SHA256 = "5b7d24046f2ce11a679403de2244c5639b5df5d81023b430de8bb73d81ce29d0"
 
 
 @pytest.fixture()
@@ -603,8 +604,8 @@ def test_a_directory_reached_through_a_link_stays_the_recorded_one(
 
 @pytest.mark.parametrize(
     "fixture",
-    [_V6822, _V6362, _V6022, _V5138, _V5107, _V4727, _V4658, _V3741, _V3387, _V3126],
-    ids=["6822", "6362", "6022", "5138", "5107", "4727", "4658", "3741", "3387", "3126"],
+    [_V6956, _V6822, _V6362, _V6022, _V5138, _V5107, _V4727, _V4658, _V3741, _V3387, _V3126],
+    ids=["6956", "6822", "6362", "6022", "5138", "5107", "4727", "4658", "3741", "3387", "3126"],
 )
 def test_a_text_shipped_since_the_ledger_is_replaced_without_a_record(
     tmp_path: Path, newer: bytes, fixture: Path
@@ -628,7 +629,7 @@ def test_the_shipped_text_is_pinned_and_not_an_earlier_one() -> None:
     now = hashlib.sha256(sk.shipped_bytes()).hexdigest()
     assert now == SHIPPED_SHA256
     assert now not in sk.LEGACY_SHA256
-    assert len(sk.LEGACY_SHA256) == 12
+    assert len(sk.LEGACY_SHA256) == 13
 
 
 def test_one_byte_changed_in_an_earlier_text_is_foreign(tmp_path: Path, newer: bytes) -> None:

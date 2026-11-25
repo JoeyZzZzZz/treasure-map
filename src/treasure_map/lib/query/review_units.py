@@ -37,17 +37,16 @@ binary holding a candidate is a must-read member (a binary holding none is one m
 anchor), handed out per binary in batches. Such a member is disposed only when its judgement, of
 whatever verdict, cites every candidate of its subject (``presence_citations_short``). Citing
 every candidate is satisfied by an EXISTENCE reading ("the binary is gone, so they are gone"), so
-on one narrow class of such a subject — a removed function that held a command-execution candidate
+on one narrow class of such a subject — a one-sided function that held a command-execution candidate
 whose binary a web entry edge references — a ``changed_real`` must also STATE what went with it
 (``presence_characterization_short``: the sink classes, the entry reading and each command sink's
-argument provenance, in ``verdict_basis.removal_characterized``). Facts, never a conclusion
+argument provenance, in ``verdict_basis.one_sided_characterized``). Facts, never a conclusion
 about impact; the other removals are not held to it, and their facts reach the hand-off either
 way. A ``changed_real`` on a must-read diff entry — function_pair or function_presence — is held
 to the same shape: it is disposed only when its ``checked`` / ``evidence`` cite every row of the
-entry
-that LANDED somewhere — every row whose ``landing`` is not ``persisted``, which is the rows the
-change is visible at — up to
-``MAX_CITED`` of them (``entry_citations_short``); an entry all of whose rows are ``persisted``
+entry that LANDED somewhere — every row whose ``landing`` is not ``persisted``, which is the rows
+the change is visible at — up to ``MAX_CITED`` of them (``entry_citations_short``); an entry all of
+whose rows are ``persisted``
 owes no citation (a function-level change lands on no candidate row, which is legitimate). Every
 candidate row of a must-read entry is read with it: its unit's material carries up to a page of
 its rows (an entry alone, or each entry of a batch or group), the rest read on by entry_id and
@@ -890,7 +889,7 @@ def presence_characterization_short(
 ) -> dict[str, dict[str, Any]]:
     """The disposed ``changed_real`` judgements on the SIGNAL class of one-sided subject — a
     command-execution candidate behind a web-referenced binary
-    (``binary_presence.characterization_applies``) — that do not say what the removed code held:
+    (``binary_presence.characterization_applies``) — that do not say what the one-sided code held:
     anchor -> what is missing (``binary_presence.characterization_gap``).
 
     Why this gate exists: on a whole-binary removal the existing gates are all satisfied by an
@@ -905,7 +904,20 @@ def presence_characterization_short(
     The gate asks for FACTS, not a conclusion: no impact judgement, no claim about an
     authentication boundary, and no free-input source class. The other removals (copy, path_sink,
     format, fmt_string) are not held to it; their facts reach the hand-off regardless, which does
-    not depend on this gate's reach."""
+    not depend on this gate's reach.
+
+    ★ ``changed_real`` ONLY — and said out loud because the gate beside it,
+    ``presence_citations_short``, holds EVERY verdict, so the difference must not look accidental.
+    What it means: a ``no_real_change`` or ``change_inconclusive`` on one of these subjects reads
+    disposed without being asked to characterise anything. For ``change_inconclusive`` that is
+    deliberate — it claims nothing settled, and demanding a structured characterisation of a
+    non-answer would reward filler — and its subject still reaches the hand-off's open items. For
+    ``no_real_change`` it is a GAP, not a decision: it is a positive claim about a subject that
+    demonstrably vanished, and nothing here or in the write path refuses it. It costs nothing
+    today (measured: all 117 removal-side judgements of the one pair holding any are
+    ``changed_real``, the 19 signal subjects included), and closing it would mean widening
+    ``no_real_change``'s basis whitelist to carry the key — which is a scope decision, not a
+    tidy-up, so it is written down here rather than quietly assumed away."""
     from treasure_map.lib.query import binary_presence as bp
 
     out: dict[str, dict[str, Any]] = {}
@@ -1663,7 +1675,7 @@ def report(
         f"presence citations short {len(presence_short)}; "
         f"entry citations short {len(entry_short)} "
         f"(landed rows uncited {sum(int(g['uncited']) for g in entry_short.values())}); "
-        f"removal characterisation short {len(char_short)}; "
+        f"one-sided characterisation short {len(char_short)}; "
         f"basis incomplete {basis_incomplete['count']}; "
         f"dangling {dangling['count']} (changed_real {dangling['changed_real']['count']}); "
         f"not listed {not_listed['count']}; "
@@ -1903,8 +1915,8 @@ def review_pair(
         progress.states[anchor] = NEEDS_RECHECK
     char_short = presence_characterization_short(atlas, facts, progress.states)
     for anchor in char_short:
-        # A whole-binary removal of a web-referenced command-execution entry that never says what
-        # the removed code held: read again, not disposed.
+        # A one-sided, entry-referenced command-execution subject that never says what the code
+        # on that side held: read again, not disposed.
         progress.states[anchor] = NEEDS_RECHECK
     audits = read_audits(atlas, facts, units)
     for anchor in audits.needs_recheck:

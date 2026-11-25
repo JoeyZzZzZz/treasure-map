@@ -1372,7 +1372,7 @@ def test_a_candidate_naming_no_function_address_is_judged_on_the_binarys_anchor(
     assert bp.required_citations(p, base) == (named,)
 
 
-# ── the removal characterisation: what a whole-binary removal must say it removed ─────────────
+# ── the one-sided characterisation: what a whole-binary removal must say it removed ─────────────
 #
 # The defect these cover: on a removal the existing gates are all satisfied by an EXISTENCE
 # reading ("the binary is gone, so its candidates are gone"), which cites every candidate and
@@ -1382,9 +1382,18 @@ def test_a_candidate_naming_no_function_address_is_judged_on_the_binarys_anchor(
 _WEB_SITE: dict[str, Any] = {"kind": "web_endpoint", "endpoint": "/cgi-bin/x", "method": "GET"}
 
 
-def _flow(*, web: bool = True) -> dict[str, Any]:
-    """One candidate's stored flow_evidence: a web entry site unless ``web`` is off."""
-    return {"entry_reach": {"sites": [dict(_WEB_SITE)] if web else []}}
+def _flow(
+    *, web: bool = True, kind: str = "web_endpoint", inferred: bool = False
+) -> dict[str, Any]:
+    """One candidate's stored flow_evidence: one entry site of ``kind`` unless ``web`` is off.
+
+    ``kind`` is any of the kinds the evidence layer records (web_endpoint / script_call /
+    exec_edge); ``inferred`` marks the site as resting on placement rather than on a reference,
+    which is the weakest reading and the only one the web kind can have."""
+    site = {**_WEB_SITE, "kind": kind}
+    if inferred:
+        site["basis"] = "inferred"
+    return {"entry_reach": {"sites": [site] if web else []}}
 
 
 def _record(
@@ -1551,18 +1560,18 @@ def test_the_gate_asks_for_every_class_and_every_command_callee(world: World) ->
     _sha7, fn_a, _fn_b = _two_functions(world)
     facts = _facts_of(world, fn_a)
     good = _characterize(world, fn_a)
-    assert bp.characterization_gap(facts, {"removal_characterized": good}) is None
+    assert bp.characterization_gap(facts, {"one_sided_characterized": good}) is None
     # A recount of the same classes is not a re-open: the NAMES are the gate.
     recount = {**good, "sink_classes": {"cmd": 99, "copy": 99}}
-    assert bp.characterization_gap(facts, {"removal_characterized": recount}) is None
+    assert bp.characterization_gap(facts, {"one_sided_characterized": recount}) is None
     missing_key = bp.characterization_gap(facts, {"evidence": ["r"]})
-    assert missing_key is not None and missing_key["missing"] == "removal_characterized"
+    assert missing_key is not None and missing_key["missing"] == "one_sided_characterized"
     assert missing_key["required_cmd_callees"] == ["popen"]
     short_class = {**good, "sink_classes": {"cmd": 1}}
-    gap = bp.characterization_gap(facts, {"removal_characterized": short_class})
+    gap = bp.characterization_gap(facts, {"one_sided_characterized": short_class})
     assert gap is not None and gap["required_sink_classes"] == ["cmd", "copy"]
     no_callee = {**good, "cmd_sinks": [{"callee": "execv"}]}
-    gap2 = bp.characterization_gap(facts, {"removal_characterized": no_callee})
+    gap2 = bp.characterization_gap(facts, {"one_sided_characterized": no_callee})
     assert gap2 is not None and gap2["missing_cmd_callees"] == ["popen"]
 
 
@@ -1580,17 +1589,17 @@ def test_a_command_candidate_with_no_def_use_record_must_still_be_stated(world: 
     anchor = f"{_anchor('a_only', 'web/untraced.cgi')}::00401000"
     facts = _facts_of(world, anchor)
     assert next(iter(facts.values()))["arg_provenance"] == []
-    gap = bp.characterization_gap(facts, {"removal_characterized": {}})
+    gap = bp.characterization_gap(facts, {"one_sided_characterized": {}})
     assert gap is not None and gap["required_cmd_callees"] == ["system"]
     stated = {
         "sink_classes": {"cmd": 1},
         "reachability": bp.reachability_of(facts),
         "cmd_sinks": [{"callee": "system", "arg_kind": None, "source_kind": "unknown"}],
     }
-    assert bp.characterization_gap(facts, {"removal_characterized": stated}) is None
+    assert bp.characterization_gap(facts, {"one_sided_characterized": stated}) is None
 
 
-def test_removal_characterized_is_taken_on_a_one_sided_subject_and_nowhere_else(
+def test_one_sided_characterized_is_taken_on_a_one_sided_subject_and_nowhere_else(
     world: World,
 ) -> None:
     """③ the write side. ``changed_real`` keeps its deliberately minimal basis everywhere except a
@@ -1598,9 +1607,9 @@ def test_removal_characterized_is_taken_on_a_one_sided_subject_and_nowhere_else(
     rationale cannot be checked. Before this, the key was refused on every anchor, so the gate
     below could never be satisfied by any write a writer could make: a dead-lock.
 
-    MUTATION (verified RED, 1 failed each): put removal_characterized back outside the allowed
+    MUTATION (verified RED, 1 failed each): put one_sided_characterized back outside the allowed
     set -> the presence write is refused -> RED; allow it on every anchor -> the function_pair
-    write is accepted -> RED; drop the ``out["removal_characterized"] = …`` line while leaving it
+    write is accepted -> RED; drop the ``out["one_sided_characterized"] = …`` line while leaving it
     past ``extra`` -> the write succeeds and the key is NOT stored -> RED (this is the failure the
     gate could never recover from: stored judgement, gate unsatisfiable)."""
     _sha7, fn_a, _fn_b = _two_functions(world)
@@ -1610,21 +1619,21 @@ def test_removal_characterized_is_taken_on_a_one_sided_subject_and_nowhere_else(
         anchor_ref=fn_a,
         verdict="changed_real",
         rationale="the whole binary is gone; this states what went with it",
-        verdict_basis={"evidence": [fn_a], "removal_characterized": rc},
+        verdict_basis={"evidence": [fn_a], "one_sided_characterized": rc},
         run_pair=PAIR,
     )
     stored = world.atlas.execute(
         "SELECT verdict_basis FROM overlay WHERE anchor_ref = ? AND anchor_kind = 'diff_subject'",
         (fn_a,),
     ).fetchone()[0]
-    assert json.loads(stored)["removal_characterized"]["cmd_sinks"] == rc["cmd_sinks"]
+    assert json.loads(stored)["one_sided_characterized"]["cmd_sinks"] == rc["cmd_sinks"]
     with pytest.raises(ConfigError, match="binary one run holds alone only"):
         overlay.annotate_diff(
             world.atlas,
             anchor_ref=f"{PAIR}#function_pair#libx:00401000",
             verdict="changed_real",
             rationale="an ordinary paired function",
-            verdict_basis={"evidence": ["r"], "removal_characterized": rc},
+            verdict_basis={"evidence": ["r"], "one_sided_characterized": rc},
             diff_id=DIFF,
         )
 
@@ -1647,13 +1656,13 @@ def test_a_malformed_characterisation_is_refused_at_the_write(world: World, bad:
 
     MUTATION (verified RED): accept any dict for the key -> every case is stored -> RED."""
     _sha7, fn_a, _fn_b = _two_functions(world)
-    with pytest.raises(ConfigError, match="removal_characterized"):
+    with pytest.raises(ConfigError, match="one_sided_characterized"):
         overlay.annotate_diff(
             world.atlas,
             anchor_ref=fn_a,
             verdict="changed_real",
             rationale="malformed",
-            verdict_basis={"removal_characterized": bad},
+            verdict_basis={"one_sided_characterized": bad},
             run_pair=PAIR,
         )
 
@@ -1741,7 +1750,7 @@ def test_an_existence_only_removal_of_the_signal_class_is_not_disposed(world: Wo
     assert rep.progress.states[fn_a] == NEEDS_RECHECK
     assert rep.progress.states[fn_b] != NEEDS_RECHECK
     assert rep.report["must_read_complete"] is False
-    assert "removal characterisation short 1" in rep.report["coverage_statement"]
+    assert "one-sided characterisation short 1" in rep.report["coverage_statement"]
 
 
 def test_stating_what_the_removal_removed_disposes_it_again(world: World) -> None:
@@ -1759,7 +1768,7 @@ def test_stating_what_the_removal_removed_disposes_it_again(world: World) -> Non
         rationale="the binary is a_only; this states the classes, the entry reading and the sink",
         verdict_basis={
             "evidence": [fn_a, *refs],
-            "removal_characterized": _characterize(world, fn_a),
+            "one_sided_characterized": _characterize(world, fn_a),
         },
         run_pair=PAIR,
     )
@@ -1800,8 +1809,8 @@ def test_the_write_tells_a_held_subject_what_it_still_owes(world: World) -> None
     assert bare["characterization"]["applies"] is True
     assert bare["characterization"]["states_it"] is False
     assert bare["characterization"]["owes"]["required_cmd_callees"] == ["popen"]
-    assert "removal_characterized" in bare["characterization_short"]
-    full = write(fn_a, removal_characterized=rc)
+    assert "one_sided_characterized" in bare["characterization_short"]
+    full = write(fn_a, one_sided_characterized=rc)
     assert full["characterization"]["states_it"] is True
     assert "characterization_short" not in full
     # A subject the gate does not hold is never told it owes a characterisation.
@@ -1813,7 +1822,7 @@ def test_a_batch_can_characterise_the_removals_it_covers(world: World) -> None:
     batch is how they are judged; without it the gate would be satisfiable only one subject at a
     time, which is the dead-lock again in a slower form.
 
-    MUTATION (verified RED, 1 failed each): drop removal_characterized from _BATCH_ITEM_KEYS ->
+    MUTATION (verified RED, 1 failed each): drop one_sided_characterized from _BATCH_ITEM_KEYS ->
     the item is refused as a stray key -> RED; leave it in the key set but out of
     _diff_verdict_basis -> it is accepted, silently dropped, and the subject stays short -> RED."""
     _sha7, fn_a, _fn_b = _two_functions(world)
@@ -1825,10 +1834,357 @@ def test_a_batch_can_characterise_the_removals_it_covers(world: World) -> None:
                 "verdict": "changed_real",
                 "rationale": "the binary is a_only; this states what went with it",
                 "evidence": [fn_a, *(bp.required_citations(_presence(world), fn_a) or ())],
-                "removal_characterized": _characterize(world, fn_a),
+                "one_sided_characterized": _characterize(world, fn_a),
             }
         ],
         run_pair=PAIR,
     )
     assert out.get("written") is True, out
     assert _review(world).report["presence_characterization_short"] == {}
+
+
+# ── the gate's fourth question: the entry reading is COMPARED, not just required ─────────────
+
+
+def _mixed_cmd(w: World) -> tuple[str, str]:
+    """A removed, web-referenced function holding TWO command candidates: ``popen`` with a def-use
+    record at its own callsite and ``system`` with none. The shape the gate and the hand-off have
+    to agree on, and the one no earlier fixture built."""
+    sha = "be" * 32
+    w.binary("a", "web/mixed.cgi", sha)
+    (traced,) = w.cand(
+        "a", "web/mixed.cgi", sha, "cmd", addr="00401000", sink="popen", flow=_flow()
+    )
+    _record(w, traced, "popen")
+    w.cand("a", "web/mixed.cgi", sha, "cmd", addr="00401000", sink="system", flow=_flow())
+    w.commit()
+    base = _anchor("a_only", "web/mixed.cgi")
+    return sha, f"{base}::00401000"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("status", "unknown"),
+        ("status", "no entry edge — unreachable"),
+        ("status", "blocked"),
+        ("kinds", []),
+        ("kinds", ["script_call"]),
+        ("kinds", ["web_endpoint", "exec_edge"]),
+        ("basis", "inferred"),
+        ("basis", None),
+    ],
+)
+def test_a_characterisation_whose_entry_reading_contradicts_the_facts_is_short(
+    world: World, field: str, value: Any
+) -> None:
+    """★ The gate COMPARES the entry reading; it does not merely require the field to be present.
+
+    A field that must be given and is never checked is the worst of both: it reads as though the
+    judgement engaged with the entry reading, while allowing the one answer a reader would take as
+    reassurance — a stored "nothing reached it" on a web-referenced removal, disposed. The other
+    two content questions were always comparisons; this one is now one of them.
+
+    MUTATION (verified RED, ``1 failed`` each): drop the reachability comparison from
+    ``characterization_gap`` -> every case here reads SATISFIED; compare ``note`` as well -> the
+    honest-writer case below goes short on prose.
+    """
+    _sha, fn, _fn_b = _two_functions(world)
+    facts = _facts_of(world, fn)
+    good = _characterize(world, fn)
+    assert bp.characterization_gap(facts, {"one_sided_characterized": good}) is None
+
+    wrong = {**good, "reachability": {**good["reachability"], field: value}}
+    gap = bp.characterization_gap(facts, {"one_sided_characterized": wrong})
+    assert gap is not None, (field, value)
+    assert gap["required_reachability"] == {
+        "status": "found",
+        "kinds": ["web_endpoint"],
+        "basis": "reference",
+    }
+    assert gap["stated_reachability"][field] == (sorted(value) if field == "kinds" else value)
+
+
+def test_the_entry_reading_is_compared_on_its_facts_not_on_its_prose(world: World) -> None:
+    # ``note`` carries the caveats ("unknown is a coverage gap, NOT unreachable"); holding a writer
+    # to its wording would hold them to a sentence. Three machine-readable parts, nothing else.
+    _sha, fn, _fn_b = _two_functions(world)
+    facts = _facts_of(world, fn)
+    good = _characterize(world, fn)
+    reworded = {
+        **good,
+        "reachability": {**good["reachability"], "note": "my own words about the entry edge"},
+    }
+    assert bp.characterization_gap(facts, {"one_sided_characterized": reworded}) is None
+    # and a reading given without kinds/basis at all is short, with both named back
+    bare = {**good, "reachability": {"status": "found"}}
+    gap = bp.characterization_gap(facts, {"one_sided_characterized": bare})
+    assert gap is not None
+    assert gap["required_reachability"]["kinds"] == ["web_endpoint"]
+    assert gap["stated_reachability"] == {"status": "found", "kinds": [], "basis": None}
+
+
+def test_the_missing_key_gap_names_the_entry_reading_it_owes(world: World) -> None:
+    _sha, fn, _fn_b = _two_functions(world)
+    facts = _facts_of(world, fn)
+    gap = bp.characterization_gap(facts, {"evidence": ["r"]})
+    assert gap is not None and gap["missing"] == "one_sided_characterized"
+    assert gap["required_reachability"] == {
+        "status": "found",
+        "kinds": ["web_endpoint"],
+        "basis": "reference",
+    }
+
+
+# ── the hand-off names EVERY command callee the gate requires ───────────────────────────────
+
+
+def test_an_untraced_command_candidate_is_still_named_in_the_handoff(world: World) -> None:
+    """★ The hand-off's command-sink cell is built per command CANDIDATE, not per def-use record.
+
+    Flattening the records drops a candidate whose own callsite has none — so on a MIXED subject
+    (one traced, one not) the gate would name a callee the hand-off never mentioned, and the writer
+    could not restate what it was being asked for. The "none traced" fallback did not cover this:
+    it only fired when EVERY command candidate was untraced.
+
+    MUTATION (verified RED, ``1 failed``): build the cell from a flat list of the records again ->
+    ``system`` is absent from the block while the gate requires it -> RED.
+    """
+    from treasure_map.lib.query import review_report as rr
+
+    _sha, fn = _mixed_cmd(world)
+    facts = _facts_of(world, fn)
+    required = bp.characterization_gap(facts, {"evidence": ["r"]})
+    assert required is not None
+    assert required["required_cmd_callees"] == ["popen", "system"]
+
+    block = rr.handoff_chunk(
+        world.atlas,
+        PAIR,
+        {
+            "anchor_ref": fn,
+            "subject_kind": "binary_presence",
+            "verdict": "changed_real",
+            "review_state": "concluded",
+        },
+    )
+    # every callee the gate requires is named, and the untraced one says so
+    assert "popen(arg stack_buf, source free_string)" in block
+    assert "system(arg not traced" in block
+    assert "no def-use record at its own callsite" in block
+    for callee in required["required_cmd_callees"]:
+        assert callee in block
+
+
+def test_the_record_cap_limits_records_per_callee_never_the_callees(world: World) -> None:
+    """The cap used to apply to the flattened list, so a subject with more records than the cap
+    lost whole callees — again the set the gate requires. It now caps one callee's records."""
+    from treasure_map.lib.query import review_report as rr
+
+    sha = "ce" * 32
+    world.binary("a", "web/many.cgi", sha)
+    callees = [f"exec_{i}" for i in range(rr._CMD_SINKS_SHOWN + 3)]
+    for callee in callees:
+        (ref,) = world.cand(
+            "a", "web/many.cgi", sha, "cmd", addr="00401000", sink=callee, flow=_flow()
+        )
+        _record(world, ref, callee)
+    world.commit()
+    fn = f"{_anchor('a_only', 'web/many.cgi')}::00401000"
+    facts = _facts_of(world, fn)
+    required = bp.characterization_gap(facts, {"evidence": ["r"]})
+    assert required is not None and sorted(required["required_cmd_callees"]) == sorted(callees)
+    block = rr.handoff_chunk(
+        world.atlas,
+        PAIR,
+        {
+            "anchor_ref": fn,
+            "subject_kind": "binary_presence",
+            "verdict": "changed_real",
+            "review_state": "concluded",
+        },
+    )
+    for callee in callees:
+        assert callee in block, callee
+
+
+def test_a_parse_bug_in_the_presence_read_is_not_rendered_as_a_coverage_note(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store this read cannot reach is "unavailable", and the cell says so. A ``KeyError`` or a
+    ``ValueError`` out of the presence read is a BUG, and rendering it as the same coverage note
+    would turn a defect into a sentence a reader takes for a known gap — the one direction this
+    cell must not fail in. An unreachable store still reads unavailable.
+
+    MUTATION (verified RED, ``1 failed`` each): widen the except back to
+    ``(sqlite3.Error, ValueError, KeyError)`` -> the first half passes silently -> RED; drop
+    ``sqlite3.Error`` from it -> the second half raises -> RED.
+    """
+    import sqlite3 as _sqlite3
+
+    from treasure_map.lib.query import binary_presence as _bp
+    from treasure_map.lib.query import review_report as rr
+
+    _sha, fn, _fn_b = _two_functions(world)
+    finding = {
+        "anchor_ref": fn,
+        "subject_kind": "binary_presence",
+        "verdict": "changed_real",
+        "review_state": "concluded",
+    }
+
+    def raise_key(*_a: Any, **_k: Any) -> Any:
+        raise KeyError("a bug in the presence read, not a coverage gap")
+
+    monkeypatch.setattr(_bp, "find_presence", raise_key)
+    with pytest.raises(KeyError):
+        rr.handoff_chunk(world.atlas, PAIR, finding)
+
+    def raise_db(*_a: Any, **_k: Any) -> Any:
+        raise _sqlite3.OperationalError("no such table: instance")
+
+    monkeypatch.setattr(_bp, "find_presence", raise_db)
+    block = rr.handoff_chunk(world.atlas, PAIR, finding)
+    assert "the pair's one-sided binaries cannot be read" in block
+
+
+# ── the gate's reach: every recorded entry kind, either side ────────────────────────────────
+
+
+def _one_sided_cmd(w: World, side: str, rel: str, sha: str, **flow: Any) -> str:
+    """A binary only ``side`` holds, with one command candidate whose entry reading is ``flow``."""
+    w.binary(side, rel, sha)
+    (ref,) = w.cand(side, rel, sha, "cmd", addr="00401000", sink="popen", flow=_flow(**flow))
+    _record(w, ref, "popen")
+    w.commit()
+    tag = "a_only" if side == "a" else "b_only"
+    return f"{_anchor(tag, rel)}::00401000"
+
+
+# Written OUT, never derived from ``bp.ENTRY_SITE_KINDS``: a parametrisation read off the constant
+# under test shrinks with it, so narrowing the constant would drop the very cases that should fail.
+# (The same self-reference triage's ``_CANONICAL_DIMENSION_NAMES`` is spelled by hand to avoid.)
+_RECORDED_ENTRY_KINDS = ("exec_edge", "script_call", "web_endpoint")
+
+
+def test_the_gate_names_every_recorded_entry_kind() -> None:
+    assert set(_RECORDED_ENTRY_KINDS) == set(bp.ENTRY_SITE_KINDS)
+
+
+@pytest.mark.parametrize("kind", _RECORDED_ENTRY_KINDS)
+def test_the_gate_holds_a_command_subject_behind_any_recorded_entry_kind(
+    world: World, kind: str
+) -> None:
+    """★ Every kind the evidence layer RECORDS, not the web one alone.
+
+    The web kind is the only one that can rest on inference (a CGI placed in a served tree), and
+    the other two are references in the record. Asking only for web therefore took in the WEAKEST
+    reading and left the stronger ones out — measured: all 19 subjects the gate held read
+    ``(web_endpoint,) basis inferred``, while 5 one-sided functions holding a command candidate
+    read ``(exec_edge,) basis reference`` and were not held at all.
+
+    MUTATION (verified RED, ``1 failed`` each): narrow ENTRY_SITE_KINDS back to ``web_endpoint``
+    -> the script_call and exec_edge cases fail; drop the intersection and test ``status ==
+    found`` alone -> the no-kind case in the next test passes and that one fails.
+    """
+    fn = _one_sided_cmd(world, "a", f"web/{kind}.cgi", "d1" * 32, kind=kind)
+    facts = _facts_of(world, fn)
+    assert bp.reachability_of(facts)["kinds"] == [kind]
+    assert bp.characterization_applies(facts)
+
+
+def test_a_subject_no_entry_edge_names_is_not_held(world: World) -> None:
+    # ``unknown`` is a coverage gap, never "unreachable" — which is exactly why the gate does not
+    # hold it: there is no recorded edge for the writer to state.
+    fn = _one_sided_cmd(world, "a", "lib/quiet.so", "d2" * 32, web=False)
+    facts = _facts_of(world, fn)
+    assert bp.reachability_of(facts)["status"] == "unknown"
+    assert not bp.characterization_applies(facts)
+
+
+def test_the_gate_holds_an_added_binary_the_same_way_it_holds_a_removed_one(world: World) -> None:
+    """★ SIDE-BLIND. A command-execution entry that APPEARS is a new way in, and the facts the
+    writer is asked for are the same facts. Measured: on one corpus every one-sided function
+    holding a command candidate was on the ADDED side, so a removal-only gate would have held
+    none of them.
+
+    MUTATION (verified RED, ``1 failed``): make characterization_applies require ``a_only`` ->
+    this fails. (And the key's name is ``one_sided_characterized`` for this reason: the earlier
+    ``removal_characterized`` described half of what the predicate does, while the change line
+    beside it said "added".)
+    """
+    added = _one_sided_cmd(world, "b", "web/new.cgi", "d3" * 32)
+    facts = _facts_of(world, added)
+    assert bp.characterization_applies(facts)
+    gap = bp.characterization_gap(facts, {"evidence": ["r"]})
+    assert gap is not None and gap["missing"] == "one_sided_characterized"
+    # and stating it disposes the added subject exactly as it does a removed one
+    assert (
+        bp.characterization_gap(facts, {"one_sided_characterized": _characterize(world, added)})
+        is None
+    )
+
+
+def test_the_added_sides_facts_cell_says_added_not_removed(world: World) -> None:
+    from treasure_map.lib.query import review_report as rr
+
+    added = _one_sided_cmd(world, "b", "web/new.cgi", "d4" * 32)
+    block = rr.handoff_chunk(
+        world.atlas,
+        PAIR,
+        {
+            "anchor_ref": added,
+            "subject_kind": "binary_presence",
+            "verdict": "changed_real",
+            "review_state": "concluded",
+        },
+    )
+    assert "whole-binary added" in block
+    assert "whole-binary removed" not in block
+
+
+def test_a_site_kind_that_is_not_an_entry_edge_does_not_qualify(world: World) -> None:
+    """The set is intersected, not merely tested for being non-empty. ``status: found`` means some
+    site was recorded, and a kind added later that is not an entry edge would make that true
+    without being a way in — so the gate names the kinds it means."""
+    fn = _one_sided_cmd(world, "a", "web/odd.cgi", "d5" * 32, kind="some_future_kind")
+    facts = _facts_of(world, fn)
+    reach = bp.reachability_of(facts)
+    assert reach["status"] == "found" and reach["kinds"] == ["some_future_kind"]
+    assert not bp.characterization_applies(facts)
+
+
+def test_the_report_holds_an_added_subject_too_not_only_a_removed_one(world: World) -> None:
+    """The gate's reach through the REPORT, on the added side.
+
+    ``characterization_applies`` takes only the subject's per-candidate facts, so it carries no
+    side at all — the side-blindness is structural, not a condition someone forgot. What could
+    still restrict it is the report's own loop, and this holds that open: an ADDED binary whose
+    command-execution candidate sits behind a recorded entry edge reads needs_recheck until it
+    says what appeared with it.
+
+    MUTATION (verified RED, ``1 failed``): skip b_only subjects in
+    ``presence_characterization_short`` -> this subject reads disposed and the test fails.
+    """
+    from treasure_map.lib.query.coverage import NEEDS_RECHECK
+
+    added = _one_sided_cmd(world, "b", "web/new.cgi", "d6" * 32)
+    refs = bp.required_citations(_presence(world), added) or ()
+    overlay.annotate_diff(
+        world.atlas,
+        anchor_ref=added,
+        verdict="changed_real",
+        rationale="this binary is new in the b run; these candidates did not exist before",
+        verdict_basis={"evidence": [added, *refs]},
+        run_pair=PAIR,
+    )
+    rep = _review(world)
+    assert added in rep.report["presence_characterization_short"]
+    assert rep.progress.states[added] == NEEDS_RECHECK
+    gap = rep.report["presence_characterization_short"][added]
+    assert gap["required_cmd_callees"] == ["popen"]
+    assert gap["required_reachability"] == {
+        "status": "found",
+        "kinds": ["web_endpoint"],
+        "basis": "reference",
+    }

@@ -571,7 +571,7 @@ _BATCH_ITEM_KEYS = frozenset(
         "change_kind",
         # Only a binary one run holds alone takes it (see annotate_diff); a batch may hold such
         # anchors, so re-judging the removals it covers does not have to go one at a time.
-        "removal_characterized",
+        "one_sided_characterized",
     }
 )
 
@@ -610,7 +610,7 @@ def _diff_verdict_basis(item: Mapping[str, Any]) -> dict[str, Any] | None:
     (only the keys that were given), or None when none were."""
     given = {
         k: item[k]
-        for k in ("checked", "why_unchanged", "evidence", "change_kind", "removal_characterized")
+        for k in ("checked", "why_unchanged", "evidence", "change_kind", "one_sided_characterized")
         if item.get(k) is not None
     }
     return given or None
@@ -6201,7 +6201,7 @@ def make_tools(
     ) -> dict[str, Any]:
         """A write's answer on a binary one run holds alone: how far it cites its subject's
         candidates (``citations``, the shape of the report's presence_citations_short), whether
-        the removal characterisation gate holds this subject and what it still owes
+        the one-sided characterisation gate holds this subject and what it still owes
         (``characterization``), and what a short one reads as.
 
         ★ Both gaps come from the SAME predicates the report reads
@@ -6240,11 +6240,13 @@ def make_tools(
         }
         if char is not None:
             out["characterization_short"] = (
-                "does not say what the removed code held: it reads needs_recheck (not disposed) "
-                "until judged again with verdict_basis.removal_characterized — sink_classes "
-                "(every class its candidates carry), reachability (the subject's entry reading) "
-                "and cmd_sinks (one record per command candidate, 'not traced' where no def-use "
-                "record exists). State the facts; no exploitability judgement is asked for."
+                "does not say what the one-sided code held: it reads needs_recheck (not disposed) "
+                "until judged again with verdict_basis.one_sided_characterized — sink_classes "
+                "(every class its candidates carry), reachability (tmap's own entry reading, "
+                "restated: status, kinds and basis, which are COMPARED) and cmd_sinks (one "
+                "record per command candidate, 'not traced' where no def-use record exists). "
+                "State the facts; no impact judgement is asked for. ``owes`` names each "
+                "required value beside what was stated."
             )
         return out
 
@@ -6394,7 +6396,7 @@ def make_tools(
         diff_id: str | None = None,
         run_pair: str | None = None,
         change_kind: list[str] | str | None = None,
-        removal_characterized: dict[str, Any] | None = None,
+        one_sided_characterized: dict[str, Any] | None = None,
         unit_id: str | None = None,
         worker: int | None = None,
         workers: int | None = None,
@@ -6423,13 +6425,18 @@ def make_tools(
         anchor_ref, citing those candidates (or, holding none, the anchor_ref itself).
 
         On ONE narrow class of such a subject a ``changed_real`` also states what the code that
-        went with the binary HELD, in ``removal_characterized``: a removed function that held a
-        command-execution candidate AND whose binary a web entry edge references. There, citing
-        every candidate is satisfied by "the binary is gone, so they are gone", and what was lost
-        never reaches the hand-off. The key takes ``sink_classes`` (every class the subject's
+        went with the binary HELD, in ``one_sided_characterized``: a function only one side holds
+        that held a command-execution candidate AND whose binary a recorded entry edge (a web
+        endpoint, a rootfs script call or an exec from another binary) references. On a removal,
+        citing every candidate is satisfied by "the binary is gone, so they are gone", and what
+        was lost never reaches the hand-off; on an addition the same facts describe a new way
+        in. The key takes ``sink_classes`` (every class the subject's
         candidates carry, class -> count; the NAMES are what is asked for, the counts are only
-        recorded), ``reachability`` (the subject's entry reading, as the facts give it) and
-        ``cmd_sinks`` (one record per command candidate: ``callee``, ``arg_kind``,
+        recorded), ``reachability`` (the subject's entry reading as TMAP reads it, restated:
+        ``status``, ``kinds`` and ``basis`` are compared against the live reading, so a
+        characterisation cannot say an entry edge was absent where one was recorded; ``note``
+        is prose and is not compared, and the hand-off's ``reachable shape`` cell prints all
+        three) and ``cmd_sinks`` (one record per command candidate: ``callee``, ``arg_kind``,
         ``source_kind`` — ``arg_kind`` null where no def-use record exists, which says not traced,
         not that the argument is constant). It is FACTS, not a conclusion: no impact judgement and
         no claim about an authentication boundary is asked for. The write's answer
@@ -6503,7 +6510,7 @@ def make_tools(
             "why_unchanged": why_unchanged,
             "evidence": evidence,
             "change_kind": change_kind,
-            "removal_characterized": removal_characterized,
+            "one_sided_characterized": one_sided_characterized,
         }
         given = {k: v for k, v in supplied.items() if v is not None}
         if (diff_id is None) == (run_pair is None):
@@ -6654,7 +6661,7 @@ def make_tools(
         ``diff_id``: ``anchor_ref`` +
         ``verdict``, optionally ``rationale`` (no_real_change defaults it to ``why_unchanged``),
         ``checked`` / ``why_unchanged`` (no_real_change), ``evidence`` (changed_real),
-        ``group_ref``. A one-sided binary's item may also carry ``removal_characterized``.
+        ``group_ref``. A one-sided binary's item may also carry ``one_sided_characterized``.
         Only those nine keys — a stray key fails that item, named.
 
         All or none: every item is validated first (``checked`` / ``evidence`` held to the same

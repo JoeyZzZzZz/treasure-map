@@ -864,7 +864,7 @@ RENAMES = (
 REPLACED = {
     "annotate_diff_batch": {
         "Only those seven keys — a stray key fails that item, named.": (
-            "an item takes change_kind and removal_characterized too now: nine keys"
+            "an item takes change_kind and one_sided_characterized too now: nine keys"
         ),
     },
     "get_function_alignment": {

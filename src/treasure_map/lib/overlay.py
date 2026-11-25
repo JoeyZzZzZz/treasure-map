@@ -407,12 +407,12 @@ def _validate_diff_verdict_basis(
     if verdict == "changed_real":
         if vb is None:
             return None
-        # ``removal_characterized`` is allowed on a binary one run holds alone and NOWHERE else,
+        # ``one_sided_characterized`` is allowed on a binary one run holds alone and NOWHERE else,
         # the way change_inconclusive's ``checked`` is. Everywhere else changed_real keeps its
         # deliberately minimal basis: what the change DOES goes in rationale. The one exception is
-        # the removal characterisation, which a gate reads — prose cannot be checked.
+        # the one-sided characterisation, which a gate reads — prose cannot be checked.
         presence = _presence_anchor(anchor_ref)
-        allowed = {"evidence", "change_kind"} | ({"removal_characterized"} if presence else set())
+        allowed = {"evidence", "change_kind"} | ({"one_sided_characterized"} if presence else set())
         extra = set(vb) - allowed
         if extra:
             raise ConfigError(
@@ -421,7 +421,7 @@ def _validate_diff_verdict_basis(
                 + (
                     ""
                     if presence
-                    else " (removal_characterized applies to a binary one run holds alone only)"
+                    else " (one_sided_characterized applies to a binary one run holds alone only)"
                 )
             )
         out: dict[str, Any] = {"kind": "changed_real"}
@@ -452,13 +452,13 @@ def _validate_diff_verdict_basis(
                     f"once; got {kinds!r}"
                 )
             out["change_kind"] = list(kinds)
-        rc = vb.get("removal_characterized")
+        rc = vb.get("one_sided_characterized")
         if rc is not None:
             # ★ Validated AND copied into ``out``. ``out`` is rebuilt from scratch here, so a key
             # merely let past ``extra`` above is dropped on the way to storage: the write would
             # succeed, the gate would never see the key, and the subject would sit in
             # needs_recheck for good with nothing a writer could do about it.
-            out["removal_characterized"] = _removal_characterized(rc)
+            out["one_sided_characterized"] = _one_sided_characterized(rc)
         if len(out) == 1:
             return None
         return json.dumps(out)
@@ -484,8 +484,8 @@ def _validate_diff_verdict_basis(
     return None
 
 
-def _removal_characterized(rc: Any) -> dict[str, Any]:
-    """``removal_characterized`` checked for shape and returned as it will be stored: what the
+def _one_sided_characterized(rc: Any) -> dict[str, Any]:
+    """``one_sided_characterized`` checked for shape and returned as it will be stored: what the
     removed (or added) code HELD, so that "the function is gone" is not the whole of a judgement.
 
     Shape only — whether it MATCHES the subject's own candidates is the gate's question
@@ -493,13 +493,13 @@ def _removal_characterized(rc: Any) -> dict[str, Any]:
     the match here too would be the same predicate spelled twice, and the two would drift."""
     if not isinstance(rc, dict):
         raise ConfigError(
-            "changed_real.removal_characterized must be an object with sink_classes, reachability "
-            "and cmd_sinks"
+            "changed_real.one_sided_characterized must be an object with sink_classes, "
+            "reachability and cmd_sinks"
         )
     missing = [k for k in ("sink_classes", "reachability", "cmd_sinks") if k not in rc]
     if missing:
         raise ConfigError(
-            f"changed_real.removal_characterized is missing {', '.join(missing)} — it takes "
+            f"changed_real.one_sided_characterized is missing {', '.join(missing)} — it takes "
             "sink_classes (class -> count), reachability (the subject's entry reading) and "
             "cmd_sinks (one record per command candidate)"
         )
@@ -510,19 +510,21 @@ def _removal_characterized(rc: Any) -> dict[str, Any]:
         and all(isinstance(k, str) and k.strip() and isinstance(v, int) for k, v in classes.items())
     ):
         raise ConfigError(
-            "changed_real.removal_characterized.sink_classes must name at least one sink class "
+            "changed_real.one_sided_characterized.sink_classes must name at least one sink class "
             "with an integer count"
         )
     reach = rc.get("reachability")
     if not isinstance(reach, dict) or not isinstance(reach.get("status"), str):
         raise ConfigError(
-            "changed_real.removal_characterized.reachability must be an object carrying the "
-            "subject's entry reading (at least a status)"
+            "changed_real.one_sided_characterized.reachability must be an object carrying the "
+            "subject's entry reading as tmap reads it — status, kinds and basis, which the gate "
+            "COMPARES against its own reading (the hand-off's 'reachable shape' cell prints all "
+            "three); at least a status is needed to store it at all"
         )
     sinks = rc.get("cmd_sinks")
     if not isinstance(sinks, list) or not all(isinstance(s, dict) for s in sinks):
         raise ConfigError(
-            "changed_real.removal_characterized.cmd_sinks must be a list of records, one per "
+            "changed_real.one_sided_characterized.cmd_sinks must be a list of records, one per "
             "command candidate (empty when the subject holds none)"
         )
     return {
