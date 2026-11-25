@@ -17,7 +17,7 @@ from typing import Any
 import click
 
 from treasure_map.cli.interrupts import InterruptGroup
-from treasure_map.lib.query import diff_skill
+from treasure_map.lib.query import diff_skill, scan_skill
 from treasure_map.lib.query.diff_skill import SKILL_DIRNAME
 
 
@@ -260,9 +260,27 @@ def report(
 @click.option(
     "--force", is_flag=True, help="With --install: replace a file there that is not tmap's."
 )
-def skill(install_dir: str | None, force: bool) -> None:
+@click.option(
+    "--scan",
+    "as_scan",
+    is_flag=True,
+    help="Print the SCAN review skill (one firmware's candidate map) instead of the diff one.",
+)
+def skill(install_dir: str | None, force: bool, as_scan: bool) -> None:
     """Print the agent skill for reviewing a run pair unit by unit, or write it into a skills
-    directory."""
+    directory. --scan prints the one-firmware scan profile's skill instead."""
+    if as_scan:
+        if install_dir is not None:
+            # Refused rather than written: the install ledger keeps ONE skill current this
+            # version (see lib/query/scan_skill), so recording this one would claim upkeep the
+            # installer does not do.
+            raise click.UsageError(
+                "--install carries the diff-review skill this version; print --scan and save it "
+                f"as <dir>/{scan_skill.SKILL_DIRNAME}/SKILL.md yourself (tmap init will not keep "
+                "it current)"
+            )
+        click.echo(scan_skill.skill_text(), nl=False)
+        return
     text = diff_skill.skill_text()
     if install_dir is None:
         click.echo(text, nl=False)
@@ -863,4 +881,164 @@ def run(
         # Every exit leaves nothing behind: the probe-only return, a failed probe, an
         # interrupt, and the SystemExit a failed unit raises. The directory holds the
         # generated mcp.json and the probe's marker file, nothing a later run reads.
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ── the scan profile ────────────────────────────────────────────────────────────────────────────
+# A second profile under the SAME command, because it answers the same question of a different
+# scope: which of these must be read, how far has the reading come, and what is still unread. It is
+# not a new command — `tmap review scan` — and it reuses the batch driver, the sharding and the
+# unit primitives; what it does not reuse is anything shaped like a run pair (see
+# lib/query/scan_review for which is which).
+
+
+def _open_run(atlas_db: str | None, run_id: str) -> tuple[sqlite3.Connection, str]:
+    """Open the atlas and check it holds ``run_id``."""
+    from treasure_map.cli.mcp_cli import _resolve_mcp_target
+    from treasure_map.lib.atlas.connection import open_atlas
+
+    atlas, _ = _resolve_mcp_target(atlas_db, None)
+    if not Path(atlas).is_file():
+        raise click.ClickException(f"no atlas at {atlas}: pass --atlas <path to atlas.db>")
+    conn = open_atlas(Path(atlas))
+    row = conn.execute("SELECT 1 FROM instance WHERE source_run_id = ? LIMIT 1", (run_id,))
+    if row.fetchone() is None:
+        conn.close()
+        raise click.ClickException(
+            f"run {run_id!r} has no candidate in this atlas (tmap list-runs for the run ids)"
+        )
+    return conn, str(atlas)
+
+
+@review.command(name="scan")
+@click.argument("run_id")
+@click.option(
+    "--agent",
+    "agent",
+    default=None,
+    help=(
+        "Run the batch driver with this agent instead of printing the declaration: a preset "
+        "(claude-code; experimental: codex, cursor) or a command template holding {prompt} (also "
+        "{mcp_config}, {workdir}, {atlas}, {unit_id}, {run_pair} — the run id, for a scan). "
+        "{workdir} is a temporary directory removed when the command exits."
+    ),
+)
+@click.option("--probe", "probe_only", is_flag=True, help="Only check the agent's tool set.")
+@click.option("--max-units", default=None, type=click.IntRange(1, None), help="Stop after N units.")
+@click.option("--max-minutes", default=None, type=float, help="Stop after M minutes.")
+@click.option(
+    "--timeout",
+    default=None,
+    type=click.IntRange(30, None),
+    help="Seconds one launch may take (default 900).",
+)
+@click.option(
+    "--retries",
+    default=None,
+    type=click.IntRange(0, 5),
+    help="Retries of a unit that did not judge every candidate (default 2).",
+)
+@click.option("--worker", default=None, type=click.IntRange(0, None), help="This shard's index.")
+@click.option("--workers", default=None, type=click.IntRange(1, None), help="How many shards.")
+@click.option(
+    "--until",
+    "until",
+    default="must_read",
+    show_default=True,
+    type=click.Choice(["must_read", "complete"]),
+    help="must_read: hand out tier 1 only, then stop and say how much of the second tier is "
+    "unread; complete: the second tier too, after it.",
+)
+@click.option("--atlas", "atlas_db", default=None, help="Atlas DB path.")
+def scan(
+    run_id: str,
+    agent: str | None,
+    probe_only: bool,
+    max_units: int | None,
+    max_minutes: float | None,
+    timeout: int | None,
+    retries: int | None,
+    worker: int | None,
+    workers: int | None,
+    until: str,
+    atlas_db: str | None,
+) -> None:
+    """One firmware scan's review: the four bands, the two tiers, the units they are handed out
+    in, and what is still unread.
+
+    Without --agent this prints the coverage declaration and nothing else (read-only). With it,
+    tmap runs the batch driver: one launch of your agent per unit, until none is left — the same
+    loop, retry policy and sharding as a run pair's review. Reading a candidate means calling
+    explain_candidate on it; a verdict written before that reads needs_recheck.
+    """
+    import shutil
+    import tempfile
+
+    from treasure_map.lib import review_driver as rd
+    from treasure_map.lib.query import scan_review as sr
+
+    if (worker is None) != (workers is None):
+        raise click.UsageError("--worker and --workers go together")
+    if worker is not None and workers is not None and worker >= workers:
+        raise click.UsageError(f"--worker must be below --workers ({workers})")
+    conn, atlas = _open_run(atlas_db, run_id)
+    try:
+        if agent is None:
+            review = sr.review_run(conn, run_id)
+            dec = sr.declaration(
+                review,
+                worker=worker,
+                workers=workers,
+                drive_with=f"tmap review scan {run_id} --agent <preset | template>",
+            )
+            click.echo(sr.declaration_text(dec))
+            return
+    finally:
+        conn.close()
+    try:
+        preset = rd.preset_or_template(agent)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    workdir = Path(tempfile.mkdtemp(prefix="tmap-scan-"))
+    try:
+        deadline = timeout or rd.DEFAULT_TIMEOUT
+        click.echo(f"probing {preset.name} ({preset.note or 'preset'}) …")
+        pr = rd.probe(preset, atlas_path=Path(atlas), workdir=workdir, timeout=min(deadline, 300))
+        click.echo(
+            f"probe: tmap reached {pr.tmap_reached}, built-in tools blocked {pr.builtin_blocked} — "
+            f"{pr.why}"
+        )
+        if not pr.ok:
+            raise click.ClickException("the probe failed: no unit is handed to this agent")
+        if probe_only:
+            return
+        result = rd.scan_drive(
+            Path(atlas),
+            run_id,
+            preset,
+            workdir=workdir,
+            worker=worker,
+            workers=workers,
+            max_units=max_units,
+            max_minutes=max_minutes,
+            timeout=deadline,
+            retries=rd.DEFAULT_RETRIES if retries is None else retries,
+            echo=click.echo,
+            until=until,
+        )
+        click.echo(
+            f"units tried {result.units_tried}, done {result.units_done}, failed "
+            f"{len(result.failed)} — {result.stopped}"
+        )
+        for f in result.failed:
+            click.echo(
+                f"  failed {f['unit_id']} ({f['kind']}): {f['written']}/{f['members']} written"
+            )
+        if result.statement:
+            click.echo(result.statement)
+        if result.offer is not None:
+            click.echo(sr.declaration_text(result.offer))
+        if result.failed:
+            raise SystemExit(3)
+    finally:
         shutil.rmtree(workdir, ignore_errors=True)

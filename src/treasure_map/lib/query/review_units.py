@@ -149,6 +149,12 @@ ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE, PAIRING = (
     "reduce",
     "pairing_component",
 )
+# One run's scan candidates, banded (lib/query/scan_review). A kind of the SCAN profile, which has
+# its own run-level container: a unit of this kind never comes out of ``review_pair``, so it never
+# enters a run pair's must-read set and the pair predicate (``PREDICATE_VERSION``) is untouched by
+# it. Deliberately NOT in ``_KIND_RANK``: the scan profile dispatches from its own order, so there
+# is no run-pair position for this kind to sort at and the default (0) is the honest answer.
+SCAN_BAND = "scan_band"
 # Where a unit of a kind sorts among the units at the same place: a group or a pairing component
 # first (its members read together), an audit after the unit its member came from.
 _KIND_RANK = {GROUP: -1, PAIRING: -1, AUDIT: 1}

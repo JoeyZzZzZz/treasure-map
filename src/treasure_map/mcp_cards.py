@@ -861,8 +861,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
         summary=(
             "Record YOUR OWN judgment on one candidate onto the overlay; the base map is "
             "unchanged. This is YOUR decision, not a tool fact. verdict: inconclusive, suspicious "
-            "(floats), excluded (sinks), safe (sinks; needs block_source + block_point + "
-            "block_why) or exploitable (floats above suspicious; chain + verification_gaps "
+            "(floats), excluded (sinks; must-read needs exclusion_why), safe (sinks) or "
+            "exploitable (floats above suspicious; chain + verification_gaps "
             "recommended). rationale: why + next step + confidence. Call it for a conclusion worth "
             "keeping past THIS session, not on every read. One annotation per candidate: "
             "re-annotating OVERWRITES."
@@ -1283,6 +1283,12 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             "shared_prereq",
         )
     ],
+    _param(
+        "exclusion_why",
+        "an excluded judgment's basis field: what stops the input reaching the sink",
+        ("annotate",),
+        _SINGLE,
+    ),
     _param(
         "sink_class",
         "a sink class",

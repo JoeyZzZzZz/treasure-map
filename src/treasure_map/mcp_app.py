@@ -56,7 +56,7 @@ from treasure_map.lib.config.config import Config, load_config
 from treasure_map.lib.diff.code_version import diff_code_version as _diff_code_version
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.notice import LEGAL_NOTICE
-from treasure_map.lib.overlay import _DIFF_VERDICTS
+from treasure_map.lib.overlay import _DIFF_VERDICTS, WriteContext
 from treasure_map.lib.overlay import annotate_diff as _annotate_diff
 from treasure_map.lib.overlay import clear_overlay as _clear_overlay
 from treasure_map.lib.overlay import list_overlays as _list_overlays
@@ -92,11 +92,13 @@ from treasure_map.lib.query import load_coverage_index as _load_coverage_index
 from treasure_map.lib.query import malformed_filter_refusal as _malformed_filter_refusal
 from treasure_map.lib.query import only_refusal as _only_refusal
 from treasure_map.lib.query import parse_impact_order as _parse_impact_order
+from treasure_map.lib.query import read_basis as _rb
 from treasure_map.lib.query import refs_in_ledger as _refs_in_ledger
 from treasure_map.lib.query import review_report as _rr
 from treasure_map.lib.query import review_units as _ru
 from treasure_map.lib.query import run_staleness as _run_staleness
 from treasure_map.lib.query import runs_where_function_exists as _runs_where_function_exists
+from treasure_map.lib.query import scan_review as _scan_review
 from treasure_map.lib.query import state_value_label as _state_value_label
 from treasure_map.lib.query import triage as _triage
 from treasure_map.lib.query import unknown_dimension_refusal as _unknown_dim_refusal
@@ -679,6 +681,12 @@ _PAGED_KINDS = (
     _ru.REDUCE,
     _ru.PRESENCE,
     _ru.PAIRING,
+    # A scan band unit holds up to BATCH_UNIT_MAX candidates, so its material pages like any other
+    # multi-member unit. Listed here BEFORE anything hands one out through this surface: a kind
+    # that is cut into members and is absent here reads as a one-subject unit, whose material is
+    # never cut and whose members are therefore never named as shown — which would make a
+    # delivery claim more than it showed.
+    _ru.SCAN_BAND,
 )
 # A diff write made before anything of its subject was read: what that reads as, on its answer.
 _JUDGED_UNREAD = (
@@ -5690,6 +5698,7 @@ def make_tools(
         block_source: str | None = None,
         block_point: str | None = None,
         block_why: str | None = None,
+        exclusion_why: str | None = None,
         chain: str | None = None,
         verification_gaps: list[str] | None = None,
         shared_prereq: str | None = None,
@@ -5704,7 +5713,13 @@ def make_tools(
         * ``inconclusive`` — you looked and nothing decisive could be established from what this
           tool can see. Put the next step in the rationale; the candidate stays where it was.
         * ``suspicious`` — worth digging into further. Floats up.
-        * ``excluded`` — noise, or not relevant. Sinks.
+        * ``excluded`` — noise, or not relevant. Sinks. On a candidate a scan review selected as
+          must-read (``tmap review scan``: its tier 1) it REQUIRES ``exclusion_why`` — what stops
+          the input from reaching this sink at all. The two dismissal verdicts move a candidate
+          out of the dangerous view by the same amount, so where somebody was told to read it, the
+          cheaper word is not the cheaper way out of it. Off a must-read set the old threshold
+          stands: the rationale alone, nothing structured, and an existing record is never
+          re-validated.
         * ``safe`` — you judged it cannot be reached or exploited. Sinks, and REQUIRES all three of
           ``block_source`` (what input you traced), ``block_point`` (where it is stopped — name the
           function/check), ``block_why`` (why that stop covers EVERY path in and cannot be worked
@@ -5742,6 +5757,7 @@ def make_tools(
             "block_source": block_source,
             "block_point": block_point,
             "block_why": block_why,
+            "exclusion_why": exclusion_why,
             "chain": chain,
             "verification_gaps": verification_gaps,
             "shared_prereq": shared_prereq,
@@ -5752,6 +5768,11 @@ def make_tools(
         atlas = open_atlas(atlas_path)
         try:
             ref = _resolve_ref(atlas, evidence_ref)
+            # What was read before this write, recorded with it: the scan review's read gate is
+            # read off the STORED basis, because the question it answers is what the writer had
+            # read when they wrote — a later session's log cannot answer that. The call shape is
+            # scan_review's, which deliberately passes no unit_id (see ``read_basis_of``).
+            read_basis = _scan_review.read_basis_of(_rb.session_lines(call_log), evidence_ref)
             try:
                 res = _upsert_overlay(
                     atlas,
@@ -5760,6 +5781,11 @@ def make_tools(
                     rationale=rationale,
                     attributed_to="agent-via-mcp",
                     verdict_basis=verdict_basis,
+                    must_read_subject=(
+                        verdict == "excluded"
+                        and _scan_review.must_read_candidate(atlas, evidence_ref)
+                    ),
+                    ctx=WriteContext(channel="mcp", read_basis=read_basis, session=_session_id()),
                 )
             except ConfigError as exc:
                 return {"written": False, "error": str(exc)}

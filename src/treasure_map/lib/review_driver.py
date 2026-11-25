@@ -39,11 +39,12 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from treasure_map.lib import tool_call_log as tcl
 from treasure_map.lib.query import review_report as _rr
 from treasure_map.lib.query import review_units as ru
+from treasure_map.lib.query import scan_review
 
 # How far a drive goes: the must-read units (the default), or every unit (the second tier too).
 UNTIL = ("must_read", "complete")
@@ -371,6 +372,46 @@ def members_written(atlas: sqlite3.Connection, u: ru.Unit, after: int) -> set[st
     return {m.anchor_ref for m in u.members} & got
 
 
+def anchors_written(atlas: sqlite3.Connection, u: ru.Unit, after: int) -> set[str]:
+    """The unit's members that overlay_history holds a judgement on, written after history row
+    ``after`` — found by ANCHOR, not by unit.
+
+    The scan write path (``annotate``) names no unit, by design: its read gate is per candidate, so
+    a unit id on the write would buy nothing and the unit-keyed reader would come back empty for
+    every scan launch, making a launch that judged the whole unit log as having written nothing."""
+    marks = ",".join("?" * len(u.members))
+    rows = atlas.execute(
+        "SELECT DISTINCT anchor_ref FROM overlay_history WHERE id > ? "  # noqa: S608
+        "AND event IN ('insert', 'update') "
+        f"AND anchor_kind = 'evidence_ref' AND anchor_ref IN ({marks})",
+        (after, *[m.anchor_ref for m in u.members]),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def scan_unit_prompt(run_id: str, u: ru.Unit) -> str:
+    """One scan unit's prompt: read every candidate, judge every candidate, then stop."""
+    bands = sorted({m.bucket or "-" for m in u.members})
+    refs = "\n".join(f"  {m.anchor_ref}" for m in u.members)
+    return (
+        f"You are reviewing ONE work unit of the firmware scan {run_id} with the tmap tools. "
+        "tmap draws no conclusion: the judgment is yours, and it records nothing for you. "
+        f"This unit holds {len(u.members)} candidate(s), band(s) {', '.join(bands)}:\n"
+        f"{refs}\n"
+        "1. Call explain_candidate(evidence_ref=...) on EVERY ref above, and whatever further fact "
+        "tools you need (get_pseudocode, get_sink_provenance, get_callees, get_strings). Reading "
+        "the whole function does NOT count as reading a candidate: the read gate is per "
+        "evidence_ref and only explain_candidate answers it. "
+        "2. Judge EVERY ref with annotate(evidence_ref=..., verdict=..., rationale=...): "
+        "inconclusive, suspicious, excluded (give exclusion_why: what stops the input reaching "
+        "the sink), safe (give block_source + block_point + block_why) or exploitable (give "
+        "chain + verification_gaps). A verdict written before its candidate was read with "
+        "explain_candidate reads needs_recheck and the unit comes back. "
+        "3. Then stop. Do not judge anything outside this unit; the unit comes back until all "
+        "its candidates are judged."
+    )
+
+
 @dataclass
 class ProbeResult:
     ok: bool
@@ -471,20 +512,139 @@ def _log(path: Path, line: dict[str, Any]) -> None:
     tcl.append(path, {"ts": time.time(), **line})
 
 
-def _owed_members(review: ru.PairReview, u: ru.Unit) -> set[str]:
-    """The anchors of ``u``'s members still owed in ``review`` (a fresh reading): a subject unit's
+@dataclass(frozen=True)
+class Driven:
+    """One fresh reading of a review, in the only terms the drive loop needs.
+
+    ★ The drive loop is ONE loop for both profiles on purpose. What it decides — hand out the next
+    undisposed unit in its shard, launch it again while each launch disposes a new member, spend a
+    retry only on a launch that disposes none, stop the whole run when the first unit writes
+    nothing — is policy, and policy written twice drifts. So the pair-shaped parts (two runs, the
+    k, the audits, the reduce) stay behind this reading and the loop never names them."""
+
+    units: list[ru.Unit]
+    states: dict[str, str]
+    statement: str
+
+    def unit(self, uid: str) -> ru.Unit | None:
+        return next((u for u in self.units if u.unit_id == uid), None)
+
+
+class Profile(Protocol):
+    """What a review profile gives the drive loop: its scope, how to read it, what one unit's
+    prompt says, which kinds are launched blind, and what a launch wrote."""
+
+    @property
+    def scope(self) -> str: ...
+
+    @property
+    def blind_kinds(self) -> tuple[str, ...]: ...
+
+    def read(self, atlas: sqlite3.Connection) -> Driven: ...
+
+    def prompt(self, u: ru.Unit) -> str: ...
+
+    def offer(self, atlas: sqlite3.Connection) -> dict[str, Any]: ...
+
+    def written(self, atlas: sqlite3.Connection, u: ru.Unit, after: int) -> set[str]: ...
+
+
+def _owed_members(driven: Driven, u: ru.Unit) -> set[str]:
+    """The anchors of ``u``'s members still owed in ``driven`` (a fresh reading): a subject unit's
     member whose state is not disposed (needs_recheck is not); an audit's or the reduce's member
     still in an open unit of that kind (they exist only while owed)."""
     if u.kind in (ru.AUDIT, ru.REDUCE):
-        open_now = {m.anchor_ref for v in review.units if v.kind == u.kind for m in v.members}
+        open_now = {m.anchor_ref for v in driven.units if v.kind == u.kind for m in v.members}
         return {m.anchor_ref for m in u.members} & open_now
-    states = review.progress.states
-    return {m.anchor_ref for m in u.members if not ru.disposed(states.get(m.anchor_ref))}
+    return {m.anchor_ref for m in u.members if not ru.disposed(driven.states.get(m.anchor_ref))}
 
 
-def _disposed_count(review: ru.PairReview, u: ru.Unit) -> int:
-    """How many of ``u``'s members ``review`` reads disposed (no longer owed)."""
-    return len(u.members) - len(_owed_members(review, u))
+def _disposed_count(driven: Driven, u: ru.Unit) -> int:
+    """How many of ``u``'s members ``driven`` reads disposed (no longer owed)."""
+    return len(u.members) - len(_owed_members(driven, u))
+
+
+@dataclass(frozen=True)
+class _PairProfile:
+    """The run-pair profile: the diff review as the drive loop reads it."""
+
+    run_a: str
+    run_b: str
+    k: int
+    staleness: dict[str, Any]
+    sweep: bool
+    worker: int | None
+    workers: int | None
+
+    @property
+    def scope(self) -> str:
+        return f"{self.run_a}::{self.run_b}"
+
+    blind_kinds: tuple[str, ...] = (ru.AUDIT,)
+
+    def _review(self, atlas: sqlite3.Connection) -> ru.PairReview:
+        return ru.review_pair(
+            atlas,
+            self.run_a,
+            self.run_b,
+            k=self.k,
+            pair_staleness=self.staleness,
+            server_commit=None,
+        )
+
+    def read(self, atlas: sqlite3.Connection) -> Driven:
+        review = self._review(atlas)
+        return Driven(
+            units=review.units,
+            states=review.progress.states,
+            statement=review.report["coverage_statement"],
+        )
+
+    def prompt(self, u: ru.Unit) -> str:
+        return unit_prompt(self.scope, u, self.k)
+
+    def offer(self, atlas: sqlite3.Connection) -> dict[str, Any]:
+        return ru.coverage_offer(
+            self._review(atlas), worker=self.worker, workers=self.workers, sweep=self.sweep
+        )
+
+    def written(self, atlas: sqlite3.Connection, u: ru.Unit, after: int) -> set[str]:
+        return members_written(atlas, u, after)
+
+
+@dataclass(frozen=True)
+class _ScanProfile:
+    """The scan profile: one run's banded candidates as the drive loop reads it.
+
+    Two differences from the pair, both of them in what the SCAN side records rather than in any
+    policy: nothing is launched blind (there are no audit units), and a write names no unit — the
+    scan write path is ``annotate``, which takes no ``unit_id`` — so what a launch wrote is read by
+    ANCHOR out of the history instead of by unit."""
+
+    run_id: str
+
+    @property
+    def scope(self) -> str:
+        return self.run_id
+
+    blind_kinds: tuple[str, ...] = ()
+
+    def read(self, atlas: sqlite3.Connection) -> Driven:
+        review = scan_review.review_run(atlas, self.run_id)
+        return Driven(
+            units=review.units,
+            states=review.states,
+            statement=scan_review.coverage_statement(scan_review.declaration(review)),
+        )
+
+    def prompt(self, u: ru.Unit) -> str:
+        return scan_unit_prompt(self.run_id, u)
+
+    def offer(self, atlas: sqlite3.Connection) -> dict[str, Any]:
+        return scan_review.declaration(scan_review.review_run(atlas, self.run_id))
+
+    def written(self, atlas: sqlite3.Connection, u: ru.Unit, after: int) -> set[str]:
+        return anchors_written(atlas, u, after)
 
 
 def drive(
@@ -510,18 +670,99 @@ def drive(
     again while each launch disposes a new member, and retried only on a launch that disposes
     none; see the module docstring. ``until`` = ``must_read`` (the default) hands out the
     must-read units only (and the reduce); ``complete`` the second tier too, after them."""
-    from treasure_map.lib.atlas.connection import open_atlas
-
     if until not in UNTIL:
         raise ValueError(f"until must be one of {list(UNTIL)}, got {until!r}")
     sweep = until == "complete"
-    run_pair = f"{run_a}::{run_b}"
+    return _drive(
+        _PairProfile(
+            run_a=run_a,
+            run_b=run_b,
+            k=k,
+            staleness=pair_staleness or {"source_stale": False, "source_stale_reason": None},
+            sweep=sweep,
+            worker=worker,
+            workers=workers,
+        ),
+        atlas_path,
+        preset,
+        workdir=workdir,
+        worker=worker,
+        workers=workers,
+        max_units=max_units,
+        max_minutes=max_minutes,
+        timeout=timeout,
+        retries=retries,
+        runner=runner,
+        echo=echo,
+        sweep=sweep,
+    )
+
+
+def scan_drive(
+    atlas_path: Path,
+    run_id: str,
+    preset: Preset,
+    *,
+    workdir: Path,
+    worker: int | None = None,
+    workers: int | None = None,
+    max_units: int | None = None,
+    max_minutes: float | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    retries: int = DEFAULT_RETRIES,
+    runner: Callable[..., Launch] = run_agent,
+    echo: Callable[[str], None] = print,
+    until: str = "must_read",
+) -> DriveResult:
+    """Hand one run's scan units out until none is left (or a limit is reached) — the same loop,
+    the same retry policy and the same sharding as the run pair's. ``until`` = ``must_read``
+    (the default) hands out tier 1 only; ``complete`` the second tier too, after it."""
+    if until not in UNTIL:
+        raise ValueError(f"until must be one of {list(UNTIL)}, got {until!r}")
+    return _drive(
+        _ScanProfile(run_id=run_id),
+        atlas_path,
+        preset,
+        workdir=workdir,
+        worker=worker,
+        workers=workers,
+        max_units=max_units,
+        max_minutes=max_minutes,
+        timeout=timeout,
+        retries=retries,
+        runner=runner,
+        echo=echo,
+        sweep=until == "complete",
+    )
+
+
+def _drive(
+    profile: Profile,
+    atlas_path: Path,
+    preset: Preset,
+    *,
+    workdir: Path,
+    worker: int | None,
+    workers: int | None,
+    max_units: int | None,
+    max_minutes: float | None,
+    timeout: float,
+    retries: int,
+    runner: Callable[..., Launch],
+    echo: Callable[[str], None],
+    sweep: bool,
+) -> DriveResult:
+    """THE drive loop, for every profile: hand out the next unit of the shard that is not disposed,
+    launch it again while each launch disposes a new member, spend a retry only on a launch that
+    disposes none, and stop the whole run if the very first unit writes nothing at all."""
+    from treasure_map.lib.atlas.connection import open_atlas
+
+    scope = profile.scope
     log_path = tcl.log_path_for(atlas_path).with_name(DRIVER_LOG)
     out = DriveResult()
     skip: set[str] = set()
     done_ids: set[str] = set()
     deadline = time.monotonic() + max_minutes * 60 if max_minutes else None
-    staleness = pair_staleness or {"source_stale": False, "source_stale_reason": None}
     while True:
         if max_units is not None and out.units_tried >= max_units:
             out.stopped = f"max_units {max_units} reached"
@@ -531,24 +772,22 @@ def drive(
             break
         atlas = open_atlas(atlas_path)
         try:
-            review = ru.review_pair(
-                atlas, run_a, run_b, k=k, pair_staleness=staleness, server_commit=None
-            )
+            driven = profile.read(atlas)
             nxt = next(
                 (
                     u
-                    for u in ru.dispatch_order(review.units, sweep=sweep)
+                    for u in ru.dispatch_order(driven.units, sweep=sweep)
                     if u.unit_id not in skip
                     and ru.in_shard(u.unit_id, worker, workers)
-                    and not ru.unit_disposed(u, review.progress.states)
+                    and not ru.unit_disposed(u, driven.states)
                 ),
                 None,
             )
-            out.statement = review.report["coverage_statement"]
+            out.statement = driven.statement
             if nxt is None:
                 out.stopped = "no unit left" if sweep else "no must-read unit left"
                 out.finished = True
-                out.offer = ru.coverage_offer(review, worker=worker, workers=workers, sweep=sweep)
+                out.offer = profile.offer(atlas)
                 break
             mark = history_mark(atlas)
         finally:
@@ -572,7 +811,7 @@ def drive(
         first_id = nxt.unit_id
         done = False
         written: set[str] = set()
-        before = _disposed_count(review, nxt)
+        before = _disposed_count(driven, nxt)
         attempt = fails = 0
         while True:
             if attempt and deadline is not None and time.monotonic() > deadline:
@@ -581,25 +820,23 @@ def drive(
                 out.stopped = f"max_minutes {max_minutes} reached"
                 break
             attempt += 1
-            prompt = unit_prompt(run_pair, nxt, k)
-            values = _values(preset, atlas_path, workdir, prompt, nxt.unit_id, run_pair)
-            argv = render(preset, values, blind=nxt.kind == ru.AUDIT)
+            prompt = profile.prompt(nxt)
+            values = _values(preset, atlas_path, workdir, prompt, nxt.unit_id, scope)
+            argv = render(preset, values, blind=nxt.kind in profile.blind_kinds)
             launch = runner(argv, cwd=workdir, timeout=timeout)
             atlas = open_atlas(atlas_path)
             try:
-                written = members_written(atlas, nxt, mark)
-                review = ru.review_pair(
-                    atlas, run_a, run_b, k=k, pair_staleness=staleness, server_commit=None
-                )
+                written = profile.written(atlas, nxt, mark)
+                driven = profile.read(atlas)
             finally:
                 atlas.close()
-            now = _disposed_count(review, nxt)
+            now = _disposed_count(driven, nxt)
             done = now == len(nxt.members)
             usage, no_usage = agent_usage(preset, launch)
             _log(
                 log_path,
                 {
-                    "run_pair": run_pair,
+                    "scope": scope,
                     "unit_id": nxt.unit_id,
                     "kind": nxt.kind,
                     "attempt": attempt,
@@ -624,10 +861,10 @@ def drive(
             if now > before:
                 # A new member disposed: the same unit again, no retry spent (the reduce keeps its
                 # id as its owed members shrink).
-                again = review.unit(nxt.unit_id)
+                again = driven.unit(nxt.unit_id)
                 if again is None:
                     break
-                nxt, before = again, _disposed_count(review, again)
+                nxt, before = again, _disposed_count(driven, again)
                 continue
             fails += 1
             if fails > retries:
@@ -640,7 +877,7 @@ def drive(
             "unit_id": nxt.unit_id,
             "kind": nxt.kind,
             "written": len(written),
-            "disposed": _disposed_count(review, nxt),
+            "disposed": _disposed_count(driven, nxt),
             "members": len(nxt.members),
         }
         if out.stopped is not None:

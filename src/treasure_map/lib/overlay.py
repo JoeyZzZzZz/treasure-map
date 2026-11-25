@@ -174,14 +174,22 @@ _CHAIN_ANCHOR = re.compile(
 _SAFE_FIELDS = ("block_source", "block_point", "block_why")
 
 
-def _validate_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | None:
+def _validate_verdict_basis(
+    verdict: str, vb: dict[str, Any] | None, *, must_read_subject: bool = False
+) -> str | None:
     """Check the justification a verdict must carry, and return it as JSON to store (or None).
 
-    Two verdicts make a claim strong enough to owe an explanation, and they owe different ones:
+    Three verdicts make a claim strong enough to owe an explanation, and they owe different ones:
 
     * ``safe`` REQUIRES all three parts. Saying a candidate is safe is the one judgement that takes
       it off the table, and a wrong one only comes back when the CODE changes — never because the
       judgement itself was wrong. So it has to name what is blocked, where, and why that holds.
+    * ``excluded`` requires ``exclusion_why`` on a MUST-READ subject (``must_read_subject``), and
+      takes it from any other. The two dismissal verdicts move a candidate out of the dangerous
+      view by the same amount, so where a subject was selected as one somebody has to read, the
+      cheaper word may not be the cheaper way out of it. Off a must-read set the old threshold
+      stands: a sentence of rationale, nothing structured, and an existing record is never
+      re-validated.
     * ``exploitable`` validates what it is GIVEN but does not yet require it. The shape is still
       being learned from real cases; making it mandatory before it has settled would push people
       into writing filler to satisfy a form.
@@ -237,10 +245,33 @@ def _validate_verdict_basis(verdict: str, vb: dict[str, Any] | None) -> str | No
             }
         )
 
+    if verdict == "excluded":
+        why = (vb or {}).get("exclusion_why")
+        if isinstance(why, str) and why.strip():
+            extra = sorted(set(vb or {}) - {"exclusion_why"})
+            if extra:
+                raise ConfigError(f"excluded takes exclusion_why alone; it was given {extra}")
+            return json.dumps({"kind": "excluded", "exclusion_why": why.strip()})
+        if must_read_subject:
+            raise ConfigError(
+                "excluded on a must-read candidate requires exclusion_why — say what stops the "
+                "input from reaching this sink at all. This subject was selected as one somebody "
+                "has to read, and excluded moves it out of the dangerous view exactly as safe "
+                "does, so it owes a reason of the same kind"
+            )
+        if vb is not None and "exclusion_why" in vb:
+            raise ConfigError(
+                "excluded.exclusion_why must be non-blank — say what stops the input from "
+                "reaching this sink"
+            )
+
     # Every other verdict carries no basis. Accepting one silently would store a justification
     # under a verdict nothing reads it for, so say so instead of dropping it.
     if vb is not None:
-        raise ConfigError(f"verdict_basis applies to safe / exploitable only, not {verdict!r}")
+        raise ConfigError(
+            f"verdict_basis applies to safe / exploitable only, not {verdict!r} "
+            "(excluded takes exclusion_why, and nothing else)"
+        )
     return None
 
 
@@ -847,6 +878,7 @@ def upsert_overlay(
     commit: bool = True,
     promoted_from: dict[str, Any] | None = None,
     ctx: WriteContext | None = None,
+    must_read_subject: bool = False,
 ) -> UpsertResult:
     """Write (or overwrite) the annotation for one ``evidence_ref`` — last write wins, one row per
     anchor. Rejects an unknown verdict, a blank rationale, or a fabricated attribution. Snapshots
@@ -854,14 +886,17 @@ def upsert_overlay(
     before a scan exists — reports ``basis_resolved=False``). Touches ONLY the overlay table.
 
     ``verdict_basis`` carries the structured justification the strong verdicts owe — required for
-    ``safe``, validated-if-given for ``exploitable``, refused for the rest. See
-    ``_validate_verdict_basis`` for what each shape must contain and for the honest limits of the
-    checking.
+    ``safe``, required for ``excluded`` when ``must_read_subject`` says this candidate is one of
+    those a review selected to be read, validated-if-given for ``exploitable``, refused for the
+    rest. See ``_validate_verdict_basis`` for what each shape must contain and for the honest
+    limits of the checking.
 
     ``promoted_from`` is passed by ``promote`` and by nothing else. Every other write stores NULL
     there, on an overwrite too: a judgement re-written by hand no longer came from the diff."""
     _check_candidate_verdict(verdict)
-    basis_json = _validate_verdict_basis(verdict, verdict_basis)
+    basis_json = _validate_verdict_basis(
+        verdict, verdict_basis, must_read_subject=must_read_subject
+    )
     _check_text_and_attribution(rationale, attributed_to)
     _refuse_degraded_anchor(atlas, evidence_ref)
     basis = capture_basis(atlas, evidence_ref)

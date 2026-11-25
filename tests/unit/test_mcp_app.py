@@ -1445,7 +1445,15 @@ def test_annotate_blind_write_warns_but_records(tmp_path: Path) -> None:
 def test_annotate_overwrites_in_place_with_echo(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
     tools["annotate"]("run_m#fn1@cmd", "suspicious", "first pass")
-    r = tools["annotate"]("run_m#fn1@cmd", "excluded", "on reflection, benign")
+    # ``exclusion_why`` because this candidate is one the scan profile reads as must-read, where
+    # excluded owes a reason (lib/overlay ``_validate_verdict_basis``). What this test is about is
+    # the overwrite and its echo, not that threshold — test_scan_review holds the threshold.
+    r = tools["annotate"](
+        "run_m#fn1@cmd",
+        "excluded",
+        "on reflection, benign",
+        exclusion_why="the sink argument is a .rodata literal; no request value reaches it",
+    )
     assert r["action"] == "updated" and r["overwrote"]["attributed_to"] == "agent-via-mcp"
     assert tools["list_overlays"]()["count"] == 1  # one row, last write wins
 
