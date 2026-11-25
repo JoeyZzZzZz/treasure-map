@@ -30,7 +30,11 @@ The four bands (every candidate is in exactly one):
 * ``unresolved`` — one of those sink families, not proven safe, with at least one dimension the
   analysis could not resolve. Not a weaker finding: an unread axis, which is why it is must-read.
 * ``tail`` — everything else: a proven-safe fact, or neither a dangerous source nor an unresolved
-  axis. Counted in the declaration, never handed out.
+  axis. In every corpus measured the band is EXACTLY the proven-safe set, and every member of it
+  still carries at least one unread axis — nothing reaches the tail by being plain, only by being
+  lifted out of the set by the demotion iron law. The second branch is kept because the predicate
+  admits it, not because anything has ever landed there. Counted in the declaration, never handed
+  out.
 
 ★ WHAT THIS IS NOT. This profile reads ONE run's candidates, which are the sinks of binaries that
 are PRESENT. A binary a version diff removed has no candidates on the side it is gone from, and
@@ -57,7 +61,6 @@ from typing import Any
 from treasure_map.lib.query import coverage as cov
 from treasure_map.lib.query import review_units as ru
 from treasure_map.lib.query.review_units import _chunks  # the shared unit-cutting primitive
-from treasure_map.lib.query.sink_impact import DEFAULT_SINK_IMPACT
 from treasure_map.lib.query.triage import (
     _UNRESOLVED_VALUES,
     TriageCandidate,
@@ -76,6 +79,9 @@ BANDS = (EXEC, WRITE, UNRESOLVED, TAIL)
 # and a logging call is not a write or an execution.
 EXEC_SINKS: frozenset[str] = frozenset({"cmd", "fmt_string", "path_sink"})
 WRITE_SINKS: frozenset[str] = frozenset({"copy", "format"})
+# The two families together: what a DANGEROUS-SOURCE candidate is banded by. The unresolved
+# band asks nothing about the class (see ``band``), so this is not "the classes the profile
+# knows" — it is the classes a dangerous source can be banded at.
 BANDED_SINKS: frozenset[str] = EXEC_SINKS | WRITE_SINKS
 
 # The source kinds that leave an analyzer-marked parameter unconstrained: a free string, or a
@@ -125,13 +131,17 @@ def has_unresolved_dimension(c: TriageCandidate) -> bool:
 def band(c: TriageCandidate) -> str:
     """Which band ``c`` is in (one of ``BANDS``).
 
-    ★ An UNRECOGNISED sink_class reads ``unresolved``, not ``tail``. ``sink_class`` is an open
-    value set — ``sink_impact`` states that an unmapped class is still ranked and never silently
-    dropped — so a class a future extractor emits must not fall out of the must-read set on its
-    way in. It lands in the weakest must-read band rather than in a band whose question it has not
-    been shown to answer. Every class in every corpus measured is one of the five named above, so
-    this branch changes no band count that exists today; it is what stops the next one from
-    disappearing.
+    ★ The ``unresolved`` band asks NOTHING about the sink class. Not proven safe, and an axis the
+    analysis could not read: that is must-read whatever the sink is. This started out testing the
+    class — the five banded ones, plus any class the impact map does not know — and the test was
+    both unnecessary and subtly wrong. Unnecessary because ``sink_class`` is an open value set
+    (``sink_impact`` states that an unmapped class is still ranked and never silently dropped), so
+    a class a future extractor emits must not fall out of the must-read set on its way in. Wrong
+    because it protected the classes the map does NOT know while letting a class it DOES know and
+    that no band claims (``log``) fall through to the tail — the one shape with no protection was
+    the one that had been thought about. Dropping the test removes the asymmetry and costs nothing
+    measured: a census of the whole library, 288,224 candidates over 13 runs, holds exactly the
+    five banded classes and no ``log`` candidate at all.
     """
     sink_class = (c.sink_class or "").lower()
     safe = _is_proven_safe(c)
@@ -140,8 +150,7 @@ def band(c: TriageCandidate) -> str:
     if sink_class in WRITE_SINKS and not safe and dangerous_source(c):
         return WRITE
     if not safe and has_unresolved_dimension(c):
-        if sink_class in BANDED_SINKS or sink_class not in DEFAULT_SINK_IMPACT:
-            return UNRESOLVED
+        return UNRESOLVED
     return TAIL
 
 
@@ -331,11 +340,18 @@ def read_basis_of(lines: list[dict[str, Any]] | None, evidence_ref: str) -> dict
 def must_read_candidate(atlas: sqlite3.Connection, evidence_ref: str) -> bool:
     """Whether ``evidence_ref`` is a candidate the scan profile selects as must-read (tier 1).
 
-    Read at WRITE time, by the one caller that needs it: the dismissal threshold a write is held
-    to. The run is resolved from the candidate's own instance row, and the banding then comes off
-    the run's ``triage`` reading, which is cached per run — so the first write of a session pays
-    for the reading the session's first ``list_candidates`` would have paid for anyway, and the
-    rest pay nothing. A ref no instance names is not must-read: there is no candidate to band.
+    Read at WRITE time, by the writers that need it: the dismissal threshold a write is held to.
+    The run is resolved from the candidate's own instance row, and the banding then comes off the
+    run's ``triage`` reading.
+
+    COST, stated honestly: that reading is cached per process and per run, so the FIRST such write
+    in a process pays for it and the rest pay nothing (measured: 5.5s cold, 2ms warm on a
+    30,000-candidate run). A scan review's own loop does not call ``list_candidates`` — it calls
+    ``explain_candidate`` and the fact tools — so nothing warms the cache for it, and under the
+    batch driver each launch is its own process: one cold reading per launch that dismisses
+    something. Called only for ``excluded``, so no other verdict pays it.
+
+    A ref no instance names is not must-read: there is no candidate to band.
     """
     from treasure_map.lib.query.triage import triage  # noqa: PLC0415
 
@@ -395,13 +411,22 @@ def scan_states(
       write never uses; reading it through the shared predicate is what keeps the two profiles
       from drifting the next time it changes, and the reduction is pinned by a test.
 
-    ★ And the third state, which is NOT a disposition: a write made by a server that kept no
-    tool-call log records basis ``unknown`` (``review_units.NO_SESSION_LOG``). ``held_unread`` is
-    false for it — correctly, since nothing says the subject was unread — so the write disposes
-    its member. That is the right call and a silent one: a whole run judged by such a server would
-    read fully disposed with the read gate never having fired once. These members are returned
-    separately so the declaration can state how much of its own disposed count rests on a gate it
-    could not apply.
+    ★ And the third state, which is NOT a disposition: a judgement whose read gate cannot be
+    evaluated AT ALL. ``held_unread`` is false for it — correctly, since nothing says the subject
+    was unread — so the write disposes its member. That is the right call and a silent one: a whole
+    run judged this way would read fully disposed with the read gate never having fired once. These
+    members are returned separately so the declaration can state how much of its own disposed count
+    rests on a gate it could not apply.
+
+    TWO ways it happens, and the second is the whole of the stock today:
+
+    * a server that kept no tool-call log records basis ``unknown``
+      (``review_units.NO_SESSION_LOG``);
+    * the write recorded NO basis — the history row's column is null, or there is no history row
+      for the anchor at all. Every candidate judgement in the live atlas is of this shape (its
+      history holds diff subjects only), and so is every write made by a path that passes no
+      ``WriteContext``. Counting only the first kind therefore counted the rarer one and let the
+      common one through, which is the failure this ★ exists to prevent.
     """
     index = cov.load_coverage_index(atlas)
     writes = _latest_write_bases(atlas, run_id)
@@ -414,10 +439,14 @@ def scan_states(
                 continue
             state = index.state_for(ref)
             last = writes.get(ref)
-            if state != cov.UNSEEN and last is not None:
-                if ru.held_unread(last["verdict"], last["read_basis"]):
+            if state != cov.UNSEEN:
+                basis = (last or {}).get("read_basis") or {}
+                if last is not None and ru.held_unread(last["verdict"], basis):
                     state = cov.NEEDS_RECHECK
-                elif last["read_basis"].get("why") == ru.NO_SESSION_LOG:
+                elif not basis or basis.get("why") == ru.NO_SESSION_LOG:
+                    # No basis recorded at all (no history row, or a null column), or one that
+                    # says the writing server kept no log: either way the gate has nothing to
+                    # apply, and saying so is the only honest thing left.
                     unverifiable.append(ref)
             states[ref] = state
     return states, tuple(unverifiable)
@@ -485,6 +514,31 @@ SECOND_TIER_GROUP_KEY = ("sink_class", "source_kind", "binary")
 # number of groups and the total number of members are always stated, printed or not.
 GROUPS_SHOWN = 20
 
+# The keys of a declaration that are the WHOLE RUN's even when the scope is one shard — named,
+# the way ``coverage_offer`` names ``PAIR_WIDE_OFFER_KEYS`` and ``progress_block`` names
+# ``PROGRESS_PAIR_WIDE_KEYS``, because a reader cannot tell by looking.
+#
+# ★ Why this is not cosmetic: a shard's declaration states the whole run's four band counts, its
+# tail and its second-tier group distribution beside its OWN tier counts. Printed under a "shard
+# scope" heading those read as the shard's, and at ``--workers 64`` they contradict it outright —
+# the largest second-tier group (370 on one corpus) is twice that shard's entire second tier. The
+# skill tells the agent to quote these numbers verbatim, so four workers would each report the
+# same run-wide counts as theirs.
+RUN_WIDE_KEYS = (
+    "candidates",
+    "by_band",
+    "unanchored",
+    "tail",
+    "not_seen",
+    "tier_2.groups",
+    "tier_2.group_size_median",
+    "tier_2.group_size_max",
+    "tier_2.largest_groups",
+    "tier_2.groups_shown",
+    "tier_2.groups_not_shown",
+    "tier_2.members_not_shown",
+)
+
 # The last line of every declaration, fixed. The one sentence that has to survive someone skimming
 # the numbers above it.
 UNREAD_NOT_UNFOUND = "What is not disposed above is UNREAD, not 'nothing found'."
@@ -493,6 +547,10 @@ UNREAD_NOT_UNFOUND = "What is not disposed above is UNREAD, not 'nothing found'.
 # the analysis does not resolve, not labels any row carries, so every one of them matches zero rows
 # in the fact tables by construction. A count would therefore read as "no such gap", which is the
 # opposite of what they say.
+# Why a disposed member's read gate could not be applied — BOTH shapes, because counting only one
+# of them counted the rarer one (see ``scan_states``).
+READ_GATE_UNVERIFIABLE_WHY = f"no basis recorded with the write, or {ru.NO_SESSION_LOG}"
+
 BLIND_SPOTS_ARE_TEXT = (
     "named gaps, stated not counted: no row carries one of these as a label, so a count of them "
     "would read as 'none found' rather than 'not looked for'"
@@ -536,6 +594,15 @@ def declaration(
     would be the fact layer making a prediction, and the only honest divisor for it (how much one
     session disposes) has never been measured. What a context too small for the set gets instead is
     the batch driver's own command, named — the precedent ``IF_THIS_CONTEXT_FILLS`` sets.
+
+    ★ WHERE, though, needs no prediction, and tier 1 states it: ``undisposed_by_binary``, the
+    largest few images the unread part sits in. "How long" is the half of the question this layer
+    must not answer; "where" is the half it can, and the second tier was already stated this way
+    while the tier somebody has to READ was three band counts and nothing else. Measured, it is
+    the difference between a flat 8,737 and knowing that 1,775 of them are in one binary and five
+    binaries hold half: a reader can tell which decompiler session to open first without the tool
+    ranking anything for them. A count by facet, exactly as the second tier's groups are — no
+    rank moves, nothing is collapsed, and the tail and the second tier stay as queryable as before.
     """
     in_shard = [u for u in review.units if ru.in_shard(u.unit_id, worker, workers)]
     tier1 = [u for u in in_shard if u.must_read]
@@ -546,18 +613,31 @@ def declaration(
     def _members(units: list[ru.Unit]) -> list[ru.Member]:
         return [m for u in units for m in u.members]
 
+    binary_of = {b.evidence_ref: b.binary for b in review.banded}
+
     def _split(units: list[ru.Unit]) -> dict[str, Any]:
         members = _members(units)
         done = sum(1 for m in members if ru.disposed(review.states.get(m.anchor_ref)))
         undone = [m for m in members if not ru.disposed(review.states.get(m.anchor_ref))]
         by_band: dict[str, int] = {}
+        by_binary: dict[str, int] = {}
         for m in undone:
             by_band[m.bucket or "-"] = by_band.get(m.bucket or "-", 0) + 1
+            binary = binary_of.get(m.anchor_ref) or ""
+            by_binary[binary] = by_binary.get(binary, 0) + 1
+        largest = sorted(by_binary.items(), key=lambda kv: (-kv[1], kv[0]))
         return {
             "members": len(members),
             "disposed": done,
             "undisposed": len(undone),
             "undisposed_by_band": dict(sorted(by_band.items())),
+            # WHERE the unread part sits — the shard's own count, like every other key of this
+            # dict. The sum over ALL binaries is ``undisposed``; only the printed list is capped.
+            "binaries": len(by_binary),
+            "undisposed_by_binary": [
+                {"binary": b, "members": n} for b, n in largest[:GROUPS_SHOWN]
+            ],
+            "binaries_not_shown": max(len(largest) - GROUPS_SHOWN, 0),
             "units": len(units),
             "units_undisposed": sum(1 for u in units if not ru.unit_disposed(u, review.states)),
         }
@@ -591,18 +671,20 @@ def declaration(
         "tail": {
             "members": review.by_band.get(TAIL, 0),
             "why": (
-                "a proven-safe fact, or neither a dangerous source nor an unresolved axis; "
+                "a proven-safe fact (a compile-time-constant value at the sink) — measured, that "
+                "is the whole of this band, and every member still carries an unread axis; "
                 "counted, never handed out, and still readable and judgeable by hand"
             ),
         },
         "not_seen": list(ru.NOT_SEEN),
         "not_seen_note": BLIND_SPOTS_ARE_TEXT,
+        "run_wide": list(RUN_WIDE_KEYS),
         # How much of the disposed count above rests on a read gate that could not be applied: a
         # write by a server keeping no tool-call log records no basis either way, so it disposes
         # its member and the gate never fires. Stated, because a whole run judged by such a server
         # would otherwise read fully disposed with nothing saying the gate was never applied.
         "read_gate_unverifiable": len(review.unverifiable_read),
-        "read_gate_unverifiable_why": ru.NO_SESSION_LOG,
+        "read_gate_unverifiable_why": READ_GATE_UNVERIFIABLE_WHY,
         "unread_not_unfound": UNREAD_NOT_UNFOUND,
     }
     if drive_with and out["tier_1"]["undisposed"]:
@@ -614,40 +696,64 @@ def coverage_statement(dec: dict[str, Any]) -> str:
     """The one line a report leads with: the counts, and nothing that is not a count."""
     t1, t2 = dec["tier_1"], dec["tier_2"]
     bands = "; ".join(f"{name} {dec['by_band'].get(name, 0)}" for name in BANDS)
+    # In a shard the band counts, the group count and the named gaps are the WHOLE RUN's while
+    # the tier counts are this shard's (``RUN_WIDE_KEYS``). The skill tells an agent to quote this
+    # line verbatim, so it says which is which rather than leaving four workers to report the same
+    # run-wide numbers as four shards' own.
+    scope = (
+        " (bands and groups are the whole run's; the tier counts are this shard's)"
+        if (dec["scope"] == "shard")
+        else ""
+    )
     return (
         f"scan {dec['run_id']}: {dec['candidates']} candidate(s) — {bands}. "
         f"tier 1 {t1['disposed']}/{t1['members']} disposed, {t1['units_undisposed']} unit(s) left; "
         f"tier 2 {t2['disposed']}/{t2['members']} disposed in {t2['groups']} group(s); "
-        f"{len(dec['not_seen'])} named gap(s). {dec['unread_not_unfound']}"
+        f"{len(dec['not_seen'])} named gap(s){scope}. {dec['unread_not_unfound']}"
     )
 
 
 def declaration_text(dec: dict[str, Any]) -> str:
-    """The declaration as the lines ``tmap review scan`` prints."""
+    """The declaration as the lines ``tmap review scan`` prints.
+
+    ★ In a SHARD, every line whose numbers ``RUN_WIDE_KEYS`` names carries ``(whole run)``. The
+    shard's own counts are the tier lines and nothing else, and a reader cannot tell which is
+    which by looking — four workers each printing the same band counts under "shard" is how the
+    same number gets reported four times as four different things."""
     t1, t2 = dec["tier_1"], dec["tier_2"]
+    sharded = dec["scope"] == "shard"
+    whole = " (whole run)" if sharded else ""
     lines = [
         coverage_statement(dec),
         "",
-        f"candidates: {dec['candidates']} ({dec['scope']} scope)",
+        f"candidates: {dec['candidates']}{whole or ''}"
+        + (f" — this shard holds {t1['members'] + t2['members']} of them" if sharded else ""),
     ]
     for name in BANDS:
-        lines.append(f"  band {name}: {dec['by_band'].get(name, 0)}")
+        lines.append(f"  band {name}: {dec['by_band'].get(name, 0)}{whole}")
     if dec["unanchored"]:
-        lines.append(f"  no evidence_ref (nothing to anchor a read on): {dec['unanchored']}")
+        lines.append(f"  no evidence_ref (nothing to anchor a read on): {dec['unanchored']}{whole}")
     lines += [
         "",
-        f"tier 1 (must read): {t1['members']} member(s) in {t1['units']} unit(s) — "
-        f"{t1['disposed']} disposed, {t1['undisposed']} not",
+        f"tier 1 (must read{', this shard' if sharded else ''}): {t1['members']} member(s) in "
+        f"{t1['units']} unit(s) — {t1['disposed']} disposed, {t1['undisposed']} not",
     ]
     for name, count in t1["undisposed_by_band"].items():
         lines.append(f"  not disposed, band {name}: {count}")
     lines.append(f"  units not disposed: {t1['units_undisposed']}")
+    if t1["undisposed_by_binary"]:
+        lines.append(f"  not disposed, by binary ({t1['binaries']} in all):")
+        for row in t1["undisposed_by_binary"]:
+            short = (row["binary"] or "").rsplit("/", 1)[-1] or row["binary"]
+            lines.append(f"    {row['members']:6d}  {short or '(no path)'}")
+        if t1["binaries_not_shown"]:
+            lines.append(f"    ... and {t1['binaries_not_shown']} further binary(ies)")
     lines += [
         "",
-        f"tier 2 (not handed out until tier 1 is done): {t2['members']} member(s) — "
-        f"{t2['disposed']} disposed, {t2['undisposed']} not",
+        f"tier 2 (not handed out until tier 1 is done{', this shard' if sharded else ''}): "
+        f"{t2['members']} member(s) — {t2['disposed']} disposed, {t2['undisposed']} not",
         f"  grouped by {' + '.join(t2['group_key'])}: {t2['groups']} group(s), "
-        f"median {t2['group_size_median']}, largest {t2['group_size_max']}",
+        f"median {t2['group_size_median']}, largest {t2['group_size_max']}{whole}",
     ]
     for g in t2["largest_groups"]:
         # The key keeps the whole path (it is the group's identity); the LINE shows the last
@@ -669,7 +775,12 @@ def declaration_text(dec: dict[str, Any]) -> str:
             f"{dec['read_gate_unverifiable_why']}, so what was read before those verdicts is "
             "not recorded either way",
         ]
-    lines += ["", f"tail: {dec['tail']['members']} — {dec['tail']['why']}", "", "not seen:"]
+    lines += [
+        "",
+        f"tail: {dec['tail']['members']}{whole} — {dec['tail']['why']}",
+        "",
+        "not seen:",
+    ]
     lines += [f"  {name}" for name in dec["not_seen"]]
     lines.append(f"  ({dec['not_seen_note']})")
     if dec.get("if_this_context_fills"):

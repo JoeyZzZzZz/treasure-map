@@ -960,10 +960,211 @@ def test_a_write_whose_read_gate_could_not_be_applied_is_stated_not_hidden(
     assert ru.disposed(review.states[ref])  # it IS disposed: nothing says it was unread
     dec = sr.declaration(review)
     assert dec["read_gate_unverifiable"] == 1
-    assert dec["read_gate_unverifiable_why"] == ru.NO_SESSION_LOG
+    assert ru.NO_SESSION_LOG in dec["read_gate_unverifiable_why"]
     assert "read gate not applicable to 1 disposed member(s)" in sr.declaration_text(dec)
     # a write WITH a log is not counted here
     other = refs[sr.EXEC][1]
     _write(conn, other, "inconclusive", read=True)
     assert _review(conn).unverifiable_read == (ref,)
+    conn.close()
+
+
+def test_a_write_that_recorded_no_basis_at_all_is_counted_too(tmp_path: Path) -> None:
+    """★ The second shape, and the whole of the stock today: the write recorded NO basis — no
+    ``WriteContext``, so the history column is null, or there is no history row for the anchor at
+    all, which is every candidate judgement in the live atlas. ``held_unread`` is false for it, so
+    it disposes its member; counting only the "server kept no log" shape counted the rarer one and
+    let the common one through.
+
+    MUTATION (verified RED, ``1 failed``): count only the ``NO_SESSION_LOG`` shape -> 1, not 2.
+    """
+    conn, refs = _world(tmp_path, exec_n=3)
+    no_basis, no_log, read_it = refs[sr.EXEC]
+    overlay.upsert_overlay(  # no ctx at all: the shape promote and every older write had
+        conn, evidence_ref=no_basis, verdict="inconclusive", rationale="r"
+    )
+    overlay.upsert_overlay(
+        conn,
+        evidence_ref=no_log,
+        verdict="inconclusive",
+        rationale="r",
+        ctx=overlay.WriteContext(
+            channel="mcp", read_basis=sr.read_basis_of(None, no_log), session="s1"
+        ),
+    )
+    _write(conn, read_it, "inconclusive", read=True)
+    review = _review(conn)
+    assert set(review.unverifiable_read) == {no_basis, no_log}
+    assert all(ru.disposed(review.states[r]) for r in (no_basis, no_log, read_it))
+    dec = sr.declaration(review)
+    assert dec["read_gate_unverifiable"] == 2
+    assert "no basis recorded" in dec["read_gate_unverifiable_why"]
+    assert "read gate not applicable to 2 disposed member(s)" in sr.declaration_text(dec)
+    conn.close()
+
+
+# ── a shard says whose numbers are whose ────────────────────────────────────────────────────
+
+
+def test_a_shard_names_the_numbers_that_are_the_whole_runs(tmp_path: Path) -> None:
+    """★ A shard's declaration states the whole run's band counts, tail and second-tier group
+    distribution beside its OWN tier counts. Under a "shard" heading those read as the shard's,
+    and at a high worker count they contradict it outright — the largest second-tier group can be
+    larger than that shard's entire second tier. ``RUN_WIDE_KEYS`` names them, the way
+    ``coverage_offer`` names ``PAIR_WIDE_OFFER_KEYS``.
+
+    MUTATION (verified RED, ``1 failed`` each): drop ``run_wide`` from the declaration -> the
+    first assertion fails; stop suffixing the run-wide lines -> the text assertions fail.
+    """
+    conn, _ = _world(tmp_path, exec_n=ru.BATCH_UNIT_MAX * 3, second_n=ru.BATCH_UNIT_MAX * 2)
+    review = _review(conn)
+    whole = sr.declaration(review)
+    shard = sr.declaration(review, worker=0, workers=4)
+    assert shard["scope"] == "shard" and whole["scope"] == "run"
+    assert shard["run_wide"] == list(sr.RUN_WIDE_KEYS)
+
+    def _at(dec: dict[str, Any], dotted: str) -> Any:
+        node: Any = dec
+        for part in dotted.split("."):
+            node = node[part]
+        return node
+
+    # every key the list names reads the same in the shard as in the whole run ...
+    for key in sr.RUN_WIDE_KEYS:
+        assert _at(shard, key) == _at(whole, key), key
+    # ... and the tier counts, which are NOT on the list, differ
+    assert shard["tier_1"]["members"] < whole["tier_1"]["members"]
+    assert shard["tier_2"]["members"] < whole["tier_2"]["members"]
+
+    text = sr.declaration_text(shard)
+    assert "(whole run)" in text
+    assert "this shard holds" in text
+    assert "the tier counts are this shard's" in sr.coverage_statement(shard)
+    # the whole-run text claims nothing about shards
+    assert "(whole run)" not in sr.declaration_text(whole)
+    assert "this shard" not in sr.coverage_statement(whole)
+    conn.close()
+
+
+def test_a_shards_second_tier_group_figures_are_not_read_as_its_own(tmp_path: Path) -> None:
+    # The contradiction that made this worth fixing: the largest group can exceed the shard's
+    # whole second tier, which is only coherent once the figure is named as the run's.
+    conn, _ = _world(tmp_path, second_n=ru.BATCH_UNIT_MAX * 4)
+    shard = sr.declaration(_review(conn), worker=0, workers=16)
+    t2 = shard["tier_2"]
+    assert t2["group_size_max"] > t2["members"]  # only honest because it is named run-wide
+    assert "tier_2.group_size_max" in shard["run_wide"]
+    conn.close()
+
+
+# ── the counts nothing was watching ─────────────────────────────────────────────────────────
+
+
+def test_a_candidate_with_no_evidence_ref_is_counted_not_dropped(tmp_path: Path) -> None:
+    """``band_run`` promises to count a candidate with no ref under ``unanchored`` "rather than
+    dropping it quietly", and nothing held it to that.
+
+    MUTATION (verified RED, ``1 failed``): report ``unanchored=0`` -> this fails.
+    """
+    clear_triage_cache()
+    conn = open_atlas(tmp_path / "atlas.db")
+    p = _pattern(conn, "fp_exec", "cmd", "external_input")
+    ref = _inst(conn, p, binary="/fw/a")
+    conn.execute("UPDATE instance SET evidence_ref = NULL WHERE evidence_ref = ?", (ref,))
+    _inst(conn, p, binary="/fw/a")
+    conn.commit()
+    review = _review(conn)
+    assert review.unanchored == 1
+    assert len(review.banded) == 1  # the anchorless one is not banded: nothing to read it by
+    dec = sr.declaration(review)
+    assert dec["unanchored"] == 1
+    assert dec["candidates"] == 2  # counted in the total, whatever else it is left out of
+    assert "no evidence_ref" in sr.declaration_text(dec)
+    conn.close()
+
+
+def test_a_class_the_impact_map_knows_but_no_band_claims_is_still_must_read(
+    tmp_path: Path,
+) -> None:
+    """``log`` is in the impact map and in no band. It used to fall through to the TAIL while an
+    UNRECOGNISED class was protected — so the one shape with no protection was the one that had
+    been thought about. The unresolved band now asks nothing about the class at all.
+
+    MUTATION (verified RED, ``1 failed``): put the class test back on the unresolved branch ->
+    both cases here read ``tail``.
+    """
+    assert "log" in DEFAULT_SINK_IMPACT and "log" not in sr.BANDED_SINKS
+    known_but_unbanded = _cand(sink_class="log", param_source=False, unresolved=("writer",))
+    assert sr.band(known_but_unbanded) == sr.UNRESOLVED
+    assert sr.tier(sr.UNRESOLVED, "log") == sr.TIER_2
+    # and a proven-safe one of the same class still sinks: the iron law is unaffected
+    assert sr.band(_cand(sink_class="log", controllability=("proven", "constant"))) == sr.TAIL
+
+
+def test_tier_one_says_where_the_unread_part_sits(tmp_path: Path) -> None:
+    """★ "How long" is the half of the question this layer must not answer; "where" is the half it
+    can. The second tier was already stated by facet while the tier somebody has to READ was three
+    band counts — so a reader could not tell whether the unread part was spread over everything or
+    sitting in two images.
+
+    MUTATION (verified RED, ``1 failed``): drop ``undisposed_by_binary`` -> this fails.
+    """
+    clear_triage_cache()
+    conn = open_atlas(tmp_path / "atlas.db")
+    p = _pattern(conn, "fp_exec", "cmd", "external_input")
+    for binary, n in (("/fw/big", 20), ("/fw/small", 3)):
+        for _ in range(n):
+            _inst(conn, p, binary=binary)
+    conn.commit()
+    review = _review(conn)
+    t1 = sr.declaration(review)["tier_1"]
+    assert t1["binaries"] == 2
+    assert [r["members"] for r in t1["undisposed_by_binary"]] == [20, 3]  # largest first
+    # the facet accounts for the whole of it: only the printed list is capped
+    assert sum(r["members"] for r in t1["undisposed_by_binary"]) == t1["undisposed"]
+    assert t1["binaries_not_shown"] == 0
+    text = sr.declaration_text(sr.declaration(review))
+    assert "not disposed, by binary (2 in all)" in text
+    assert "big" in text and "small" in text
+    conn.close()
+
+
+def test_the_by_binary_facet_caps_what_it_prints_not_what_it_counts(tmp_path: Path) -> None:
+    clear_triage_cache()
+    conn = open_atlas(tmp_path / "atlas.db")
+    p = _pattern(conn, "fp_exec", "cmd", "external_input")
+    for i in range(sr.GROUPS_SHOWN + 3):
+        for _ in range(i + 1):
+            _inst(conn, p, binary=f"/fw/b{i:02d}")
+    conn.commit()
+    t1 = sr.declaration(_review(conn))["tier_1"]
+    assert t1["binaries"] == sr.GROUPS_SHOWN + 3
+    assert len(t1["undisposed_by_binary"]) == sr.GROUPS_SHOWN
+    assert t1["binaries_not_shown"] == 3
+    # the sum over the WHOLE facet is still the undisposed count
+    assert t1["undisposed"] == sum(range(1, sr.GROUPS_SHOWN + 4))
+    assert "further binary(ies)" in sr.declaration_text(sr.declaration(_review(conn)))
+    conn.close()
+
+
+def test_an_overlay_row_with_no_history_row_at_all_is_counted_too(tmp_path: Path) -> None:
+    """★ The live atlas's exact shape: 25 candidate judgements in ``overlay`` and NOT ONE write row
+    for a candidate anchor in ``overlay_history``. ``_latest_write_bases`` then returns nothing for
+    the anchor, so there is no basis to read and the gate has nothing to apply — and skipping the
+    member because no write was found is how a whole stock of judgements reads fully disposed with
+    the gate never having fired.
+
+    MUTATION (verified RED, ``1 failed``): require a history row before counting
+    (``and last is not None``) -> this reads 0.
+    """
+    conn, refs = _world(tmp_path, exec_n=1)
+    ref = refs[sr.EXEC][0]
+    _write(conn, ref, "inconclusive", read=True)  # a real write, basis recorded
+    assert _review(conn).unverifiable_read == ()  # the gate applied
+    conn.execute("DELETE FROM overlay_history WHERE anchor_ref = ?", (ref,))
+    conn.commit()
+    review = _review(conn)
+    assert ru.disposed(review.states[ref])  # the overlay row still says what it says
+    assert review.unverifiable_read == (ref,)  # but nothing records what was read before it
+    assert sr.declaration(review)["read_gate_unverifiable"] == 1
     conn.close()

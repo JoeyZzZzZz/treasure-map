@@ -681,11 +681,13 @@ _PAGED_KINDS = (
     _ru.REDUCE,
     _ru.PRESENCE,
     _ru.PAIRING,
-    # A scan band unit holds up to BATCH_UNIT_MAX candidates, so its material pages like any other
-    # multi-member unit. Listed here BEFORE anything hands one out through this surface: a kind
-    # that is cut into members and is absent here reads as a one-subject unit, whose material is
-    # never cut and whose members are therefore never named as shown — which would make a
-    # delivery claim more than it showed.
+    # A RESERVATION, not support: a scan band unit holds up to BATCH_UNIT_MAX candidates, so when
+    # one is ever handed out through this surface its material must page like any other
+    # multi-member unit's — a kind cut into members and absent from this tuple reads as a
+    # one-subject unit, whose material is never cut and whose members are therefore never named as
+    # shown, which would make a delivery claim more than it showed. Today nothing reaches it:
+    # ``review_pair`` never produces this kind and ``_unit_material`` has no branch for it. That
+    # branch goes in with the scan side's own dispatch surface, in the same change.
     _ru.SCAN_BAND,
 )
 # A diff write made before anything of its subject was read: what that reads as, on its answer.
@@ -7135,6 +7137,17 @@ def make_tools(
                     verdict_basis=given or None,
                     allow_stale_source=allow_stale_source,
                     attributed_to="agent-via-mcp",
+                    # The same two things annotate computes, for the same candidate anchor: a
+                    # promotion writes a candidate verdict, so the dismissal threshold and the
+                    # read basis belong to it exactly as they do to a write made by hand.
+                    must_read_subject=(
+                        verdict == "excluded" and _scan_review.must_read_candidate(atlas, row_ref)
+                    ),
+                    ctx=WriteContext(
+                        channel="mcp",
+                        read_basis=_scan_review.read_basis_of(_rb.session_lines(call_log), row_ref),
+                        session=_session_id(),
+                    ),
                 )
             except ConfigError as exc:
                 out: dict[str, Any] = {"written": False, "error": str(exc)}

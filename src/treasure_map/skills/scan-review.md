@@ -23,9 +23,11 @@ Every candidate is in exactly one, cut above the ranking (nothing here changes a
 - **`unresolved`** — one of those sink families, not proven safe, and at least one dimension the
   analysis could not resolve. This is NOT a weaker finding than the two above: it is an UNREAD
   axis. A reachability of `unknown` never means unreachable.
-- **`tail`** — a proven-safe fact (a compile-time-constant value at the sink), or neither a
-  dangerous source nor an unresolved axis. Counted in the declaration, not handed out. Still
-  readable and judgeable by hand.
+- **`tail`** — a proven-safe fact: a compile-time-constant value at the sink. Measured on every
+  corpus, that is the WHOLE of this band, and every member of it still carries at least one unread
+  axis — nothing reaches the tail by being plain, only by being lifted out of the must-read set by
+  the demotion iron law. Counted in the declaration, not handed out. Still readable and judgeable
+  by hand.
 
 Entering a band asks only "could this be written to, or executed". It does NOT ask how much it
 would matter: `format` sits at the lowest IMPACT tier and is still a `write` band member, because a
@@ -45,6 +47,12 @@ one axis that IS resolved for them. An unread source on a `system()` call is a w
 reading than an unread source on a `memcpy`.
 
 ## The loop
+
+This describes a unit as the BATCH DRIVER hands it out. There is no tool for asking the server for
+the next scan unit this version, and `tmap review scan <run_id>` prints counts only — no unit ids
+and no refs. So in an interactive session there is no step 1 to do: either a person runs the driver
+(below), or you are working from refs you already have, in which case steps 2–4 still apply to each
+of them.
 
 1. You are handed ONE unit: a list of candidate `evidence_ref`s from one binary, at most 16.
 2. For EVERY ref in the unit, call `explain_candidate(evidence_ref=...)`. Then read whatever else
@@ -100,6 +108,10 @@ one once it has. Each worker holds its own agent process and its own decompiler 
 ceiling in practice is memory and disk, not CPU. Run one worker first and watch it before fanning
 out.
 
-The declaration says how many units are left, never how long they will take or how many sessions
-they need: that would be the fact layer making a prediction it has no basis for. If your context
-fills, stop at a unit boundary and say so.
+The declaration says how many units are left and WHICH BINARIES the unread part sits in, never how
+long it will take or how many sessions it needs: that would be the fact layer making a prediction it
+has no basis for. If your context fills, stop at a unit boundary and say so.
+
+**Working a shard** (`--worker i --workers n`): the declaration's band counts, its tail and its
+second-tier group figures are the WHOLE RUN's — the keys `run_wide` names — while the tier counts
+are your shard's. Quote them as what they are; the printed lines say `(whole run)` for you.

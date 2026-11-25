@@ -1367,6 +1367,7 @@ def promote(
     attributed_to: str | None = "agent-via-mcp",
     commit: bool = True,
     ctx: WriteContext | None = None,
+    must_read_subject: bool = False,
 ) -> PromoteResult:
     """Carry a judgement reached on a diff entry onto one of its candidates, as a candidate verdict.
 
@@ -1389,7 +1390,12 @@ def promote(
             "promoting as exploitable requires verdict_basis (chain + verification_gaps): the "
             "judgment rests on a diff, and its reason has to be written down with it"
         )
-    _validate_verdict_basis(verdict, verdict_basis)
+    # ★ ``must_read_subject`` is threaded here for the same reason the other four write paths
+    # carry it: a promotion writes a CANDIDATE verdict, and ``excluded`` is one of the five it may
+    # write. Without it, the one dismissal threshold a scan review imposes was reachable by one of
+    # the five tools and not the other four — the gate held ``annotate`` and let the same verdict
+    # through here. Same key, same threshold, whichever tool writes it.
+    _validate_verdict_basis(verdict, verdict_basis, must_read_subject=must_read_subject)
     _check_text_and_attribution(rationale, attributed_to)
     from treasure_map.lib.query.diff_annotations import check_promotion
 
@@ -1410,6 +1416,7 @@ def promote(
         commit=commit,
         promoted_from=origin,
         ctx=ctx,
+        must_read_subject=must_read_subject,
     )
     return PromoteResult(written=written, evidence_ref=row_ref, promoted_from=origin)
 

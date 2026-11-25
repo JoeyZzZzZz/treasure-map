@@ -1662,3 +1662,158 @@ def test_list_candidates_names_a_binary_an_analyzer_threw_on(tmp_path: Path) -> 
     assert out["incomplete_binaries"] == []
     assert out.get("analyzer_degraded_binaries") == want
     assert out["coverage"]["blind_spots"].get("analyzer_degraded_binaries") == want
+
+
+# ── the two scan-side gates, at the PRODUCTION call sites ────────────────────────────────────
+#
+# Both gates are computed in exactly one place each (mcp_app's annotate / promote), and every test
+# of them used to build the WriteContext itself or pass must_read_subject=True itself — so the two
+# lines that compute them in production had no test passing through them at all. Two mutations
+# proved it: dropping read_basis from annotate's ctx, and hardcoding must_read_subject=False, both
+# left the whole suite green. These go through the tools.
+
+
+def _atlas_of(tmp_path: Path) -> Path:
+    return tmp_path / "atlas.db"
+
+
+def _history(tmp_path: Path, ref: str) -> list[sqlite3.Row]:
+    from treasure_map.lib.atlas.connection import open_atlas
+
+    conn = open_atlas(_atlas_of(tmp_path))
+    try:
+        return conn.execute(
+            "SELECT channel, read_basis FROM overlay_history WHERE anchor_kind = 'evidence_ref' "
+            "AND anchor_ref = ? ORDER BY id",
+            (ref,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_annotate_refuses_a_bare_excluded_on_a_must_read_candidate(tmp_path: Path) -> None:
+    """★ The dismissal threshold, through the tool that computes it.
+
+    MUTATION (verified RED, ``1 failed``): hardcode ``must_read_subject=False`` at annotate's call
+    to upsert_overlay -> the bare write succeeds and this fails. Before this test that mutation
+    left 372 tests green.
+    """
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.query import scan_review as sr
+
+    tools = _tools(tmp_path)
+    ref = "run_m#fn1@cmd"
+    conn = open_atlas(_atlas_of(tmp_path))
+    try:
+        assert sr.must_read_candidate(conn, ref)  # the fixture's candidate is one
+    finally:
+        conn.close()
+    bare = tools["annotate"](ref, "excluded", "noise")
+    assert bare["written"] is False
+    assert "exclusion_why" in bare["error"]
+    ok = tools["annotate"](
+        ref, "excluded", "noise", exclusion_why="the sink argument is a .rodata literal"
+    )
+    assert ok["written"] is True
+
+
+def test_annotate_records_what_was_read_before_it(tmp_path: Path) -> None:
+    """★ The read basis, through the tool that computes it.
+
+    MUTATION (verified RED, ``1 failed``): drop ``read_basis=`` from annotate's WriteContext ->
+    the column is null and this fails. Before this test that mutation left 372 tests green.
+    """
+    tools = _tools(tmp_path)
+    ref = "run_m#fn1@cmd"
+    assert tools["annotate"](ref, "suspicious", "worth a look")["written"] is True
+    rows = _history(tmp_path, ref)
+    assert len(rows) == 1
+    assert rows[0]["channel"] == "mcp"
+    assert rows[0]["read_basis"]  # non-null: what the writer had read is recorded with the write
+
+
+def test_a_scan_candidate_judged_without_being_explained_reads_needs_recheck(
+    tmp_path: Path,
+) -> None:
+    """The read gate end to end: the tool records what the writer had read, and the scan review
+    reads it back. With a tool-call log in which nothing explained the candidate, the basis is
+    ``none`` and the verdict does not dispose it.
+
+    MUTATION (verified RED, ``1 failed``): drop ``read_basis=`` from annotate's WriteContext ->
+    the gate has nothing to apply, the member reads disposed, and this fails.
+    """
+    from treasure_map.lib import tool_call_log as tcl
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.query import review_units as ru
+    from treasure_map.lib.query import scan_review as sr
+    from treasure_map.lib.query.triage import clear_triage_cache
+
+    _mk_analysis(tmp_path)
+    atlas = _mk_atlas(tmp_path)
+    log = tcl.ToolCallLog(tcl.log_path_for(atlas))
+    # One read of this session that is NOT an explain_candidate of the ref: the log exists, so the
+    # basis is a real reading rather than "no log", and it says nothing was read of this candidate.
+    log.record("get_pseudocode", {"run_id": "run_m", "function": "0x00401000"}, result={})
+    tools = mcp_app.make_tools(atlas, call_log=log)
+    ref = "run_m#fn1@cmd"
+    assert (
+        tools["annotate"](
+            ref, "safe", "nothing reaches it", block_source="p", block_point="q", block_why="r"
+        )["written"]
+        is True
+    )
+    clear_triage_cache()
+    conn = open_atlas(atlas)
+    try:
+        review = sr.review_run(conn, "run_m")
+        assert review.states[ref] == "needs_recheck"
+        assert not ru.disposed(review.states[ref])
+        assert ref not in review.unverifiable_read  # the gate APPLIED; it was not skipped
+    finally:
+        conn.close()
+
+
+def test_a_write_by_a_server_with_no_log_is_disposed_but_counted(tmp_path: Path) -> None:
+    """The other half of the same question. With no tool-call log the basis says so, nothing
+    claims the subject was unread, and the verdict disposes its member — correctly. What must not
+    happen is that passing in silence: it is counted, and the declaration states the count.
+
+    MUTATION (verified RED, ``1 failed``): count only the ``NO_SESSION_LOG`` shape and not the
+    no-basis one -> ``promote``'s and any ctx-less write's members vanish from the count.
+    """
+    from treasure_map.lib.atlas.connection import open_atlas
+    from treasure_map.lib.query import review_units as ru
+    from treasure_map.lib.query import scan_review as sr
+    from treasure_map.lib.query.triage import clear_triage_cache
+
+    tools = _tools(tmp_path)  # no call_log: the server keeps none
+    ref = "run_m#fn1@cmd"
+    assert tools["annotate"](ref, "suspicious", "worth a look")["written"] is True
+    clear_triage_cache()
+    conn = open_atlas(_atlas_of(tmp_path))
+    try:
+        review = sr.review_run(conn, "run_m")
+        assert ru.disposed(review.states[ref])  # nothing says it was unread
+        assert ref in review.unverifiable_read  # and the gate could not be applied: counted
+        dec = sr.declaration(review)
+        assert dec["read_gate_unverifiable"] == 1
+        assert "no basis recorded" in dec["read_gate_unverifiable_why"]
+    finally:
+        conn.close()
+
+
+def test_promote_is_held_to_the_same_two_gates_as_annotate(tmp_path: Path) -> None:
+    """★ ``promote`` writes a CANDIDATE verdict, and ``excluded`` is one of the five it may write.
+    It was the one write tool of the five that passed neither gate: the dismissal threshold was
+    reachable through it, and it recorded no read basis, so its member read disposed with the gate
+    never applied.
+
+    MUTATION (verified RED, ``1 failed`` each): drop ``must_read_subject=`` from the promote call
+    -> the bare excluded is refused only by the later diff check, never by the gate, so the error
+    no longer names exclusion_why; drop its ``ctx=`` -> no basis is recorded.
+    """
+    tools = _tools(tmp_path)
+    out = tools["promote"]("run_m::run_m::libx", "pair:1:1", "run_m#fn1@cmd", "excluded", "noise")
+    assert out["written"] is False
+    # the gate speaks BEFORE the diff lookup: the error is about what the verdict owes
+    assert "exclusion_why" in out["error"]
