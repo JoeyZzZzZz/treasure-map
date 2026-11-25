@@ -8,10 +8,11 @@
 
 ### Treasure Map draws the map; your agent finds the treasure.
 
-[![PyPI](https://img.shields.io/pypi/v/tmap-agents?style=flat-square&color=3775a9)](https://pypi.org/project/tmap-agents/)
-[![MCP registry](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fregistry.modelcontextprotocol.io%2Fv0%2Fservers%3Fsearch%3Dio.github.JoeyZzZzZz%2Ftreasure-map%26limit%3D1&query=%24.servers%5B0%5D.server.version&prefix=v&label=MCP%20registry&color=5c4ee5&style=flat-square)](https://registry.modelcontextprotocol.io/?q=io.github.JoeyZzZzZz%2Ftreasure-map)
-[![Python](https://img.shields.io/pypi/pyversions/tmap-agents?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/tmap-agents/)
-[![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square)](https://github.com/JoeyZzZzZz/treasure-map/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/tmap-agents?style=flat-square&color=3775a9&label=PyPI)](https://pypi.org/project/tmap-agents/)
+[![Downloads](https://img.shields.io/pypi/dm/tmap-agents?style=flat-square&color=2ea44f&label=Downloads)](https://pypistats.org/packages/tmap-agents)
+[![MCP registry](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fregistry.modelcontextprotocol.io%2Fv0%2Fservers%3Fsearch%3Dio.github.JoeyZzZzZz%2Ftreasure-map%26version%3Dlatest%26limit%3D1&query=%24.servers%5B0%5D.server.version&prefix=v&label=MCP%20registry&color=5c4ee5&style=flat-square)](https://registry.modelcontextprotocol.io/?q=io.github.JoeyZzZzZz%2Ftreasure-map)
+[![Python](https://img.shields.io/pypi/pyversions/tmap-agents?style=flat-square&logo=python&logoColor=white&color=f2c443&label=Python)](https://pypi.org/project/tmap-agents/)
+[![License](https://img.shields.io/github/license/JoeyZzZzZz/treasure-map?style=flat-square&color=6e7781&label=License)](https://github.com/JoeyZzZzZz/treasure-map/blob/main/LICENSE)
 
 [**Quick start**](#quick-start) · [**Website**](https://tmap.tools/) · [**Showcase**](https://tmap.tools/showcase/) · [**Blog**](https://tmap.tools/blog/)
 
