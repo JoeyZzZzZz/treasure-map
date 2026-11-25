@@ -567,6 +567,9 @@ _BATCH_ITEM_KEYS = frozenset(
         "evidence",
         "group_ref",
         "change_kind",
+        # Only a binary one run holds alone takes it (see annotate_diff); a batch may hold such
+        # anchors, so re-judging the removals it covers does not have to go one at a time.
+        "removal_characterized",
     }
 )
 
@@ -605,7 +608,7 @@ def _diff_verdict_basis(item: Mapping[str, Any]) -> dict[str, Any] | None:
     (only the keys that were given), or None when none were."""
     given = {
         k: item[k]
-        for k in ("checked", "why_unchanged", "evidence", "change_kind")
+        for k in ("checked", "why_unchanged", "evidence", "change_kind", "removal_characterized")
         if item.get(k) is not None
     }
     return given or None
@@ -6171,19 +6174,51 @@ def make_tools(
         atlas: sqlite3.Connection, run_pair: str, anchor_ref: str, basis: Any
     ) -> dict[str, Any]:
         """A write's answer on a binary one run holds alone: how far it cites its subject's
-        candidates (``citations``, the shape of the report's presence_citations_short), and what a
-        short one reads as."""
+        candidates (``citations``, the shape of the report's presence_citations_short), whether
+        the removal characterisation gate holds this subject and what it still owes
+        (``characterization``), and what a short one reads as.
+
+        ★ Both gaps come from the SAME predicates the report reads
+        (``binary_presence.citation_gap``, ``characterization_applies`` /
+        ``characterization_gap``). A second spelling here is how a write comes back saying a
+        judgement reads disposed that the report holds back, or the reverse."""
         from treasure_map.lib.query import binary_presence as _bp
         from treasure_map.lib.query.diff_annotations import presence_scope
 
-        gap = _bp.citation_gap(presence_scope(atlas, run_pair), anchor_ref, basis)
-        if gap is None:
-            return {}
-        out: dict[str, Any] = {"citations": gap}
-        if gap["cited"] < gap["required"]:
-            out["citations_short"] = (
-                "cites fewer than every candidate of its subject: it reads needs_recheck (not "
-                "disposed) until judged again citing all of them (checked / evidence)"
+        presence = presence_scope(atlas, run_pair)
+        out: dict[str, Any] = {}
+        gap = _bp.citation_gap(presence, anchor_ref, basis)
+        if gap is not None:
+            out["citations"] = gap
+            if gap["cited"] < gap["required"]:
+                out["citations_short"] = (
+                    "cites fewer than every candidate of its subject: it reads needs_recheck (not "
+                    "disposed) until judged again citing all of them (checked / evidence)"
+                )
+        found = presence.resolve(anchor_ref)
+        if found is None:
+            return out
+        b, addr = found
+        facts = b.function_facts(addr) if addr is not None else dict(b.facts_by_ref)
+        if not _bp.characterization_applies(facts):
+            return out
+        char = _bp.characterization_gap(facts, basis)
+        out["characterization"] = {
+            "applies": True,
+            "why_it_applies": (
+                "a command-execution candidate behind a web-referenced binary: its removal is the "
+                "one a reader cannot settle with 'the function is gone'"
+            ),
+            "states_it": char is None,
+            **({} if char is None else {"owes": char}),
+        }
+        if char is not None:
+            out["characterization_short"] = (
+                "does not say what the removed code held: it reads needs_recheck (not disposed) "
+                "until judged again with verdict_basis.removal_characterized — sink_classes "
+                "(every class its candidates carry), reachability (the subject's entry reading) "
+                "and cmd_sinks (one record per command candidate, 'not traced' where no def-use "
+                "record exists). State the facts; no exploitability judgement is asked for."
             )
         return out
 
@@ -6333,6 +6368,7 @@ def make_tools(
         diff_id: str | None = None,
         run_pair: str | None = None,
         change_kind: list[str] | str | None = None,
+        removal_characterized: dict[str, Any] | None = None,
         unit_id: str | None = None,
         worker: int | None = None,
         workers: int | None = None,
@@ -6359,6 +6395,21 @@ def make_tools(
         function's ``checked`` (or ``evidence``) cites every one of its candidates' evidence_ref;
         a binary holding none, or only candidates that name no function, is judged on its own
         anchor_ref, citing those candidates (or, holding none, the anchor_ref itself).
+
+        On ONE narrow class of such a subject a ``changed_real`` also states what the code that
+        went with the binary HELD, in ``removal_characterized``: a removed function that held a
+        command-execution candidate AND whose binary a web entry edge references. There, citing
+        every candidate is satisfied by "the binary is gone, so they are gone", and what was lost
+        never reaches the hand-off. The key takes ``sink_classes`` (every class the subject's
+        candidates carry, class -> count; the NAMES are what is asked for, the counts are only
+        recorded), ``reachability`` (the subject's entry reading, as the facts give it) and
+        ``cmd_sinks`` (one record per command candidate: ``callee``, ``arg_kind``,
+        ``source_kind`` — ``arg_kind`` null where no def-use record exists, which says not traced,
+        not that the argument is constant). It is FACTS, not a conclusion: no impact judgement and
+        no claim about an authentication boundary is asked for. The write's answer
+        says whether this subject is held to it (``characterization``) and what it still owes; a
+        subject it does not hold reports nothing about it, and the key is refused on any other
+        anchor. Until it is stated, such a subject reads needs_recheck.
 
         ``anchor_ref`` is the entry's ``anchor_ref`` as get_diff_patch_view prints it (a function
         pair, or a function with no counterpart), or a candidate row's
@@ -6426,6 +6477,7 @@ def make_tools(
             "why_unchanged": why_unchanged,
             "evidence": evidence,
             "change_kind": change_kind,
+            "removal_characterized": removal_characterized,
         }
         given = {k: v for k, v in supplied.items() if v is not None}
         if (diff_id is None) == (run_pair is None):
@@ -6576,7 +6628,8 @@ def make_tools(
         ``diff_id``: ``anchor_ref`` +
         ``verdict``, optionally ``rationale`` (no_real_change defaults it to ``why_unchanged``),
         ``checked`` / ``why_unchanged`` (no_real_change), ``evidence`` (changed_real),
-        ``group_ref``. Only those eight keys — a stray key fails that item, named.
+        ``group_ref``. A one-sided binary's item may also carry ``removal_characterized``.
+        Only those nine keys — a stray key fails that item, named.
 
         All or none: every item is validated first (``checked`` / ``evidence`` held to the same
         anchor rule as annotate_diff), and if any fails NOTHING is written — the failures are

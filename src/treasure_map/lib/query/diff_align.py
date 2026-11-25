@@ -1307,6 +1307,91 @@ class NotDiffedBinary:
     by_class: dict[str, set[str]]
 
 
+# How many refs one ``candidate_facts_for`` query asks for, as diff_sink_axes.fetch chunks.
+_REF_CHUNK = 400
+
+
+def candidate_facts_for(
+    atlas: sqlite3.Connection, run: str, refs: Iterable[str]
+) -> dict[str, dict[str, Any]]:
+    """``candidate_facts`` for the named candidates of ``run`` — ref -> its facts, a ref with no
+    row left out.
+
+    ★ Asked for by REF, never computed while walking the run: parsing every instance's
+    flow_evidence to serve the few candidates a reader wants costs ten times the walk itself
+    (measured on a 30k-instance run), and ``not_diffed_groups`` is on the read path of every
+    coverage and report call. The caller names the refs it will actually read — the one-sided
+    binaries' candidates, a few hundred of the thirty thousand."""
+    want = sorted(set(refs))
+    out: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(want), _REF_CHUNK):
+        chunk = want[i : i + _REF_CHUNK]
+        marks = ", ".join("?" * len(chunk))
+        # ``+source_run_id`` keeps the planner on the evidence_ref index, as diff_sink_axes.fetch
+        # does: a run-wide scan per chunk is the cost this function exists to avoid.
+        for ref, sink_class, sink_anchor, flow in atlas.execute(
+            "SELECT i.evidence_ref, p.sink_class, i.sink_anchor, i.flow_evidence FROM instance i "
+            "LEFT JOIN pattern p ON p.pattern_id = i.pattern_id "
+            f"WHERE +i.source_run_id = ? AND i.evidence_ref IN ({marks})",
+            (run, *chunk),
+        ):
+            out[ref] = candidate_facts(ref, sink_class, sink_anchor, flow)
+    return out
+
+
+def candidate_facts(
+    ref: str, sink_class: str | None, sink_anchor: str | None, flow_evidence: str | None
+) -> dict[str, Any]:
+    """One candidate's ``{sink_class, entry_reach, arg_provenance}``, read from its stored
+    flow_evidence.
+
+    ``entry_reach`` carries the site KINDS the hunt layer recorded and whether the web reading
+    rests on placement (``basis: inferred``) — the mechanistic reading of
+    ``triage._entry_reach_status``, never collapsed to a reachability verdict and never a claim
+    about an authentication boundary. No site recorded is ``kinds: []``: a coverage gap, NOT
+    "unreachable".
+
+    ``arg_provenance`` is the anchored sink's def-use records, scoped to this candidate's OWN
+    callsite (``triage._writer_scoped_records``, strictly — a sibling call's record is never read
+    off as this one's, because a located writer reads as reassurance). A candidate with no record
+    of its own gets an empty list, which says not traced, not "safe"."""
+    from treasure_map.lib.callsite_ref import callsite_abs_addr
+    from treasure_map.lib.query.triage import (
+        _entry_reach_sites,
+        _source_kind_from_evidence,
+        _writer_scoped_records,
+    )
+
+    sites = _entry_reach_sites(flow_evidence)
+    kinds = sorted({k for s in sites if isinstance(k := s.get("kind"), str)})
+    inferred = sorted(
+        {k for s in sites if s.get("basis") == "inferred" and isinstance(k := s.get("kind"), str)}
+    )
+    recs = _writer_scoped_records(flow_evidence, sink_anchor, callsite_addr=callsite_abs_addr(ref))
+    source_kind = _source_kind_from_evidence(flow_evidence)
+    return {
+        "sink_class": sink_class,
+        # The sink this candidate is anchored on. A candidate whose own callsite has no def-use
+        # record still names its callee here, so a reader (and the characterisation gate) can
+        # speak about it instead of it silently having no row at all.
+        "sink_anchor": sink_anchor,
+        "entry_reach": {"kinds": kinds, "inferred_kinds": inferred, "sites": len(sites)},
+        "arg_provenance": [_arg_record(r, source_kind) for r in recs],
+    }
+
+
+def _arg_record(rec: dict[str, Any], source_kind: str) -> dict[str, Any]:
+    """One def-use record as ``{callee, arg_kind, source_kind}`` — the sink called, where that
+    argument's value was written, and the class the evidence layer gave the source. A record whose
+    provenance is unreadable reports ``arg_kind: None`` (not traced), never a safe-looking kind."""
+    prov = rec.get("provenance")
+    return {
+        "callee": rec.get("sink"),
+        "arg_kind": prov.get("kind") if isinstance(prov, dict) else None,
+        "source_kind": source_kind,
+    }
+
+
 def not_diffed_groups(
     atlas: sqlite3.Connection, run_a: str, run_b: str
 ) -> dict[str, dict[str, dict[str | None, NotDiffedBinary]]]:

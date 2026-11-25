@@ -864,7 +864,7 @@ RENAMES = (
 REPLACED = {
     "annotate_diff_batch": {
         "Only those seven keys — a stray key fails that item, named.": (
-            "an item takes change_kind too now (what a changed_real does): eight keys"
+            "an item takes change_kind and removal_characterized too now: nine keys"
         ),
     },
     "get_function_alignment": {
@@ -1212,7 +1212,7 @@ BOUNDARY: dict[str, tuple[str, ...]] = {
         "Plain-text notes are kept but do not count",
         "re-annotating OVERWRITES",
     ),
-    "annotate_diff_batch": ("all of them or none", "Only those eight keys"),
+    "annotate_diff_batch": ("all of them or none", "Only those nine keys"),
     "promote": ("Refused, with the facts that refused it", "it reads ``source_diff_stale`` there"),
     "list_overlays": (
         "These are AGENT decisions on the overlay, not tool facts",

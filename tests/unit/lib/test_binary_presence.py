@@ -23,6 +23,7 @@ from treasure_map.cli import run_commands
 from treasure_map.lib import overlay
 from treasure_map.lib.analyze.ghidra_runner import current_pass_version
 from treasure_map.lib.atlas.connection import open_atlas
+from treasure_map.lib.callsite_ref import callsite_abs_addr
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query import binary_presence as bp
 from treasure_map.lib.query import diff_align as da
@@ -88,9 +89,13 @@ class World:
         sink_class: str = "cmd",
         n: int = 1,
         addr: str | None = None,
+        flow: dict[str, Any] | None = None,
+        sink: str = "x",
     ) -> list[str]:
         """``n`` candidates of a binary not diffed (it holds them; no diff names its hash), each in
-        a function of its own — or all in the function at ``addr``."""
+        a function of its own — or all in the function at ``addr``. ``flow`` is the candidate's
+        stored flow_evidence (entry_reach sites, sink_arg_provenance) and ``sink`` its anchored
+        sink."""
         refs = []
         for _ in range(n):
             self._n += 1
@@ -98,8 +103,17 @@ class World:
             ref = f"{self.run[side]}#{sha[:8]}:{fn}@{sink_class}@0x{self._n:x}"
             self.atlas.execute(
                 "INSERT INTO instance (pattern_id, evidence_ref, source_run_id, "
-                "binary_content_hash, binary_path, sink_anchor) VALUES (?, ?, ?, ?, ?, 'x')",
-                (self._pattern(sink_class), ref, self.run[side], sha, f"{self.root[side]}/{rel}"),
+                "binary_content_hash, binary_path, sink_anchor, flow_evidence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self._pattern(sink_class),
+                    ref,
+                    self.run[side],
+                    sha,
+                    f"{self.root[side]}/{rel}",
+                    sink,
+                    None if flow is None else json.dumps(flow),
+                ),
             )
             refs.append(ref)
         return refs
@@ -1356,3 +1370,465 @@ def test_a_candidate_naming_no_function_address_is_judged_on_the_binarys_anchor(
     base = _anchor("b_only", "usr/bin/wide")
     assert subjects == {base: (named,), f"{base}::100004000": (wide,)}
     assert bp.required_citations(p, base) == (named,)
+
+
+# ── the removal characterisation: what a whole-binary removal must say it removed ─────────────
+#
+# The defect these cover: on a removal the existing gates are all satisfied by an EXISTENCE
+# reading ("the binary is gone, so its candidates are gone"), which cites every candidate and
+# reads disposed. Measured on a real pair, 117 removal-side judgements read that way and exactly
+# one said anything about whether an entry edge reached the removed code.
+
+_WEB_SITE: dict[str, Any] = {"kind": "web_endpoint", "endpoint": "/cgi-bin/x", "method": "GET"}
+
+
+def _flow(*, web: bool = True) -> dict[str, Any]:
+    """One candidate's stored flow_evidence: a web entry site unless ``web`` is off."""
+    return {"entry_reach": {"sites": [dict(_WEB_SITE)] if web else []}}
+
+
+def _record(
+    w: World, ref: str, sink: str, *, arg_kind: str = "stack_buf", source: str = "free_string"
+) -> None:
+    """Give ``ref`` a def-use record for its OWN callsite — the record's sink_addr is the address
+    the ref names, which is what ``_writer_scoped_records`` scopes by (a record at another
+    address belongs to a sibling call and must not be read off as this one's)."""
+    addr = callsite_abs_addr(ref)
+    assert addr is not None, ref
+    row = w.atlas.execute(
+        "SELECT flow_evidence FROM instance WHERE evidence_ref = ?", (ref,)
+    ).fetchone()
+    flow = json.loads(row[0]) if row and row[0] else {}
+    flow["source_kind"] = source
+    flow["sink_arg_provenance"] = [
+        {"sink": sink, "sink_addr": hex(addr), "provenance": {"kind": arg_kind}}
+    ]
+    w.atlas.execute(
+        "UPDATE instance SET flow_evidence = ? WHERE evidence_ref = ?", (json.dumps(flow), ref)
+    )
+
+
+def _two_functions(w: World) -> tuple[str, str, str]:
+    """A removed binary with THREE functions, so each half of the gate is isolated by one of
+    them: ``A`` (cmd + copy, web-referenced) is the signal class; ``B`` (copy only, ALSO
+    web-referenced) differs from A in the sink class alone; ``C`` (copy only, nothing reached it)
+    differs in the entry reading alone. Returns (sha, anchor A, anchor B); C is ``::00403000``."""
+    sha = "7a" * 32
+    w.binary("a", "web/gone.cgi", sha)
+    (cmd_ref,) = w.cand(
+        "a", "web/gone.cgi", sha, "cmd", addr="00401000", sink="popen", flow=_flow()
+    )
+    _record(w, cmd_ref, "popen")
+    w.cand("a", "web/gone.cgi", sha, "copy", addr="00401000", flow=_flow())
+    w.cand("a", "web/gone.cgi", sha, "copy", addr="00402000", flow=_flow())
+    w.cand("a", "web/gone.cgi", sha, "copy", addr="00403000", flow=_flow(web=False))
+    w.commit()
+    base = _anchor("a_only", "web/gone.cgi")
+    return sha, f"{base}::00401000", f"{base}::00402000"
+
+
+def _facts_of(w: World, anchor: str) -> dict[str, dict[str, Any]]:
+    p = _presence(w)
+    found = p.resolve(anchor)
+    assert found is not None
+    b, addr = found
+    return b.function_facts(addr) if addr is not None else dict(b.facts_by_ref)
+
+
+def _characterize(w: World, anchor: str) -> dict[str, Any]:
+    """The characterisation a writer who read the live facts would record."""
+    facts = _facts_of(w, anchor)
+    classes: dict[str, int] = {}
+    sinks: list[dict[str, Any]] = []
+    for f in facts.values():
+        cls = str(f["sink_class"])
+        classes[cls] = classes.get(cls, 0) + 1
+        if cls == bp.CMD_CLASS:
+            sinks += f["arg_provenance"] or [
+                {"callee": f["sink_anchor"], "arg_kind": None, "source_kind": "unknown"}
+            ]
+    return {"sink_classes": classes, "reachability": bp.reachability_of(facts), "cmd_sinks": sinks}
+
+
+def test_each_candidate_of_a_one_sided_binary_carries_its_own_hunt_facts(world: World) -> None:
+    """Step 0: the per-candidate facts (sink class, entry sites, the anchored sink's def-use
+    record) survive find_presence instead of being collapsed into the ``by_class`` counts, and
+    ``function_facts`` slices them to ONE function.
+
+    MUTATION (verified RED, 1 failed each): drop facts_by_ref from the PresentBinary built in
+    find_presence -> both slices empty -> RED; have function_facts return the whole binary's
+    facts -> B shows A's cmd candidate -> RED."""
+    _sha7, fn_a, fn_b = _two_functions(world)
+    a, b = _facts_of(world, fn_a), _facts_of(world, fn_b)
+    assert sorted(f["sink_class"] for f in a.values()) == ["cmd", "copy"]
+    assert sorted(f["sink_class"] for f in b.values()) == ["copy"]
+    cmd = next(f for f in a.values() if f["sink_class"] == "cmd")
+    assert cmd["sink_anchor"] == "popen"
+    assert cmd["arg_provenance"] == [
+        {"callee": "popen", "arg_kind": "stack_buf", "source_kind": "free_string"}
+    ]
+    # by_class stays a COUNT, so what a judgement rests on reads as it always did.
+    binary = _by_rel(_presence(world))[("a_only", "web/gone.cgi")]
+    assert binary.by_class == {"cmd": 1, "copy": 3}
+
+
+def test_a_functions_entry_reading_is_its_own_candidates_never_the_binarys(world: World) -> None:
+    """①a: the weak entry reading a function's judgement rests on is ORed over THAT function's
+    candidates. A function whose own candidates recorded no site reads unknown even though the
+    binary's other function was web-referenced — a coverage gap, never "unreachable".
+
+    MUTATION (verified RED, 1 failed each): aggregate reachability over b.facts_by_ref instead of
+    b.function_facts(addr) in function_subject_facts -> B reads found -> RED; report status
+    'found' when the sites list is empty -> B reads found -> RED."""
+    _sha7, fn_a, _fn_b = _two_functions(world)
+    fn_c = f"{_anchor('a_only', 'web/gone.cgi')}::00403000"
+    p = _presence(world)
+    subjects = bp.presence_subjects(p)
+    reach_a = subjects[fn_a].facts["reachability"]
+    reach_b = subjects[fn_c].facts["reachability"]
+    assert (reach_a["status"], reach_a["kinds"]) == ("found", ["web_endpoint"])
+    assert (reach_b["status"], reach_b["kinds"]) == ("unknown", [])
+    assert "NOT unreachable" in reach_b["note"]
+    # The binary's own anchor may OR across its functions — that anchor IS the whole binary.
+    whole = bp.subject_facts(_by_rel(p)[("a_only", "web/gone.cgi")])
+    assert whole["reachability"]["status"] == "found"
+
+
+def test_a_reading_that_rests_on_placement_says_so(world: World) -> None:
+    """An inferred web site (a CGI in a tree a named CGI is served from) is not a reference: the
+    basis says ``inferred`` and the note replaces the reference sentence, so a reader can tell the
+    two apart and demote it.
+
+    MUTATION (verified RED): report basis 'reference' whatever the sites carry -> RED."""
+    sha = "8b" * 32
+    world.binary("a", "web/guessed.cgi", sha)
+    world.cand(
+        "a",
+        "web/guessed.cgi",
+        sha,
+        "cmd",
+        addr="00401000",
+        sink="system",
+        flow={"entry_reach": {"sites": [{**_WEB_SITE, "basis": "inferred"}]}},
+    )
+    world.commit()
+    reach = _facts_of(world, f"{_anchor('a_only', 'web/guessed.cgi')}::00401000")
+    out = bp.reachability_of(reach)
+    assert out["basis"] == "inferred"
+    assert "PLACEMENT" in out["note"]
+
+
+def test_the_gate_holds_only_a_web_referenced_command_execution_removal(world: World) -> None:
+    """②'s applicability: both halves are needed. The function holding cmd behind a web entry is
+    held; the copy-only function is not, and neither is a cmd function nothing reached.
+
+    MUTATION (verified RED, 1 failed each): drop the cmd half -> B is held -> RED; drop the web
+    half -> the unreferenced cmd function is held -> RED."""
+    _sha7, fn_a, fn_b = _two_functions(world)
+    assert bp.characterization_applies(_facts_of(world, fn_a)) is True
+    # B is web-referenced and holds NO cmd candidate: the sink-class half alone decides it.
+    assert bp.reachability_of(_facts_of(world, fn_b))["status"] == "found"
+    assert bp.characterization_applies(_facts_of(world, fn_b)) is False
+    sha = "9c" * 32
+    world.binary("a", "bin/quiet", sha)
+    (quiet_ref,) = world.cand(
+        "a", "bin/quiet", sha, "cmd", addr="00401000", sink="system", flow=_flow(web=False)
+    )
+    _record(world, quiet_ref, "system")
+    world.commit()
+    quiet = _facts_of(world, f"{_anchor('a_only', 'bin/quiet')}::00401000")
+    assert bp.characterization_applies(quiet) is False
+
+
+def test_the_gate_asks_for_every_class_and_every_command_callee(world: World) -> None:
+    """②'s three questions, read against the LIVE facts: the key is there, its sink_classes names
+    exactly the classes the subject carries (as a SET — counts are recorded, never gated), and
+    every command candidate's callee is stated.
+
+    MUTATION (verified RED, 1 failed each): compare sink_classes by equality including counts ->
+    the recount case is held -> RED; drop the callee check -> the missing-popen case passes ->
+    RED; accept a missing key -> the None case passes -> RED."""
+    _sha7, fn_a, _fn_b = _two_functions(world)
+    facts = _facts_of(world, fn_a)
+    good = _characterize(world, fn_a)
+    assert bp.characterization_gap(facts, {"removal_characterized": good}) is None
+    # A recount of the same classes is not a re-open: the NAMES are the gate.
+    recount = {**good, "sink_classes": {"cmd": 99, "copy": 99}}
+    assert bp.characterization_gap(facts, {"removal_characterized": recount}) is None
+    missing_key = bp.characterization_gap(facts, {"evidence": ["r"]})
+    assert missing_key is not None and missing_key["missing"] == "removal_characterized"
+    assert missing_key["required_cmd_callees"] == ["popen"]
+    short_class = {**good, "sink_classes": {"cmd": 1}}
+    gap = bp.characterization_gap(facts, {"removal_characterized": short_class})
+    assert gap is not None and gap["required_sink_classes"] == ["cmd", "copy"]
+    no_callee = {**good, "cmd_sinks": [{"callee": "execv"}]}
+    gap2 = bp.characterization_gap(facts, {"removal_characterized": no_callee})
+    assert gap2 is not None and gap2["missing_cmd_callees"] == ["popen"]
+
+
+def test_a_command_candidate_with_no_def_use_record_must_still_be_stated(world: World) -> None:
+    """A command candidate whose own callsite has no def-use record is NOT excused: the writer
+    states it as not traced. Leaving it out would let the one candidate whose argument could not
+    be traced be the one nobody mentions.
+
+    MUTATION (verified RED): take the required callees from the def-use records instead of each
+    cmd candidate's sink_anchor -> the untraced candidate asks for nothing -> RED."""
+    sha = "ad" * 32
+    world.binary("a", "web/untraced.cgi", sha)
+    world.cand("a", "web/untraced.cgi", sha, "cmd", addr="00401000", sink="system", flow=_flow())
+    world.commit()
+    anchor = f"{_anchor('a_only', 'web/untraced.cgi')}::00401000"
+    facts = _facts_of(world, anchor)
+    assert next(iter(facts.values()))["arg_provenance"] == []
+    gap = bp.characterization_gap(facts, {"removal_characterized": {}})
+    assert gap is not None and gap["required_cmd_callees"] == ["system"]
+    stated = {
+        "sink_classes": {"cmd": 1},
+        "reachability": bp.reachability_of(facts),
+        "cmd_sinks": [{"callee": "system", "arg_kind": None, "source_kind": "unknown"}],
+    }
+    assert bp.characterization_gap(facts, {"removal_characterized": stated}) is None
+
+
+def test_removal_characterized_is_taken_on_a_one_sided_subject_and_nowhere_else(
+    world: World,
+) -> None:
+    """③ the write side. ``changed_real`` keeps its deliberately minimal basis everywhere except a
+    binary one run holds alone, where the characterisation gate reads a STRUCTURED key — prose in
+    rationale cannot be checked. Before this, the key was refused on every anchor, so the gate
+    below could never be satisfied by any write a writer could make: a dead-lock.
+
+    MUTATION (verified RED, 1 failed each): put removal_characterized back outside the allowed
+    set -> the presence write is refused -> RED; allow it on every anchor -> the function_pair
+    write is accepted -> RED; drop the ``out["removal_characterized"] = …`` line while leaving it
+    past ``extra`` -> the write succeeds and the key is NOT stored -> RED (this is the failure the
+    gate could never recover from: stored judgement, gate unsatisfiable)."""
+    _sha7, fn_a, _fn_b = _two_functions(world)
+    rc = _characterize(world, fn_a)
+    overlay.annotate_diff(
+        world.atlas,
+        anchor_ref=fn_a,
+        verdict="changed_real",
+        rationale="the whole binary is gone; this states what went with it",
+        verdict_basis={"evidence": [fn_a], "removal_characterized": rc},
+        run_pair=PAIR,
+    )
+    stored = world.atlas.execute(
+        "SELECT verdict_basis FROM overlay WHERE anchor_ref = ? AND anchor_kind = 'diff_subject'",
+        (fn_a,),
+    ).fetchone()[0]
+    assert json.loads(stored)["removal_characterized"]["cmd_sinks"] == rc["cmd_sinks"]
+    with pytest.raises(ConfigError, match="binary one run holds alone only"):
+        overlay.annotate_diff(
+            world.atlas,
+            anchor_ref=f"{PAIR}#function_pair#libx:00401000",
+            verdict="changed_real",
+            rationale="an ordinary paired function",
+            verdict_basis={"evidence": ["r"], "removal_characterized": rc},
+            diff_id=DIFF,
+        )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "not an object",
+        {"sink_classes": {"cmd": 1}, "cmd_sinks": []},
+        {"sink_classes": {}, "reachability": {"status": "found"}, "cmd_sinks": []},
+        {"sink_classes": {"cmd": "one"}, "reachability": {"status": "found"}, "cmd_sinks": []},
+        {"sink_classes": {"cmd": 1}, "reachability": "found", "cmd_sinks": []},
+        {"sink_classes": {"cmd": 1}, "reachability": {"status": "found"}, "cmd_sinks": "popen"},
+    ],
+)
+def test_a_malformed_characterisation_is_refused_at_the_write(world: World, bad: Any) -> None:
+    """Shape is checked where it is written, so a stored key is always readable. Whether it
+    MATCHES the subject is the gate's question, read against the live facts — the same predicate
+    spelled in two places would drift.
+
+    MUTATION (verified RED): accept any dict for the key -> every case is stored -> RED."""
+    _sha7, fn_a, _fn_b = _two_functions(world)
+    with pytest.raises(ConfigError, match="removal_characterized"):
+        overlay.annotate_diff(
+            world.atlas,
+            anchor_ref=fn_a,
+            verdict="changed_real",
+            rationale="malformed",
+            verdict_basis={"removal_characterized": bad},
+            run_pair=PAIR,
+        )
+
+
+def test_the_handoff_states_what_a_removal_removed_instead_of_not_applicable(
+    world: World,
+) -> None:
+    """①b: the three facts cells of a one-sided finding used to read "not applicable" whatever the
+    subject was. They carry the real facts now — for EVERY one-sided finding, so what reaches a
+    reader does not depend on the characterisation gate's reach. The siblings cell stays not
+    applicable: it compares against a counterpart, and there is none.
+
+    MUTATION (verified RED, 1 failed each): put the "not applicable" cells back -> RED; render the
+    cmd row from the whole binary's candidates rather than the subject's -> the copy-only
+    function shows popen -> RED."""
+    from treasure_map.lib.query import review_report as rr
+
+    _sha7, fn_a, fn_b = _two_functions(world)
+    for anchor, want_cmd in ((fn_a, True), (fn_b, False)):
+        block = rr.handoff_chunk(
+            world.atlas,
+            PAIR,
+            {
+                "anchor_ref": anchor,
+                "subject_kind": "binary_presence",
+                "verdict": "changed_real",
+                "review_state": "concluded",
+            },
+        )
+        assert "change (tmap facts): not applicable" not in block
+        assert "reachable shape (tmap facts): not applicable" not in block
+        assert "same-shape unchanged siblings (tmap facts): not applicable" in block
+        assert ("popen(arg stack_buf, source free_string)" in block) is want_cmd
+    a_block = rr.handoff_chunk(
+        world.atlas,
+        PAIR,
+        {"anchor_ref": fn_a, "subject_kind": "binary_presence", "verdict": "changed_real"},
+    )
+    assert "whole-binary removed: 2 candidate(s) in this function" in a_block
+    assert "by sink class: cmd 1, copy 1" in a_block
+    assert "entry found (web_endpoint" in a_block
+
+
+def _review(w: World) -> Any:
+    from treasure_map.lib.query import review_units as ru
+
+    return ru.review_pair(
+        w.atlas,
+        "runA",
+        "runB",
+        k=ru.DEFAULT_K,
+        pair_staleness={"source_stale": False, "source_stale_reason": None},
+        server_commit="c0",
+    )
+
+
+def test_an_existence_only_removal_of_the_signal_class_is_not_disposed(world: World) -> None:
+    """② end to end. A judgement that cites every candidate and settles the removal on existence
+    alone satisfies every OTHER gate — presence citations are complete, so it reads disposed and
+    the pair reports its must-read set done. On the signal class it is now held: the subject goes
+    to needs_recheck and ``must_read_complete`` is false, which is what refuses the hand-off.
+
+    MUTATION (verified RED, 1 failed each): drop the presence_characterization_short call from
+    review_pair -> the existence-only judgement reads disposed -> RED; return {} from the short ->
+    same -> RED; set the state to CONCLUDED instead of NEEDS_RECHECK -> RED."""
+    from treasure_map.lib.query.coverage import NEEDS_RECHECK
+
+    _sha7, fn_a, fn_b = _two_functions(world)
+    for anchor in (fn_a, fn_b):
+        refs = bp.required_citations(_presence(world), anchor) or ()
+        overlay.annotate_diff(
+            world.atlas,
+            anchor_ref=anchor,
+            verdict="changed_real",
+            rationale="the binary is a_only; these candidates no longer exist in the firmware",
+            verdict_basis={"evidence": [anchor, *refs]},
+            run_pair=PAIR,
+        )
+    rep = _review(world)
+    short = rep.report["presence_characterization_short"]
+    # The copy-only function is NOT held: its facts still reach the hand-off, but no gate asks it
+    # to characterise anything.
+    assert set(short) == {fn_a}
+    assert short[fn_a]["required_cmd_callees"] == ["popen"]
+    assert rep.progress.states[fn_a] == NEEDS_RECHECK
+    assert rep.progress.states[fn_b] != NEEDS_RECHECK
+    assert rep.report["must_read_complete"] is False
+    assert "removal characterisation short 1" in rep.report["coverage_statement"]
+
+
+def test_stating_what_the_removal_removed_disposes_it_again(world: World) -> None:
+    """The gate is satisfiable by a write a writer can actually make, and it is satisfied by
+    STATING the facts — not by concluding anything about exploitability.
+
+    MUTATION (verified RED, 1 failed each): keep the subject in the short whatever the key says ->
+    RED; compare sink_classes including counts -> a recount re-opens -> RED."""
+    _sha7, fn_a, _fn_b = _two_functions(world)
+    refs = bp.required_citations(_presence(world), fn_a) or ()
+    overlay.annotate_diff(
+        world.atlas,
+        anchor_ref=fn_a,
+        verdict="changed_real",
+        rationale="the binary is a_only; this states the classes, the entry reading and the sink",
+        verdict_basis={
+            "evidence": [fn_a, *refs],
+            "removal_characterized": _characterize(world, fn_a),
+        },
+        run_pair=PAIR,
+    )
+    rep = _review(world)
+    assert rep.report["presence_characterization_short"] == {}
+    assert fn_a not in rep.report["presence_characterization_short"]
+
+
+def test_the_write_tells_a_held_subject_what_it_still_owes(world: World) -> None:
+    """★ the two paths share one predicate. A write on the signal class that does not characterise
+    the removal is told so IN THE WRITE'S ANSWER, in the same terms the report holds it to; a
+    write that does characterise it reads ``states_it`` true; and a subject the gate does not hold
+    is told nothing about it.
+
+    Two spellings of "what is owed" is how a write comes back saying disposed on a subject the
+    report holds back (or the reverse) — the failure entry_citation_applies' ★ names.
+
+    MUTATION (verified RED, 1 failed each): answer characterization on every presence anchor ->
+    the copy-only subject carries it -> RED; read the gap from a second, local predicate that
+    ignores cmd_sinks -> the owing write reads states_it true -> RED."""
+    _sha7, fn_a, fn_b = _two_functions(world)
+    rc = _characterize(world, fn_a)
+    tools = mcp_app.make_tools(world.path)
+
+    def write(anchor: str, **kw: Any) -> dict[str, Any]:
+        out = tools["annotate_diff"](
+            anchor_ref=anchor,
+            verdict="changed_real",
+            rationale="the binary is a_only and these candidates went with it",
+            run_pair=PAIR,
+            evidence=[anchor, *(bp.required_citations(_presence(world), anchor) or ())],
+            **kw,
+        )
+        assert out["written"] is True, out
+        return out
+
+    bare = write(fn_a)
+    assert bare["characterization"]["applies"] is True
+    assert bare["characterization"]["states_it"] is False
+    assert bare["characterization"]["owes"]["required_cmd_callees"] == ["popen"]
+    assert "removal_characterized" in bare["characterization_short"]
+    full = write(fn_a, removal_characterized=rc)
+    assert full["characterization"]["states_it"] is True
+    assert "characterization_short" not in full
+    # A subject the gate does not hold is never told it owes a characterisation.
+    assert "characterization" not in write(fn_b)
+
+
+def test_a_batch_can_characterise_the_removals_it_covers(world: World) -> None:
+    """A batch write takes the key too. A pair can hold a hundred one-sided subjects, and the
+    batch is how they are judged; without it the gate would be satisfiable only one subject at a
+    time, which is the dead-lock again in a slower form.
+
+    MUTATION (verified RED, 1 failed each): drop removal_characterized from _BATCH_ITEM_KEYS ->
+    the item is refused as a stray key -> RED; leave it in the key set but out of
+    _diff_verdict_basis -> it is accepted, silently dropped, and the subject stays short -> RED."""
+    _sha7, fn_a, _fn_b = _two_functions(world)
+    tools = mcp_app.make_tools(world.path)
+    out = tools["annotate_diff_batch"](
+        annotations=[
+            {
+                "anchor_ref": fn_a,
+                "verdict": "changed_real",
+                "rationale": "the binary is a_only; this states what went with it",
+                "evidence": [fn_a, *(bp.required_citations(_presence(world), fn_a) or ())],
+                "removal_characterized": _characterize(world, fn_a),
+            }
+        ],
+        run_pair=PAIR,
+    )
+    assert out.get("written") is True, out
+    assert _review(world).report["presence_characterization_short"] == {}

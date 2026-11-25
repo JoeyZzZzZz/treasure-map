@@ -893,7 +893,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "current view; Plain-text notes are kept but do not count) or change_inconclusive. "
             "rationale is required except for no_real_change (it defaults to why_unchanged). "
             "group_ref records a same-shape group the judgment leaned on; change_kind what a "
-            "changed_real does. unit_id (a work unit from start_diff_review(run_pair)) returns "
+            "changed_real does; removal_characterized what a removed binary held, when asked. "
+            "unit_id (a start_diff_review(run_pair) work unit) returns "
             "the next one, read at the session's k. One judgment per "
             "anchor: re-annotating OVERWRITES. Many entries at once: annotate_diff_batch."
         ),
@@ -906,12 +907,12 @@ TOOL_CARDS: dict[str, ToolCard] = {
             'annotate_diff_batch(annotations=[{"anchor_ref": "<anchor_ref>", '
             '"verdict": "change_inconclusive", "rationale": "<why>"}], diff_id="<diff_id>")'
         ),
-        boundary=("all of them or none", "Only those eight keys"),
+        boundary=("all of them or none", "Only those nine keys"),
         summary=(
             "Record YOUR judgments on many entries of one diff at once — all of them or none. "
             "annotations is 1..200 objects with annotate_diff's per-entry fields and no diff_id: "
             "anchor_ref + verdict, optionally rationale, checked, why_unchanged, evidence, "
-            "group_ref, change_kind. Only those eight keys — a stray key fails that item. "
+            "group_ref, change_kind, removal_characterized. Only those nine keys. "
             "unit_id as in annotate_diff. Every item is "
             "validated first; if any fails nothing is written and the failures come back merged "
             "by message with their indexes. The same anchor_ref twice refuses the batch."
@@ -1186,6 +1187,12 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
     _param(
         "change_kind",
         "what a changed_real does (sink_removed / ... / unknown)",
+        ("annotate_diff",),
+        _SINGLE,
+    ),
+    _param(
+        "removal_characterized",
+        "what a removed binary held (sink_classes, reachability, cmd_sinks)",
         ("annotate_diff",),
         _SINGLE,
     ),

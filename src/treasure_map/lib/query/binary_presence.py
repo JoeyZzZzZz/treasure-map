@@ -54,7 +54,11 @@ from typing import Any
 from treasure_map.lib.errors import ConfigError
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN, UNSEEN
-from treasure_map.lib.query.diff_align import NotDiffedBinary, not_diffed_groups
+from treasure_map.lib.query.diff_align import (
+    NotDiffedBinary,
+    candidate_facts_for,
+    not_diffed_groups,
+)
 from treasure_map.lib.ro_db import ro_connect
 
 SIDES = {"a": "a_only", "b": "b_only"}
@@ -89,6 +93,10 @@ class PresentBinary:
     functions: tuple[tuple[str, tuple[str, ...]], ...] = ()
     # The candidates whose evidence_ref names no function address (judged on the binary's anchor).
     unplaced: tuple[str, ...] = ()
+    # ref -> diff_align.candidate_facts: what each candidate's hunt record says about it. The
+    # per-candidate layer ``by_class`` collapses; ``by_class`` stays a count so that what a
+    # judgement rests on (``subject_facts``) reads as it always did.
+    facts_by_ref: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def tag(self) -> str:
@@ -103,6 +111,15 @@ class PresentBinary:
     def function_refs(self, addr: str) -> tuple[str, ...] | None:
         """The candidates of the function at ``addr``, or None when it holds none."""
         return dict(self.functions).get(addr)
+
+    def function_facts(self, addr: str) -> dict[str, dict[str, Any]]:
+        """``facts_by_ref`` for the candidates of the function at ``addr`` only — the per-function
+        slice ①a's reachability, the hand-off's facts and the characterisation gate all read."""
+        return {
+            ref: f
+            for ref in self.function_refs(addr) or ()
+            if (f := self.facts_by_ref.get(ref)) is not None
+        }
 
 
 @dataclass
@@ -345,6 +362,7 @@ def find_presence(
     runs = {"a": _read_run(atlas, run_a), "b": _read_run(atlas, run_b)}
     for side, other_side in (("a", "b"), ("b", "a")):
         own, other = runs[side], runs[other_side]
+        own_run = run_a if side == "a" else run_b
         if other.error is not None or other.root is None:
             continue  # nothing can be proven absent from a run that was not read
         if own.error is not None or own.root is None:
@@ -376,6 +394,7 @@ def find_presence(
                     referenced_by=_referenced_by(own, other, name),
                     functions=functions,
                     unplaced=unplaced,
+                    facts_by_ref=candidate_facts_for(atlas, own_run, b.refs),
                 )
             )
         out.items += _candidate_free(atlas, side, run_a, run_b, own, other)
@@ -430,6 +449,68 @@ def _candidate_free(
     return out
 
 
+# The two caveats a reachability reading always carries (the reachability-caveat contract, as in
+# triage._dim_reachability): they ride in ``note`` and NEVER collapse into ``status``.
+_REACH_NOTE_FOUND = (
+    "entry-level only: an entry edge of this kind references the binary — tmap does not connect "
+    "entry->sink within a function, and this says nothing about an authentication boundary"
+)
+_REACH_NOTE_INFERRED = (
+    "the web reading rests on PLACEMENT (basis: inferred — a CGI in a tree a named CGI is served "
+    "from), not on a web asset naming this file"
+)
+_REACH_NOTE_UNKNOWN = (
+    "no script/web/launch entry recorded — unknown, a coverage gap, NOT unreachable: cross-binary "
+    "launch edges are incomplete and service-dispatch/IPC bridges are not modelled"
+)
+
+
+def reachability_of(facts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """The weak entry reading over the candidates ``facts`` covers: ``status`` found when ANY of
+    them recorded an entry site, unknown when none did.
+
+    ★ Called with ONE function's candidates for a function subject and with the whole binary's for
+    the binary's own — the slice IS the scope. A function must never be given the binary's facts:
+    a function whose own candidates recorded no site would then read as web-reached because some
+    other function was, which over-states what tmap knows about this subject.
+
+    Weak by construction: ``status: found`` means an entry edge of some kind REFERENCES the binary
+    (or, with ``inferred`` among ``basis``, that placement suggests it is served), never that input
+    arrives at a sink and never that the entry is reachable without authenticating. ``unknown`` is
+    a coverage gap, never "unreachable"; both caveats ride in ``note``."""
+    kinds: set[str] = set()
+    inferred: set[str] = set()
+    refs: list[str] = []
+    for ref, f in sorted(facts.items()):
+        reach = f.get("entry_reach")
+        if not isinstance(reach, dict):
+            continue
+        ks = [k for k in reach.get("kinds") or () if isinstance(k, str)]
+        if ks:
+            refs.append(ref)
+        kinds |= set(ks)
+        inferred |= {k for k in reach.get("inferred_kinds") or () if isinstance(k, str)}
+    if not kinds:
+        return {
+            "status": "unknown",
+            "kinds": [],
+            "basis": None,
+            "note": _REACH_NOTE_UNKNOWN,
+            "evidence_refs": [],
+        }
+    rests_on_inference = bool(inferred) and inferred >= kinds
+    note = _REACH_NOTE_FOUND
+    if inferred:
+        note = f"{note}; {_REACH_NOTE_INFERRED}"
+    return {
+        "status": "found",
+        "kinds": sorted(kinds),
+        "basis": "inferred" if rests_on_inference else ("mixed" if inferred else "reference"),
+        "note": note,
+        "evidence_refs": refs,
+    }
+
+
 def subject_facts(b: PresentBinary) -> dict[str, Any]:
     """What a judgement on one of these rests on; any change re-checks it."""
     return {
@@ -440,6 +521,10 @@ def subject_facts(b: PresentBinary) -> dict[str, Any]:
         "candidates": b.candidates,
         "candidates_by_sink_class": dict(b.by_class),
         "referenced_by": [dict(r) for r in b.referenced_by],
+        # The whole binary's weak entry reading: ORed over every candidate it holds, which is what
+        # this anchor is about. A judgement written before this fact existed does not move on it
+        # (diff_review.facts_delta compares only the keys the stored snapshot holds).
+        "reachability": reachability_of(b.facts_by_ref),
     }
 
 
@@ -454,6 +539,98 @@ def function_subject_facts(b: PresentBinary, addr: str, refs: tuple[str, ...]) -
         "sha256": b.sha256,
         "function": addr,
         "candidates": list(refs),
+        # THIS function's weak entry reading — over its own candidates only, never the binary's
+        # (reachability_of's ★). A removal judged "the function is gone" now rests on whether
+        # anything reached it, so a later run that moves that reading re-checks the judgement.
+        "reachability": reachability_of(b.function_facts(addr)),
+    }
+
+
+# ── the removal characterisation gate: what a changed_real on the signal class must state ─────
+
+# The sink class the gate is about. A command-execution candidate is the one whose disappearance a
+# reader cannot settle with "the function is gone": what the removed code could run, and from what
+# argument, is the whole of what was lost.
+CMD_CLASS = "cmd"
+# The entry site kind the gate asks for. A WEAK reading (reachability_of): an edge of this kind
+# REFERENCES the binary. It is not a claim that the entry is reachable without authenticating —
+# the gate asks the writer to state what was there, never to conclude what could be done with it.
+WEB_KIND = "web_endpoint"
+
+
+def characterization_applies(facts: dict[str, dict[str, Any]]) -> bool:
+    """Whether the removal characterisation gate holds a ``changed_real`` on the subject whose
+    candidates are ``facts``: it holds a command-execution candidate AND a web entry edge
+    references its binary.
+
+    ★ The ONE predicate — the report's ``presence_characterization_short``, which decides whether
+    a stored judgement reads disposed, and anything that tells a writer what it still owes, read
+    THIS. Two spellings of the question is how a write comes back saying it reads needs_recheck on
+    a subject the report never holds, or the reverse (entry_citation_applies' ★).
+
+    Both halves are tmap's own recorded facts — a sink class and an entry edge — not a score, a
+    rank or a verdict. The gate asks the writer to STATE what the removed code held; it never asks
+    what could be done with it, and it never asks which free-input source fed it."""
+    if not any(f.get("sink_class") == CMD_CLASS for f in facts.values()):
+        return False
+    reach = reachability_of(facts)
+    return reach["status"] == "found" and WEB_KIND in reach["kinds"]
+
+
+def characterization_gap(
+    facts: dict[str, dict[str, Any]], verdict_basis: Any
+) -> dict[str, Any] | None:
+    """How far a judgement's ``removal_characterized`` characterises the subject whose candidates
+    are ``facts`` — None when it characterises it fully (the judgement counts as disposed).
+
+    Three questions, all three answered from the LIVE facts: the key is there and well formed; its
+    ``sink_classes`` names exactly the classes the subject's candidates carry (class NAMES as a
+    set — the counts are recorded, never gated, so a recount does not re-open a judgement); and
+    every command candidate's callee appears in ``cmd_sinks``. A command candidate whose own
+    callsite has no def-use record still has to be stated — "not traced" is the honest answer and
+    the writer gives it, rather than the candidate quietly having no row."""
+    vb = verdict_basis
+    if isinstance(vb, str) or vb is None:
+        try:
+            vb = json.loads(vb) if vb else {}
+        except (TypeError, ValueError):
+            vb = {}
+    rc = vb.get("removal_characterized") if isinstance(vb, dict) else None
+    want_classes = {str(f.get("sink_class")) for f in facts.values() if f.get("sink_class")}
+    want_callees = sorted(
+        {
+            str(f.get("sink_anchor"))
+            for f in facts.values()
+            if f.get("sink_class") == CMD_CLASS and f.get("sink_anchor")
+        }
+    )
+    if not isinstance(rc, dict):
+        return {
+            "missing": "removal_characterized",
+            "required_sink_classes": sorted(want_classes),
+            "required_cmd_callees": want_callees,
+            "why": (
+                "a whole-binary removal of a web-referenced binary holding a command-execution "
+                "candidate states what was removed: removal_characterized with sink_classes, "
+                "reachability and cmd_sinks"
+            ),
+        }
+    got_classes = {str(k) for k in (rc.get("sink_classes") or {})}
+    sinks = rc.get("cmd_sinks")
+    got_callees = (
+        {str(s.get("callee")) for s in sinks if isinstance(s, dict)}
+        if isinstance(sinks, list)
+        else set()
+    )
+    missing_callees = [c for c in want_callees if c not in got_callees]
+    if got_classes == want_classes and not missing_callees:
+        return None
+    return {
+        "missing": "characterisation does not match the subject's candidates",
+        "required_sink_classes": sorted(want_classes),
+        "stated_sink_classes": sorted(got_classes),
+        "required_cmd_callees": want_callees,
+        "missing_cmd_callees": missing_callees,
     }
 
 

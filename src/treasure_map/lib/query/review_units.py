@@ -35,9 +35,16 @@ Besides the entries, every changed non-binary file of the pair is a must-read un
 so are the binaries one run of the pair holds alone (``binary_presence``): each function of such a
 binary holding a candidate is a must-read member (a binary holding none is one member on its own
 anchor), handed out per binary in batches. Such a member is disposed only when its judgement, of
-whatever verdict, cites every candidate of its subject (``presence_citations_short``). A
-``changed_real`` on a must-read diff entry — function_pair or function_presence — is held to the
-same shape: it is disposed only when its ``checked`` / ``evidence`` cite every row of the entry
+whatever verdict, cites every candidate of its subject (``presence_citations_short``). Citing
+every candidate is satisfied by an EXISTENCE reading ("the binary is gone, so they are gone"), so
+on one narrow class of such a subject — a removed function that held a command-execution candidate
+whose binary a web entry edge references — a ``changed_real`` must also STATE what went with it
+(``presence_characterization_short``: the sink classes, the entry reading and each command sink's
+argument provenance, in ``verdict_basis.removal_characterized``). Facts, never a conclusion
+about impact; the other removals are not held to it, and their facts reach the hand-off either
+way. A ``changed_real`` on a must-read diff entry — function_pair or function_presence — is held
+to the same shape: it is disposed only when its ``checked`` / ``evidence`` cite every row of the
+entry
 that LANDED somewhere — every row whose ``landing`` is not ``persisted``, which is the rows the
 change is visible at — up to
 ``MAX_CITED`` of them (``entry_citations_short``); an entry all of whose rows are ``persisted``
@@ -872,6 +879,57 @@ def presence_citations_short(
     return out
 
 
+def presence_characterization_short(
+    atlas: sqlite3.Connection, facts: PairFacts, states: dict[str, str]
+) -> dict[str, dict[str, Any]]:
+    """The disposed ``changed_real`` judgements on the SIGNAL class of one-sided subject — a
+    command-execution candidate behind a web-referenced binary
+    (``binary_presence.characterization_applies``) — that do not say what the removed code held:
+    anchor -> what is missing (``binary_presence.characterization_gap``).
+
+    Why this gate exists: on a whole-binary removal the existing gates are all satisfied by an
+    EXISTENCE reading. "The binary is gone, so the function is gone, so its candidates are gone"
+    cites every candidate, so it reads disposed and no gate holds it back. Measured on a real
+    pair: of 117 removal-side judgements, every one read disposed and exactly ONE said anything
+    about whether an entry edge reached the removed code. A command-execution entry that
+    disappears is the one removal a reader cannot settle that way, so on those — and only those —
+    the judgement states the sink classes, the entry reading and each command sink's argument
+    provenance.
+
+    The gate asks for FACTS, not a conclusion: no impact judgement, no claim about an
+    authentication boundary, and no free-input source class. The other removals (copy, path_sink,
+    format, fmt_string) are not held to it; their facts reach the hand-off regardless, which does
+    not depend on this gate's reach."""
+    from treasure_map.lib.query import binary_presence as bp
+
+    out: dict[str, dict[str, Any]] = {}
+    pair = dr.run_pair(facts.run_a, facts.run_b)
+    rows = {
+        r[0]: r[1]
+        for r in atlas.execute(
+            "SELECT anchor_ref, verdict_basis FROM overlay "
+            "WHERE anchor_kind = 'diff_subject' AND run_id = ? AND verdict = 'changed_real'",
+            (pair,),
+        )
+    }
+    if not rows:
+        return out
+    for m in facts.presence_members:
+        if not disposed(states.get(m.anchor_ref)) or m.anchor_ref not in rows:
+            continue
+        found = facts.presence.resolve(m.anchor_ref)
+        if found is None:
+            continue
+        b, addr = found
+        per_ref = b.function_facts(addr) if addr is not None else dict(b.facts_by_ref)
+        if not bp.characterization_applies(per_ref):
+            continue
+        gap = bp.characterization_gap(per_ref, rows[m.anchor_ref])
+        if gap is not None:
+            out[m.anchor_ref] = gap
+    return out
+
+
 # ── the diff entries: whether a changed_real cites the rows it landed on ─────────────────────
 
 
@@ -1493,6 +1551,7 @@ def report(
     audits: Audits | None = None,
     presence_short: dict[str, dict[str, Any]] | None = None,
     entry_short: dict[str, dict[str, Any]] | None = None,
+    char_short: dict[str, dict[str, Any]] | None = None,
     reduce_owed: list[Member] | None = None,
 ) -> dict[str, Any]:
     """The pair's report: the must-read set by unit kind and by reason, how much of it and of every
@@ -1502,6 +1561,7 @@ def report(
     audits = audits or Audits()
     presence_short = presence_short or {}
     entry_short = entry_short or {}
+    char_short = char_short or {}
     reduce_owed = reduce_owed or []
     # An audit re-reads a subject and a reduce re-judges one: neither is a subject of its own.
     subjects = [u for u in units if u.kind not in (AUDIT, REDUCE)]
@@ -1597,6 +1657,7 @@ def report(
         f"presence citations short {len(presence_short)}; "
         f"entry citations short {len(entry_short)} "
         f"(landed rows uncited {sum(int(g['uncited']) for g in entry_short.values())}); "
+        f"removal characterisation short {len(char_short)}; "
         f"basis incomplete {basis_incomplete['count']}; "
         f"dangling {dangling['count']} (changed_real {dangling['changed_real']['count']}); "
         f"not listed {not_listed['count']}; "
@@ -1654,6 +1715,9 @@ def report(
         # landed rows carry no citation at all (an over-cap entry owes MAX_CITED of them).
         "entry_citations_short": entry_short,
         "entry_citations_uncited": sum(int(g["uncited"]) for g in entry_short.values()),
+        # The one-sided removals of the signal class whose judgement never says what the removed
+        # code held (presence_characterization_short).
+        "presence_characterization_short": char_short,
         "groups": {
             "units": len(group_units),
             "members": sum(len(u.members) for u in group_units),
@@ -1831,6 +1895,11 @@ def review_pair(
     for anchor in entry_short:
         # A changed_real that does not cite the rows it landed on: read again, not disposed.
         progress.states[anchor] = NEEDS_RECHECK
+    char_short = presence_characterization_short(atlas, facts, progress.states)
+    for anchor in char_short:
+        # A whole-binary removal of a web-referenced command-execution entry that never says what
+        # the removed code held: read again, not disposed.
+        progress.states[anchor] = NEEDS_RECHECK
     audits = read_audits(atlas, facts, units)
     for anchor in audits.needs_recheck:
         # Judged before anything of the subject was read (A-2(2)): re-read, not disposed. Always
@@ -1873,6 +1942,7 @@ def review_pair(
         audits=audits,
         presence_short=short,
         entry_short=entry_short,
+        char_short=char_short,
         reduce_owed=owed,
     )
     nav = None

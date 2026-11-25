@@ -228,6 +228,18 @@ class SameShapeReads:
     views: dict[str, BuiltDiff | None] = field(default_factory=dict)
     calls: dict[tuple[str, str], list[_Call]] = field(default_factory=dict)
     sides: dict[tuple[str, str | None], _Side] = field(default_factory=dict)
+    presences: dict[str, Any] = field(default_factory=dict)
+
+    def presence(self, atlas: sqlite3.Connection, run_a: str, run_b: str) -> Any:
+        """The pair's one-sided binaries (binary_presence.Presence), read once for the pass. The
+        hand-off asks for it once per whole-binary finding, and a pair can hold a hundred of
+        them."""
+        from treasure_map.lib.query.binary_presence import find_presence
+
+        key = f"{run_a}::{run_b}"
+        if key not in self.presences:
+            self.presences[key] = find_presence(atlas, run_a, run_b)
+        return self.presences[key]
 
     def view(self, atlas: sqlite3.Connection, diff_id: str) -> BuiltDiff | None:
         if diff_id not in self.views:

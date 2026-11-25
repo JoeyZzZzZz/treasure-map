@@ -15,6 +15,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -574,6 +575,9 @@ _SIBLINGS = "same-shape unchanged siblings (tmap facts)"
 _FILE = "file difference (tmap facts)"
 _FILE_HUNK = "file hunk (tmap facts)"
 _FENCE = "```"
+# How many of a subject's command-sink records one cell shows. The sink CLASS itself is
+# binary_presence.CMD_CLASS — the gate's own constant, read rather than spelled again here.
+_CMD_SINKS_SHOWN = 6
 
 
 @dataclass(frozen=True)
@@ -1115,18 +1119,124 @@ def _handoff_file_facts(atlas: Any, run_a: str, run_b: str, path: str) -> list[s
     return out + tail
 
 
-def _handoff_binary_facts(side_path: str, addr: str | None = None) -> list[str]:
-    """A binary present in one run of the pair only, or one function of it (``addr``): a
-    whole-binary add or remove, so the function-pair facts do not apply."""
+def _handoff_binary_facts(
+    atlas: Any,
+    run_pair: str,
+    anchor: str,
+    side_path: str,
+    addr: str | None = None,
+    *,
+    reads: SameShapeReads | None = None,
+) -> list[str]:
+    """A binary present in one run of the pair only, or one function of it (``addr``).
+
+    ★ The three cells below used to read "not applicable (whole-binary add / remove)" on every one
+    of these. On a REMOVAL that is the wrong shape of answer: a reader settles it with "the
+    function is gone", and what the removed code HELD — the sink classes, whether an entry edge
+    reached it, where each command argument came from — never reaches the hand-off at all. They
+    carry those facts now, for every one-sided finding and whatever the characterisation gate
+    covers, so the facts never depend on a judgement having been written. ``same-shape unchanged
+    siblings`` stays not applicable: it compares against a counterpart, and there is none."""
     where = f"present on one side only: {_inline(side_path)}"
     if addr is not None:
         where = f"function {_inline(addr)} of one-sided binary {_inline(side_path)} ({where})"
-    return [
-        _cell("whole-binary presence (tmap facts)", where),
-        _cell(_CHANGE, "not applicable (whole-binary add / remove)"),
-        _cell(_SHAPE, "not applicable (whole-binary add / remove)"),
-        _cell(_SIBLINGS, "not applicable (whole-binary add / remove)"),
+    out = [_cell("whole-binary presence (tmap facts)", where)]
+    facts = _presence_facts(atlas, run_pair, anchor, reads=reads)
+    if facts is None:
+        out.append(_cell(_CHANGE, _unavailable("the pair's one-sided binaries cannot be read")))
+        out.append(_cell(_SHAPE, _unavailable("the pair's one-sided binaries cannot be read")))
+    else:
+        out += _presence_fact_cells(facts)
+    out.append(_cell(_SIBLINGS, "not applicable (whole-binary add / remove — no counterpart)"))
+    return out
+
+
+def _presence_facts(
+    atlas: Any, run_pair: str, anchor: str, *, reads: SameShapeReads | None
+) -> dict[str, Any] | None:
+    """The hunt facts of the subject ``anchor`` names: the candidates removed or added with it,
+    their sink classes, the weak entry reading over them, and each command sink's argument
+    provenance. None when the pair or the anchor cannot be resolved."""
+    from treasure_map.lib.query import binary_presence as bp
+    from treasure_map.lib.query import file_diff as _fd
+
+    runs = _fd.split_run_pair(atlas, run_pair)
+    if runs is None:
+        return None
+    try:
+        presence = (
+            reads.presence(atlas, runs[0], runs[1])
+            if reads is not None
+            else bp.find_presence(atlas, runs[0], runs[1])
+        )
+        found = presence.resolve(anchor)
+    except (sqlite3.Error, ValueError, KeyError):
+        return None
+    if found is None:
+        return None
+    b, addr = found
+    per_ref = b.function_facts(addr) if addr is not None else dict(b.facts_by_ref)
+    classes: dict[str, int] = {}
+    cmd_sinks: list[dict[str, Any]] = []
+    cmd_candidates = 0
+    for f in per_ref.values():
+        cls = f.get("sink_class")
+        classes[str(cls)] = classes.get(str(cls), 0) + 1
+        if cls == bp.CMD_CLASS:
+            cmd_candidates += 1
+            cmd_sinks += [dict(r) for r in f.get("arg_provenance") or ()]
+    return {
+        "side": b.tag,
+        "functions": len(b.functions),
+        "candidates": len(per_ref),
+        "sink_classes": dict(sorted(classes.items())),
+        "reachability": bp.reachability_of(per_ref),
+        "cmd_sinks": cmd_sinks,
+        # How many command candidates the subject holds, so the cell can say "none traced" apart
+        # from "holds none" without naming the sink class again here.
+        "cmd_candidates": cmd_candidates,
+        "scope": "function" if addr is not None else "binary",
+    }
+
+
+def _presence_fact_cells(facts: dict[str, Any]) -> list[str]:
+    """The ``change`` and ``reachable shape`` cells of a one-sided subject, from ``_presence_facts``
+    — the SAME reading the characterisation gate is held to, rendered once here."""
+    gone = "removed" if facts["side"] == "a_only" else "added"
+    classes = facts["sink_classes"]
+    spread = ", ".join(f"{k} {v}" for k, v in classes.items()) or "none"
+    scope = (
+        f"{facts['candidates']} candidate(s) in this function"
+        if facts["scope"] == "function"
+        else f"{facts['candidates']} candidate(s) in {facts['functions']} function(s)"
+    )
+    reach = facts["reachability"]
+    shape = f"entry {reach['status']}"
+    if reach["kinds"]:
+        shape += f" ({', '.join(reach['kinds'])}, basis {reach['basis']})"
+    shape += f" — {reach['note']}"
+    cmd = facts["cmd_sinks"]
+    out = [
+        _cell(_CHANGE, f"whole-binary {gone}: {scope}; by sink class: {spread}"),
+        _cell(_SHAPE, shape),
     ]
+    if cmd:
+        shown = [
+            f"{c.get('callee') or '?'}(arg {c.get('arg_kind') or 'not traced'}, source "
+            f"{c.get('source_kind') or 'unknown'})"
+            for c in cmd[:_CMD_SINKS_SHOWN]
+        ]
+        more = f" (+{len(cmd) - len(shown)} more)" if len(cmd) > len(shown) else ""
+        out.append(_cell("command sinks (tmap facts)", "; ".join(shown) + more))
+    elif facts["cmd_candidates"]:
+        out.append(
+            _cell(
+                "command sinks (tmap facts)",
+                "no def-use record for the anchored sink of any command candidate — not traced, "
+                "which is not a statement that the argument is constant",
+            )
+        )
+    return out
 
 
 def _finding_change_kind(finding: dict[str, Any]) -> str:
@@ -1292,7 +1402,9 @@ def handoff_chunk(
         fn = dr.split_presence_function(anchor)
         base = fn[0] if fn is not None else anchor
         side = base.split("#binary_presence#", 1)[1] if "#binary_presence#" in base else base
-        lines += _handoff_binary_facts(side, fn[1] if fn is not None else None)
+        lines += _handoff_binary_facts(
+            atlas, run_pair, anchor, side, fn[1] if fn is not None else None, reads=reads
+        )
     else:
         why = f"unknown subject kind {kind!r}" if kind else "no diff for this finding"
         lines.append(_cell(_CHANGE, _unavailable(why)))
