@@ -4,9 +4,10 @@
 
 A tool's docstring is its FULL reference — kept whole and served by get_tool_reference. What a
 client is sent as the tool's description is short instead, rendered from the tool's card here: a
-first line naming the parameters a call needs, the card's summary, and a pointer back to the full
-reference. Clients cut long descriptions (and long server instructions) at a fixed length, so the
-part a reader most needs has to come first and the whole of it has to fit.
+first line naming the parameters a call needs, then the card's summary (the server's instructions
+say once that ``get_tool_reference(name)`` returns the full reference). Clients cut long
+descriptions (and long server instructions) at a fixed length, so the part a reader most needs has
+to come first and the whole of it has to fit.
 
 A card is DOCUMENTATION. At run time it is used for exactly three things: rendering text (the
 first line, get_tool_reference), naming what is still missing when a call carries an unknown
@@ -103,8 +104,10 @@ def reference_call(name: str) -> str:
 
 
 def render_description(name: str, card: ToolCard) -> str:
-    """What a client is sent as the tool's description: the first line, the summary, the pointer."""
-    return f"{render_requires(card)}\n{card.summary}\nFull reference: {reference_call(name)}."
+    """What a client is sent as the tool's description: the first line and the summary. Where the
+    full reference is (``get_tool_reference(name)``) is said once, in the server's instructions,
+    not again in every tool's description."""
+    return f"{render_requires(card)}\n{card.summary}"
 
 
 def _given_names(card: ToolCard, arguments: Mapping[str, Any]) -> set[str]:

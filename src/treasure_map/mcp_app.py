@@ -32,6 +32,7 @@ summary / vuln_hint / has_user_input) is ever produced.
 
 from __future__ import annotations
 
+import copy
 import difflib
 import functools
 import inspect
@@ -44,6 +45,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import Tool as MCPTool
 from mcp.types import ToolAnnotations
 
 from treasure_map import mcp_cards as _cards
@@ -7448,6 +7450,54 @@ def make_tools(
     return tools
 
 
+# Keywords whose value is data, not a subschema: copied as they are.
+_SCHEMA_DATA_KEYWORDS = frozenset({"default", "enum", "const", "examples"})
+# Keywords whose value maps NAMES to subschemas: the names are never read as keywords.
+_SCHEMA_NAME_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
+
+
+def _bare_types(members: object) -> list[str] | None:
+    """The member types of an ``anyOf`` whose every member is exactly ``{"type": <name>}``; None
+    for any other ``anyOf`` (one member carrying ``items``, ``additionalProperties`` or anything
+    else beside its type)."""
+    if not isinstance(members, list) or not members:
+        return None
+    out: list[str] = []
+    for m in members:
+        if not isinstance(m, dict) or set(m) != {"type"} or not isinstance(m["type"], str):
+            return None
+        out.append(m["type"])
+    return out
+
+
+def _compact_schema(node: Any) -> Any:
+    """``node`` (a JSON schema) without what costs a client's context and tells a caller nothing:
+    every ``title`` keyword is dropped (FastMCP derives each from the parameter or model name),
+    and an ``anyOf`` of bare ``{"type": T}`` members becomes ``"type": [T, ...]`` — the same set
+    of accepted values. An ``anyOf`` any of whose members carries more than its type is kept as it
+    is. Names under ``properties`` (and the other name maps) and the values of data keywords are
+    never read as keywords. Builds new containers; pass a deep copy when the leaves must not be
+    shared."""
+    if isinstance(node, list):
+        return [_compact_schema(x) for x in node]
+    if not isinstance(node, dict):
+        return node
+    folded = _bare_types(node.get("anyOf")) if "type" not in node else None
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "title":
+            continue
+        if key == "anyOf" and folded is not None:
+            out["type"] = folded
+        elif key in _SCHEMA_DATA_KEYWORDS:
+            out[key] = value
+        elif key in _SCHEMA_NAME_MAPS and isinstance(value, dict):
+            out[key] = {name: _compact_schema(sub) for name, sub in value.items()}
+        else:
+            out[key] = _compact_schema(value)
+    return out
+
+
 class _CheckedFastMCP(FastMCP[Any]):
     """FastMCP that refuses a call naming a parameter the tool does not take.
 
@@ -7456,10 +7506,34 @@ class _CheckedFastMCP(FastMCP[Any]):
     missing — an answer to another question. Every call goes through ``call_tool``, so this is the
     one place to stop it. ONLY unknown names are refused here, before the tool runs (a write tool
     therefore never writes half): a call that is merely missing something reaches the tool, which
-    reports it itself, in its own order and with its own structured fields."""
+    reports it itself, in its own order and with its own structured fields.
+
+    ``list_tools`` sends each tool's declaration without the parts that tell a caller nothing; the
+    tools themselves and their answers are FastMCP's own."""
 
     _accepted: dict[str, tuple[str, ...]]
     _call_log: _tool_call_log.ToolCallLog | None = None
+
+    async def list_tools(self) -> list[MCPTool]:
+        """The tools as FastMCP lists them, each with an ``inputSchema`` passed through
+        ``_compact_schema`` and no ``outputSchema``. Every tool returns a free-form object, so the
+        output schema FastMCP derives says only ``{"type": "object", "additionalProperties":
+        true}``; leaving it out of the declaration changes nothing a call returns — whether an
+        answer carries ``structuredContent`` is decided by the tool's own ``fn_metadata``, which is
+        not touched. The low-level server checks a call's arguments against the schema listed
+        here, and the folded form accepts exactly the values the ``anyOf`` did. FastMCP hands out
+        each tool's own ``parameters`` dict (copied only at its top level), so the schema is
+        deep-copied before it is rewritten: the tool's own ``parameters`` keeps every key."""
+        listed = await super().list_tools()
+        return [
+            t.model_copy(
+                update={
+                    "inputSchema": _compact_schema(copy.deepcopy(t.inputSchema)),
+                    "outputSchema": None,
+                }
+            )
+            for t in listed
+        ]
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         accepted = self._accepted.get(name)

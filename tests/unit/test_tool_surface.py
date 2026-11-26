@@ -3,9 +3,11 @@
 """What a client is sent for each tool, and what a call that names the wrong parameters gets back.
 
 Each tool goes out with a short description rendered from its card (mcp_cards): a first line of
-required parameters, a summary that keeps the tool's boundary phrases, and a pointer to its full
-reference — the unchanged docstring, served by get_tool_reference. The server instructions are cut
-to what a client shows, the whole guide one call away. An unknown parameter is refused before the
+required parameters and a summary that keeps the tool's boundary phrases; the full reference — the
+unchanged docstring — is served by get_tool_reference, which the server instructions name once.
+Each declaration leaves out what tells a caller nothing (schema titles, the free-form output
+schema) and folds a nullable ``anyOf`` into a type list. The server instructions are cut to what a
+client shows, the whole guide one call away. An unknown parameter is refused before the
 tool runs, with the closest names; a call that is only missing something still reaches the tool,
 whose error gains a minimal call.
 
@@ -27,7 +29,7 @@ from typing import Any
 import pytest
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import CallToolRequest, CallToolRequestParams
+from mcp.types import CallToolRequest, CallToolRequestParams, ListToolsRequest
 
 from treasure_map import mcp_app
 from treasure_map import mcp_cards as cards
@@ -182,10 +184,10 @@ def test_the_descriptions_and_the_instructions_fit_what_a_client_shows(atlas: Pa
     listed = asyncio.run(mcp_app.build_server(atlas).list_tools())
     sizes = {t.name: len(t.description or "") for t in listed}
     assert len(sizes) == 42
-    # Raised from 25,000 when get_diff_handoff (the findings hand-off, Design B) was added as the
-    # 42nd tool: the 41-tool surface was already at ~24,962, and a legitimate new tool needs room.
+    # 23,404 once each description stopped repeating the "Full reference:" line (the instructions
+    # say it once): the cap sits just above that, so the room it freed is not spent silently.
     # The per-tool cap (1,200) is unchanged — that is the real per-description UX limit.
-    assert sum(sizes.values()) <= 26_000, sum(sizes.values())
+    assert sum(sizes.values()) <= 24_000, sum(sizes.values())
     assert max(sizes.values()) <= 1_200, max(sizes.items(), key=lambda kv: kv[1])
     for t in listed:
         assert t.description == inspect.cleandoc(t.description or ""), t.name
@@ -1300,7 +1302,9 @@ def test_the_instructions_hold_both_entry_points_within_what_a_client_shows() ->
     the length test)."""
     text = mcp_app._AGENT_INSTRUCTIONS
     assert text.index("DIFF: ") < 3_800
-    assert text.endswith(_POINTER) and text.index(_POINTER) < 3_800
+    # the whole sentence, not only its start: it is the one place a client is told where each
+    # tool's full reference is (no tool description repeats it)
+    assert text.endswith(_POINTER) and text.index(_POINTER) + len(_POINTER) <= 3_800
     for phrase in (
         "read-only fact tools, plus five that write only YOUR judgments onto an overlay "
         "(annotate, annotate_diff, annotate_diff_batch, promote, clear_overlay; the base map is "
@@ -1525,17 +1529,179 @@ def test_the_reference_is_the_docstring_with_only_its_indentation_taken_out(
         assert _norm(got) == _norm(fn.__doc__ or ""), name
 
 
-def test_the_hint_layer_leaves_each_tool_schema_byte_for_byte(atlas: Path) -> None:
+def _plain_and_ours(atlas: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Each tool as this server lists it, and as a plain FastMCP lists the same functions."""
     ours = {t.name: t for t in asyncio.run(mcp_app.build_server(atlas).list_tools())}
     plain = FastMCP("plain")
     for name, fn in mcp_app.make_tools(atlas).items():
         plain.add_tool(fn, name=name)
     theirs = {t.name: t for t in asyncio.run(plain.list_tools())}
     assert set(ours) == set(theirs)
+    return theirs, ours
+
+
+_NAME_MAPS = ("properties",)
+
+
+def _schema_differences(theirs: Any, ours: Any, path: str, out: dict[str, list[str]]) -> None:
+    """Every difference between two schemas, sorted into ``title_removed`` (a ``title`` keyword
+    that is gone), ``null_union_folded`` (an ``anyOf`` of bare ``{"type": T}`` members replaced by
+    ``"type": [T, ...]`` in the same order) and ``OTHER`` (anything else). Written apart from the
+    server's own rewrite, so a rewrite that does more than those two things shows up here."""
+    if isinstance(theirs, dict) and isinstance(ours, dict):
+        accounted: set[str] = set()
+        for key, value in theirs.items():
+            if key == "title" and key not in ours:
+                out["title_removed"].append(f"{path}/title")
+                continue
+            if key == "anyOf" and key not in ours:
+                bare = isinstance(value, list) and all(
+                    isinstance(m, dict) and set(m) == {"type"} for m in value
+                )
+                if bare and "type" not in theirs and ours.get("type") == [m["type"] for m in value]:
+                    out["null_union_folded"].append(f"{path}/anyOf")
+                    accounted.add("type")
+                else:
+                    out["OTHER"].append(f"{path}/anyOf")
+                continue
+            if key not in ours:
+                out["OTHER"].append(f"{path}/{key} removed")
+                continue
+            if key in _NAME_MAPS and isinstance(value, dict) and isinstance(ours[key], dict):
+                if set(value) != set(ours[key]):
+                    out["OTHER"].append(f"{path}/{key} names")
+                for name in value.keys() & ours[key].keys():
+                    _schema_differences(value[name], ours[key][name], f"{path}/{key}/{name}", out)
+                continue
+            _schema_differences(value, ours[key], f"{path}/{key}", out)
+        for key in ours.keys() - theirs.keys() - accounted:
+            out["OTHER"].append(f"{path}/{key} added")
+        return
+    if isinstance(theirs, list) and isinstance(ours, list) and len(theirs) == len(ours):
+        for i, (a, b) in enumerate(zip(theirs, ours, strict=True)):
+            _schema_differences(a, b, f"{path}/{i}", out)
+        return
+    if json.dumps(theirs, sort_keys=True) != json.dumps(ours, sort_keys=True):
+        out["OTHER"].append(f"{path} value")
+
+
+def test_the_input_schema_differs_from_plain_fastmcp_only_by_titles_and_folded_unions(
+    atlas: Path,
+) -> None:
+    """Each tool's ``inputSchema`` is the one FastMCP derives from the tool's own signature, less
+    two things that carry no meaning a caller lacks: every ``title`` (FastMCP's from the
+    parameter name), and an ``anyOf`` of bare types written as a type list. Nothing else — an
+    ``anyOf`` with ``items`` or ``additionalProperties`` on a member stays as it is.
+
+    MUTATION (verified RED, 1 failed): fold an ``anyOf`` whose members carry ``items`` too
+    (hoisting them to the parent) -> OTHER != 0 -> RED.
+    MUTATION (verified RED, 1 failed): also drop ``default`` -> OTHER != 0 -> RED.
+    MUTATION (verified RED, 1 failed): stop folding -> null_union_folded == 0 -> RED."""
+    theirs, ours = _plain_and_ours(atlas)
+    out: dict[str, list[str]] = {"title_removed": [], "null_union_folded": [], "OTHER": []}
     for name in ours:
-        assert json.dumps(ours[name].inputSchema, sort_keys=True) == json.dumps(
-            theirs[name].inputSchema, sort_keys=True
-        ), name
-        assert json.dumps(ours[name].outputSchema, sort_keys=True) == json.dumps(
-            theirs[name].outputSchema, sort_keys=True
-        ), name
+        _schema_differences(theirs[name].inputSchema, ours[name].inputSchema, name, out)
+    assert out["OTHER"] == []
+    # counts of today's 42 tools, so a rewrite that quietly stops doing either shows
+    assert len(out["title_removed"]) == 275, len(out["title_removed"])
+    assert len(out["null_union_folded"]) == 131, len(out["null_union_folded"])
+
+
+def test_no_tool_declares_an_output_schema_and_plain_fastmcp_s_says_nothing(atlas: Path) -> None:
+    """The ``outputSchema`` left out of every declaration is one that carries no information:
+    plain FastMCP derives, for every tool, a bare free-form object (and a title from the function
+    name). A tool that comes to return a typed result would make it say something, and this turns
+    red — leaving it out then would lose that.
+
+    MUTATION (verified RED, 1 failed): keep FastMCP's ``outputSchema`` in ``list_tools`` -> RED."""
+    theirs, ours = _plain_and_ours(atlas)
+    for name in ours:
+        assert ours[name].outputSchema is None, name
+        plain = {k: v for k, v in (theirs[name].outputSchema or {}).items() if k != "title"}
+        assert plain == {"additionalProperties": True, "type": "object"}, name
+
+
+def _nullable(p: dict[str, Any]) -> bool:
+    return isinstance(p.get("anyOf"), list) and {"type": "null"} in p["anyOf"]
+
+
+def test_every_parameter_that_took_null_still_declares_it(atlas: Path) -> None:
+    """A parameter plain FastMCP declares nullable is still declared nullable: a folded one has
+    ``"null"`` in its type list, one left as ``anyOf`` (a member carries more than its type) still
+    has ``{"type": "null"}`` there. Keyed by (tool, parameter) — the same name is nullable in one
+    tool and required in another. Every ``anyOf`` left is one with such a member.
+
+    MUTATION (verified RED, 1 failed): fold dropping the ``null`` member -> RED.
+    MUTATION (verified RED, 1 failed): leave a bare-types ``anyOf`` unfolded -> RED."""
+    theirs, ours = _plain_and_ours(atlas)
+    nullable_before = {
+        (n, pn)
+        for n, t in theirs.items()
+        for pn, p in t.inputSchema.get("properties", {}).items()
+        if _nullable(p)
+    }
+    assert len(nullable_before) == 138, len(nullable_before)  # never an empty set read as a pass
+    for name, t in ours.items():
+        for pname, p in t.inputSchema.get("properties", {}).items():
+            if "anyOf" in p:
+                assert not all(set(m) <= {"type"} for m in p["anyOf"]), (name, pname)
+            if (name, pname) in nullable_before:
+                if "anyOf" in p:
+                    assert {"type": "null"} in p["anyOf"], (name, pname)
+                else:
+                    assert isinstance(p.get("type"), list) and "null" in p["type"], (name, pname)
+
+
+def test_listing_twice_gives_the_same_and_leaves_the_tools_own_schemas_whole(
+    atlas: Path,
+) -> None:
+    """The rewrite is made on a copy: FastMCP lists each tool's own ``parameters`` dict, shared
+    below its top level, so rewriting what it hands out in place would rewrite the tool itself.
+
+    MUTATION (verified RED, 1 failed): drop the deep copy in ``list_tools`` -> RED."""
+    server = mcp_app.build_server(atlas)
+    first = [
+        t.model_dump(by_alias=True, exclude_none=True) for t in asyncio.run(server.list_tools())
+    ]
+    again = [
+        t.model_dump(by_alias=True, exclude_none=True) for t in asyncio.run(server.list_tools())
+    ]
+    assert first == again
+    for name in mcp_app.make_tools(atlas):
+        params = server._tool_manager.get_tool(name).parameters
+        assert "title" in params, name
+        assert all("title" in p for p in params.get("properties", {}).values()), name
+
+
+def test_the_listing_fits_its_budget_as_a_client_receives_it(atlas: Path) -> None:
+    """The whole ``tools/list`` answer, serialized the way it goes over the wire (compact JSON, no
+    None fields): 42,040 characters for today's 42 tools, the cap just above.
+
+    MUTATION (verified RED, 1 failed): keep every schema title -> RED."""
+    listed = asyncio.run(mcp_app.build_server(atlas).list_tools())
+    raw = json.dumps(
+        [t.model_dump(by_alias=True, exclude_none=True) for t in listed],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    assert len(raw) <= 43_000, len(raw)
+
+
+def test_a_call_still_answers_with_structured_content(atlas: Path) -> None:
+    """No declared ``outputSchema`` does not take the structured part out of an answer: through
+    the low-level request handler (the path a client's call takes, after a listing), the result
+    carries ``structuredContent`` equal to the JSON text block.
+
+    MUTATION (verified RED, 1 failed): register the tools with ``structured_output=False``
+    -> RED."""
+    server = mcp_app.build_server(atlas)
+    low = server._mcp_server
+    asyncio.run(low.request_handlers[ListToolsRequest](ListToolsRequest(method="tools/list")))
+    req = CallToolRequest(
+        method="tools/call", params=CallToolRequestParams(name="list_runs", arguments={})
+    )
+    res = asyncio.run(low.request_handlers[CallToolRequest](req)).root
+    assert not res.isError
+    assert res.structuredContent is not None
+    assert res.structuredContent == json.loads(res.content[0].text)
+    assert res.structuredContent["runs"][0]["run_id"]
