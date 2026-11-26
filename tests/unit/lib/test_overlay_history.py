@@ -92,6 +92,37 @@ def test_a_promotion_is_recorded_as_one(world: World) -> None:
     assert row["event"] == "promote" and row["after"]["promoted_from"]
 
 
+def test_an_mcp_promotion_records_what_was_read_before_it(world: World, tmp_path: Path) -> None:
+    """★ A promotion writes a CANDIDATE verdict, so the read basis and the channel belong to it
+    exactly as they do to a write made by hand — and ``promote`` was the one write tool of the five
+    that passed no context at all, which is why its member read disposed with the read gate never
+    applied.
+
+    Through the TOOL, and on a promotion that is WRITTEN: the gate half of the same fix is
+    witnessed by a refused write (test_mcp_app), and a refused write produces no history row, so
+    nothing there can see what a successful one records.
+
+    MUTATION (verified RED, ``1 failed``): drop ``ctx=`` from the promote call site -> channel
+    ``api`` and a null read_basis -> RED; drop ``read_basis=`` from that context -> RED.
+    """
+    from treasure_map import mcp_app
+    from treasure_map.lib import tool_call_log as tcl
+
+    world.pair(DX, "00001000", "00002000")
+    ref = _ref("runA", "00001000")
+    world.rows[DX] = [a_row("00001000")]
+    world.candidate(ref)
+    log = tcl.ToolCallLog(tmp_path / "calls.jsonl", tcl.Session(id="promote-session"))
+    # one read of this session, so the basis is a real reading rather than "no log"
+    log.record("get_pseudocode", {"run_id": "runA", "function": "0x00001000"}, result={})
+    tools = mcp_app.make_tools(world.path, call_log=log)
+    out = tools["promote"](DX, "pair:00001000:00002000", ref, "suspicious", "carried over")
+    assert out["written"] is True, out
+    (row,) = [r for r in _history(world, ref) if r["event"] == "promote"]
+    assert (row["channel"], row["session"]) == ("mcp", "promote-session")
+    assert row["read_basis"] and "basis" in row["read_basis"]
+
+
 @pytest.mark.parametrize("scope", ["anchor", "run", "kind"])
 def test_every_clear_scope_records_each_row_it_deletes(
     judged: tuple[World, str], scope: str

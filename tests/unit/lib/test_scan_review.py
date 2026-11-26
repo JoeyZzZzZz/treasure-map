@@ -1148,8 +1148,9 @@ def test_the_by_binary_facet_caps_what_it_prints_not_what_it_counts(tmp_path: Pa
 
 
 def test_an_overlay_row_with_no_history_row_at_all_is_counted_too(tmp_path: Path) -> None:
-    """★ The live atlas's exact shape: 25 candidate judgements in ``overlay`` and NOT ONE write row
-    for a candidate anchor in ``overlay_history``. ``_latest_write_bases`` then returns nothing for
+    """★ The live atlas's exact shape: every candidate judgement in ``overlay`` (41 of them on
+    2026-11-25) and NOT ONE write row for a candidate anchor in ``overlay_history`` — the only
+    candidate-anchor rows there are 22 deletes. ``_latest_write_bases`` then returns nothing for
     the anchor, so there is no basis to read and the gate has nothing to apply — and skipping the
     member because no write was found is how a whole stock of judgements reads fully disposed with
     the gate never having fired.
@@ -1167,4 +1168,76 @@ def test_an_overlay_row_with_no_history_row_at_all_is_counted_too(tmp_path: Path
     assert ru.disposed(review.states[ref])  # the overlay row still says what it says
     assert review.unverifiable_read == (ref,)  # but nothing records what was read before it
     assert sr.declaration(review)["read_gate_unverifiable"] == 1
+    conn.close()
+
+
+def test_a_member_coming_back_to_be_judged_again_is_not_counted_as_a_disposed_one(
+    tmp_path: Path,
+) -> None:
+    """★ The count says how much of the DISPOSED count rests on a gate that could not be applied,
+    so a member that does not read disposed has no business in it. A member whose facts have moved
+    reads ``needs_recheck`` from the coverage index — it is coming back to be judged again — and
+    its basis is missing for the same reason every other one's is.
+
+    Why this is not a corner: measured on the live atlas, EVERY member in the count was of this
+    shape — 63 of 63, over seven runs that between them had disposed nothing — so the line read
+    "the read gate was not applicable to 16 disposed member(s)" of a run with no disposed member
+    at all, pointing a reader at 16 verdicts to take as settled-but-unverifiable when they are 16
+    verdicts to make again.
+
+    MUTATION (verified RED, ``1 failed``): drop the ``ru.disposed(state)`` conjunct -> 1, not 0.
+    """
+    conn, refs = _world(tmp_path, exec_n=1)
+    ref = refs[sr.EXEC][0]
+    _write(conn, ref, "inconclusive", read=True)
+    # the facts move under the stored snapshot, which is what needs_recheck means ...
+    snap = json.loads(
+        conn.execute("SELECT basis_state FROM overlay WHERE anchor_ref = ?", (ref,)).fetchone()[0]
+    )
+    snap["siblings"] = [*snap["siblings"], ["a-sibling-that-is-no-longer-there"]]
+    conn.execute("UPDATE overlay SET basis_state = ? WHERE anchor_ref = ?", (json.dumps(snap), ref))
+    # ... and the write recorded no basis, the live shape: it would be counted on that alone
+    conn.execute("DELETE FROM overlay_history WHERE anchor_ref = ?", (ref,))
+    conn.commit()
+    review = _review(conn)
+    assert review.states[ref] == "needs_recheck"
+    assert not ru.disposed(review.states[ref])
+    assert review.unverifiable_read == ()
+    dec = sr.declaration(review)
+    assert dec["read_gate_unverifiable"] == 0
+    assert "read gate not applicable" not in sr.declaration_text(dec)
+    conn.close()
+
+
+def test_a_shards_read_gate_count_is_its_own_and_not_the_runs(tmp_path: Path) -> None:
+    """★ The sentence this count prints ties it to the disposed count — "of the members this scope
+    reads disposed, how many rest on a gate that could not be applied" — and that count is the
+    shard's. ``scan_states`` walks every unit of the run, so without a filter a shard states the
+    whole run's number beside its own tier counts: the one mix no ``(whole run)`` tag can repair,
+    because the two halves of a single sentence would then be at different scopes.
+
+    MUTATION (verified RED, ``1 failed``): count ``review.unverifiable_read`` whole again -> every
+    shard reads the whole run's number as its own.
+    """
+    conn, _ = _world(tmp_path, exec_n=ru.BATCH_UNIT_MAX * 4)
+    units = [u for u in _review(conn).units if u.must_read]
+    assert len(units) == 4
+    for u in units:  # one basis-less disposing write in every unit
+        overlay.upsert_overlay(
+            conn, evidence_ref=u.members[0].anchor_ref, verdict="inconclusive", rationale="r"
+        )
+    conn.commit()
+    review = _review(conn)
+    whole = sr.declaration(review)["read_gate_unverifiable"]
+    assert whole == 4
+    counts = [
+        sr.declaration(review, worker=i, workers=4)["read_gate_unverifiable"] for i in range(4)
+    ]
+    assert sum(counts) == whole  # every member sits in exactly one shard
+    assert min(counts) < whole  # and no shard states the whole run's number as its own
+    for i, n in enumerate(counts):
+        mine = {
+            m.anchor_ref for u in review.units if ru.in_shard(u.unit_id, i, 4) for m in u.members
+        }
+        assert n == sum(1 for r in review.unverifiable_read if r in mine), i
     conn.close()

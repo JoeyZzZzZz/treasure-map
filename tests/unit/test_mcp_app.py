@@ -1808,9 +1808,14 @@ def test_promote_is_held_to_the_same_two_gates_as_annotate(tmp_path: Path) -> No
     reachable through it, and it recorded no read basis, so its member read disposed with the gate
     never applied.
 
-    MUTATION (verified RED, ``1 failed`` each): drop ``must_read_subject=`` from the promote call
-    -> the bare excluded is refused only by the later diff check, never by the gate, so the error
-    no longer names exclusion_why; drop its ``ctx=`` -> no basis is recorded.
+    MUTATION (verified RED, ``1 failed``): drop ``must_read_subject=`` from the promote call ->
+    the bare excluded is refused only by the later diff check, never by the gate, so the error no
+    longer names exclusion_why.
+
+    The OTHER leg of the same call site — that it passes a ``ctx``, so the write records what had
+    been read and which channel wrote it — cannot be witnessed here: this write is REFUSED, so no
+    history row exists to read a basis from. It is witnessed on a promotion that goes through, in
+    test_overlay_history.test_an_mcp_promotion_records_what_was_read_before_it.
     """
     tools = _tools(tmp_path)
     out = tools["promote"]("run_m::run_m::libx", "pair:1:1", "run_m#fn1@cmd", "excluded", "noise")

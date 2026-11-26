@@ -6234,8 +6234,8 @@ def make_tools(
         out["characterization"] = {
             "applies": True,
             "why_it_applies": (
-                "a command-execution candidate behind a web-referenced binary: its removal is the "
-                "one a reader cannot settle with 'the function is gone'"
+                "a command-execution candidate behind an entry-referenced binary: its removal is "
+                "the one a reader cannot settle with 'the function is gone'"
             ),
             "states_it": char is None,
             **({} if char is None else {"owes": char}),

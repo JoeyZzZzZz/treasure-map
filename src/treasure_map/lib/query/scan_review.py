@@ -418,6 +418,15 @@ def scan_states(
     members are returned separately so the declaration can state how much of its own disposed count
     rests on a gate it could not apply.
 
+    ★ ONLY the members that read DISPOSED, which is what that sentence claims of them. A member
+    whose state is ``needs_relabel`` or ``needs_recheck`` is coming back to be judged again, and
+    its basis is missing for the same reason every other one is; counting it here would print it
+    as a disposed member whose gate could not be reached, when it is the opposite — a member
+    nobody is being asked to take as settled. Measured on the live atlas, every single member in
+    the count was of that shape (16 of 16 on one run, 3 of 3 on another, all ``needs_recheck`` on
+    runs with nothing disposed at all), so the line read "the gate was not applicable to 16
+    disposed members" of a run that had disposed none.
+
     TWO ways it happens, and the second is the whole of the stock today:
 
     * a server that kept no tool-call log records basis ``unknown``
@@ -443,7 +452,7 @@ def scan_states(
                 basis = (last or {}).get("read_basis") or {}
                 if last is not None and ru.held_unread(last["verdict"], basis):
                     state = cov.NEEDS_RECHECK
-                elif not basis or basis.get("why") == ru.NO_SESSION_LOG:
+                elif ru.disposed(state) and (not basis or basis.get("why") == ru.NO_SESSION_LOG):
                     # No basis recorded at all (no history row, or a null column), or one that
                     # says the writing server kept no log: either way the gate has nothing to
                     # apply, and saying so is the only honest thing left.
@@ -472,9 +481,10 @@ class ScanReview:
     states: dict[str, str]
     unanchored: int = 0
     by_band: dict[str, int] = field(default_factory=dict)
-    # Members whose read gate could NOT be evaluated: the write was made by a server with no
-    # tool-call log, so what had been read before it is not recorded either way. Kept and stated,
-    # never folded into the disposed count — see ``unverifiable_read`` below.
+    # DISPOSED members whose read gate could not be evaluated: no basis was recorded with the
+    # write, or the writing server kept no tool-call log, so what had been read before the verdict
+    # is not recorded either way (``scan_states``). They stay in the disposed count — nothing says
+    # they were unread — and the declaration states how much of that count they are.
     unverifiable_read: tuple[str, ...] = ()
 
 
@@ -614,6 +624,14 @@ def declaration(
         return [m for u in units for m in u.members]
 
     binary_of = {b.evidence_ref: b.binary for b in review.banded}
+    # ★ The read-gate count is THIS SCOPE's, because the sentence it prints ties it to the
+    # disposed count ("of the members this scope reads disposed, how many rest on a gate that
+    # could not be applied") and that count is the shard's. ``scan_states`` walks every unit of
+    # the run, so a shard would otherwise state the whole run's number beside its own tier counts
+    # — the mix no ``(whole run)`` tag can fix, since the two halves of one sentence would be at
+    # different scopes. In run scope ``in_shard`` is every unit, so this filter is the identity.
+    in_shard_refs = {m.anchor_ref for u in in_shard for m in u.members}
+    unverifiable = [r for r in review.unverifiable_read if r in in_shard_refs]
 
     def _split(units: list[ru.Unit]) -> dict[str, Any]:
         members = _members(units)
@@ -683,7 +701,8 @@ def declaration(
         # write by a server keeping no tool-call log records no basis either way, so it disposes
         # its member and the gate never fires. Stated, because a whole run judged by such a server
         # would otherwise read fully disposed with nothing saying the gate was never applied.
-        "read_gate_unverifiable": len(review.unverifiable_read),
+        # This scope's, not the run's — see ``in_shard_refs`` above.
+        "read_gate_unverifiable": len(unverifiable),
         "read_gate_unverifiable_why": READ_GATE_UNVERIFIABLE_WHY,
         "unread_not_unfound": UNREAD_NOT_UNFOUND,
     }

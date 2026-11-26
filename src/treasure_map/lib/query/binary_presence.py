@@ -471,8 +471,8 @@ def reachability_of(facts: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
     ★ Called with ONE function's candidates for a function subject and with the whole binary's for
     the binary's own — the slice IS the scope. A function must never be given the binary's facts:
-    a function whose own candidates recorded no site would then read as web-reached because some
-    other function was, which over-states what tmap knows about this subject.
+    a function whose own candidates recorded no site would then read as entry-reached because
+    some other function was, which over-states what tmap knows about this subject.
 
     Weak by construction: ``status: found`` means an entry edge of some kind REFERENCES the binary
     (or, with ``inferred`` among ``basis``, that placement suggests it is served), never that input
@@ -593,6 +593,12 @@ def characterization_applies(facts: dict[str, dict[str, Any]]) -> bool:
     if not any(f.get("sink_class") == CMD_CLASS for f in facts.values()):
         return False
     reach = reachability_of(facts)
+    # ★ The kind test is what carries the gate; the status test states the intent beside it. Where
+    # the "no recorded kind is still out" red line actually rests is ``reachability_of``'s own
+    # invariant — ``status`` is ``unknown`` exactly when ``kinds`` is empty — so a non-empty
+    # intersection already implies ``found`` and dropping this conjunct changes no answer today.
+    # It is kept because it says what is being asked, and because it is the one thing standing
+    # there if that invariant is ever loosened; the invariant itself is pinned by its own tests.
     return reach["status"] == "found" and bool(set(reach["kinds"]) & ENTRY_SITE_KINDS)
 
 
@@ -616,7 +622,7 @@ def characterization_gap(
     ★ The reachability question is COMPARED, not merely required to be present. A field that must
     be given and is never checked is the worst of both: it reads as though the judgement engaged
     with the entry reading while allowing the one answer that would be read as reassurance — a
-    stored "nothing reached it" on a web-referenced removal, disposed. The other two content
+    stored "nothing reached it" on an entry-referenced removal, disposed. The other two content
     questions were always comparisons (a set of class names, a set of callees), and this one is
     now consistent with them: the writer restates tmap's own reading and the gate holds it to it.
     ``note`` is prose and is NOT compared; the three machine-readable parts are, and they are

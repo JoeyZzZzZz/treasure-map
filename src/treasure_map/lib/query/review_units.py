@@ -38,7 +38,7 @@ anchor), handed out per binary in batches. Such a member is disposed only when i
 whatever verdict, cites every candidate of its subject (``presence_citations_short``). Citing
 every candidate is satisfied by an EXISTENCE reading ("the binary is gone, so they are gone"), so
 on one narrow class of such a subject — a one-sided function that held a command-execution candidate
-whose binary a web entry edge references — a ``changed_real`` must also STATE what went with it
+whose binary a recorded entry edge references — a ``changed_real`` must also STATE what went with it
 (``presence_characterization_short``: the sink classes, the entry reading and each command sink's
 argument provenance, in ``verdict_basis.one_sided_characterized``). Facts, never a conclusion
 about impact; the other removals are not held to it, and their facts reach the hand-off either
@@ -888,7 +888,7 @@ def presence_characterization_short(
     atlas: sqlite3.Connection, facts: PairFacts, states: dict[str, str]
 ) -> dict[str, dict[str, Any]]:
     """The disposed ``changed_real`` judgements on the SIGNAL class of one-sided subject — a
-    command-execution candidate behind a web-referenced binary
+    command-execution candidate behind an entry-referenced binary
     (``binary_presence.characterization_applies``) — that do not say what the one-sided code held:
     anchor -> what is missing (``binary_presence.characterization_gap``).
 
