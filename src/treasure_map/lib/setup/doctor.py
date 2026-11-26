@@ -387,8 +387,15 @@ def _client_checks(inp: DoctorInputs) -> list[Check]:
     return out
 
 
+# How bad one skill's state in a directory is, for the one line that directory gets: a requested
+# directory without a skill (missing) fails the run, so it must outrank a file left alone (warn).
+_SKILL_SEVERITY: dict[str, int] = {"ok": 0, "info": 1, "warn": 2, "missing": 3, "wrong": 4}
+
+
 def _skill_checks(inp: DoctorInputs) -> list[Check]:
-    """One line per skills directory tmap writes the diff-review skill into."""
+    """One line per skills directory tmap writes its skills into: the worst of the shipped
+    skills' states there (wrong > missing > warn > info > ok), the detail giving each skill's own
+    state and what to do about it."""
     from treasure_map.lib.errors import ConfigError
     from treasure_map.lib.setup import skills as sk
     from treasure_map.lib.setup.ledger import LEDGER_NAME, Ledger
@@ -400,44 +407,49 @@ def _skill_checks(inp: DoctorInputs) -> list[Check]:
     # as init and uninstall will see it: an interrupted skill write settled (on a copy; the
     # doctor changes nothing)
     ledger = sk.settled_copy(ledger)
-    want = sk.shipped_bytes()
+    want = {skill.dirname: sk.shipped_bytes(skill) for skill in sk.SHIPPED}
     home, environ = inp.client_host.home, inp.client_host.environ
     requested = sk.target_roots(inp.requested_clients, home, environ)
     managed = sk.managed_roots(home, environ, ledger)
     known = [r for _n, r in managed]
     named = {r for _n, r in sk.named_roots(home, environ)}
+
+    def recorded(root: Path, skill: sk.Shipped) -> bool:
+        return ledger.committed(sk.entry_id(sk.skill_path(root, skill))) is not None
+
+    def one(root: Path, skill: sk.Shipped) -> tuple[State, str]:
+        st = sk.classify(root, skill, ledger, want[skill.dirname], known=known)
+        if st.state == "aligned":
+            return "ok", str(st.path)
+        if st.state == "missing" and root not in named and root not in requested:
+            if recorded(root, skill):
+                # a directory only the ledger names: its record is what lets uninstall take back
+                # the directories that install created, so it is kept, not reported as a gap
+                return "info", (
+                    f"{st.path}: no longer there; still in tmap's install ledger — "
+                    "`tmap uninstall` clears the record and the directories its install created"
+                )
+            # the ledger names the directory for another skill only: this one was never there,
+            # and init adds nothing to such a directory
+            others = [s.label for s in sk.SHIPPED if s is not skill and recorded(root, s)]
+            return "info", (
+                f"{st.path}: not installed — tmap's install ledger holds only the "
+                f"{' and '.join(others) or 'other'} skill for this directory, and tmap init adds "
+                f"nothing there; to add it: `{sk.install_command(root, skill)}`"
+            )
+        if st.state == "missing":
+            return ("missing" if root in requested else "info"), f"{st.path}: not installed"
+        if st.state in ("stale", "legacy"):  # every run of init replaces either, anywhere
+            return "warn", f"{st.path}: {st.detail}; `tmap init` replaces it"
+        if st.state == "foreign":
+            return "warn", f"{st.path}: {st.detail} — not modified; {sk.next_step(st)}"
+        return "wrong", f"{st.path}: {st.detail}"
+
     out = []
     for short, root in managed:
-        st = sk.classify(root, ledger, want, known=known)
-        name = f"skill.{short}"
-        if st.state == "aligned":
-            out.append(check(name, "ok", str(st.path)))
-        elif st.state == "missing" and root not in named and root not in requested:
-            # a directory only the ledger names: its record is what lets uninstall take back the
-            # directories that install created, so it is kept, not reported as a gap
-            out.append(
-                check(
-                    name,
-                    "info",
-                    f"{st.path}: no longer there; still in tmap's install ledger — "
-                    "`tmap uninstall` clears the record and the directories its install created",
-                )
-            )
-        elif st.state == "missing":
-            state: State = "missing" if root in requested else "info"
-            out.append(check(name, state, f"{st.path}: not installed"))
-        elif st.state in ("stale", "legacy"):  # every run of init replaces either, anywhere
-            out.append(check(name, "warn", f"{st.path}: {st.detail}; `tmap init` replaces it"))
-        elif st.state == "foreign":
-            out.append(
-                check(
-                    name,
-                    "warn",
-                    f"{st.path}: {st.detail} — not modified; {sk.next_step(st)}",
-                )
-            )
-        else:
-            out.append(check(name, "wrong", f"{st.path}: {st.detail}"))
+        parts = [one(root, skill) for skill in sk.SHIPPED]
+        state = max((p[0] for p in parts), key=_SKILL_SEVERITY.__getitem__)
+        out.append(check(f"skill.{short}", state, " | ".join(p[1] for p in parts)))
     return out
 
 

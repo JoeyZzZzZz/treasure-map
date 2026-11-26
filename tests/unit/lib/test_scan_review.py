@@ -922,15 +922,27 @@ def test_the_scan_skill_is_shipped_and_names_its_own_read_gate() -> None:
         assert f"`{band}`" in text
 
 
-def test_the_installer_refuses_to_claim_the_scan_skill() -> None:
-    # The install ledger keeps ONE skill current; recording this one would claim upkeep it does
-    # not do, so --install is refused rather than quietly writing an unmanaged file.
+def test_the_installer_writes_and_records_the_scan_skill_alone(tmp_path: Path) -> None:
+    """``--scan --install <dir>`` writes the scan-review skill — that one only — and records it in
+    the install ledger, so tmap init keeps it current and tmap uninstall takes it back.
+
+    MUTATION (verified RED, 1 failed): refuse ``--scan`` with ``--install`` again -> RED."""
     from click.testing import CliRunner
 
     from treasure_map.cli.review_cli import review
+    from treasure_map.lib.query import scan_skill
+    from treasure_map.lib.setup import skills as sk
+    from treasure_map.lib.setup.ledger import LEDGER_NAME, Ledger
 
-    res = CliRunner().invoke(review, ["skill", "--scan", "--install", "/tmp/nowhere"])
-    assert res.exit_code != 0 and "will not keep it current" in res.output
+    root = tmp_path / "skills"
+    res = CliRunner().invoke(review, ["skill", "--scan", "--install", str(root)])
+    assert res.exit_code == 0, res.output
+    path = root / scan_skill.SKILL_DIRNAME / "SKILL.md"
+    assert path.read_text(encoding="utf-8") == scan_skill.skill_text()
+    assert not (root / sk.DIFF.dirname).exists()  # --scan names one skill
+    ledger = Ledger.load(Path.home() / ".treasure-map" / "toolchain" / LEDGER_NAME)
+    entry = ledger.committed(sk.entry_id(path))
+    assert entry is not None and entry.extra["root"] == str(root)
 
 
 def test_a_write_whose_read_gate_could_not_be_applied_is_stated_not_hidden(

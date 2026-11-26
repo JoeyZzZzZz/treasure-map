@@ -1020,46 +1020,52 @@ def run_init(
         if st.state != "aligned":  # a working entry noted where it lives is not a to-do
             for r in st.reported:
                 plan.needs_you.append(f"{label}: {r}")
-    # the diff-review skill: each skills directory the chosen agents read, once
-    skill_bytes = sk.shipped_bytes()
+    # every skill tmap ships, each into each skills directory the chosen agents read, once — the
+    # diff-review skill's writes first (an uninstall, newest first, then empties the directories
+    # those first writes created only after the skill written beside it is gone)
+    skill_bytes = {skill.dirname: sk.shipped_bytes(skill) for skill in sk.SHIPPED}
     # the directories tmap manages: its named ones and every one the ledger holds a skill for
     # (`tmap review skill --install <dir>` records any directory, a project's included)
     skill_known = [r for _n, r in sk.managed_roots(chost.home, chost.environ, ledger)]
     skill_targets = sk.target_roots(selected, chost.home, chost.environ)
-    for root in skill_targets:
-        sst = sk.classify(root, ledger, skill_bytes, known=skill_known)
-        if sst.state in ("missing", "stale", "legacy"):
-            plan.add(
-                Action(
-                    "install_skill",
-                    f"install the diff-review skill in {root}{sk.shared_note(root, chost.home)}",
-                    target=sst.path,
-                    lines=[] if sst.state == "missing" else [f"replaces: {sst.detail}"],
+    for skill in sk.SHIPPED:
+        want = skill_bytes[skill.dirname]
+        for root in skill_targets:
+            sst = sk.classify(root, skill, ledger, want, known=skill_known)
+            if sst.state in ("missing", "stale", "legacy"):
+                plan.add(
+                    Action(
+                        "install_skill",
+                        f"install the {skill.label} skill in {root}"
+                        f"{sk.shared_note(root, chost.home)}",
+                        target=sst.path,
+                        lines=[] if sst.state == "missing" else [f"replaces: {sst.detail}"],
+                    )
                 )
-            )
-        elif sst.state == "foreign":
-            plan.needs_you.append(
-                f"skill {sst.path}: {sst.detail}; not modified — {sk.next_step(sst)}"
-            )
-        elif sst.state == "invalid":
-            plan.needs_you.append(f"skill {sst.path}: {sst.detail}; not modified")
-    # A copy tmap wrote, still byte for byte, or an earlier tmap's text installed by hand, in a
-    # directory no agent chosen in this run reads is brought up to date too (an agent reading two
-    # directories would otherwise see two versions); nothing is created there.
-    for root in skill_known:
-        if root in skill_targets:
-            continue
-        sst = sk.classify(root, ledger, skill_bytes, known=skill_known)
-        if sst.state in ("stale", "legacy"):
-            plan.add(
-                Action(
-                    "install_skill",
-                    f"update the diff-review skill tmap installed in {root}"
-                    f"{sk.shared_note(root, chost.home)}",
-                    target=sst.path,
-                    lines=[f"replaces: {sst.detail}"],
+            elif sst.state == "foreign":
+                plan.needs_you.append(
+                    f"skill {sst.path}: {sst.detail}; not modified — {sk.next_step(sst)}"
                 )
-            )
+            elif sst.state == "invalid":
+                plan.needs_you.append(f"skill {sst.path}: {sst.detail}; not modified")
+        # A copy tmap wrote, still byte for byte, or an earlier tmap's text installed by hand, in
+        # a directory no agent chosen in this run reads is brought up to date too (an agent
+        # reading two directories would otherwise see two versions); nothing is created there —
+        # not even a skill the ledger holds only the other skill for there.
+        for root in skill_known:
+            if root in skill_targets:
+                continue
+            sst = sk.classify(root, skill, ledger, want, known=skill_known)
+            if sst.state in ("stale", "legacy"):
+                plan.add(
+                    Action(
+                        "install_skill",
+                        f"update the {skill.label} skill tmap installed in {root}"
+                        f"{sk.shared_note(root, chost.home)}",
+                        target=sst.path,
+                        lines=[f"replaces: {sst.detail}"],
+                    )
+                )
     for cid in selected:
         if cid in sk.MANUAL:  # a note, not a to-do: it would repeat on every run
             echo(f"  Skill: {sk.MANUAL[cid]}")
@@ -1190,8 +1196,10 @@ def run_init(
             if not out.ok and out.manual:
                 needs_you.append(f"{out.message}; run: {out.manual}")
         elif a.kind == "install_skill" and a.target is not None:
+            skill = sk.BY_DIRNAME[a.target.parent.name]
+            data = skill_bytes[skill.dirname]
             # looked at again: the file may have been edited since the plan was shown
-            now = sk.classify(a.target.parent.parent, ledger, skill_bytes, known=skill_known)
+            now = sk.classify(a.target.parent.parent, skill, ledger, data, known=skill_known)
             if now.state not in ("missing", "stale", "legacy"):
                 if now.state != "aligned":
                     why = f"skill {now.path}: {now.detail}; not modified"
@@ -1203,7 +1211,7 @@ def run_init(
             try:
                 sk.install(
                     a.target,
-                    skill_bytes,
+                    data,
                     ledger,
                     claude_config_dir=sk.claude_config_dir_of(
                         a.target.parent.parent, chost.home, chost.environ
@@ -1211,7 +1219,7 @@ def run_init(
                 )
             except OSError as exc:  # this directory only, reported
                 echo(f"  ✗ skill: {exc}")
-                needs_you.append(f"write the diff-review skill at {a.target}: {exc}")
+                needs_you.append(f"write the {skill.label} skill at {a.target}: {exc}")
                 continue
             echo(f"  ✓ skill: wrote {a.target}")
 

@@ -18,7 +18,6 @@ import click
 
 from treasure_map.cli.interrupts import InterruptGroup
 from treasure_map.lib.query import diff_skill, scan_skill
-from treasure_map.lib.query.diff_skill import SKILL_DIRNAME
 
 
 class _ReviewGroup(InterruptGroup):
@@ -252,9 +251,13 @@ def report(
     default=None,
     type=click.Path(file_okay=False),
     help=(
-        "A skills directory to write it into, as <dir>/" + SKILL_DIRNAME + "/SKILL.md, "
-        "recorded so tmap init keeps it current and tmap uninstall removes it (an earlier "
-        "tmap's file there is replaced; any other file only with --force)."
+        "A skills directory to write the skills into, as <dir>/"
+        + diff_skill.SKILL_DIRNAME
+        + "/SKILL.md and <dir>/"
+        + scan_skill.SKILL_DIRNAME
+        + "/SKILL.md (one of them with --diff or --scan), recorded so tmap init keeps them "
+        "current and tmap uninstall removes them (an earlier tmap's file there is replaced; any "
+        "other file only with --force)."
     ),
 )
 @click.option(
@@ -264,30 +267,28 @@ def report(
     "--scan",
     "as_scan",
     is_flag=True,
-    help="Print the SCAN review skill (one firmware's candidate map) instead of the diff one.",
+    help="The SCAN review skill (one firmware's candidate map): print it, or install it alone.",
 )
-def skill(install_dir: str | None, force: bool, as_scan: bool) -> None:
-    """Print the agent skill for reviewing a run pair unit by unit, or write it into a skills
-    directory. --scan prints the one-firmware scan profile's skill instead."""
-    if as_scan:
-        if install_dir is not None:
-            # Refused rather than written: the install ledger keeps ONE skill current this
-            # version (see lib/query/scan_skill), so recording this one would claim upkeep the
-            # installer does not do.
-            raise click.UsageError(
-                "--install carries the diff-review skill this version; print --scan and save it "
-                f"as <dir>/{scan_skill.SKILL_DIRNAME}/SKILL.md yourself (tmap init will not keep "
-                "it current)"
-            )
-        click.echo(scan_skill.skill_text(), nl=False)
-        return
-    text = diff_skill.skill_text()
+@click.option(
+    "--diff",
+    "as_diff",
+    is_flag=True,
+    help="The DIFF review skill (the default to print): with --install, install it alone.",
+)
+def skill(install_dir: str | None, force: bool, as_scan: bool, as_diff: bool) -> None:
+    """Print the agent skill for reviewing a run pair unit by unit (--scan: the one-firmware scan
+    profile's skill instead), or write the skills into a skills directory — both, unless --diff or
+    --scan names one."""
+    if as_scan and as_diff:
+        raise click.UsageError("--scan and --diff name one skill each; give at most one")
     if install_dir is None:
-        click.echo(text, nl=False)
+        click.echo(scan_skill.skill_text() if as_scan else diff_skill.skill_text(), nl=False)
         return
     from treasure_map.lib.errors import ConfigError
     from treasure_map.lib.setup import skills as sk
     from treasure_map.lib.setup.ledger import LEDGER_NAME, Ledger
+
+    chosen = (sk.SCAN,) if as_scan else (sk.DIFF,) if as_diff else sk.SHIPPED
 
     home = Path.home()
     try:
@@ -299,28 +300,36 @@ def skill(install_dir: str | None, force: bool, as_scan: bool) -> None:
     # absolute, not resolved: the ledger names the file from any working directory, and a
     # directory reached through a link stays the one the earlier install recorded
     root = Path(install_dir).expanduser().absolute()
-    data = text.encode("utf-8")
     known = [r for _n, r in sk.managed_roots(home, os.environ, ledger)]
-    st = sk.classify(root, ledger, data, known=known)
-    if st.state == "aligned":
-        click.echo(f"{st.path} is already current")
-        return
-    if st.state == "foreign" and not force:
-        raise click.ClickException(f"{st.path}: {st.detail}; not replaced — {sk.next_step(st)}")
-    if st.state == "invalid" and not force:
-        raise click.ClickException(f"{st.path}: {st.detail}; not replaced (--force replaces it)")
-    # Recorded wherever it goes: tmap init keeps tmap's copy there current, tmap uninstall takes
-    # it back.
-    try:
-        sk.install(
-            st.path,
-            data,
-            ledger,
-            claude_config_dir=sk.claude_config_dir_of(root, home, os.environ),
-        )
-    except OSError as exc:
-        raise click.ClickException(f"could not write {st.path}: {exc}") from exc
-    click.echo(f"wrote {st.path}")
+    refused: list[str] = []
+    # each skill on its own: one tmap will not write is said so, and the other is still written
+    for chosen_skill in chosen:
+        data = sk.shipped_bytes(chosen_skill)
+        st = sk.classify(root, chosen_skill, ledger, data, known=known)
+        if st.state == "aligned":
+            click.echo(f"{st.path} is already current")
+            continue
+        if st.state == "foreign" and not force:
+            refused.append(f"{st.path}: {st.detail}; not replaced — {sk.next_step(st)}")
+            continue
+        if st.state == "invalid" and not force:
+            refused.append(f"{st.path}: {st.detail}; not replaced (--force replaces it)")
+            continue
+        # Recorded wherever it goes: tmap init keeps tmap's copy there current, tmap uninstall
+        # takes it back.
+        try:
+            sk.install(
+                st.path,
+                data,
+                ledger,
+                claude_config_dir=sk.claude_config_dir_of(root, home, os.environ),
+            )
+        except OSError as exc:
+            refused.append(f"could not write {st.path}: {exc}")
+            continue
+        click.echo(f"wrote {st.path}")
+    if refused:
+        raise click.ClickException("\n".join(refused))
 
 
 # ── a person's judgements: judge (one) and the audit worksheet (many) ────────────────────────

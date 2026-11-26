@@ -5,14 +5,15 @@
 Only two kinds of thing are removed: tmap's own entries in the agents' configurations (with the
 backup tmap made of such a file, and a file tmap's entry was all that held), and the paths the
 install ledger records (the downloaded toolchain, BinExport, the completion script and
-its rc block, the diff-review skill). A path the ledger does not record is never removed — not the
-user's own JDK, Ghidra or BinDiff, even when config.yaml points at them. Before a recorded path is
-deleted it must still be what tmap put there: under ``~/.treasure-map/toolchain``, or (BinExport
-in a user's Ghidra) a ``BinExport`` directory whose jars still hash to what tmap installed, or (the
-skill) a ``tmap-diff-review/SKILL.md`` in one of tmap's skills directories that still hashes to
-what tmap wrote — read after an interrupted skill write is settled (``skills.recover``), so a
-replacement cut off half way is not taken for a user's edit. The directories that skill's write
-created go with it, each only when empty.
+its rc block, the diff-review and scan-review skills). A path the ledger does not record is never
+removed — not the user's own JDK, Ghidra or BinDiff, even when config.yaml points at them. Before a
+recorded path is deleted it must still be what tmap put there: under ``~/.treasure-map/toolchain``,
+or (BinExport in a user's Ghidra) a ``BinExport`` directory whose jars still hash to what tmap
+installed, or (a skill) a ``<skill dirname>/SKILL.md`` in one of tmap's skills directories that
+still hashes to what tmap wrote — read after an interrupted skill write is settled
+(``skills.recover``), so a replacement cut off half way is not taken for a user's edit. The
+directories that skill's write created go with it, each only when empty — tried once more after
+every entry is done, since the other skill beside it may have been removed only later.
 
 The data stays unless ``--purge-data`` is given AND the user types the confirmation phrase;
 ``--yes`` does not stand in for it. Even then only what is provably tmap's goes (``purge_plan``):
@@ -233,6 +234,9 @@ def uninstall(
     for line in sk.recover(ledger):  # an interrupted skill write, settled before it is judged
         echo(f"  {line}")
     removed_paths: list[Path] = []
+    # every removed skill with the directories its write created: tried again below, once the
+    # other skill sharing those directories is gone too
+    removed_skills: list[tuple[Path, object]] = []
     for e in list(reversed(ledger.entries)):
         why = safe_to_remove(e, toolchain_dir=toolchain_dir, home=home, environ=client_host.environ)
         if why is not None:
@@ -251,6 +255,7 @@ def uninstall(
             if e.id.startswith(sk.ID_PREFIX):
                 for d in sk.prune_dirs(path, e.extra.get("created_dirs")):
                     report.removed.append(f"removed {d}")
+                removed_skills.append((path, e.extra.get("created_dirs")))
         except OSError as exc:  # this entry only: it stays in the ledger for a later run
             verb = "restore" if e.kind == "edit" else "remove"
             report.manual.append(f"could not {verb} {path}: {exc}; run tmap uninstall again")
@@ -263,6 +268,12 @@ def uninstall(
                 continue  # the entry stays, so a later run removes the block
             report.removed.append(note)
         ledger.remove(e.id)
+    # Two skills share the directories above them, and the ledger records them with whichever
+    # skill's write created them — not always the one removed last (a replacement moves its
+    # entry to the end). Each is now tried again, still only when empty.
+    for path, created in removed_skills:
+        for d in sk.prune_dirs(path, created, parent=False):
+            report.removed.append(f"removed {d}")
     # 3. config keys that pointed at what was removed
     if config_path.exists() and removed_paths:
         try:

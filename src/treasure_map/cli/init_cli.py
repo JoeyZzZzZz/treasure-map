@@ -95,7 +95,7 @@ def render_checks(result: InitResult) -> bool:
 
 # What to say to the agent, written out in full (one sentence per line) so it can be copied as is.
 # The README's English prompts are these lines. They say only what the person wants: how to work
-# the map or the diff is the server's standing instructions and the diff-review skill.
+# the map or the diff is the server's standing instructions and the review skills.
 _AUDIT_PROMPT = (
     "Audit firmware my-fw with Treasure Map.",
     "End with the leads worth following up, each with its evidence_ref and why.",

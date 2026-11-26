@@ -40,9 +40,12 @@ _V6822 = _FIXTURES / "legacy_diff_review_6822.md"
 _V6956 = _FIXTURES / "legacy_diff_review_6956.md"
 _SRC = Path(__file__).parents[4] / "src"
 
-# The text this tmap ships. Changing it means adding this value to LEGACY_SHA256 and the new one
-# here.
+# The diff-review text this tmap ships. Changing it means adding this value to DIFF.legacy and the
+# new one here.
 SHIPPED_SHA256 = "5b7d24046f2ce11a679403de2244c5639b5df5d81023b430de8bb73d81ce29d0"
+# The scan-review text this tmap ships (7,830 bytes). It was in no release before this one, so
+# SCAN.legacy is empty; once it has shipped, changing it means adding this value to SCAN.legacy.
+SCAN_SHIPPED_SHA256 = "ddcfed8dda79ce6f33d82d12b66a223bbc4ca361a21e6e75fcd88c0b50d04136"
 
 
 @pytest.fixture()
@@ -89,7 +92,7 @@ def _record(ledger: Ledger, path: Path, data: bytes, **extra: object) -> None:
 def test_claude_code_alone_writes_the_shared_agents_directory_too(tmp_path: Path) -> None:
     """MUTATION: add ~/.agents/skills only when Codex or Cursor is chosen -> RED."""
     home = tmp_path / "h"
-    target = sk.skill_path(sk.agents_root(home))
+    target = sk.skill_path(sk.agents_root(home), sk.DIFF)
     assert any(f"→ {target}" in ln and "install" in ln for ln in _plan(home, ["claude-code"]))
 
 
@@ -98,7 +101,7 @@ def test_the_shared_directory_is_planned_once(tmp_path: Path) -> None:
 
     MUTATION: drop the de-duplication in target_roots -> two actions -> RED."""
     home = tmp_path / "h"
-    target = sk.skill_path(sk.agents_root(home))
+    target = sk.skill_path(sk.agents_root(home), sk.DIFF)
     assert sum(f"→ {target}" in ln for ln in _plan(home, ["codex", "cursor"])) == 1
     env = {"DSH_AGENTS_HOME": str(home / ".agents")}
     assert sum(f"→ {target}" in ln for ln in _plan(home, ["codex", "dsh"], env)) == 1
@@ -151,7 +154,7 @@ def test_dsh_gets_its_own_directory_and_the_shared_one(tmp_path: Path) -> None:
     home = tmp_path / "h"
     lines = _plan(home, ["dsh"])
     for root in (home / ".dsh" / "skills", home / ".agents" / "skills"):
-        assert any(f"→ {sk.skill_path(root)}" in ln for ln in lines), lines
+        assert any(f"→ {sk.skill_path(root, sk.DIFF)}" in ln for ln in lines), lines
     assert len([ln for ln in lines if "→" in ln]) == 2
 
 
@@ -162,7 +165,7 @@ def test_dsh_is_no_longer_told_to_do_it_by_hand(tmp_path: Path) -> None:
     _init(home, ("dsh",), echo)
     assert "dsh" not in sk.MANUAL
     assert not any("dsh:" in ln and "agent skills" in ln for ln in echo)
-    assert sk.skill_path(sk.dsh_root(home, {})).read_bytes() == sk.shipped_bytes()
+    assert sk.skill_path(sk.dsh_root(home, {}), sk.DIFF).read_bytes() == sk.shipped_bytes(sk.DIFF)
 
 
 def test_dsh_home_moves_its_directory(tmp_path: Path) -> None:
@@ -171,7 +174,9 @@ def test_dsh_home_moves_its_directory(tmp_path: Path) -> None:
     env = {"DSH_HOME": str(tmp_path / "x")}
     assert tmp_path / "x" / "skills" in sk.target_roots(["dsh"], home, env)
     _init(home, ("dsh",), environ=env)
-    assert sk.skill_path(tmp_path / "x" / "skills").read_bytes() == sk.shipped_bytes()
+    assert sk.skill_path(tmp_path / "x" / "skills", sk.DIFF).read_bytes() == sk.shipped_bytes(
+        sk.DIFF
+    )
 
 
 def test_a_blank_dsh_home_is_unset(tmp_path: Path) -> None:
@@ -288,7 +293,7 @@ def test_a_root_that_is_not_the_files_directory_lets_nothing_be_removed(tmp_path
 
     MUTATION: accept any string ``root`` -> removed -> RED."""
     home = tmp_path / "h"
-    path = sk.skill_path(tmp_path / "custom")
+    path = sk.skill_path(tmp_path / "custom", sk.DIFF)
     path.parent.mkdir(parents=True)
     path.write_bytes(b"x")
     sha = sk.sha256_of(b"x")
@@ -310,7 +315,7 @@ def test_a_project_directory_once_installed_into_is_kept_current_and_named_in_fu
     lines = _plan(home, ["claude-code"])
     assert any(f"update the diff-review skill tmap installed in {proj}" in ln for ln in lines)
     _init(home, ("claude-code",))
-    assert sk.skill_path(proj).read_bytes() == changed.encode("utf-8")
+    assert sk.skill_path(proj, sk.DIFF).read_bytes() == changed.encode("utf-8")
 
 
 # ── uninstall takes back a recorded directory ────────────────────────────────────────────────
@@ -321,7 +326,7 @@ def test_uninstall_takes_back_an_install_into_any_directory(tmp_path: Path) -> N
     home = Path.home()
     root = tmp_path / "new" / "skills"
     assert _install(root).exit_code == 0
-    assert sk.skill_path(root).is_file()
+    assert sk.skill_path(root, sk.DIFF).is_file()
     report = _uninstall(home)
     assert not report.refused, report.refused
     assert not (tmp_path / "new").exists()
@@ -332,7 +337,7 @@ def test_uninstall_keeps_a_recorded_file_changed_since(tmp_path: Path) -> None:
     home = Path.home()
     root = tmp_path / "skills"
     assert _install(root).exit_code == 0
-    path = sk.skill_path(root)
+    path = sk.skill_path(root, sk.DIFF)
     path.write_bytes(path.read_bytes() + b"!")
     report = _uninstall(home)
     assert path.is_file()
@@ -358,8 +363,8 @@ def test_a_root_does_not_widen_the_link_test(tmp_path: Path) -> None:
     theirs.mkdir()
     (theirs / sk.SKILL_FILE).write_bytes(b"x")
     root.mkdir()
-    (root / sk.SKILL_DIRNAME).symlink_to(theirs, target_is_directory=True)
-    path = sk.skill_path(root)
+    (root / sk.DIFF.dirname).symlink_to(theirs, target_is_directory=True)
+    path = sk.skill_path(root, sk.DIFF)
     with pytest.raises(sk.SkillWriteError):
         sk.install(path, b"y", Ledger(tmp_path / "l.json"))
     why = sk.removable(path, sk.sha256_of(b"x"), home, {}, recorded_root=str(root))
@@ -379,7 +384,7 @@ def test_a_copy_written_under_claude_config_dir_is_refused_without_it_even_with_
     cfg = tmp_path / "cc"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
     assert _install(cfg / "skills").exit_code == 0
-    path = sk.skill_path(cfg / "skills")
+    path = sk.skill_path(cfg / "skills", sk.DIFF)
     entry = _ledger(home).committed(sk.entry_id(path))
     assert entry is not None and entry.extra["claude_config_dir"] == str(cfg)
     assert entry.extra["root"] == str(cfg / "skills")
@@ -394,7 +399,7 @@ def test_a_copy_written_under_claude_config_dir_is_refused_without_it_even_with_
 
 def test_a_custom_root_is_removable_with_its_root_and_not_without(tmp_path: Path) -> None:
     home = tmp_path / "h"
-    path = sk.skill_path(tmp_path / "custom")
+    path = sk.skill_path(tmp_path / "custom", sk.DIFF)
     path.parent.mkdir(parents=True)
     path.write_bytes(b"x")
     sha = sk.sha256_of(b"x")
@@ -407,7 +412,7 @@ def test_a_custom_root_is_removable_with_its_root_and_not_without(tmp_path: Path
 def test_an_entry_without_claude_config_dir_is_judged_as_before(tmp_path: Path, where: str) -> None:
     """MUTATION: refuse at the CLAUDE_CONFIG_DIR step when the entry has no such key -> RED."""
     home = tmp_path / "h"
-    path = sk.skill_path(dict(sk.named_roots(home, {}))[where])
+    path = sk.skill_path(dict(sk.named_roots(home, {}))[where], sk.DIFF)
     path.parent.mkdir(parents=True)
     path.write_bytes(b"x")
     assert sk.removable(path, sk.sha256_of(b"x"), home, {}) is None
@@ -427,13 +432,13 @@ def test_the_doctor_reports_a_recorded_directory_under_a_name_from_its_path(
     checks = _doctor(home)
     name = "skill." + sk.custom_name(root)
     assert re.fullmatch(r"skill\.custom\.[0-9a-f]{8}", name)
-    assert checks[name] == ("ok", str(sk.skill_path(root)))
+    assert checks[name] == ("ok", " | ".join(str(sk.skill_path(root, x)) for x in sk.SHIPPED))
 
 
 def test_a_pending_entry_names_its_directory(tmp_path: Path) -> None:
     """MUTATION: read committed entries only -> RED."""
     ledger = Ledger(tmp_path / "l.json")
-    path = sk.skill_path(tmp_path / "skills")
+    path = sk.skill_path(tmp_path / "skills", sk.DIFF)
     ledger.add_pending(sk.entry_id(path), "file", path, sha256="0" * 64)
     assert sk.recorded_roots(ledger) == (tmp_path / "skills",)
 
@@ -450,7 +455,7 @@ def test_a_recorded_directory_is_brought_up_to_date(
     state, detail = _doctor(home)["skill." + sk.custom_name(root)]
     assert state == "warn" and "earlier version" in detail
     _init(home, ("codex",))
-    assert sk.skill_path(root).read_bytes() == changed.encode("utf-8")
+    assert sk.skill_path(root, sk.DIFF).read_bytes() == changed.encode("utf-8")
 
 
 @pytest.mark.parametrize(
@@ -463,15 +468,24 @@ def test_only_a_skill_shaped_path_names_a_directory(tmp_path: Path, rel: str) ->
     assert sk.recorded_roots(ledger) == ()
 
 
+@pytest.mark.parametrize("dirname", ["tmap-diff-review", "tmap-scan-review"])
+def test_each_shipped_skills_path_names_its_directory(tmp_path: Path, dirname: str) -> None:
+    """MUTATION (verified RED, 1 failed): accept only the diff-review skill's directory name ->
+    the scan case -> RED."""
+    ledger = Ledger(tmp_path / "l.json")
+    _record(ledger, tmp_path / "x" / dirname / sk.SKILL_FILE, b"x")
+    assert sk.recorded_roots(ledger) == (tmp_path / "x",)
+
+
 def test_the_short_name_comes_from_the_path_alone(tmp_path: Path) -> None:
     """MUTATION: number the recorded directories in path order -> P2's name moves -> RED."""
     home = tmp_path / "h"
     p1, p2 = tmp_path / "a" / "skills", tmp_path / "b" / "skills"
     want = "custom." + hashlib.sha256(str(p2).encode("utf-8")).hexdigest()[:8]
     ledger = Ledger(tmp_path / "l.json")
-    _record(ledger, sk.skill_path(p2), b"x")
+    _record(ledger, sk.skill_path(p2, sk.DIFF), b"x")
     assert dict((r, n) for n, r in sk.managed_roots(home, {}, ledger))[p2] == want
-    _record(ledger, sk.skill_path(p1), b"x")
+    _record(ledger, sk.skill_path(p1, sk.DIFF), b"x")
     names = dict((r, n) for n, r in sk.managed_roots(home, {}, ledger))
     assert names[p2] == want and names[p1] != want
 
@@ -484,7 +498,7 @@ def test_a_recorded_directory_never_makes_a_foreign_file_tmaps(
     home = Path.home()
     root = tmp_path / "skills"
     assert _install(root).exit_code == 0
-    path = sk.skill_path(root)
+    path = sk.skill_path(root, sk.DIFF)
     path.write_bytes(b"---\nname: tmap-diff-review\ndescription: mine\n---\nmine\n")
     state, detail = _doctor(home)["skill." + sk.custom_name(root)]
     assert state == "warn" and "changed since tmap installed it" in detail
@@ -505,7 +519,7 @@ def test_a_relative_entry_names_no_directory_from_any_working_directory(
     MUTATION: take relative entries too -> init replaces the file under the new working directory
     -> RED."""
     home = Path.home()
-    rel = Path("rel") / "skills" / sk.SKILL_DIRNAME / sk.SKILL_FILE
+    rel = Path("rel") / "skills" / sk.DIFF.dirname / sk.SKILL_FILE
     old = b"an earlier text tmap wrote\n"
     _record(_ledger(home), rel, old)
     assert sk.recorded_roots(_ledger(home)) == ()
@@ -524,7 +538,7 @@ def test_a_recorded_file_that_is_gone_is_info_and_its_record_kept(tmp_path: Path
     home = Path.home()
     root = tmp_path / "made" / "skills"
     assert _install(root).exit_code == 0
-    path = sk.skill_path(root)
+    path = sk.skill_path(root, sk.DIFF)
     path.unlink()
     state, detail = _doctor(home)["skill." + sk.custom_name(root)]
     assert state == "info" and "`tmap uninstall`" in detail
@@ -548,12 +562,12 @@ def test_a_relative_install_directory_is_recorded_absolute(
     home = Path.home()
     a, b = tmp_path / "A", tmp_path / "B"
     a.mkdir()
-    theirs = sk.skill_path(b / "sub" / "skills")
+    theirs = sk.skill_path(b / "sub" / "skills", sk.DIFF)
     theirs.parent.mkdir(parents=True)
-    theirs.write_bytes(sk.shipped_bytes())
+    theirs.write_bytes(sk.shipped_bytes(sk.DIFF))
     monkeypatch.chdir(a)
     assert _install("sub/skills").exit_code == 0
-    path = sk.skill_path(a / "sub" / "skills")
+    path = sk.skill_path(a / "sub" / "skills", sk.DIFF)
     entry = _ledger(home).committed(sk.entry_id(path))
     assert entry is not None and entry.path == str(path)
     assert entry.extra["root"] == str(a / "sub" / "skills")
@@ -562,7 +576,7 @@ def test_a_relative_install_directory_is_recorded_absolute(
     report = _uninstall(home)
     assert not report.refused, report.refused
     assert not path.exists() and not (a / "sub").exists()
-    assert theirs.read_bytes() == sk.shipped_bytes()
+    assert theirs.read_bytes() == sk.shipped_bytes(sk.DIFF)
 
 
 def test_a_tilde_install_directory_is_the_home(
@@ -571,7 +585,7 @@ def test_a_tilde_install_directory_is_the_home(
     """MUTATION: drop ``.expanduser()`` -> written under <cwd>/~ -> RED."""
     monkeypatch.chdir(tmp_path)
     assert _install("~/x").exit_code == 0
-    assert sk.skill_path(Path.home() / "x").read_bytes() == sk.shipped_bytes()
+    assert sk.skill_path(Path.home() / "x", sk.DIFF).read_bytes() == sk.shipped_bytes(sk.DIFF)
     assert not (tmp_path / "~").exists()
 
 
@@ -592,8 +606,10 @@ def test_a_directory_reached_through_a_link_stays_the_recorded_one(
     assert _install(home / ".agents" / "skills").exit_code == 0
     later = earlier + "later\n"
     monkeypatch.setattr(diff_skill, "skill_text", lambda: later)
-    path = sk.skill_path(home / ".agents" / "skills")
-    st = sk.classify(home / ".agents" / "skills", _ledger(home), later.encode("utf-8"), known=[])
+    path = sk.skill_path(home / ".agents" / "skills", sk.DIFF)
+    st = sk.classify(
+        home / ".agents" / "skills", sk.DIFF, _ledger(home), later.encode("utf-8"), known=[]
+    )
     assert st.state == "stale"
     _init(home, ("codex",))
     assert path.read_bytes() == later.encode("utf-8")
@@ -610,9 +626,9 @@ def test_a_directory_reached_through_a_link_stays_the_recorded_one(
 def test_a_text_shipped_since_the_ledger_is_replaced_without_a_record(
     tmp_path: Path, newer: bytes, fixture: Path
 ) -> None:
-    """MUTATION: drop that text's sha256 from LEGACY_SHA256 -> foreign -> left -> RED."""
+    """MUTATION: drop that text's sha256 from DIFF.legacy -> foreign -> left -> RED."""
     home = tmp_path / "h"
-    path = sk.skill_path(sk.agents_root(home))
+    path = sk.skill_path(sk.agents_root(home), sk.DIFF)
     path.parent.mkdir(parents=True)
     path.write_bytes(fixture.read_bytes())
     assert _ledger(home).find(sk.entry_id(path)) is None
@@ -622,14 +638,39 @@ def test_a_text_shipped_since_the_ledger_is_replaced_without_a_record(
 
 
 def test_the_shipped_text_is_pinned_and_not_an_earlier_one() -> None:
-    """Changing the skill text fails here until its sha256 is added to LEGACY_SHA256 (so a copy
+    """Changing the skill text fails here until its sha256 is added to DIFF.legacy (so a copy
     of the old text is still replaced) and the new one pinned.
 
     MUTATION: change one word of the skill template -> RED."""
-    now = hashlib.sha256(sk.shipped_bytes()).hexdigest()
+    now = hashlib.sha256(sk.shipped_bytes(sk.DIFF)).hexdigest()
     assert now == SHIPPED_SHA256
-    assert now not in sk.LEGACY_SHA256
-    assert len(sk.LEGACY_SHA256) == 13
+    assert now not in sk.DIFF.legacy
+    assert len(sk.DIFF.legacy) == 13
+
+
+def test_the_scan_text_is_pinned_and_not_an_earlier_one() -> None:
+    """Changing the scan-review text fails here until it is pinned again — and, once the earlier
+    text has shipped, its sha256 is added to SCAN.legacy, so a copy of it is still replaced.
+
+    MUTATION (verified RED, 1 failed): change one word of scan-review.md -> RED."""
+    now = hashlib.sha256(sk.shipped_bytes(sk.SCAN)).hexdigest()
+    assert now == SCAN_SHIPPED_SHA256
+    assert now not in sk.SCAN.legacy
+    assert len(sk.SCAN.legacy) == 0  # one more for each earlier text that shipped
+
+
+@pytest.mark.parametrize("skill", sk.SHIPPED, ids=[s.id for s in sk.SHIPPED])
+def test_each_skill_is_written_under_the_name_its_text_gives_itself(skill: sk.Shipped) -> None:
+    """An agent finds a skill by its frontmatter ``name``; the directory tmap writes it into
+    carries the same name.
+
+    MUTATION (verified RED, 1 failed): write the scan skill under ``tmap-scan`` -> RED."""
+    text = skill.text()
+    head = text.split("---\n", 2)
+    assert text.startswith("---\n") and len(head) == 3
+    names = [ln.removeprefix("name: ") for ln in head[1].splitlines() if ln.startswith("name: ")]
+    assert names == [skill.dirname]
+    assert sk.BY_DIRNAME[skill.dirname] is skill
 
 
 def test_one_byte_changed_in_an_earlier_text_is_foreign(tmp_path: Path, newer: bytes) -> None:
@@ -637,7 +678,7 @@ def test_one_byte_changed_in_an_earlier_text_is_foreign(tmp_path: Path, newer: b
     home = tmp_path / "h"
     edited = bytearray(_V3387.read_bytes())
     edited[-2] = ord("#") if edited[-2] != ord("#") else ord("!")
-    path = sk.skill_path(sk.agents_root(home))
+    path = sk.skill_path(sk.agents_root(home), sk.DIFF)
     path.parent.mkdir(parents=True)
     path.write_bytes(bytes(edited))
     result = _init(home, ("codex",))
@@ -650,7 +691,7 @@ def test_one_byte_changed_in_an_earlier_text_is_foreign(tmp_path: Path, newer: b
 
 def _recorded_copy(home: Path, data: bytes, recorded: bytes) -> Path:
     """``data`` at the Claude Code skill path, the ledger recording ``recorded`` there."""
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     path.parent.mkdir(parents=True)
     path.write_bytes(data)
     _record(_ledger(home), path, recorded, root=str(path.parents[1]))
@@ -658,18 +699,18 @@ def _recorded_copy(home: Path, data: bytes, recorded: bytes) -> Path:
 
 
 def _classify(home: Path, want: bytes) -> sk.SkillStatus:
-    return sk.classify(sk.claude_root(home, {}), _ledger(home), want, known=[])
+    return sk.classify(sk.claude_root(home, {}), sk.DIFF, _ledger(home), want, known=[])
 
 
 def test_a_recorded_copy_of_an_earlier_text_is_tmaps(tmp_path: Path, newer: bytes) -> None:
     """★ T-F4a: the text tmap shipped until now, written by tmap (the ledger records those very
     bytes), is ``stale`` — tmap's, from an earlier version — though that text is now also one of
-    LEGACY_SHA256's; replaced all the same.
+    DIFF.legacy's; replaced all the same.
 
-    MUTATION (verified RED, 1 failed): read LEGACY_SHA256 before the ledger -> legacy -> RED."""
+    MUTATION (verified RED, 1 failed): read DIFF.legacy before the ledger -> legacy -> RED."""
     home = tmp_path / "h"
     old = _V3741.read_bytes()
-    assert sk.sha256_of(old) in sk.LEGACY_SHA256  # the precondition
+    assert sk.sha256_of(old) in sk.DIFF.legacy  # the precondition
     path = _recorded_copy(home, old, old)
     st = _classify(home, newer)
     assert (st.state, st.detail) == ("stale", "tmap's, from an earlier version")
@@ -684,7 +725,7 @@ def test_a_recorded_copy_overwritten_with_an_earlier_text_is_still_replaced(
     tmap's text: ``legacy`` (tmap's text, so tmap's to replace), not ``foreign``.
 
     MUTATION (verified RED, 1 failed): read the whole ledger block (both of its answers) before
-    LEGACY_SHA256 -> foreign -> left -> RED."""
+    DIFF.legacy -> foreign -> left -> RED."""
     home = tmp_path / "h"
     path = _recorded_copy(home, _V3387.read_bytes(), b"another text tmap wrote\n")
     st = _classify(home, newer)
@@ -697,7 +738,7 @@ def test_a_recorded_copy_changed_into_no_tmap_text_is_left(tmp_path: Path, newer
     """★ T-F4c: the ledger records other bytes there and the file is no text tmap shipped:
     ``foreign`` (changed since tmap installed it), never modified.
 
-    MUTATION (verified RED, 1 failed): drop the recorded-but-changed answer after LEGACY_SHA256 ->
+    MUTATION (verified RED, 1 failed): drop the recorded-but-changed answer after DIFF.legacy ->
     "not in tmap's install ledger" -> RED."""
     home = tmp_path / "h"
     edited = b"a person's own edit\n"
@@ -729,9 +770,15 @@ def test_what_is_replaced_is_the_same_in_every_state(
 ) -> None:
     """★ T-F4d: over every state classify gives (and both ways a file can be ``legacy`` or
     ``stale``), whether init replaces the file and what the doctor reports are unchanged — only
-    the wording of one state moved. The table was read from d3eb840 by the same test body."""
+    the wording of one state moved. The table was read from d3eb840 by the same test body. The
+    scan-review skill is current beside it, so the directory's one line is the diff-review
+    skill's state."""
     home = tmp_path / "h"
-    path = sk.skill_path(sk.claude_root(home, {}))
+    scan = sk.skill_path(sk.claude_root(home, {}), sk.SCAN)
+    scan.parent.mkdir(parents=True)
+    scan.write_bytes(sk.shipped_bytes(sk.SCAN))
+    _record(_ledger(home), scan, sk.shipped_bytes(sk.SCAN), root=str(scan.parents[1]))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     earlier = _V3387.read_bytes()
     other = b"another text tmap wrote\n"
     if case == "aligned":

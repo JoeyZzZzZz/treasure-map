@@ -455,7 +455,7 @@ def test_the_text_shipped_before_is_an_earlier_version() -> None:
     MUTATION (verified RED): the skill changed without adding its old hash -> RED."""
     old = (_FIXTURES / "skills" / "legacy_diff_review_4658.md").read_bytes()
     assert len(old) == 4_658
-    assert hashlib.sha256(old).hexdigest() in sk.LEGACY_SHA256
+    assert hashlib.sha256(old).hexdigest() in sk.DIFF.legacy
     src = (_SRC / "lib" / "setup" / "skills.py").read_text(encoding="utf-8")
     assert src.count("81cb1c8a3f38f56e1db267cd05eefd0e4dc01fa90ff0b51d624555ff3b2c7055") == 1
 

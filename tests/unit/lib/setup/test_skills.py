@@ -45,6 +45,16 @@ def _shipped() -> bytes:
     return diff_skill.skill_text().encode("utf-8")
 
 
+def _both(root: Path) -> set[Path]:
+    """Where every skill tmap ships goes in skills directory ``root``."""
+    return {sk.skill_path(root, s) for s in sk.SHIPPED}
+
+
+def _all_current(root: Path) -> str:
+    """The doctor's detail for ``root`` when every skill there is current."""
+    return " | ".join(str(sk.skill_path(root, s)) for s in sk.SHIPPED)
+
+
 @pytest.fixture()
 def newer(monkeypatch: pytest.MonkeyPatch) -> bytes:
     """A shipped skill that is none of the earlier versions (the real one may still equal one)."""
@@ -132,14 +142,15 @@ def test_each_shared_skills_directory_is_written_once(
     desktop_dsh has no ~/.agents copy -> RED."""
     home = tmp_path / "h"
     _init(home, clients)
-    want = {home / r / "skills" / sk.SKILL_DIRNAME / sk.SKILL_FILE for r in roots}
-    assert _skill_files(home) == want
-    assert all(p.read_bytes() == _shipped() for p in want)
+    want = {home / r / "skills" / s.dirname / sk.SKILL_FILE for r in roots for s in sk.SHIPPED}
+    assert _skill_files(home) == want  # every shipped skill in each directory, each once
     ledger = _ledger(home)
     for p in want:
-        entry = ledger.committed(sk.entry_id(p))
+        data = sk.shipped_bytes(sk.BY_DIRNAME[p.parent.name])
+        assert p.read_bytes() == data
+        entry = ledger.committed(sk.entry_id(p))  # one entry per skill per directory
         assert entry is not None and entry.kind == "file" and entry.path == str(p)
-        assert entry.extra["sha256"] == hashlib.sha256(_shipped()).hexdigest()
+        assert entry.extra["sha256"] == hashlib.sha256(data).hexdigest()
 
 
 def test_claude_desktop_gets_steps_to_follow_and_no_file_of_its_own(tmp_path: Path) -> None:
@@ -151,7 +162,7 @@ def test_claude_desktop_gets_steps_to_follow_and_no_file_of_its_own(tmp_path: Pa
     home = tmp_path / "h"
     echo: list[str] = []
     _init(home, ("claude-desktop",), echo)
-    assert _skill_files(home) == {sk.skill_path(sk.agents_root(home))}
+    assert _skill_files(home) == _both(sk.agents_root(home))
     assert any("Claude Desktop: tmap does not install agent skills" in ln for ln in echo)
 
 
@@ -182,14 +193,15 @@ def test_a_foreign_skill_is_never_rewritten_and_the_command_is_given(tmp_path: P
 
     MUTATION: take a name match alone as tmap's (no ledger record needed) -> overwritten -> RED."""
     home = tmp_path / "h"
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     path.parent.mkdir(parents=True)
     mine = b"---\nname: tmap-diff-review\ndescription: my own\n---\nmine\n"
     path.write_bytes(mine)
     result = _init(home, ("claude-code",))
     assert path.read_bytes() == mine
     assert _ledger(home).find(sk.entry_id(path)) is None
-    cmd = f"tmap review skill --install {sk.claude_root(home, {})} --force"
+    # names its skill: --install alone writes both, and --force would reach the other one too
+    cmd = f"tmap review skill --install {sk.claude_root(home, {})} --diff --force"
     assert any(cmd in n for n in result.needs_you)
     assert _doctor(home)["skill.claude"][0] == "warn"
 
@@ -201,7 +213,7 @@ def test_a_symbolic_link_is_foreign(tmp_path: Path, newer: bytes) -> None:
     home = tmp_path / "h"
     target = tmp_path / "elsewhere.md"
     target.write_bytes(_LEGACY.read_bytes())
-    path = sk.skill_path(sk.agents_root(home))
+    path = sk.skill_path(sk.agents_root(home), sk.DIFF)
     path.parent.mkdir(parents=True)
     path.symlink_to(target)
     result = _init(home, ("codex",))
@@ -222,19 +234,19 @@ def test_a_hand_installed_earlier_version_is_replaced_and_recorded(
     shipped text (E-m3c: each fixture is skills/diff-review.md exactly as git holds that version).
 
     MUTATION: drop the earlier-version hashes -> foreign -> left -> RED; drop only the 2,962-byte
-    hash from LEGACY_SHA256 -> the 2962 case -> RED (1 failed: the file is left); the same for
+    hash from DIFF.legacy -> the 2962 case -> RED (1 failed: the file is left); the same for
     each of the texts shipped after the ledger recorded skills (3126, 3387, 3741, 4658, 4727,
     5107) — a copy written where an earlier tmap did not record it is found by its text alone."""
     old = fixture.read_bytes()
     assert len(old) == size
     home = tmp_path / "h"
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     path.parent.mkdir(parents=True)
     path.write_bytes(old)
     assert _doctor(home)["skill.claude"][0] == "warn"
     _init(home, ("claude-code",))
     assert path.read_bytes() == newer == _shipped()
-    assert hashlib.sha256(old).hexdigest() in sk.LEGACY_SHA256
+    assert hashlib.sha256(old).hexdigest() in sk.DIFF.legacy
     entry = _ledger(home).committed(sk.entry_id(path))
     assert entry is not None and entry.extra["sha256"] == hashlib.sha256(newer).hexdigest()
 
@@ -246,7 +258,7 @@ def test_an_edited_copy_of_an_earlier_version_is_foreign(tmp_path: Path, newer: 
     edited = _LEGACY.read_bytes().replace(b"unit by unit", b"unit by Unit", 1)
     assert edited != _LEGACY.read_bytes()
     home = tmp_path / "h"
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     path.parent.mkdir(parents=True)
     path.write_bytes(edited)
     result = _init(home, ("claude-code",))
@@ -270,7 +282,7 @@ def test_a_recorded_skill_goes_stale_when_the_shipped_text_changes(
     state, detail = _doctor(home)["skill.claude"]
     assert state == "warn" and "earlier version" in detail
     _init(home, ("claude-code",))
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     assert path.read_bytes() == changed.encode("utf-8")
     entry = _ledger(home).committed(sk.entry_id(path))
     assert entry is not None
@@ -290,7 +302,9 @@ def test_the_doctor_reports_one_line_per_skills_directory(tmp_path: Path) -> Non
     assert _doctor(home, ("cursor",))["skill.agents"][0] == "missing"
     _init(home, ("cursor",))
     assert _doctor(home, ("cursor",))["skill.agents"][0] == "ok"
-    sk.skill_path(sk.claude_root(home, {})).mkdir(parents=True)  # a directory named SKILL.md
+    sk.skill_path(sk.claude_root(home, {}), sk.DIFF).mkdir(
+        parents=True
+    )  # a directory named SKILL.md
     assert _doctor(home)["skill.claude"][0] == "wrong"
 
 
@@ -304,7 +318,7 @@ def test_a_write_that_does_not_read_back_stays_pending(
 
     MUTATION: commit before the read-back -> the entry is committed -> RED."""
     ledger = Ledger(tmp_path / LEDGER_NAME)
-    path = sk.skill_path(tmp_path / "skills")
+    path = sk.skill_path(tmp_path / "skills", sk.DIFF)
     data = b"---\nname: tmap-diff-review\n---\nbody\n"
     monkeypatch.setattr(sk, "_read_back", lambda _p: b"torn")
     with pytest.raises(sk.SkillWriteError):
@@ -324,7 +338,7 @@ def test_an_interrupted_replacement_keeps_the_earlier_record(tmp_path: Path) -> 
     MUTATION: drop the earlier-record branch -> the entry is dropped (the file turns foreign) ->
     RED."""
     ledger = Ledger(tmp_path / LEDGER_NAME)
-    path = sk.skill_path(tmp_path / "skills")
+    path = sk.skill_path(tmp_path / "skills", sk.DIFF)
     old = b"---\nname: tmap-diff-review\n---\nold\n"
     sk.install(path, old, ledger)
     old_sha = hashlib.sha256(old).hexdigest()
@@ -338,18 +352,20 @@ def test_an_interrupted_replacement_keeps_the_earlier_record(tmp_path: Path) -> 
 
 
 def test_uninstall_removes_the_skills_init_installed(tmp_path: Path) -> None:
-    """★ init -> uninstall: both files and their tmap-diff-review directories are gone.
+    """★ init -> uninstall: every file — both skills in both directories — and their skill
+    directories are gone.
 
     MUTATION: drop the skill branch (falls through to "outside the toolchain") -> RED; leave
     the emptied directory -> RED."""
     home = Path.home()
     _init(home, ("claude-code", "codex"))
-    assert len(_skill_files(home)) == 2
+    assert _skill_files(home) == _both(sk.claude_root(home, {})) | _both(sk.agents_root(home))
     report = _uninstall(home)
     assert not report.refused, report.refused
     assert _skill_files(home) == set()
     for root in sk.known_roots(home, {}):
-        assert not (root / sk.SKILL_DIRNAME).exists()
+        for s in sk.SHIPPED:
+            assert not (root / s.dirname).exists()
     assert not (home / ".treasure-map" / "toolchain" / LEDGER_NAME).exists()
 
 
@@ -359,7 +375,7 @@ def test_uninstall_keeps_a_skill_edited_since_and_lists_it(tmp_path: Path) -> No
     MUTATION: drop the sha256 comparison -> removed -> RED."""
     home = Path.home()
     _init(home, ("claude-code",))
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     edited = path.read_bytes().replace(b"tmap", b"Tmap", 1)
     path.write_bytes(edited)
     ledger = _ledger(home)
@@ -421,14 +437,14 @@ def test_review_skill_install_follows_the_same_rules(tmp_path: Path) -> None:
     MUTATION: write over a foreign file without --force -> RED."""
     home = Path.home()
     root = sk.claude_root(home, {})
-    path = sk.skill_path(root)
+    path = sk.skill_path(root, sk.DIFF)
     res = _install(root)
     assert res.exit_code == 0, res.output  # type: ignore[attr-defined]
     assert path.read_bytes() == _shipped()
     assert _ledger(home).committed(sk.entry_id(path)) is not None
     assert "already current" in _install(root).output  # type: ignore[attr-defined]
 
-    other = sk.skill_path(sk.agents_root(home))
+    other = sk.skill_path(sk.agents_root(home), sk.DIFF)
     other.parent.mkdir(parents=True)
     other.write_bytes(b"mine\n")
     res = _install(sk.agents_root(home))
@@ -449,7 +465,7 @@ def test_review_skill_install_elsewhere_is_recorded_with_its_root(
     MUTATION: write a directory outside named_roots unrecorded again -> RED; drop ``root`` from
     install's record -> RED."""
     root = tmp_path / "skills"
-    path = sk.skill_path(root)
+    path = sk.skill_path(root, sk.DIFF)
     path.parent.mkdir(parents=True)
     path.write_bytes(_LEGACY.read_bytes())
     res = _install(root)
@@ -479,7 +495,7 @@ def test_a_recorded_skill_edited_since_is_not_rewritten(tmp_path: Path) -> None:
     again) -> the doctor says "an earlier version" and init overwrites the edit -> RED."""
     home = Path.home()
     _init(home, ("claude-code",))
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     assert _ledger(home).committed(sk.entry_id(path)) is not None
     edited = path.read_bytes() + b"\n- my own rule\n"  # the name is kept
     path.write_bytes(edited)
@@ -488,7 +504,7 @@ def test_a_recorded_skill_edited_since_is_not_rewritten(tmp_path: Path) -> None:
     assert "earlier version" not in detail
     result = _init(home, ("claude-code",))
     assert path.read_bytes() == edited
-    cmd = f"tmap review skill --install {sk.claude_root(home, {})} --force"
+    cmd = f"tmap review skill --install {sk.claude_root(home, {})} --diff --force"
     assert any("changed since tmap installed it" in n and cmd in n for n in result.needs_you)
     rep = _uninstall(home)
     assert path.read_bytes() == edited and any("changed since" in r for r in rep.refused)
@@ -501,7 +517,7 @@ def test_init_looks_again_before_it_writes(tmp_path: Path, monkeypatch: pytest.M
     MUTATION: drop the second classify before ``sk.install`` -> the edit is overwritten -> RED."""
     home = Path.home()
     _init(home, ("claude-code",))
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     changed = diff_skill.skill_text() + "\nchanged\n"
     monkeypatch.setattr(diff_skill, "skill_text", lambda: changed)
     edited = path.read_bytes() + b"- my own rule\n"
@@ -534,13 +550,13 @@ def test_init_updates_tmaps_copy_in_a_directory_no_chosen_agent_reads(
     ~/.dsh copy keeps the old text -> RED."""
     home = tmp_path / "h"
     _init(home, ("dsh",))
-    agents = sk.skill_path(sk.dsh_root(home, {}))
+    agents = sk.skill_path(sk.dsh_root(home, {}), sk.DIFF)
     assert agents.read_bytes() == _shipped()
     changed = diff_skill.skill_text() + "\nchanged\n"
     monkeypatch.setattr(diff_skill, "skill_text", lambda: changed)
     _init(home, ("claude-code",))
     assert agents.read_bytes() == changed.encode("utf-8")
-    assert sk.skill_path(sk.claude_root(home, {})).read_bytes() == changed.encode("utf-8")
+    assert sk.skill_path(sk.claude_root(home, {}), sk.DIFF).read_bytes() == changed.encode("utf-8")
     entry = _ledger(home).committed(sk.entry_id(agents))
     assert entry is not None
     assert entry.extra["sha256"] == hashlib.sha256(changed.encode("utf-8")).hexdigest()
@@ -570,17 +586,17 @@ def test_force_does_not_write_through_a_linked_skill_directory(tmp_path: Path) -
     mine = b"---\nname: tmap-diff-review\n---\nmine\n"
     (theirs / sk.SKILL_FILE).write_bytes(mine)
     root.mkdir(parents=True)
-    (root / sk.SKILL_DIRNAME).symlink_to(theirs, target_is_directory=True)
+    (root / sk.DIFF.dirname).symlink_to(theirs, target_is_directory=True)
     res = _install_r(root, "--force")
     assert res.exit_code != 0
     assert f"symbolic link to {theirs}" in res.output
     assert (theirs / sk.SKILL_FILE).read_bytes() == mine
-    assert _ledger(home).find(sk.entry_id(sk.skill_path(root))) is None
+    assert _ledger(home).find(sk.entry_id(sk.skill_path(root, sk.DIFF))) is None
 
     other = sk.agents_root(home)
     target = tmp_path / "elsewhere.md"
     target.write_bytes(mine)
-    link = sk.skill_path(other)
+    link = sk.skill_path(other, sk.DIFF)
     link.parent.mkdir(parents=True)
     link.symlink_to(target)
     res = _install_r(other, "--force")
@@ -604,12 +620,12 @@ def test_a_linked_skill_directory_holding_an_earlier_version_is_not_written(
     (theirs / sk.SKILL_FILE).write_bytes(_LEGACY.read_bytes())
     root = sk.claude_root(home, {})
     root.mkdir(parents=True)
-    (root / sk.SKILL_DIRNAME).symlink_to(theirs, target_is_directory=True)
+    (root / sk.DIFF.dirname).symlink_to(theirs, target_is_directory=True)
     echo: list[str] = []
     result = _init(home, ("claude-code",), echo)
     assert not any("install the diff-review skill" in ln for ln in echo)
     assert (theirs / sk.SKILL_FILE).read_bytes() == _LEGACY.read_bytes() != newer
-    hint = f"{root / sk.SKILL_DIRNAME} is a link; remove or replace it first"
+    hint = f"{root / sk.DIFF.dirname} is a link; remove or replace it first"
     assert any("symbolic link" in n and hint in n for n in result.needs_you)
     assert not any("--force" in n for n in result.needs_you)  # --force would refuse it
     state, detail = _doctor(home)["skill.claude"]
@@ -624,7 +640,7 @@ def test_uninstall_refuses_a_recorded_skill_replaced_by_a_link(tmp_path: Path) -
     MUTATION: drop ``path.is_symlink()`` from removable -> the link is removed -> RED."""
     home = Path.home()
     _init(home, ("claude-code",))
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     copy = tmp_path / "copy.md"
     copy.write_bytes(path.read_bytes())
     path.unlink()
@@ -643,19 +659,19 @@ def test_a_directory_tmap_does_not_manage_is_said_so(tmp_path: Path) -> None:
     home = Path.home()
     known = sk.known_roots(home, {})
     root = tmp_path / "skills"
-    path = sk.skill_path(root)
+    path = sk.skill_path(root, sk.DIFF)
     path.parent.mkdir(parents=True)
     path.write_bytes(b"an older text\n")
     wording = "not in tmap's install ledger (a directory tmap does not manage)"
-    st = sk.classify(root, _ledger(home), _shipped(), known=known)
+    st = sk.classify(root, sk.DIFF, _ledger(home), _shipped(), known=known)
     assert st.state == "foreign" and st.detail == wording
     res = _install_r(root)
     assert res.exit_code != 0 and wording in res.output
     assert path.read_bytes() == b"an older text\n"
-    managed = sk.skill_path(sk.agents_root(home))
+    managed = sk.skill_path(sk.agents_root(home), sk.DIFF)
     managed.parent.mkdir(parents=True)
     managed.write_bytes(b"an older text\n")
-    st = sk.classify(sk.agents_root(home), _ledger(home), _shipped(), known=known)
+    st = sk.classify(sk.agents_root(home), sk.DIFF, _ledger(home), _shipped(), known=known)
     assert st.state == "foreign" and st.detail == "tmap did not install it"
 
 
@@ -668,7 +684,7 @@ def test_uninstall_removes_the_directories_its_install_created(tmp_path: Path) -
     home = Path.home()
     (home / ".claude").mkdir()
     _init(home, ("claude-code", "codex"))
-    entry = _ledger(home).committed(sk.entry_id(sk.skill_path(sk.agents_root(home))))
+    entry = _ledger(home).committed(sk.entry_id(sk.skill_path(sk.agents_root(home), sk.DIFF)))
     assert entry is not None
     report = _uninstall(home)
     assert not report.refused, report.refused
@@ -692,7 +708,7 @@ def test_uninstall_keeps_a_created_directory_that_is_not_empty(tmp_path: Path) -
     report = _uninstall(home)
     assert not report.refused, report.refused
     assert theirs.is_file() and theirs.read_bytes() == b"mine\n"
-    assert not (home / ".agents" / "skills" / sk.SKILL_DIRNAME).exists()
+    assert not (home / ".agents" / "skills" / sk.DIFF.dirname).exists()
 
 
 def test_claude_code_skills_follow_claude_config_dir(
@@ -715,8 +731,8 @@ def test_claude_code_skills_follow_claude_config_dir(
         host=fakes.make_host(home, environ=env),
         tmap=None,
     )
-    want = cfg / "skills" / sk.SKILL_DIRNAME / sk.SKILL_FILE
-    assert _skill_files(home) == {sk.skill_path(sk.agents_root(home))}  # the shared one only
+    want = cfg / "skills" / sk.DIFF.dirname / sk.SKILL_FILE
+    assert _skill_files(home) == _both(sk.agents_root(home))  # the shared one only
     assert want.read_bytes() == _shipped()
     assert _ledger(home).committed(sk.entry_id(want)) is not None
     chost = cl.ClientHost(home, env, fakes.linux(), lambda _n: None, fakes.fake_run())
@@ -730,7 +746,7 @@ def test_claude_code_skills_follow_claude_config_dir(
         check_only=True,
     )
     checks = {c.name: (c.state, c.detail) for c in _skill_checks(inp)}
-    assert checks["skill.claude"] == ("ok", str(want))
+    assert checks["skill.claude"] == ("ok", _all_current(cfg / "skills"))
     tm = home / ".treasure-map"
     report = un.uninstall(
         home=home,
@@ -760,7 +776,7 @@ def test_uninstall_settles_an_interrupted_replacement_first(tmp_path: Path) -> N
     copy) -> the ledger file changes -> RED."""
     home = Path.home()
     _init(home, ("claude-code",))
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     ledger = _ledger(home)
     old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
     ledger.add_pending(sk.entry_id(path), "file", path, sha256="0" * 64, prior_sha256=old_sha)
@@ -792,10 +808,10 @@ def test_cursor_still_gets_the_skill_when_claude_config_dir_is_set(tmp_path: Pat
     home = Path.home()
     cfg = tmp_path / "cfg"
     _init(home, ("claude-code", "cursor"), environ={"CLAUDE_CONFIG_DIR": str(cfg)})
-    assert sk.skill_path(cfg / "skills").read_bytes() == _shipped()
+    assert sk.skill_path(cfg / "skills", sk.DIFF).read_bytes() == _shipped()
     cursor_reads = [home / d / "skills" for d in (".agents", ".cursor", ".claude", ".codex")]
-    assert any(sk.skill_path(r).is_file() for r in cursor_reads)
-    assert _skill_files(home) == {sk.skill_path(sk.agents_root(home))}
+    assert any(sk.skill_path(r, sk.DIFF).is_file() for r in cursor_reads)
+    assert _skill_files(home) == _both(sk.agents_root(home))
 
 
 def test_a_copy_in_the_default_claude_directory_stays_tmaps_under_claude_config_dir(
@@ -809,14 +825,17 @@ def test_a_copy_in_the_default_claude_directory_stays_tmaps_under_claude_config_
     while the variable is set -> the copy is neither refreshed nor removable -> RED."""
     home = Path.home()
     _init(home, ("claude-code",))
-    default = sk.skill_path(home / ".claude" / "skills")
+    default = sk.skill_path(home / ".claude" / "skills", sk.DIFF)
     assert default.read_bytes() == _shipped()
     env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "cfg")}
     changed = diff_skill.skill_text() + "\nchanged\n"
     monkeypatch.setattr(diff_skill, "skill_text", lambda: changed)
     _init(home, ("claude-code",), environ=env)
     assert default.read_bytes() == changed.encode("utf-8")
-    assert _doctor(home, environ=env)["skill.claude.default"] == ("ok", str(default))
+    assert _doctor(home, environ=env)["skill.claude.default"] == (
+        "ok",
+        _all_current(home / ".claude" / "skills"),
+    )
     # unset: the named directories, and $CLAUDE_CONFIG_DIR/skills as one the ledger holds a skill
     # for
     custom = "skill." + sk.custom_name(tmp_path / "cfg" / "skills")
@@ -839,7 +858,7 @@ def test_uninstall_without_claude_config_dir_names_the_command_for_a_copy_writte
     cfg = tmp_path / "cfg"
     env = {"CLAUDE_CONFIG_DIR": str(cfg)}
     _init(home, ("claude-code",), environ=env)
-    path = sk.skill_path(cfg / "skills")
+    path = sk.skill_path(cfg / "skills", sk.DIFF)
     entry = _ledger(home).committed(sk.entry_id(path))
     assert entry is not None and entry.extra.get("claude_config_dir") == str(cfg)
     report = _uninstall(home)
@@ -865,7 +884,7 @@ def test_the_doctor_settles_an_interrupted_replacement_as_uninstall_does(
     "tmap did not install it ... --force" -> RED."""
     home = Path.home()
     _init(home, ("claude-code",))
-    path = sk.skill_path(sk.claude_root(home, {}))
+    path = sk.skill_path(sk.claude_root(home, {}), sk.DIFF)
     old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
     changed = diff_skill.skill_text() + "\nchanged\n"
     monkeypatch.setattr(diff_skill, "skill_text", lambda: changed)
@@ -891,17 +910,18 @@ def test_an_earlier_version_outside_this_runs_directories_is_replaced_too(
     (not earlier versions) -> the ~/.dsh copy keeps the old text -> RED. MUTATION: leave dsh out
     of named_roots -> RED."""
     home = tmp_path / "h"
-    agents = sk.skill_path(sk.dsh_root(home, {}))
+    agents = sk.skill_path(sk.dsh_root(home, {}), sk.DIFF)
     agents.parent.mkdir(parents=True)
     old = (_FIXTURES / "legacy_diff_review_3387.md").read_bytes()
     agents.write_bytes(old)
     assert _ledger(home).find(sk.entry_id(agents)) is None
     state, detail = _doctor(home)["skill.dsh"]
-    assert state == "warn" and detail.endswith("; `tmap init` replaces it")
+    diff_part = detail.split(" | ")[0]  # the scan-review skill was never there: not installed
+    assert state == "warn" and diff_part.endswith("; `tmap init` replaces it"), detail
     _init(home, ("claude-code",))
     assert agents.read_bytes() == newer
     assert _ledger(home).committed(sk.entry_id(agents)) is not None
-    missing = sk.skill_path(sk.dsh_root(tmp_path / "h2", {}))
+    missing = sk.skill_path(sk.dsh_root(tmp_path / "h2", {}), sk.DIFF)
     _init(tmp_path / "h2", ("claude-code",))
     assert not missing.parent.exists()  # nothing is created where there was no copy
 
@@ -930,7 +950,7 @@ def test_an_interrupted_first_install_leaves_no_empty_directories(
     with pytest.raises(KeyboardInterrupt):
         _init(home, ("codex",))
     monkeypatch.undo()
-    path = sk.skill_path(sk.agents_root(home))
+    path = sk.skill_path(sk.agents_root(home), sk.DIFF)
     assert path.parent.is_dir() and not path.exists()
     _doctor(home)
     assert path.parent.is_dir()  # the doctor changes nothing on disk
@@ -946,15 +966,15 @@ def test_review_skill_install_does_not_offer_force_for_a_linked_directory(tmp_pa
     MUTATION (verified RED, 1 failed): give the foreign refusal "(--force replaces it)" again ->
     RED."""
     root = sk.claude_root(Path.home(), {})
-    theirs = tmp_path / "dot" / sk.SKILL_DIRNAME
+    theirs = tmp_path / "dot" / sk.DIFF.dirname
     theirs.mkdir(parents=True)
     (theirs / sk.SKILL_FILE).write_bytes(b"mine\n")
     root.mkdir(parents=True)
-    (root / sk.SKILL_DIRNAME).symlink_to(theirs, target_is_directory=True)
+    (root / sk.DIFF.dirname).symlink_to(theirs, target_is_directory=True)
     res = _install_r(root)
     assert res.exit_code != 0
     assert "--force replaces it" not in res.output, res.output
-    assert f"{root / sk.SKILL_DIRNAME} is a link; remove or replace it first" in res.output
+    assert f"{root / sk.DIFF.dirname} is a link; remove or replace it first" in res.output
     assert (theirs / sk.SKILL_FILE).read_bytes() == b"mine\n"
 
 
@@ -965,11 +985,11 @@ def test_force_into_an_unmanaged_directory_does_not_write_through_a_link(tmp_pat
     MUTATION (verified RED, 1 failed): drop the linked-directory refusal from write_plain -> the
     user's file is overwritten -> RED."""
     root = tmp_path / "custom"
-    theirs = tmp_path / "dot" / sk.SKILL_DIRNAME
+    theirs = tmp_path / "dot" / sk.DIFF.dirname
     theirs.mkdir(parents=True)
     (theirs / sk.SKILL_FILE).write_bytes(b"mine\n")
     root.mkdir()
-    (root / sk.SKILL_DIRNAME).symlink_to(theirs, target_is_directory=True)
+    (root / sk.DIFF.dirname).symlink_to(theirs, target_is_directory=True)
     res = _install_r(root, "--force")
     assert res.exit_code != 0 and f"symbolic link to {theirs}" in res.output
     assert (theirs / sk.SKILL_FILE).read_bytes() == b"mine\n"
@@ -988,7 +1008,7 @@ def test_a_recorded_directory_that_is_not_above_the_skill_is_never_removed(
     unrelated = home / "empty-but-mine"
     unrelated.mkdir()
     ledger = _ledger(home)
-    entry = ledger.find(sk.entry_id(sk.skill_path(sk.agents_root(home))))
+    entry = ledger.find(sk.entry_id(sk.skill_path(sk.agents_root(home), sk.DIFF)))
     assert entry is not None
     entry.extra["created_dirs"] = [*entry.extra["created_dirs"], str(unrelated)]
     ledger.save()
@@ -1004,13 +1024,207 @@ def test_the_created_directories_survive_a_replacement(
     the file (that write creates none), so uninstall still takes them away.
 
     MUTATION (verified RED, 1 failed): record only the directories the latest write created ->
-    ~/.agents stays after uninstall -> RED."""
+    ~/.agents stays after uninstall -> RED. The replaced diff-review entry is now newer than the
+    scan-review one beside it, so uninstall removes it first, while the scan-review directory still
+    fills ~/.agents/skills.
+    MUTATION (verified RED, 1 failed): drop uninstall's second pass over the created directories
+    -> ~/.agents stays -> RED."""
     home = Path.home()
     _init(home, ("codex",))
     changed = diff_skill.skill_text() + "\nchanged\n"
     monkeypatch.setattr(diff_skill, "skill_text", lambda: changed)
     _init(home, ("codex",))
-    assert sk.skill_path(sk.agents_root(home)).read_bytes() == changed.encode("utf-8")
+    assert sk.skill_path(sk.agents_root(home), sk.DIFF).read_bytes() == changed.encode("utf-8")
     report = _uninstall(home)
     assert not report.refused, report.refused
     assert not (home / ".agents").exists()
+
+
+# ── two skills: one line per directory, each skill named in it ──────────────────────────────
+
+
+def test_one_line_names_both_skills_when_they_differ(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Both installed, then the scan-review copy edited: the directory still gets one line, its
+    state the worse of the two (warn, not the diff-review skill's ok), and the detail names the
+    scan-review file with its own command. With the diff-review copy also stale, the detail gives
+    both remedies — each skill's own.
+
+    MUTATION (verified RED, 1 failed): report only the first skill -> RED.
+    MUTATION (verified RED, 1 failed): take the better of the two states, not the worse -> RED."""
+    home = Path.home()
+    _init(home, ("claude-code",))
+    root = sk.claude_root(home, {})
+    scan = sk.skill_path(root, sk.SCAN)
+    scan.write_bytes(scan.read_bytes() + b"\n- my own rule\n")
+    checks = _doctor(home)
+    assert set(checks) == {"skill.claude", "skill.agents", "skill.dsh"}  # one line each
+    state, detail = checks["skill.claude"]
+    assert state == "warn", (state, detail)
+    want = f"{scan}: changed since tmap installed it — not modified; to replace it: " + (
+        sk.replace_command(root, sk.SCAN)
+    )
+    assert want in detail and "--scan --force" in detail
+    changed = diff_skill.skill_text() + "\nchanged\n"
+    monkeypatch.setattr(diff_skill, "skill_text", lambda: changed)
+    state, detail = _doctor(home)["skill.claude"]
+    assert state == "warn"
+    assert f"{sk.skill_path(root, sk.DIFF)}: tmap's, from an earlier version; `tmap init`" in detail
+    assert want in detail
+
+
+def test_a_requested_directory_missing_a_skill_fails_beside_one_left_alone(
+    tmp_path: Path,
+) -> None:
+    """A directory this run asks for, with a diff-review file tmap leaves alone (warn) and no
+    scan-review skill (missing): the line is missing — what fails the run — not the warn.
+
+    MUTATION (verified RED, 1 failed): rank warn above missing -> RED."""
+    home = Path.home()
+    diff = sk.skill_path(sk.agents_root(home), sk.DIFF)
+    diff.parent.mkdir(parents=True)
+    diff.write_bytes(b"---\nname: tmap-diff-review\n---\nmine\n")
+    state, detail = _doctor(home, ("codex",))["skill.agents"]
+    assert state == "missing", (state, detail)
+    assert f"{sk.skill_path(sk.agents_root(home), sk.SCAN)}: not installed" in detail
+    assert "tmap did not install it" in detail
+
+
+def test_a_directory_recorded_for_diff_only_does_not_claim_scan_was_there(tmp_path: Path) -> None:
+    """★ A directory an earlier tmap's ``tmap review skill --install <dir>`` recorded (the
+    diff-review skill only): init brings tmap's copy up to date there but adds nothing, and the
+    doctor does not say the scan-review skill is "no longer there; still in tmap's install
+    ledger" — it never was there and has no record. It says so, with the command that adds it.
+
+    MUTATION (verified RED, 1 failed): give a missing skill the "still in tmap's install ledger"
+    line whenever the directory is in the ledger (not only for that skill's own record) -> RED."""
+    home = Path.home()
+    root = tmp_path / "proj" / "skills"
+    assert _install_r(root, "--diff").exit_code == 0
+    assert not sk.skill_path(root, sk.SCAN).exists()
+    _init(home, ("codex",))
+    assert not sk.skill_path(root, sk.SCAN).exists()  # nothing is created there
+    state, detail = _doctor(home)["skill." + sk.custom_name(root)]
+    scan_part = [p for p in detail.split(" | ") if sk.SCAN.dirname in p]
+    assert state == "info" and len(scan_part) == 1, (state, detail)
+    assert "still in tmap's install ledger" not in scan_part[0]
+    assert "holds only the diff-review skill for this directory" in scan_part[0]
+    assert f"`tmap review skill --install {root} --scan`" in scan_part[0]
+    # its own record, its file gone: the earlier line, for that skill
+    sk.skill_path(root, sk.DIFF).unlink()
+    state, detail = _doctor(home)["skill." + sk.custom_name(root)]
+    diff_part = [p for p in detail.split(" | ") if sk.DIFF.dirname in p]
+    assert state == "info" and "still in tmap's install ledger" in diff_part[0]
+
+
+def test_an_edited_scan_skill_is_left_and_the_command_names_scan(tmp_path: Path) -> None:
+    """The scan-review copy tmap wrote, edited since: init leaves it and gives the command that
+    replaces that file alone; that command replaces it and leaves the diff-review copy as it was.
+
+    MUTATION (verified RED, 1 failed): give every skill the diff-review skill's command -> RED."""
+    home = Path.home()
+    _init(home, ("codex",))
+    root = sk.agents_root(home)
+    scan, diff = sk.skill_path(root, sk.SCAN), sk.skill_path(root, sk.DIFF)
+    edited = scan.read_bytes() + b"\n- my own rule\n"
+    scan.write_bytes(edited)
+    mine = b"---\nname: tmap-diff-review\n---\nmine too\n"
+    diff.write_bytes(mine)
+    result = _init(home, ("codex",))
+    assert scan.read_bytes() == edited and diff.read_bytes() == mine
+    cmd = f"tmap review skill --install {root} --scan --force"
+    assert any(str(scan) in n and cmd in n for n in result.needs_you), result.needs_you
+    res = _install_r(root, "--scan", "--force")
+    assert res.exit_code == 0, res.output
+    assert scan.read_bytes() == sk.shipped_bytes(sk.SCAN)
+    assert diff.read_bytes() == mine  # --scan --force reached the scan-review file alone
+
+
+def test_review_skill_takes_at_most_one_of_scan_and_diff(tmp_path: Path) -> None:
+    """MUTATION (verified RED, 1 failed): drop the check -> --scan wins silently -> RED."""
+    for args in (["--scan", "--diff"], ["--scan", "--diff", "--install", str(tmp_path / "s")]):
+        res = CliRunner().invoke(review_cli.review, ["skill", *args])
+        assert res.exit_code == 2 and "--scan and --diff" in res.output, res.output
+    assert not (tmp_path / "s").exists()
+    printed = CliRunner().invoke(review_cli.review, ["skill"])
+    assert printed.exit_code == 0 and printed.output == diff_skill.skill_text()
+    printed = CliRunner().invoke(review_cli.review, ["skill", "--diff"])
+    assert printed.exit_code == 0 and printed.output == diff_skill.skill_text()
+
+
+def test_install_writes_both_skills_and_one_refusal_does_not_stop_the_other(
+    tmp_path: Path,
+) -> None:
+    """``--install <dir>`` alone writes every skill tmap ships, each recorded; a file tmap will not
+    replace is refused (the run fails, naming it) while the other skill is still written.
+
+    MUTATION (verified RED, 1 failed): stop at the first refusal -> the scan-review skill is
+    not written -> RED."""
+    root = tmp_path / "skills"
+    diff = sk.skill_path(root, sk.DIFF)
+    diff.parent.mkdir(parents=True)
+    diff.write_bytes(b"mine\n")
+    res = _install_r(root)
+    assert res.exit_code != 0 and f"{diff}: " in res.output and "--diff --force" in res.output
+    assert diff.read_bytes() == b"mine\n"
+    scan = sk.skill_path(root, sk.SCAN)
+    assert scan.is_file() and scan.read_bytes() == sk.shipped_bytes(sk.SCAN)
+    assert _ledger(Path.home()).committed(sk.entry_id(scan)) is not None
+    assert _ledger(Path.home()).find(sk.entry_id(diff)) is None
+
+
+def test_an_upgrade_adds_the_scan_skill_and_leaves_the_diff_record_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A machine an earlier tmap set up with the diff-review skill alone: the next init adds the
+    scan-review skill beside it in every directory the run writes, and the diff-review entry
+    stays exactly as it was (nothing to migrate). Its plan has one line per skill per directory.
+
+    MUTATION (verified RED, 1 failed): install only the first shipped skill -> RED."""
+    home = tmp_path / "h"
+    monkeypatch.setattr(sk, "SHIPPED", (sk.DIFF,))  # what an earlier tmap shipped
+    _init(home, ("claude-code", "dsh"))
+    monkeypatch.undo()
+    roots = (sk.claude_root(home, {}), sk.agents_root(home), sk.dsh_root(home, {}))
+    assert _skill_files(home) == {sk.skill_path(r, sk.DIFF) for r in roots}
+    before = {r: _ledger(home).committed(sk.entry_id(sk.skill_path(r, sk.DIFF))) for r in roots}
+    echo: list[str] = []
+    _init(home, ("claude-code", "dsh"), echo)
+    assert _skill_files(home) == set().union(*(_both(r) for r in roots))
+    for r in roots:
+        now = _ledger(home).committed(sk.entry_id(sk.skill_path(r, sk.DIFF)))
+        was = before[r]
+        assert now is not None and was is not None and now.to_json() == was.to_json()
+    assert sum("install the scan-review skill" in ln.lower() for ln in echo) == 3
+    assert not any("diff-review skill" in ln for ln in echo)  # aligned: nothing to do
+    fresh: list[str] = []
+    run_init(
+        dry_run=True,
+        non_interactive=True,
+        clients=("claude-code", "dsh"),
+        prompt=lambda _m: "",
+        echo=fresh.append,
+        platform=fakes.linux(),
+        host=fakes.make_host(tmp_path / "h2"),
+        tmap=None,
+    )
+    lines = [ln for ln in "\n".join(fresh).splitlines() if "-review skill in" in ln]
+    assert len(lines) == 6, lines  # three directories, two skills each
+
+
+def test_an_earlier_diff_review_text_at_the_scan_path_is_not_tmaps_to_replace(
+    tmp_path: Path,
+) -> None:
+    """Each skill's earlier texts are its own: a file at the scan-review path that is byte for
+    byte an earlier diff-review text is no scan-review text tmap shipped, so it is left alone.
+
+    MUTATION (verified RED, 1 failed): read the diff-review skill's earlier texts for every skill
+    -> replaced -> RED."""
+    home = tmp_path / "h"
+    scan = sk.skill_path(sk.agents_root(home), sk.SCAN)
+    scan.parent.mkdir(parents=True)
+    scan.write_bytes(_LEGACY.read_bytes())
+    assert hashlib.sha256(_LEGACY.read_bytes()).hexdigest() in sk.DIFF.legacy  # the precondition
+    _init(home, ("codex",))
+    assert scan.read_bytes() == _LEGACY.read_bytes()
