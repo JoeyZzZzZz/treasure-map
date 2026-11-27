@@ -1,0 +1,2 @@
+# The skill copies are compared byte for byte with what tmap installs (LF).
+/skills/** text eol=lf

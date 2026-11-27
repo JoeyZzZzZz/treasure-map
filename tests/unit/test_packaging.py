@@ -52,6 +52,7 @@ def test_pyproject_declares_package_data() -> None:
     assert "*.java" in package_data["treasure_map.lib.diff.ghidra"]
     assert "*.sql" in package_data["treasure_map.lib.storage"]
     assert "*.json" in package_data["treasure_map.lib.setup"]
+    assert "*.md" in package_data["treasure_map.skills"]
 
 
 def test_one_command_and_one_version_source() -> None:
