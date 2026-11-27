@@ -106,7 +106,7 @@ def test_the_skill_says_a_pair_spans_sessions_and_how_one_hands_off() -> None:
     text = skill_text()
     head, rules = text[: text.index("## Rules")], text[text.index("## Rules") :]
     assert "until the server reports the must-read set complete" not in head
-    assert "a whole run pair usually spans several sessions, or tmap's batch driver" in head
+    assert "A whole run pair usually takes several sessions, or tmap's batch driver." in head
     assert rules.index("`tmap review run <run_pair>") < rules.index("An unjudged member is UNREAD")
     assert "it probes the agent's tool set first" in rules
     flat = " ".join(rules.split())

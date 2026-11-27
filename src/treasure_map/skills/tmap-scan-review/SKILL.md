@@ -1,6 +1,6 @@
 ---
 name: tmap-scan-review
-description: Work through one firmware scan's candidate map with the Treasure Map (tmap) MCP server, unit by unit; the must-read set of one image usually spans many sessions, or tmap's batch driver. Use when asked to review, triage or audit a single firmware scan (one run, not a version diff) with Treasure Map or tmap.
+description: Work through one firmware scan's candidate map with the Treasure Map (tmap) MCP server, reading each candidate before judging it. Reading one image's whole must-read set takes tmap's batch driver. Use when asked to review, triage or audit a single firmware scan (one run, not a version diff) with Treasure Map or tmap.
 ---
 
 # Reviewing one firmware scan with tmap
@@ -8,8 +8,8 @@ description: Work through one firmware scan's candidate map with the Treasure Ma
 tmap scans one firmware and hands you a candidate map — tens of thousands of leads for a large
 image. `list_candidates` RANKS them, which says what to read first and never what may be left
 unread. This skill is the other half: the scan review profile cuts the run into four bands and two
-tiers, hands the must-read part out in work units, and counts what is still unread. tmap draws no
-conclusion and produces no attack: every judgment is yours.
+tiers, hands the must-read part out in work units through tmap's batch driver, and counts what is
+still unread. tmap draws no conclusion and produces no attack: every judgment is yours.
 
 ## The four bands
 
@@ -48,11 +48,10 @@ reading than an unread source on a `memcpy`.
 
 ## The loop
 
-This describes a unit as the BATCH DRIVER hands it out. There is no tool for asking the server for
-the next scan unit this version, and `tmap review scan <run_id>` prints counts only — no unit ids
-and no refs. So in an interactive session there is no step 1 to do: either a person runs the driver
-(below), or you are working from refs you already have, in which case steps 2–4 still apply to each
-of them.
+The steps below are one unit as the BATCH DRIVER hands it out. No MCP tool hands out scan units,
+and `tmap review scan <run_id>` prints counts only — no unit ids and no refs. So in an interactive
+session step 1 does not happen: either a person runs the driver (below), or you work from refs you
+already have (from `list_candidates`, say), and steps 2–4 apply to each of them.
 
 1. You are handed ONE unit: a list of candidate `evidence_ref`s from one binary, at most 16.
 2. For EVERY ref in the unit, call `explain_candidate(evidence_ref=...)`. Then read whatever else
@@ -80,15 +79,18 @@ of them.
   one: why the block covers EVERY path in and cannot be worked around. A wrong `safe` only comes
   back when the code changes, never because the judgment was wrong.
 - `exploitable` should carry `chain` (citing code) and two or more `verification_gaps` — what is
-  still to be confirmed on real hardware. `inconclusive` is an honest answer and stays in view.
+  still to be confirmed on real hardware. `suspicious` floats a candidate up for more digging.
+  `inconclusive` is an honest answer and stays in view.
 - **Stopping rule**: tier 1 empty for your scope, then stop. Tier 2 only when a person asks for
-  it. Stop only at a unit boundary — every ref of the unit in hand judged.
-- Quote the declaration's numbers verbatim when you report: the four band counts, tier 1
-  disposed / not disposed, the tier 2 group count, and the named gaps. Do not re-derive them.
-- The `controllable` source branch (a value-store key a web form writes) is NOT exercised by the
-  reference truth set this profile was measured against — two of the three corpora hold no such
-  candidate at all. It is in the predicate because dropping it would lose that whole family of
-  leads, not because it has been validated end to end.
+  it. Stop only at a unit boundary — every ref of the unit in hand judged. Interactively you cannot
+  see tier 1: say which refs you judged and that the rest of the map is unread.
+- Quote the declaration's numbers (`tmap review scan <run_id>` prints them) verbatim when you
+  report: the four band counts, tier 1 disposed / not disposed, the tier 2 group count, and the
+  named gaps. Do not re-derive them.
+- The `controllable` source branch (a value-store key a web form writes) has NOT been validated
+  end to end: two of the three firmware images this profile was measured on hold no such
+  candidate at all. It stays in the predicate because dropping it would lose that whole family
+  of leads.
 
 ## Running the whole thing
 
@@ -101,10 +103,9 @@ tmap review scan <run_id> --agent claude-code --until complete   # the second ti
 ```
 
 **Sharding.** `--worker <i> --workers <n>` splits the units by id, so `n` shells work disjoint
-slices of the same run with no coordination. A reasonable starting value is **`--workers 4`** on a
-machine with 8 or more cores — this is an EXPERIENCE value, not a measurement: the per-launch
-throughput of this profile has not been measured, and the number should be replaced with a measured
-one once it has. Each worker holds its own agent process and its own decompiler reads, so the
+slices of the same run with no coordination. Start with **`--workers 4`** on a machine with 8 or
+more cores. That is an EXPERIENCE value, not a measurement: this profile's per-launch throughput
+has not been measured. Each worker holds its own agent process and its own decompiler reads, so the
 ceiling in practice is memory and disk, not CPU. Run one worker first and watch it before fanning
 out.
 

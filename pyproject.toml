@@ -71,7 +71,7 @@ where = ["src"]
 "treasure_map.lib.diff.ghidra" = ["*.java"]
 "treasure_map.lib.storage" = ["*.sql"]
 "treasure_map.lib.setup" = ["*.json"]
-"treasure_map.skills" = ["*.md"]
+"treasure_map.skills" = ["*/SKILL.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

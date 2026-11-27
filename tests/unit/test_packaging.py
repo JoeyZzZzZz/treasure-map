@@ -38,7 +38,7 @@ _ASSETS = _load_asset_list()
 def test_runtime_assets_are_resolvable() -> None:
     # Resolves the same way an installed wheel exposes them; missing data files fail here.
     for package, resource in _ASSETS:
-        path = files(package) / resource
+        path = files(package).joinpath(*resource.split("/"))
         assert path.is_file(), f"{package}/{resource} not packaged"
 
 
@@ -52,7 +52,7 @@ def test_pyproject_declares_package_data() -> None:
     assert "*.java" in package_data["treasure_map.lib.diff.ghidra"]
     assert "*.sql" in package_data["treasure_map.lib.storage"]
     assert "*.json" in package_data["treasure_map.lib.setup"]
-    assert "*.md" in package_data["treasure_map.skills"]
+    assert "*/SKILL.md" in package_data["treasure_map.skills"]
 
 
 def test_one_command_and_one_version_source() -> None:

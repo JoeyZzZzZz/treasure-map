@@ -152,11 +152,12 @@ def test_every_text_that_teaches_the_pair_loop_names_the_unit() -> None:
 
 
 def test_the_skill_quotes_the_servers_own_loop() -> None:
-    """★ F-10: the skill's loop is the two workflow constants, quoted — not retyped — with its
+    """★ F-10: the skill's loop is the two workflow constants, copied in verbatim — the skill
+    file is the finished text, so this is what keeps it saying what the server says — with its
     frontmatter and rules around them and the guide named last.
 
-    MUTATION (verified RED, 1 failed): build the loop from a hand-written sentence instead of the
-    two constants -> RED. (A template without the marker fails louder: skill_text raises.)"""
+    MUTATION (verified RED, 1 failed): change one word of either constant, or of the loop in the
+    skill file -> RED."""
     from treasure_map.lib.query.diff_skill import skill_text
     from treasure_map.lib.query.diff_workflow import PAIR_WORKFLOW
 

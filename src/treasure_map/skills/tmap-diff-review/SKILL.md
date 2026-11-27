@@ -1,6 +1,6 @@
 ---
 name: tmap-diff-review
-description: Review every change between two firmware versions with the Treasure Map (tmap) MCP server, unit by unit; a whole run pair usually spans several sessions, or tmap's batch driver. Use when asked to review, triage or audit a version diff (a run pair) with Treasure Map or tmap.
+description: Review every change between two firmware versions with the Treasure Map (tmap) MCP server, unit by unit. A whole run pair usually takes several sessions, or tmap's batch driver. Use when asked to review, triage or audit a version diff (a run pair) with Treasure Map or tmap.
 ---
 
 # Reviewing a version diff with tmap
@@ -46,19 +46,20 @@ Read next_unit.material (start_diff_review(run_pair, unit=<unit_id>) reads one u
   `persisted` owes no row citation — a change in the function body that lands on no candidate is
   legitimate.
 - On ONE narrow class of one-sided subject a `changed_real` also has to say what the code on that
-  side HELD: a binary only one run has, holding a command-execution candidate, whose binary a
-  recorded entry edge references (a web endpoint, a rootfs script call, or an exec from another
-  binary). There "the binary is gone, so its candidates are gone" cites every candidate and reads
-  disposed, so nothing would be said about what was lost — and on the added side, about what
-  appeared. Pass `one_sided_characterized`: `sink_classes` (every class its candidates carry,
-  class -> count; the NAMES are what is asked for), `reachability` (tmap's own entry reading,
-  restated — `status`, `kinds` and `basis` are COMPARED against it, and the hand-off's
-  `reachable shape` cell prints all three), and `cmd_sinks` (one record per command candidate —
-  `callee`, `arg_kind`, `source_kind`; where the callsite has no def-use record say so rather
-  than leaving the candidate out, and the hand-off's `command sinks` cell names every callee the
-  gate wants). Facts only: no impact judgement, and no claim about an authentication boundary is
-  asked for. Short reads `needs_recheck`, counted under `one-sided characterisation short`; the
-  write's own answer tells you whether this subject is held and what it still owes.
+  side HELD: a function of a binary only one run has (or the binary itself, when it is judged
+  whole), holding a command-execution candidate, where a recorded entry edge references the binary
+  (a web endpoint, a rootfs script call, or an exec from another binary). There "the binary is gone,
+  so its candidates are gone" cites every candidate and reads disposed, so nothing would be said
+  about what was lost — and on the added side, about what appeared. Pass `one_sided_characterized`:
+  `sink_classes` (every class its candidates carry, class -> count; the NAMES are what is asked
+  for), `reachability` (tmap's own entry reading, restated — `status`, `kinds` and `basis` are
+  COMPARED against it, and the hand-off's `reachable shape` cell prints all three), and `cmd_sinks`
+  (one record per command candidate — `callee`, `arg_kind`, `source_kind`; where the callsite has no
+  def-use record say so rather than leaving the candidate out, and the hand-off's `command sinks`
+  cell names every callee the gate wants). Facts only: no impact judgement, and no claim about an
+  authentication boundary is asked for. Short reads `needs_recheck`, counted under
+  `one-sided characterisation short`; the write's own answer tells you whether this subject is held
+  and what it still owes.
 - A `pairing_component` unit holds the alternative pairings an alternative-pairing claim proposes
   for mis-paired entries. Read its alternative entries first and judge each on its own anchor; a
   superseded entry needs no judgment; judge an end function (`ends`) on the entry it is in; in a

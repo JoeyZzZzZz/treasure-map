@@ -40,12 +40,12 @@ _V6822 = _FIXTURES / "legacy_diff_review_6822.md"
 _V6956 = _FIXTURES / "legacy_diff_review_6956.md"
 _SRC = Path(__file__).parents[4] / "src"
 
-# The diff-review text this tmap ships. Changing it means adding this value to DIFF.legacy and the
-# new one here.
-SHIPPED_SHA256 = "5b7d24046f2ce11a679403de2244c5639b5df5d81023b430de8bb73d81ce29d0"
-# The scan-review text this tmap ships (7,830 bytes). It was in no release before this one, so
+# The diff-review text this tmap ships. Changing it once it has been in a release means adding this
+# value to DIFF.legacy and the new one here.
+SHIPPED_SHA256 = "283897586b75ed41faf08541b086c2b5dbb38faae7a5fb90812164fb624665b6"
+# The scan-review text this tmap ships (7,895 bytes). It was in no release before this one, so
 # SCAN.legacy is empty; once it has shipped, changing it means adding this value to SCAN.legacy.
-SCAN_SHIPPED_SHA256 = "ddcfed8dda79ce6f33d82d12b66a223bbc4ca361a21e6e75fcd88c0b50d04136"
+SCAN_SHIPPED_SHA256 = "ac34d40d7268d081e040ab0da15b9be7b4e332a7c42c4ac530d89539296e5f88"
 
 
 @pytest.fixture()
@@ -641,7 +641,7 @@ def test_the_shipped_text_is_pinned_and_not_an_earlier_one() -> None:
     """Changing the skill text fails here until its sha256 is added to DIFF.legacy (so a copy
     of the old text is still replaced) and the new one pinned.
 
-    MUTATION: change one word of the skill template -> RED."""
+    MUTATION: change one word of the skill file -> RED."""
     now = hashlib.sha256(sk.shipped_bytes(sk.DIFF)).hexdigest()
     assert now == SHIPPED_SHA256
     assert now not in sk.DIFF.legacy
@@ -652,7 +652,7 @@ def test_the_scan_text_is_pinned_and_not_an_earlier_one() -> None:
     """Changing the scan-review text fails here until it is pinned again — and, once the earlier
     text has shipped, its sha256 is added to SCAN.legacy, so a copy of it is still replaced.
 
-    MUTATION (verified RED, 1 failed): change one word of scan-review.md -> RED."""
+    MUTATION (verified RED, 1 failed): change one word of tmap-scan-review/SKILL.md -> RED."""
     now = hashlib.sha256(sk.shipped_bytes(sk.SCAN)).hexdigest()
     assert now == SCAN_SHIPPED_SHA256
     assert now not in sk.SCAN.legacy

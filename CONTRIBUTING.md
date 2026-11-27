@@ -59,9 +59,10 @@ run only there.
 A behaviour change should come with a test that fails without it. Unit tests never touch the
 network or your real `~/.treasure-map`; the fixtures in `tests/conftest.py` take care of that.
 
-The agent skills are written in `src/treasure_map/skills/`. The copies in `skills/` at the root are
-generated: after editing a skill, run `python scripts/sync_skills.py`; a unit test fails while a
-copy differs from what `tmap init` installs.
+The agent skills are `src/treasure_map/skills/<name>/SKILL.md`, the very files `tmap init`
+installs. When you change one, add the old text's sha256 to that skill's `legacy` set in
+`src/treasure_map/lib/setup/skills.py`, so a copy of the old text already on a machine is still
+replaced; a unit test fails until you do.
 
 ## Keeping the repository vendor-neutral
 

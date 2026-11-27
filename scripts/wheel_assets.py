@@ -14,7 +14,8 @@ from __future__ import annotations
 import sys
 import zipfile
 
-# (package, resource) for every non-.py file the runtime loads from disk.
+# (package, resource) for every non-.py file the runtime loads from disk; a resource may sit in a
+# plain directory under its package (``<dir>/<file>``).
 ASSETS: tuple[tuple[str, str], ...] = (
     ("treasure_map.lib.analyze.ghidra", "ExportFunctions.java"),
     ("treasure_map.lib.analyze.ghidra", "PromoteUndefined.java"),
@@ -26,8 +27,8 @@ ASSETS: tuple[tuple[str, str], ...] = (
     ("treasure_map.lib.storage", "overlay_schema.sql"),
     ("treasure_map.lib.storage", "schema.sql"),
     ("treasure_map.lib.setup", "toolchain_lock.json"),
-    ("treasure_map.skills", "diff-review.md"),
-    ("treasure_map.skills", "scan-review.md"),
+    ("treasure_map.skills", "tmap-diff-review/SKILL.md"),
+    ("treasure_map.skills", "tmap-scan-review/SKILL.md"),
 )
 
 
@@ -44,7 +45,11 @@ def missing_from_wheel(wheel: str, extra: tuple[str, ...] = ()) -> list[str]:
 def missing_from_installed() -> list[str]:
     from importlib.resources import files
 
-    return [f"{pkg}/{name}" for pkg, name in ASSETS if not (files(pkg) / name).is_file()]
+    return [
+        f"{pkg}/{name}"
+        for pkg, name in ASSETS
+        if not files(pkg).joinpath(*name.split("/")).is_file()
+    ]
 
 
 def main(argv: list[str]) -> int:
