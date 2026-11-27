@@ -1658,7 +1658,9 @@ def test_listing_twice_gives_the_same_and_leaves_the_tools_own_schemas_whole(
     """The rewrite is made on a copy: FastMCP lists each tool's own ``parameters`` dict, shared
     below its top level, so rewriting what it hands out in place would rewrite the tool itself.
 
-    MUTATION (verified RED, 1 failed): drop the deep copy in ``list_tools`` -> RED."""
+    MUTATION (verified RED, 1 failed): rewrite the listed schema in place (pop each property's
+    ``title`` from what FastMCP hands out) -> RED. Dropping only the deep copy stays green:
+    ``_compact_schema`` builds new containers, so the copy is a second guard, not the only one."""
     server = mcp_app.build_server(atlas)
     first = [
         t.model_dump(by_alias=True, exclude_none=True) for t in asyncio.run(server.list_tools())
@@ -1671,6 +1673,53 @@ def test_listing_twice_gives_the_same_and_leaves_the_tools_own_schemas_whole(
         params = server._tool_manager.get_tool(name).parameters
         assert "title" in params, name
         assert all("title" in p for p in params.get("properties", {}).values()), name
+
+
+def test_compact_schema_reads_names_and_data_as_they_are() -> None:
+    """No tool today has a parameter named like a schema keyword, ``$defs`` or a default holding
+    one, so the listing tests cannot see the two guards in ``_compact_schema``: a name under
+    ``properties`` / ``$defs`` is a name, and the value of ``default`` / ``enum`` / ``const`` /
+    ``examples`` is data. This schema has all of them.
+
+    MUTATION (verified RED, 1 failed each): read the names under the name maps as keywords -> RED;
+    walk the values of the data keywords as subschemas -> RED."""
+    schema: dict[str, Any] = {
+        "title": "args",
+        "type": "object",
+        "properties": {
+            "title": {"title": "Title", "type": "string"},
+            "type": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+            "opts": {
+                "default": {"title": "x"},
+                "enum": [{"title": "y"}],
+                "examples": [{"title": "z"}],
+            },
+            "mark": {"const": {"title": "w"}},
+            "kept": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]},
+            "typed": {"type": "integer", "anyOf": [{"type": "integer"}, {"type": "null"}]},
+        },
+        "$defs": {"title": {"title": "Inner", "type": "string"}},
+        "required": ["title"],
+    }
+    before = json.dumps(schema, sort_keys=True)
+    assert mcp_app._compact_schema(schema) == {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "type": {"type": ["string", "null"], "default": None},
+            "opts": {
+                "default": {"title": "x"},
+                "enum": [{"title": "y"}],
+                "examples": [{"title": "z"}],
+            },
+            "mark": {"const": {"title": "w"}},
+            "kept": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]},
+            "typed": {"type": "integer", "anyOf": [{"type": "integer"}, {"type": "null"}]},
+        },
+        "$defs": {"title": {"type": "string"}},
+        "required": ["title"],
+    }
+    assert json.dumps(schema, sort_keys=True) == before
 
 
 def test_the_listing_fits_its_budget_as_a_client_receives_it(atlas: Path) -> None:
