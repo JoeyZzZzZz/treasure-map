@@ -32,9 +32,17 @@ its listed members is must-read by the reasons above — and then every member c
 its component's unit), and no component member is a callee group's.
 
 Besides the entries, every changed non-binary file of the pair is a must-read unit of its own, and
-so are the binaries one run of the pair holds alone (``binary_presence``): each function of such a
-binary holding a candidate is a must-read member (a binary holding none is one member on its own
-anchor), handed out per binary in batches. Such a member is disposed only when its judgement, of
+so are the binaries one run of the pair holds alone (``binary_presence``, either side). Such a
+binary is read as its own run's scan reads it: each of its candidates the scan profile puts in tier
+1 (scan_review's ``tier`` / ``band``, the very predicates) is a must-read member of its own
+(``presence_candidate``, read with explain_candidate and judged with ``annotate`` — the scan read
+gate, so one judgement disposes it here and in that run's scan review alike), a tier 2 one is
+second tier, and a tail one is counted (by the predicate that put it there), never a member. Its
+function bodies stay members too: one the one-sided characterisation gate holds (below) is
+must-read, every other one second tier; a binary judged whole (no candidate, or candidates naming
+no function) is must-read on its own anchor. Each kind is cut into units of its own, per binary
+in batches, so a unit's members are all judged with one tool (``write_tool``). A function body is
+disposed only when its judgement, of
 whatever verdict, cites every candidate of its subject (``presence_citations_short``). Citing
 every candidate is satisfied by an EXISTENCE reading ("the binary is gone, so they are gone"), so
 on one narrow class of such a subject — a one-sided function that held a command-execution candidate
@@ -94,7 +102,12 @@ from treasure_map.lib.pattern import sink_vocabulary
 from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query.coverage import CONCLUDED, NEEDS_RECHECK, NEEDS_RELABEL, OPEN, UNSEEN
 
-PREDICATE_VERSION = "v5"
+# The must-read predicate's version: part of every unit id, and stated by every report. ★ The pair
+# predicate now READS the scan profile's banding — a one-sided binary's candidates are must-read by
+# scan_review's ``tier()`` / ``band()`` — so a change to the scan side's band or tier rules changes
+# a run pair's must-read set too, and is a bump here as well: otherwise the set moves while the
+# version every report prints stays the same.
+PREDICATE_VERSION = "v6"
 DEFAULT_K = 4
 MAX_K = 200
 # At most this many items in one annotate_diff_batch call.
@@ -154,6 +167,18 @@ ENTRY, S_BATCH, PRESENCE, FILE, SECOND_TIER, AUDIT, GROUP, REDUCE, PAIRING = (
 # it. Deliberately NOT in ``_KIND_RANK``: the scan profile dispatches from its own order, so there
 # is no run-pair position for this kind to sort at and the default (0) is the honest answer.
 SCAN_BAND = "scan_band"
+# A one-sided binary's candidates, each its own member (``PRESENCE_CANDIDATE``), judged the way a
+# scan candidate is — read with explain_candidate, written with annotate — and never mixed into a
+# unit with members judged by annotate_diff: a unit's prompt and its write tool are one per unit.
+# Must-read for the scan profile's tier 1 candidates, second tier for its tier 2 ones; the tail is
+# counted, never a member. Its own kind, not SCAN_BAND: a SCAN_BAND unit still never comes out of
+# ``review_pair``.
+PRESENCE_CANDIDATES = "presence_candidates"
+# The member kinds a candidate is: a run pair's one-sided binary's (``PRESENCE_CANDIDATE``) and a
+# scan unit's (``SCAN_CANDIDATE``, scan_review.MEMBER_KIND). Both are judged with ``annotate``.
+PRESENCE_CANDIDATE = "presence_candidate"
+SCAN_CANDIDATE = "scan_candidate"
+CANDIDATE_MEMBER_KINDS = frozenset({PRESENCE_CANDIDATE, SCAN_CANDIDATE})
 # Where a unit of a kind sorts among the units at the same place: a group or a pairing component
 # first (its members read together), an audit after the unit its member came from.
 _KIND_RANK = {GROUP: -1, PAIRING: -1, AUDIT: 1}
@@ -211,6 +236,66 @@ def held_unread(verdict: Any, read_basis: dict[str, Any]) -> bool:
 
 
 PRESENCE_STREAM, FILE_STREAM, REDUCE_STREAM = "binary_presence", "non_binary_file", "reduce"
+# The one-sided binaries' candidates: a stream of their own, round robin with the others.
+PRESENCE_CANDIDATE_STREAM = "presence_candidate"
+
+
+def write_tool(m: Member) -> str:
+    """The tool a member is judged with: ``annotate`` for a candidate (``CANDIDATE_MEMBER_KINDS``),
+    ``annotate_diff`` for every other subject. THE one place it is decided — a unit's material, its
+    members' ``judge_with``, the refusal of a write made with the other tool, and the batch
+    driver's reading of what a launch wrote all read it."""
+    return "annotate" if m.kind in CANDIDATE_MEMBER_KINDS else "annotate_diff"
+
+
+# What a member's ``judge_with`` leaves to the member and its unit, said once beside it.
+JUDGE_WITH_NOTE = (
+    "judge_with names the call and its scope: pass the member's anchor_ref (as evidence_ref, to "
+    "annotate) and, to annotate_diff, the unit's unit_id; annotate takes no unit_id"
+)
+
+
+def judge_with(m: Member) -> dict[str, Any]:
+    """The call a member is judged with and the argument that scopes it (``write_tool``): a
+    candidate's ``annotate`` — its ``evidence_ref`` is the member's anchor_ref, and it takes no
+    unit (its read gate is per candidate) — or a diff subject's ``annotate_diff`` with its
+    ``diff_id`` (an entry) or ``run_pair`` (a file, a one-sided binary). Compact on purpose: it
+    rides on every member of every hand-out, whose page is budgeted; the anchor_ref and the unit_id
+    are the member's and the unit's own (``JUDGE_WITH_NOTE``)."""
+    if write_tool(m) == "annotate":
+        return {"tool": "annotate"}
+    if m.kind in ("entry", "alternative"):
+        return {"tool": "annotate_diff", "diff_id": m.stream}
+    # A file's or a one-sided binary's anchor starts with its run pair.
+    return {"tool": "annotate_diff", "run_pair": m.anchor_ref.split("#", 1)[0]}
+
+
+def read_gate_unverifiable(basis: dict[str, Any] | None) -> bool:
+    """Whether a disposed judgement's read gate cannot be applied: its latest write recorded no
+    read basis at all (no history row, or a null column), or one saying the writing server kept no
+    tool-call log (``NO_SESSION_LOG``). Nothing says such a subject was unread, and nothing says it
+    was read. THE predicate both profiles read: the scan declaration counts these, and a must-read
+    set holding one is not done (``must_read_set_done``)."""
+    return not basis or basis.get("why") == NO_SESSION_LOG
+
+
+def must_read_set_done(
+    members: Iterable[Member], states: dict[str, str], unverifiable: frozenset[str]
+) -> bool:
+    """Whether a must-read set is read through: every member disposed, and none of them resting on
+    a read gate that could not be applied (``read_gate_unverifiable``). The part of completion both
+    profiles share — the scan profile's ``must_read_complete`` is exactly this over tier 1; the run
+    pair's adds its own pair-shaped conditions beside it.
+
+    ★ A deliberate tightening for the run pair: on a server that keeps no tool-call log every
+    write records ``NO_SESSION_LOG``, so its must-read set can no longer read complete there. What
+    was read before such a verdict is recorded neither way, and a completion that rests on it
+    would be the one claim the read gate exists to stop."""
+    return all(
+        disposed(states.get(m.anchor_ref)) and m.anchor_ref not in unverifiable for m in members
+    )
+
+
 # The reduce unit is handed out after every other unit.
 _REDUCE_POSITION = 1 << 30
 
@@ -254,6 +339,9 @@ class Member:
     lift_basis: str | None = None
     rows: int = 0  # its candidate rows
     reasons: tuple[str, ...] = ()
+    # The run a candidate member is of (a one-sided binary's run): what its scan states and its
+    # unit's prompt are read for. None for every other member.
+    run: str | None = None
 
     @property
     def must_read(self) -> bool:
@@ -543,6 +631,94 @@ class PairFacts:
     failed_diffs: list[dict[str, Any]]
     not_diffed_binaries: dict[str, Any]
     identical_not_diffed: dict[str, Any]
+    # Each one-sided binary's candidates of the scan profile's two tiers, one member each
+    # (``PRESENCE_CANDIDATE``: tier 1 must-read, tier 2 second tier); the tail is not a member.
+    presence_candidates: list[Member] = field(default_factory=list)
+    # candidate ref -> the anchor of the one-sided binary it is of, and its binary's path as the
+    # material names it (the rel path under the firmware root).
+    candidate_binary: dict[str, str] = field(default_factory=dict)
+    candidate_path: dict[str, str] = field(default_factory=dict)
+    # The one-sided candidates by the scan profile's reading, counted: ``tier_1`` / ``tier_2`` /
+    # ``tail``, the tail by the predicate that put it there, and the one-sided binaries holding
+    # candidates of which none is tier 1 (named, so their leaving the must-read set is visible).
+    presence_scan: dict[str, Any] = field(default_factory=dict)
+    # run -> {candidate ref -> its current scan verdict}, read with the candidates' states.
+    candidate_verdicts: dict[str, dict[str, str]] = field(default_factory=dict)
+
+
+def _presence_scan(
+    atlas: sqlite3.Connection, presence: Any
+) -> tuple[list[Member], dict[str, str], dict[str, str], dict[str, Any], set[str]]:
+    """The one-sided binaries' candidates as the scan profile reads them (scan_review's ``band`` /
+    ``tier``, the very predicates, read over each side's own run): the members (tier 1 and tier 2,
+    in each binary's ranking order), each ref's binary anchor and rel path, the counts, and the
+    function anchors the characterisation gate holds (``binary_presence.characterization_applies``)
+    — those stay must-read whatever tier their candidates are in."""
+    from treasure_map.lib.query import binary_presence as bp  # noqa: PLC0415
+    from treasure_map.lib.query import scan_review as sr  # noqa: PLC0415 (a cycle at import)
+    from treasure_map.lib.query.triage import triage  # noqa: PLC0415
+
+    gated = {
+        presence.function_anchor(b, addr)
+        for b in presence.items
+        for addr, _refs in b.functions
+        if bp.characterization_applies(b.function_facts(addr))
+    }
+    tail_by: dict[str, int] = dict.fromkeys(sr.TAIL_PREDICATES, 0)
+    counts = {"tier_1": 0, "tier_2": 0, "tail": 0, "not_banded": 0}
+    without_t1: list[str] = []
+    members: list[Member] = []
+    binary_of: dict[str, str] = {}
+    path_of: dict[str, str] = {}
+    banded: dict[str, dict[str, Any]] = {}
+    for run in sorted({b.run for b in presence.items if b.candidates}):
+        banded[run] = {x.evidence_ref: x for x in sr.band_run(triage(atlas, run_id=run))}
+    for b in sorted(presence.items, key=lambda b: (b.tag, b.rel_path)):
+        if not b.candidates:
+            continue
+        rows = sorted(
+            (x for r in b.facts_by_ref if (x := banded.get(b.run, {}).get(r)) is not None),
+            key=lambda x: x.rank,
+        )
+        counts["not_banded"] += len(b.facts_by_ref) - len(rows)
+        any_t1 = False
+        for x in rows:
+            where = sr.tier(x.band, x.sink_class)
+            if where is None:
+                counts["tail"] += 1
+                tail_by[x.predicate] = tail_by.get(x.predicate, 0) + 1
+                continue
+            any_t1 = any_t1 or where == sr.TIER_1
+            counts["tier_1" if where == sr.TIER_1 else "tier_2"] += 1
+            members.append(
+                Member(
+                    anchor_ref=x.evidence_ref,
+                    kind=PRESENCE_CANDIDATE,
+                    stream=PRESENCE_CANDIDATE_STREAM,
+                    position=len(members),
+                    bucket=x.band,
+                    subclass=x.sink_class or None,
+                    reasons=("binary_presence",) if where == sr.TIER_1 else (),
+                    run=b.run,
+                )
+            )
+            binary_of[x.evidence_ref] = presence.anchor(b)
+            path_of[x.evidence_ref] = b.rel_path
+        if not any_t1:
+            without_t1.append(f"{b.tag}:{b.rel_path}")
+    scan = {
+        **counts,
+        "tail_by_predicate": tail_by,
+        "binaries_without_tier_1": len(without_t1),
+        "binaries_without_tier_1_named": without_t1[:DISAGREEMENTS_SHOWN],
+        "rule": (
+            "a one-sided binary's candidates are read as its own run's scan reads them: tier 1 "
+            "must-read (read with explain_candidate, judged with annotate), tier 2 the second "
+            "tier, the tail counted and never handed out; a function the one-sided "
+            "characterisation gate holds, and a binary judged whole, stay must-read"
+        ),
+    }
+    return members, binary_of, path_of, scan, gated
 
 
 def pair_facts(
@@ -575,6 +751,11 @@ def pair_facts(
     ]
     groups = not_diffed_groups(atlas, run_a, run_b)
     presence = bp.find_presence(atlas, run_a, run_b, groups)
+    cand_members, cand_binary, cand_path, presence_scan, gated = _presence_scan(atlas, presence)
+    # A one-sided function body is must-read only where the characterisation gate holds it (its
+    # candidates are must-read by their own tier, as members of their own); a binary judged whole
+    # is must-read always (no scan reading has a view on a binary one run lacks). Every other
+    # function body is second tier.
     presence_members = [
         Member(
             anchor_ref=s.anchor,
@@ -584,7 +765,7 @@ def pair_facts(
             bucket="binary_presence",
             subclass=s.binary.tag,
             rows=len(s.refs),
-            reasons=("binary_presence",),
+            reasons=("binary_presence",) if s.addr is None or s.anchor in gated else (),
         )
         for i, s in enumerate(bp.review_subjects(presence))
     ]
@@ -623,6 +804,10 @@ def pair_facts(
         failed_diffs=failed,
         not_diffed_binaries=blind_not_diffed,
         identical_not_diffed=identical,
+        presence_candidates=cand_members,
+        candidate_binary=cand_binary,
+        candidate_path=cand_path,
+        presence_scan=presence_scan,
     )
 
 
@@ -696,7 +881,7 @@ def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
     """Every unit of the pair, in the order they are handed out (``Unit.order``)."""
     units: list[Unit] = []
     streams = [d.diff_id for d in sorted(facts.diffs, key=lambda d: d.diff_id)]
-    streams += [PRESENCE_STREAM, FILE_STREAM]
+    streams += [PRESENCE_STREAM, FILE_STREAM, PRESENCE_CANDIDATE_STREAM]
     index = {s: i for i, s in enumerate(streams)}
 
     def add(
@@ -750,14 +935,27 @@ def cut_units(facts: PairFacts, k: int = DEFAULT_K) -> list[Unit]:
         for bucket in sorted(second):
             for chunk in _chunks(second[bucket]):
                 add(SECOND_TIER, chunk, False)
-    # A one-sided binary's subjects (its functions) are handed out together, in batches.
+    # A one-sided binary's subjects are cut into units of ONE kind each, so that every member of a
+    # unit is judged with the same tool (``write_tool``) and its prompt says the right one: the
+    # must-read function bodies and the binary judged whole (PRESENCE), the other function bodies
+    # (SECOND_TIER), and its candidates — tier 1 must-read, tier 2 not — (PRESENCE_CANDIDATES).
     by_binary: dict[str, list[Member]] = {}
     for m in facts.presence_members:
         fn = dr.split_presence_function(m.anchor_ref)
         by_binary.setdefault(fn[0] if fn is not None else m.anchor_ref, []).append(m)
     for members in by_binary.values():
-        for chunk in _chunks(members):
+        for chunk in _chunks([m for m in members if m.must_read]):
             add(PRESENCE, chunk, True)
+        for chunk in _chunks([m for m in members if not m.must_read]):
+            add(SECOND_TIER, chunk, False)
+    cands: dict[str, list[Member]] = {}
+    for m in facts.presence_candidates:
+        cands.setdefault(facts.candidate_binary.get(m.anchor_ref, ""), []).append(m)
+    for members in cands.values():
+        for chunk in _chunks([m for m in members if m.must_read]):
+            add(PRESENCE_CANDIDATES, chunk, True)
+        for chunk in _chunks([m for m in members if not m.must_read]):
+            add(PRESENCE_CANDIDATES, chunk, False)
     for m in facts.file_members:
         add(FILE, [m], True)
     units.sort(key=lambda u: u.order)
@@ -1125,6 +1323,10 @@ class Audits:
     basis_incomplete: list[str] = field(default_factory=list)
     # Every current diff_subject judgement of the pair: anchor_ref -> its verdict.
     verdicts: dict[str, str] = field(default_factory=dict)
+    # Subjects whose current judgement (not a person's) rests on a write whose read gate cannot be
+    # applied (``read_gate_unverifiable``): no basis recorded, or no tool-call log kept. The caller
+    # reads the must-read, disposed ones as holding ``must_read_complete`` false.
+    unverifiable: list[str] = field(default_factory=list)
 
 
 def _json(raw: Any) -> dict[str, Any]:
@@ -1207,6 +1409,8 @@ def read_audits(atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit]) 
             hist = history.get(m.anchor_ref, [])
             writes = [h for h in hist if h["event"] in ("insert", "update")]
             last = writes[-1] if writes else None
+            if read_gate_unverifiable(last["read_basis"] if last is not None else None):
+                out.unverifiable.append(m.anchor_ref)
             after_id = last["id"] if last is not None else 0
             blind = [
                 h
@@ -1437,7 +1641,10 @@ def coverage_offer(
     members = [m for u in second for m in u.members if not disposed(states.get(m.anchor_ref))]
     by_bucket: dict[str, int] = {}
     for m in members:
-        by_bucket[m.bucket or "-"] = by_bucket.get(m.bucket or "-", 0) + 1
+        # A one-sided candidate's bucket is its scan band: named with its kind, so it is not read
+        # as a diff bucket.
+        key = f"{m.kind}:{m.bucket}" if m.kind in CANDIDATE_MEMBER_KINDS else (m.bucket or "-")
+        by_bucket[key] = by_bucket.get(key, 0) + 1
     pair = dr.run_pair(review.facts.run_a, review.facts.run_b)
     reduce_id = unit_id(REDUCE, [pair])
     owed = rep["reduce"]["owed"]
@@ -1454,7 +1661,8 @@ def coverage_offer(
             "why": (
                 "the listed entries the must-read predicate "
                 f"({PREDICATE_VERSION}, k={review.k}) did not select, cut into batches per diff "
-                "and bucket, and the pairing components it did not select"
+                "and bucket, the pairing components it did not select, and the one-sided "
+                "binaries' other function bodies and tier 2 candidates"
             ),
             "handed_out": sweep,
             "due_recheck": sum(
@@ -1543,6 +1751,7 @@ def progress_block(
                 "audits_open": rep["audits"]["open"],
                 "disagreements": rep["disagreements"]["count"],
                 "judged_unread": rep["judged_unread"]["count"],
+                "read_gate_unverifiable": rep["read_gate_unverifiable"]["count"],
             },
             "dispositions": rep["verdicts"]["disposed"],
             "coverage_statement": rep["coverage_statement"],
@@ -1571,6 +1780,7 @@ def report(
     entry_short: dict[str, dict[str, Any]] | None = None,
     char_short: dict[str, dict[str, Any]] | None = None,
     reduce_owed: list[Member] | None = None,
+    unverifiable: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """The pair's report: the must-read set by unit kind and by reason, how much of it and of every
     listed subject is disposed, ``must_read_complete`` beside the existing ``complete``, what no
@@ -1605,7 +1815,7 @@ def report(
     all_done = sum(1 for m in all_members if disposed(states.get(m.anchor_ref)))
     unseen = sum(1 for m in all_members if states.get(m.anchor_ref, UNSEEN) == UNSEEN)
     must_read_complete = (
-        must_done == len(must_members)
+        must_read_set_done(must_members, states, unverifiable)
         and not withheld
         and not facts.failed_diffs
         and not audits.open
@@ -1661,10 +1871,31 @@ def report(
     for m in all_members:
         if m.anchor_ref in counted or not disposed(states.get(m.anchor_ref)):
             continue
+        if m.kind in CANDIDATE_MEMBER_KINDS:
+            # A candidate's verdict is a scan verdict: counted under ``presence_candidates``.
+            continue
         counted.add(m.anchor_ref)
         v = audits.verdicts.get(m.anchor_ref)
         disposed_by[v if v in VERDICTS else "without_verdict"] += 1
     recorded = {v: sum(1 for x in audits.verdicts.values() if x == v) for v in VERDICTS}
+    cand_t1 = [m for m in must_members if m.kind == PRESENCE_CANDIDATE]
+    cand_t2 = [m for m in all_members if m.kind == PRESENCE_CANDIDATE and not m.must_read]
+    pscan = facts.presence_scan or {}
+    tail_by = pscan.get("tail_by_predicate") or {}
+    # Stated when the pair has any one-sided candidate (the report's ``presence_candidates`` holds
+    # the counts either way): the statement rides on every hand-out, whose page is budgeted.
+    t1_done = sum(disposed(states.get(m.anchor_ref)) for m in cand_t1)
+    t2_done = sum(disposed(states.get(m.anchor_ref)) for m in cand_t2)
+    tail_text = ", ".join(f"{p} {n}" for p, n in tail_by.items())
+    cand_statement = (
+        ""
+        if not (cand_t1 or cand_t2 or pscan.get("tail"))
+        else (
+            f"one-sided candidates tier 1 {t1_done}/{len(cand_t1)} disposed, tier 2 "
+            f"{t2_done}/{len(cand_t2)}, tail {pscan.get('tail', 0)} counted ({tail_text}), "
+            f"binaries without tier 1 {pscan.get('binaries_without_tier_1', 0)}; "
+        )
+    )
     statement = (
         f"must-read {len(must_members)} / disposed {must_done}; "
         f"all subjects {len(all_members)} / disposed {all_done}; "
@@ -1676,6 +1907,8 @@ def report(
         f"entry citations short {len(entry_short)} "
         f"(landed rows uncited {sum(int(g['uncited']) for g in entry_short.values())}); "
         f"one-sided characterisation short {len(char_short)}; "
+        + cand_statement
+        + f"read gate unverifiable {len(unverifiable)}; "
         f"basis incomplete {basis_incomplete['count']}; "
         f"dangling {dangling['count']} (changed_real {dangling['changed_real']['count']}); "
         f"not listed {not_listed['count']}; "
@@ -1736,6 +1969,23 @@ def report(
         # The one-sided removals of the signal class whose judgement never says what the removed
         # code held (presence_characterization_short).
         "presence_characterization_short": char_short,
+        # The one-sided binaries' candidates as the scan profile reads them: the counts, the tail
+        # by predicate, the binaries with no tier 1 candidate, and how the disposed were judged.
+        "presence_candidates": {
+            **{k: v for k, v in pscan.items() if k != "rule"},
+            "tier_1_disposed": sum(disposed(states.get(m.anchor_ref)) for m in cand_t1),
+            "tier_2_disposed": sum(disposed(states.get(m.anchor_ref)) for m in cand_t2),
+            "disposed_by_verdict": _candidate_verdicts(facts, [*cand_t1, *cand_t2], states),
+            "rule": pscan.get("rule"),
+        },
+        # Must-read disposed subjects whose read gate could not be applied: they hold
+        # must_read_complete false (must_read_set_done).
+        "read_gate_unverifiable": {
+            "count": len(unverifiable),
+            "subjects": sorted(unverifiable)[:DISAGREEMENTS_SHOWN],
+            "why": f"no basis recorded with the write, or {NO_SESSION_LOG}",
+            "cleared_by": "a later judgement written by a server keeping a tool-call log",
+        },
         "groups": {
             "units": len(group_units),
             "members": sum(len(u.members) for u in group_units),
@@ -1762,6 +2012,18 @@ def report(
         # subject once), and every current judgement of the pair.
         "verdicts": {"disposed": disposed_by, "recorded": recorded},
     }
+
+
+def _candidate_verdicts(
+    facts: PairFacts, members: list[Member], states: dict[str, str]
+) -> dict[str, int]:
+    """How the disposed one-sided candidates were judged, by scan verdict (counts only)."""
+    from treasure_map.lib.query import scan_review as sr  # noqa: PLC0415 (a cycle at import)
+
+    verdicts: dict[str, str] = {}
+    for run in sorted({m.run for m in members if m.run is not None}):
+        verdicts.update(facts.candidate_verdicts.get(run, {}))
+    return sr.disposed_by_verdict(members, states, verdicts)
 
 
 # ── the cached reading of a pair ────────────────────────────────────────────────────────────
@@ -1905,6 +2167,7 @@ def review_pair(
         diff_staleness=lambda d: pv.view_staleness(atlas, d),
         group_review=_group_reader(atlas),
     )
+    cand_unverifiable = _candidate_states(atlas, facts, units, progress.states)
     short = presence_citations_short(atlas, facts, progress.states)
     for anchor in short:
         # Judged without citing every candidate of its subject: read again, not disposed.
@@ -1947,10 +2210,21 @@ def review_pair(
                 members=tuple(owed),
                 stream=REDUCE_STREAM,
                 position=_REDUCE_POSITION,
-                stream_index=len(facts.diffs) + 2,
+                stream_index=len(facts.diffs) + 3,
             )
         )
     units = sorted([*units, *extra], key=lambda u: u.order)
+    must_anchors = {
+        m.anchor_ref
+        for u in units
+        if u.must_read and u.kind not in (AUDIT, REDUCE)
+        for m in u.members
+    }
+    unverifiable = frozenset(
+        a
+        for a in (*audits.unverifiable, *cand_unverifiable)
+        if a in must_anchors and disposed(progress.states.get(a))
+    )
     rep = report(
         facts,
         units,
@@ -1962,6 +2236,7 @@ def review_pair(
         entry_short=entry_short,
         char_short=char_short,
         reduce_owed=owed,
+        unverifiable=unverifiable,
     )
     nav = None
     if navigation:
@@ -1973,6 +2248,31 @@ def review_pair(
         nav = _nav.read(atlas, facts, units, lambda u: unit_disposed(u, progress.states))
         rep.update(nav.report)
     return PairReview(facts, units, progress, rep, k, audits, nav)
+
+
+def _candidate_states(
+    atlas: sqlite3.Connection, facts: PairFacts, units: list[Unit], states: dict[str, str]
+) -> tuple[str, ...]:
+    """Put every one-sided candidate member's state into ``states``, read as the scan profile
+    reads it (``scan_review.scan_states``: the candidate overlay and its read gate) — once per run,
+    since the two sides' one-sided binaries are of two runs and ``scan_states`` reads one — and
+    return the disposed ones whose read gate could not be applied.
+
+    ★ The same reading, not a second one: a candidate disposed here is disposed in that run's own
+    scan review too, and one ``annotate`` disposes it in both."""
+    from treasure_map.lib.query import scan_review as sr  # noqa: PLC0415 (a cycle at import)
+
+    by_run: dict[str, list[Unit]] = {}
+    for u in units:
+        if u.kind == PRESENCE_CANDIDATES and u.members and u.members[0].run is not None:
+            by_run.setdefault(u.members[0].run, []).append(u)
+    unverifiable: list[str] = []
+    for run, mine in sorted(by_run.items()):
+        got, unv = sr.scan_states(atlas, run, mine)
+        states.update(got)
+        facts.candidate_verdicts[run] = sr.current_verdicts(atlas, run)
+        unverifiable += unv
+    return tuple(unverifiable)
 
 
 def pair_staleness(

@@ -20,6 +20,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cach
     DX,
     DY,
     PAIR,
+    READ_WHOLE,
     World,
     _clear_view_caches,
     _pair_anchor,
@@ -424,7 +425,7 @@ def test_a_judged_member_is_disposed_and_the_next_unit_moves_on(
     first = r.next_unit(sweep=True)
     assert first is not None and first.members[0].entry_id == "pair:00001000:00001000"
     assert r.report["must_read_complete"] is False
-    writer = overlay.WriteContext(channel="mcp", session="writer")
+    writer = overlay.WriteContext(channel="mcp", session="writer", read_basis=READ_WHOLE)
     world.judge(DX, _pair_anchor(DX, "00001000", "00001000"), "change_inconclusive", ctx=writer)
     world.judge(DX, _pair_anchor(DX, "00002000", "00002800"), "changed_real")  # second tier
     r = _review(world, k=0)
@@ -702,7 +703,7 @@ A1 = _pair_anchor(DX, "00001000", "00001000")
 
 
 def _ctx(session: str) -> Any:
-    return overlay.WriteContext(channel="mcp", session=session)
+    return overlay.WriteContext(channel="mcp", session=session, read_basis=READ_WHOLE)
 
 
 def _nrc(anchor: str) -> dict[str, Any]:
@@ -1957,7 +1958,7 @@ def test_a_cut_batch_reads_only_the_members_its_material_showed(
     counts for the whole unit (``infer`` over every member of the unit) -> an unlisted member reads
     unit_delivered -> RED."""
     w = _hex_world(tmp_path, monkeypatch, 60)
-    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 12_000)
+    monkeypatch.setattr(mcp_app, "_RESPONSE_BYTE_BUDGET", 13_000)
     server = mcp_app.build_server(w.path)
     nu = _server_call(server, "start_diff_review", {"run_pair": PAIR, "sweep": True, "k": 0})[
         "next_unit"
@@ -2010,8 +2011,9 @@ def test_a_cut_batch_reads_only_the_members_its_material_showed(
 
 
 # Page budgets at which a single fit of the material (measured without its wrapping, or without
-# the member list the page then hands out) sends an answer over the budget.
-_OVER_AT = tuple(range(9_000, 24_001, 1_500))
+# the member list the page then hands out) sends an answer over the budget. From 10,500: below it
+# the overview's own blocks (the report, the workflow) leave the material no room at all.
+_OVER_AT = tuple(range(10_500, 24_001, 1_500))
 
 
 @pytest.mark.parametrize("page", _OVER_AT)

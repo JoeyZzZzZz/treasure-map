@@ -221,6 +221,11 @@ class World:
         return next(e for e in self.view(diff_id, **kw)["entries"] if e["entry_id"] == entry_id)
 
     def judge(self, diff_id: str, anchor: str, verdict: str, **kw: Any) -> overlay.UpsertResult:
+        # A judgement written having read its subject, as the real write paths record one: a
+        # write recording NO read basis rests on a read gate that cannot be applied, and a
+        # must-read set holding one is not done (review_units.must_read_set_done). A test about
+        # the read basis passes its own ``ctx``.
+        kw.setdefault("ctx", overlay.WriteContext(channel="api", read_basis=READ_WHOLE))
         return overlay.annotate_diff(
             self.atlas,
             diff_id=diff_id,
@@ -229,6 +234,10 @@ class World:
             rationale="looked at both sides",
             **kw,
         )
+
+
+# What a write that read its subject whole records (an MCP write handed its unit's material).
+READ_WHOLE: dict[str, Any] = {"basis": "unit_delivered", "material_cut": False}
 
 
 @pytest.fixture

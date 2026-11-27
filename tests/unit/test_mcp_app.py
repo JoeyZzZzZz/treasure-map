@@ -52,6 +52,8 @@ _EXPECTED_TOOLS = {
     "get_diff_meta",
     "get_diff_string_delta",
     "get_diff_handoff",
+    "start_scan_review",
+    "get_scan_handoff",
     "get_function_alignment",
     "get_diff_capabilities",
     "list_diffs",

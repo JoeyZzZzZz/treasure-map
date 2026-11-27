@@ -336,10 +336,11 @@ def test_an_added_reason_keeps_the_reasons_order() -> None:
 
 def test_the_predicate_version_moved_and_with_it_every_unit_id() -> None:
     """T-X3a / T-J7 (v4: the units read the facts' order, spec Y; v5: the pairing components are
-    units of their own). MUTATION (verified RED): PREDICATE_VERSION left at v4 -> RED."""
-    assert ru.PREDICATE_VERSION == "v5"
+    units of their own; v6: a one-sided binary is read by the scan profile's tiers). MUTATION
+    (verified RED): PREDICATE_VERSION left at v5 -> RED."""
+    assert ru.PREDICATE_VERSION == "v6"
     anchors = ["a", "b"]
-    for earlier in ("v2", "v3", "v4"):
+    for earlier in ("v2", "v3", "v4", "v5"):
         assert ru.unit_id(ru.S_BATCH, anchors, earlier) != ru.unit_id(ru.S_BATCH, anchors)
 
 
@@ -405,7 +406,7 @@ def test_the_instructions_point_to_the_units_the_server_hands_out() -> None:
     assert "bucket S" not in t
     assert "read every must-read unit" in t
     assert re.search(r"entry with a `{0,2}lift_basis", t)
-    assert len(mcp_app._AGENT_INSTRUCTIONS) <= 3_800
+    assert len(mcp_app._AGENT_INSTRUCTIONS) <= mcp_app.INSTRUCTIONS_MAX
 
 
 def test_the_read_first_texts_name_the_s_entries_the_predicate_keeps() -> None:

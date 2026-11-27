@@ -128,8 +128,28 @@ def has_unresolved_dimension(c: TriageCandidate) -> bool:
     return False
 
 
+# The predicate that put a candidate in its band (``band_reason``): one per band, two for the tail.
+PREDICATE_EXEC = "exec_sink_dangerous_source"
+PREDICATE_WRITE = "write_sink_dangerous_source"
+PREDICATE_UNRESOLVED = "unresolved_dimension"
+PREDICATE_PROVEN_SAFE = "proven_safe"
+PREDICATE_PLAIN = "no_dangerous_source_no_unread_axis"
+# The tail's two predicates, in the order a count of them is stated.
+TAIL_PREDICATES = (PREDICATE_PROVEN_SAFE, PREDICATE_PLAIN)
+
+
 def band(c: TriageCandidate) -> str:
-    """Which band ``c`` is in (one of ``BANDS``).
+    """Which band ``c`` is in (one of ``BANDS``): ``band_reason``'s band, nothing else."""
+    return band_reason(c)[0]
+
+
+def band_reason(c: TriageCandidate) -> tuple[str, str]:
+    """Which band ``c`` is in, and the predicate that put it there.
+
+    The predicate is what a candidate outside the must-read set is counted under: a tail member is
+    there because it carries a proven-safe fact (``proven_safe``) or because it shows neither a
+    dangerous source nor an unread axis (``no_dangerous_source_no_unread_axis``). Naming which is
+    what lets a reader of a count tell the two apart without re-deriving the band.
 
     ★ The ``unresolved`` band asks NOTHING about the sink class. Not proven safe, and an axis the
     analysis could not read: that is must-read whatever the sink is. This started out testing the
@@ -146,12 +166,12 @@ def band(c: TriageCandidate) -> str:
     sink_class = (c.sink_class or "").lower()
     safe = _is_proven_safe(c)
     if sink_class in EXEC_SINKS and not safe and dangerous_source(c):
-        return EXEC
+        return EXEC, PREDICATE_EXEC
     if sink_class in WRITE_SINKS and not safe and dangerous_source(c):
-        return WRITE
+        return WRITE, PREDICATE_WRITE
     if not safe and has_unresolved_dimension(c):
-        return UNRESOLVED
-    return TAIL
+        return UNRESOLVED, PREDICATE_UNRESOLVED
+    return TAIL, PREDICATE_PROVEN_SAFE if safe else PREDICATE_PLAIN
 
 
 # ── the two tiers ───────────────────────────────────────────────────────────────────────────
@@ -168,8 +188,10 @@ SECOND_TIER_STREAM = "scan_second_tier"
 _STREAMS = (EXEC_STREAM, WRITE_STREAM, UNRESOLVED_STREAM, SECOND_TIER_STREAM)
 
 # What one scan unit's member is, in ``Member.kind``. Not an anchor kind: the overlay still keys
-# these on ``anchor_kind='evidence_ref'``, the candidate anchor it has always used.
-MEMBER_KIND = "scan_candidate"
+# these on ``anchor_kind='evidence_ref'``, the candidate anchor it has always used. Spelled once, in
+# review_units, beside the run pair's own candidate member kind: both are judged with ``annotate``
+# (``review_units.write_tool``).
+MEMBER_KIND = ru.SCAN_CANDIDATE
 
 # Why a member is must-read, in ``Member.reasons`` (a Tier 2 member carries none, which is what
 # makes ``Member.must_read`` false for it).
@@ -204,6 +226,8 @@ class Banded:
     source_kind: str
     band: str
     rank: int  # its place in the run's default triage order
+    # The predicate that put it in its band (``band_reason``).
+    predicate: str = ""
 
 
 def band_run(candidates: list[TriageCandidate]) -> list[Banded]:
@@ -217,14 +241,16 @@ def band_run(candidates: list[TriageCandidate]) -> list[Banded]:
     for rank, c in enumerate(candidates):
         if not c.evidence_ref:
             continue
+        name, predicate = band_reason(c)
         out.append(
             Banded(
                 evidence_ref=c.evidence_ref,
                 binary=c.binary_path or "",
                 sink_class=(c.sink_class or ""),
                 source_kind=c.source_kind,
-                band=band(c),
+                band=name,
                 rank=rank,
+                predicate=predicate,
             )
         )
     return out
@@ -452,10 +478,11 @@ def scan_states(
                 basis = (last or {}).get("read_basis") or {}
                 if last is not None and ru.held_unread(last["verdict"], basis):
                     state = cov.NEEDS_RECHECK
-                elif ru.disposed(state) and (not basis or basis.get("why") == ru.NO_SESSION_LOG):
+                elif ru.disposed(state) and ru.read_gate_unverifiable(basis):
                     # No basis recorded at all (no history row, or a null column), or one that
                     # says the writing server kept no log: either way the gate has nothing to
-                    # apply, and saying so is the only honest thing left.
+                    # apply, and saying so is the only honest thing left. The predicate is the
+                    # shared one, which the run pair's completion reads too.
                     unverifiable.append(ref)
             states[ref] = state
     return states, tuple(unverifiable)
@@ -486,6 +513,31 @@ class ScanReview:
     # is not recorded either way (``scan_states``). They stay in the disposed count — nothing says
     # they were unread — and the declaration states how much of that count they are.
     unverifiable_read: tuple[str, ...] = ()
+    # The current verdict of every judged candidate of the run (evidence_ref -> verdict): what the
+    # disposed members were judged, counted, and what the hand-off reads its blocks from.
+    verdicts: dict[str, str] = field(default_factory=dict)
+
+    def tier_members(self, which: int) -> list[ru.Member]:
+        """Every member of the run's tier ``which`` (1 or 2), each once — the WHOLE RUN's, never a
+        shard's."""
+        must = which == TIER_1
+        return [m for u in self.units if u.must_read == must for m in u.members]
+
+    @property
+    def must_read_complete(self) -> bool:
+        """Whether tier 1 is done: every member disposed and none resting on a read gate that
+        could not be applied (``review_units.must_read_set_done``, the predicate the run pair's
+        completion shares). The whole run's, also in a shard."""
+        return ru.must_read_set_done(
+            self.tier_members(TIER_1), self.states, frozenset(self.unverifiable_read)
+        )
+
+    @property
+    def tiers_complete(self) -> bool:
+        """Whether both tiers are disposed. NOT called ``complete``: the tail is never handed out,
+        so no reading of this profile is ever complete in the run pair's sense."""
+        members = self.tier_members(TIER_1) + self.tier_members(TIER_2)
+        return all(ru.disposed(self.states.get(m.anchor_ref)) for m in members)
 
 
 def review_run(
@@ -511,6 +563,59 @@ def review_run(
         unanchored=sum(1 for c in candidates if not c.evidence_ref),
         by_band=by_band,
         unverifiable_read=unverifiable,
+        verdicts=current_verdicts(atlas, run_id),
+    )
+
+
+def current_verdicts(atlas: sqlite3.Connection, run_id: str) -> dict[str, str]:
+    """The current verdict of every candidate of ``run_id`` the overlay holds one on."""
+    return {
+        str(ref): str(verdict)
+        for ref, verdict in atlas.execute(
+            "SELECT anchor_ref, verdict FROM overlay WHERE anchor_kind = 'evidence_ref' "
+            "AND run_id = ?",
+            (run_id,),
+        )
+    }
+
+
+# The scan verdicts, in the order a count of them is stated.
+SCAN_VERDICTS = ("inconclusive", "suspicious", "exploitable", "excluded", "safe")
+# The verdicts that carry a lead forward (a hand-off's blocks), and the one that leaves it open.
+LEAD_VERDICTS = ("suspicious", "exploitable")
+OPEN_VERDICT = "inconclusive"
+
+
+def disposed_by_verdict(
+    members: list[ru.Member], states: dict[str, str], verdicts: dict[str, str]
+) -> dict[str, int]:
+    """How the disposed ``members`` were judged, by verdict (``SCAN_VERDICTS``; any other word
+    under ``other``). A COUNT, never a ruling: it is what makes "read, and not concluded" visible —
+    ``inconclusive`` disposes a member (``coverage.OPEN``), so a tier read through with nothing but
+    inconclusive reads complete, and this is the line that says so."""
+    out = dict.fromkeys(SCAN_VERDICTS, 0)
+    seen: set[str] = set()
+    for m in members:
+        if m.anchor_ref in seen or not ru.disposed(states.get(m.anchor_ref)):
+            continue
+        seen.add(m.anchor_ref)
+        v = verdicts.get(m.anchor_ref)
+        key = v if v in out else "other"
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+def open_items(review: ScanReview) -> list[str]:
+    """The tier 1 members disposed as ``inconclusive``, by ref: read, and left open. The hand-off
+    lists each, so a tier that reads complete on inconclusive judgements alone is not read as
+    settled."""
+    return sorted(
+        {
+            m.anchor_ref
+            for m in review.tier_members(TIER_1)
+            if ru.disposed(review.states.get(m.anchor_ref))
+            and review.verdicts.get(m.anchor_ref) == OPEN_VERDICT
+        }
     )
 
 
@@ -538,6 +643,8 @@ RUN_WIDE_KEYS = (
     "candidates",
     "by_band",
     "unanchored",
+    "must_read_complete",
+    "tiers_complete",
     "tail",
     "not_seen",
     "tier_2.groups",
@@ -547,6 +654,12 @@ RUN_WIDE_KEYS = (
     "tier_2.groups_shown",
     "tier_2.groups_not_shown",
     "tier_2.members_not_shown",
+)
+
+# What ``must_read_complete`` reads, said beside it.
+MUST_READ_RULE = (
+    "tier 1 done: every tier 1 member disposed, and none of them resting on a read gate that "
+    "could not be applied; tiers_complete also needs tier 2 (the tail is never handed out)"
 )
 
 # The last line of every declaration, fixed. The one sentence that has to survive someone skimming
@@ -658,14 +771,25 @@ def declaration(
             "binaries_not_shown": max(len(largest) - GROUPS_SHOWN, 0),
             "units": len(units),
             "units_undisposed": sum(1 for u in units if not ru.unit_disposed(u, review.states)),
+            # How the disposed members of this scope were judged: counts, never a ruling.
+            "disposed_by_verdict": disposed_by_verdict(members, review.states, review.verdicts),
         }
 
+    tail_by: dict[str, int] = dict.fromkeys(TAIL_PREDICATES, 0)
+    for b in review.banded:
+        if b.band == TAIL:
+            tail_by[b.predicate] = tail_by.get(b.predicate, 0) + 1
     out: dict[str, Any] = {
         "run_id": review.run_id,
         "scope": "shard" if workers is not None else "run",
         "candidates": len(review.banded) + review.unanchored,
         "by_band": dict(review.by_band),
         "unanchored": review.unanchored,
+        # The WHOLE RUN's, also in a shard (``RUN_WIDE_KEYS``): a shard whose own units are all
+        # disposed can still read false here. The shard's own progress is ``tier_1`` below.
+        "must_read_complete": review.must_read_complete,
+        "tiers_complete": review.tiers_complete,
+        "complete_rule": MUST_READ_RULE,
         "tier_1": _split(tier1),
         "tier_2": {
             **_split(tier2),
@@ -688,6 +812,8 @@ def declaration(
         },
         "tail": {
             "members": review.by_band.get(TAIL, 0),
+            # Which predicate put each tail member there (``band_reason``).
+            "by_predicate": tail_by,
             "why": (
                 "a proven-safe fact (a compile-time-constant value at the sink) — measured, that "
                 "is the whole of this band, and every member still carries an unread axis; "
@@ -728,6 +854,7 @@ def coverage_statement(dec: dict[str, Any]) -> str:
         f"scan {dec['run_id']}: {dec['candidates']} candidate(s) — {bands}. "
         f"tier 1 {t1['disposed']}/{t1['members']} disposed, {t1['units_undisposed']} unit(s) left; "
         f"tier 2 {t2['disposed']}/{t2['members']} disposed in {t2['groups']} group(s); "
+        f"must_read_complete {str(dec['must_read_complete']).lower()}; "
         f"{len(dec['not_seen'])} named gap(s){scope}. {dec['unread_not_unfound']}"
     )
 
@@ -759,6 +886,8 @@ def declaration_text(dec: dict[str, Any]) -> str:
     ]
     for name, count in t1["undisposed_by_band"].items():
         lines.append(f"  not disposed, band {name}: {count}")
+    judged = ", ".join(f"{v} {n}" for v, n in t1["disposed_by_verdict"].items() if n)
+    lines.append(f"  disposed, by verdict: {judged or 'none'}")
     lines.append(f"  units not disposed: {t1['units_undisposed']}")
     if t1["undisposed_by_binary"]:
         lines.append(f"  not disposed, by binary ({t1['binaries']} in all):")
@@ -796,7 +925,13 @@ def declaration_text(dec: dict[str, Any]) -> str:
         ]
     lines += [
         "",
-        f"tail: {dec['tail']['members']}{whole} — {dec['tail']['why']}",
+        f"must_read_complete: {str(dec['must_read_complete']).lower()}{whole}; tiers_complete: "
+        f"{str(dec['tiers_complete']).lower()}{whole} — {dec['complete_rule']}",
+    ]
+    by_pred = ", ".join(f"{p} {n}" for p, n in dec["tail"]["by_predicate"].items())
+    lines += [
+        "",
+        f"tail: {dec['tail']['members']}{whole} ({by_pred}) — {dec['tail']['why']}",
         "",
         "not seen:",
     ]
@@ -806,3 +941,217 @@ def declaration_text(dec: dict[str, Any]) -> str:
         lines += ["", dec["if_this_context_fills"]]
     lines += ["", dec["unread_not_unfound"]]
     return "\n".join(lines)
+
+
+# ── a unit's material: what a candidate unit hands out ─────────────────────────────────────
+
+# How a candidate handed out in a unit is read and judged — said once, by every material that
+# hands candidates out (a scan unit, and a run pair's one-sided candidate unit).
+CANDIDATE_READ_RULE = (
+    "read EVERY candidate with explain_candidate(evidence_ref=<anchor_ref>) before judging it — "
+    "only that call answers the read gate, and being handed this unit does not; then judge it "
+    "with the call its judge_with names (excluded on a tier 1 candidate needs exclusion_why)"
+)
+
+
+def candidate_material(
+    members: list[ru.Member] | tuple[ru.Member, ...],
+    states: dict[str, str],
+    binary_of: dict[str, str],
+    budget: int,
+) -> dict[str, Any]:
+    """The material of a unit of candidates: each candidate's ref, band, binary, sink class and
+    ``judge_with`` — only the ones still owed while any is — fitted to ``budget`` bytes.
+
+    ★ NO CANDIDATE FACT. The read gate is ``explain_candidate`` answered for the ref
+    (``read_basis_of`` takes no unit, on purpose): were the material to carry the candidate's facts,
+    a reader would have them without the gate ever seeing a read, and a verdict written from the
+    material alone would read as unread for a reason the reader could not see. The material says
+    WHAT to read; reading it is a call of its own.
+
+    The same function for both profiles: a scan unit (``start_scan_review``) and a run pair's
+    one-sided candidate unit (``start_diff_review``) hand out the same thing the same way."""
+    owed = [m for m in members if not ru.disposed(states.get(m.anchor_ref))] or list(members)
+    out: dict[str, Any] = {
+        "candidates_total": len(members),
+        "read_with": CANDIDATE_READ_RULE,
+        "judge_with": ru.JUDGE_WITH_NOTE,
+        "candidates": [],
+        "candidates_truncated": False,
+    }
+    room = budget - len(json.dumps(out)) - 64
+    for m in owed:
+        item = {
+            "anchor_ref": m.anchor_ref,
+            "band": m.bucket,
+            "binary": binary_of.get(m.anchor_ref),
+            "sink_class": m.subclass,
+            "judge_with": ru.judge_with(m),
+        }
+        size = len(json.dumps(item)) + 2
+        if size > room and out["candidates"]:
+            break
+        out["candidates"].append(item)
+        room -= size
+    out["candidates_truncated"] = len(out["candidates"]) < len(owed)
+    return out
+
+
+# ── attribution: where a known issue sits, read off the mechanism ──────────────────────────
+
+# Every class a known issue can fall in, exactly one each (``attribute``).
+ATTRIBUTION_CLASSES = (
+    "read",
+    "unread",
+    "tier2_undisposed",
+    "tail",
+    "ref_unresolved",
+    "absent",
+    "unanchored",
+)
+# A ``read`` issue's outcome, by the verdict it was given (the reader's, never the mechanism's).
+READ_OUTCOMES = {
+    "suspicious": "hit",
+    "exploitable": "hit",
+    "excluded": "missed",
+    "safe": "missed",
+    "inconclusive": "inconclusive",
+}
+# What each class is owed to, said with it.
+ATTRIBUTION_OWNER = {
+    "read": "the reader's verdict",
+    "unread": "the mechanism: tier 1 not read through",
+    "tier2_undisposed": (
+        "the run mode: tier 2 is handed out only with until=complete — the reporter states the "
+        "mode, this reading cannot see it"
+    ),
+    "tail": "the cut: the predicate that put it in the tail",
+    "ref_unresolved": "the truth's anchor: no such function in this run",
+    "absent": "sink-side recall: the function is there, no candidate at that sink",
+    "unanchored": "the mechanism's edge: a candidate with no evidence_ref is never handed out",
+}
+
+
+def _split_ref(ref: str) -> dict[str, str] | None:
+    """An evidence_ref's parts — ``{run}#{binary sha prefix}:{function address}@{class}@{site}``
+    — or None when it is not of that shape."""
+    run, sep, rest = ref.partition("#")
+    if not sep or ":" not in rest:
+        return None
+    sha, _, tail = rest.partition(":")
+    addr, _, more = tail.partition("@")
+    sink_class, _, site = more.partition("@")
+    if not run or not sha or not addr:
+        return None
+    return {"run": run, "sha": sha, "addr": addr, "sink_class": sink_class, "site": site}
+
+
+def _function_row(
+    atlas: sqlite3.Connection, run_id: str, sha: str, addr: str
+) -> tuple[str | None, str | None, str | None]:
+    """``(name, binary path, why)`` of the function at ``addr`` in the run's binary whose sha256
+    starts with ``sha``, read from the run's function inventory; ``why`` names why it could not be
+    read, and all three are None when it reads and holds no such function."""
+    from treasure_map.lib.ro_db import ro_connect  # noqa: PLC0415
+
+    row = atlas.execute("SELECT analysis_db_path FROM run WHERE run_id = ?", (run_id,)).fetchone()
+    if row is None or not row[0]:
+        return None, None, "the run records no function inventory"
+    try:
+        conn = ro_connect(row[0])
+    except sqlite3.Error:
+        return None, None, "the run's function inventory cannot be read"
+    try:
+        hit = conn.execute(
+            "SELECT f.name, b.path FROM functions f JOIN current_binaries b ON b.id = f.binary_id "
+            "WHERE b.sha256 LIKE ? AND lower(f.address) = lower(?) LIMIT 1",
+            (f"{sha}%", addr),
+        ).fetchone()
+    except sqlite3.Error:
+        return None, None, "the run's function inventory cannot be read"
+    finally:
+        conn.close()
+    if hit is None:
+        return None, None, None
+    return (str(hit[0]) if hit[0] is not None else None), str(hit[1]), None
+
+
+def attribute(
+    atlas: sqlite3.Connection,
+    review: ScanReview,
+    candidates: list[TriageCandidate],
+    evidence_ref: str,
+) -> dict[str, Any]:
+    """Which ``ATTRIBUTION_CLASSES`` class a known issue at ``evidence_ref`` falls in, read off the
+    mechanism alone — the bands, the tiers, the states and the run's function inventory. No truth
+    data is held here: the caller hands in the ref, and the answer says where it sits.
+
+    * a candidate in a tier, disposed on a read gate that applies — ``read``, with the recorded
+      verdict and its outcome (``READ_OUTCOMES``: hit / missed / inconclusive);
+    * a tier 1 candidate otherwise (undisposed, needs_recheck, needs_relabel, or disposed on a gate
+      that could not be applied) — ``unread``; the same in tier 2 — ``tier2_undisposed``;
+    * a candidate of the tail — ``tail``, with the predicate that put it there;
+    * no candidate under the ref: a ref-less candidate at that function and sink class —
+      ``unanchored``; else the function in the run's inventory — ``absent`` (no candidate at that
+      sink); else ``ref_unresolved`` (no such function, or the ref is not of this run).
+
+    A candidate row carries its ``source_kind`` and whether its source reads dangerous, which is
+    where a gap in source attribution shows — never as ``absent``."""
+    by_ref = {b.evidence_ref: b for b in review.banded}
+    cand_by_ref = {c.evidence_ref: c for c in candidates if c.evidence_ref}
+    out: dict[str, Any] = {"evidence_ref": evidence_ref, "run_id": review.run_id}
+    b = by_ref.get(evidence_ref)
+    if b is not None:
+        where = tier(b.band, b.sink_class)
+        c = cand_by_ref.get(evidence_ref)
+        out.update(
+            band=b.band,
+            predicate=b.predicate,
+            tier=where,
+            source_kind=b.source_kind,
+            dangerous_source=dangerous_source(c) if c is not None else None,
+        )
+        if where is None:
+            out["class"] = "tail"
+        else:
+            state = review.states.get(evidence_ref, cov.UNSEEN)
+            unverifiable = evidence_ref in set(review.unverifiable_read)
+            out["state"] = state
+            if ru.disposed(state) and not unverifiable:
+                verdict = review.verdicts.get(evidence_ref)
+                out.update(
+                    {
+                        "class": "read",
+                        "verdict": verdict,
+                        "outcome": READ_OUTCOMES.get(verdict or ""),
+                    }
+                )
+            else:
+                out["class"] = "unread" if where == TIER_1 else "tier2_undisposed"
+                if unverifiable:
+                    out["read_gate"] = READ_GATE_UNVERIFIABLE_WHY
+    else:
+        parts = _split_ref(evidence_ref)
+        if parts is None or parts["run"] != review.run_id:
+            out.update(
+                {"class": "ref_unresolved", "why": "the ref is not a candidate anchor of this run"}
+            )
+        else:
+            name, path, why = _function_row(atlas, review.run_id, parts["sha"], parts["addr"])
+            loose = [
+                c
+                for c in candidates
+                if not c.evidence_ref
+                and path is not None
+                and c.binary_path == path
+                and c.function == name
+                and (c.sink_class or "") == parts["sink_class"]
+            ]
+            if loose:
+                out["class"] = "unanchored"
+            elif name is not None or path is not None:
+                out.update({"class": "absent", "function": name, "binary": path})
+            else:
+                out.update({"class": "ref_unresolved", "why": why or "no such function"})
+    out["owed_to"] = ATTRIBUTION_OWNER[out["class"]]
+    return out

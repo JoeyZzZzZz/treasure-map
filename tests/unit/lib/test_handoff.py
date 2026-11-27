@@ -24,6 +24,7 @@ from tests.unit.lib.test_diff_review import (  # noqa: F401
 from tests.unit.lib.test_file_diff import FW, SECRET_VALUE
 from treasure_map import mcp_app, version
 from treasure_map.lib import overlay
+from treasure_map.lib import tool_call_log as tcl
 from treasure_map.lib.query import diff_align as dalign
 from treasure_map.lib.query import diff_annotations as dann
 from treasure_map.lib.query import diff_review as dr
@@ -101,6 +102,14 @@ def _stamp() -> rr.HandoffStamp:
     )
 
 
+# What a write records about what was read before it, as the real write paths record it: an MCP
+# write handed its unit's material, and a person's on the command line. A write recording NO basis
+# rests on a read gate that cannot be applied, and a must-read set holding one is not done
+# (review_units.must_read_set_done), so a fixture that means "read, then judged" says so.
+_READ = {"basis": "unit_delivered", "material_cut": False}
+_HUMAN = {"basis": "human"}
+
+
 def _judge_changed_real(w: World, anchor: str) -> None:
     overlay.annotate_diff(
         w.atlas,
@@ -112,7 +121,7 @@ def _judge_changed_real(w: World, anchor: str) -> None:
             "change_kind": ["sink_replaced"],
             "evidence": [anchor, *landed_refs(w.atlas, DX, anchor)],
         },
-        ctx=overlay.WriteContext(channel="mcp", session="s"),
+        ctx=overlay.WriteContext(channel="mcp", session="s", read_basis=_READ),
     )
 
 
@@ -254,7 +263,7 @@ def _wide_findings_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int
                 "change_kind": ["restructured"],
                 "evidence": [anchor, *landed_refs(w.atlas, DX, anchor)],
             },
-            ctx=overlay.WriteContext(channel="mcp", session="s"),
+            ctx=overlay.WriteContext(channel="mcp", session="s", read_basis=_READ),
         )
     return w
 
@@ -330,7 +339,7 @@ def test_findings_digest_changes_when_a_judgment_is_written(
             "change_kind": ["restructured"],
             "evidence": [anchor, *landed_refs(w.atlas, DX, anchor)],
         },
-        ctx=overlay.WriteContext(channel="mcp", session="s2"),
+        ctx=overlay.WriteContext(channel="mcp", session="s2", read_basis=_READ),
     )
     second = _server_call_on(w.path, "get_diff_handoff", {"run_pair": PAIR})["findings_digest"]
     assert first != second
@@ -660,7 +669,7 @@ def _judge(
                 else {}
             ),
         },
-        ctx=overlay.WriteContext(channel="mcp", session="s"),
+        ctx=overlay.WriteContext(channel="mcp", session="s", read_basis=_READ),
     )
 
 
@@ -1200,18 +1209,26 @@ def test_a_file_finding_reads_current_as_list_overlays_reads_it(
     of it.
 
     MUTATION (verified RED): call handoff_findings without file_staleness on the MCP side ->
-    "MOVED" -> RED."""
+    "MOVED" -> RED.
+
+    The write is made the way a real session makes it — the file read first, by a server keeping
+    a tool-call log — because a must-read judgement whose read gate cannot be applied holds the
+    hand-off back (review_units.must_read_set_done)."""
     _servable(monkeypatch)
     fw = FW(tmp_path)
     fw.file("a", "etc/rc", "shell_script", "echo old\n")
     fw.file("b", "etc/rc", "shell_script", "echo new\n")
-    tools = fw.tools()
+    log = tcl.ToolCallLog(tcl.log_path_for(fw.path))
+    tools = mcp_app.make_tools(fw.path, call_log=log)
     anchor = f"{PAIR}#non_binary#etc/rc"
+    read = tools["get_file_diff"](PAIR, path="etc/rc")
+    assert "error" not in read
+    log.record("get_file_diff", {"run_pair": PAIR, "path": "etc/rc"}, result=read)
     assert tools["annotate_diff"](anchor, "changed_real", "read it", run_pair=PAIR)["written"]
     listed = tools["list_overlays"](anchor_kind="diff_subject", run_id=PAIR)["overlays"]
     assert [r["review_state"] for r in listed] == ["concluded"]
     page = tools["get_diff_handoff"](PAIR)
-    assert "- basis: current" in page["text"], page["text"]
+    assert "- basis: current" in page.get("text", ""), page
     conn = fw.atlas()
     try:
         assert "- basis: current" in _block(conn, anchor)
@@ -1378,7 +1395,7 @@ def test_a_judgement_swapped_within_one_second_is_not_dropped(
         verdict="change_inconclusive",
         rationale="not read yet",
         attributed_to="human",
-        ctx=overlay.WriteContext(channel="judge", session="s"),
+        ctx=overlay.WriteContext(channel="judge", session="s", read_basis=_HUMAN),
     )
     _same_second(w)
     tools = mcp_app.make_tools(w.path)
@@ -1391,7 +1408,7 @@ def test_a_judgement_swapped_within_one_second_is_not_dropped(
         verdict="change_inconclusive",
         rationale="re-read",
         attributed_to="human",
-        ctx=overlay.WriteContext(channel="judge", session="s"),
+        ctx=overlay.WriteContext(channel="judge", session="s", read_basis=_HUMAN),
     )
     _judge(w.atlas, DX, a2, "the real one")
     _same_second(w)
@@ -2800,7 +2817,7 @@ def _human(w: World, anchor: str, verdict: str, rationale: str = "a person read 
         verdict=verdict,
         rationale=rationale,
         attributed_to="human",
-        ctx=overlay.WriteContext(channel="judge", session="p"),
+        ctx=overlay.WriteContext(channel="judge", session="p", read_basis=_HUMAN),
     )
 
 

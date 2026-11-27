@@ -38,7 +38,8 @@ def test_the_instructions_have_two_entry_points_with_the_workflow_in_the_diff_on
     scan, diff = text.index("SCAN: "), text.index("DIFF: ")
     assert scan < diff
     assert text[diff:].startswith("DIFF: " + DIFF_WORKFLOW + " get_diff_patch_view(diff_id) — ")
-    step4 = text[text.index("(4) RECORD") : diff]
+    # Step 4 ends where step 5 (the scan's must-read set) begins: still no diff sentence in it.
+    step4 = text[text.index("(4) RECORD") : text.index("(5)")]
     assert step4.rstrip().endswith("usually not worth re-verifying.")
     assert "For a version diff, start at" not in text
     assert "start at get_diff_patch_view" not in text
@@ -179,7 +180,7 @@ def test_the_guide_keeps_the_one_diff_sentence_and_the_instructions_do_not() -> 
 
     assert "DIFF: " + DIFF_ONE_DIFF + " " + DIFF_WORKFLOW + " " in mcp_app._AGENT_GUIDE
     assert DIFF_ONE_DIFF not in mcp_app._AGENT_INSTRUCTIONS
-    assert len(mcp_app._AGENT_INSTRUCTIONS) <= 3800
+    assert len(mcp_app._AGENT_INSTRUCTIONS) <= mcp_app.INSTRUCTIONS_MAX
 
 
 def test_the_guide_says_what_the_blind_audit_gate_says() -> None:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -393,8 +394,9 @@ def test_a_scan_band_unit_pages_and_never_enters_a_run_pairs_cutting() -> None:
 
     assert ru.SCAN_BAND in mcp_app._PAGED_KINDS  # it is cut into members, so its material pages
     assert ru.SCAN_BAND not in ru._KIND_RANK  # no run-pair position to sort at
-    # The pair predicate is untouched by this kind: it is not one of the kinds review_pair cuts,
-    # so no pair's unit_id set moves and the version does not rise.
+    # This kind is not one of the kinds review_pair cuts. (The pair predicate does read the scan
+    # profile's banding for a one-sided binary's candidates, a kind of its own — so a change of
+    # the banding is a bump of the pair's version, v6.)
     pair_kinds = (
         ru.ENTRY,
         ru.S_BATCH,
@@ -405,9 +407,10 @@ def test_a_scan_band_unit_pages_and_never_enters_a_run_pairs_cutting() -> None:
         ru.GROUP,
         ru.REDUCE,
         ru.PAIRING,
+        ru.PRESENCE_CANDIDATES,
     )
     assert ru.SCAN_BAND not in pair_kinds
-    assert ru.PREDICATE_VERSION == "v5"
+    assert ru.PREDICATE_VERSION == "v6"
 
 
 # ── test 5: the read gate — the one that is easy to get wrong ───────────────────────────────
@@ -1028,10 +1031,19 @@ def test_a_shard_names_the_numbers_that_are_the_whole_runs(tmp_path: Path) -> No
     MUTATION (verified RED, ``1 failed`` each): drop ``run_wide`` from the declaration -> the
     first assertion fails; stop suffixing the run-wide lines -> the text assertions fail.
     """
-    conn, _ = _world(tmp_path, exec_n=ru.BATCH_UNIT_MAX * 3, second_n=ru.BATCH_UNIT_MAX * 2)
+    conn, _ = _world(tmp_path, exec_n=ru.BATCH_UNIT_MAX * 3, second_n=ru.BATCH_UNIT_MAX * 4)
     review = _review(conn)
     whole = sr.declaration(review)
-    shard = sr.declaration(review, worker=0, workers=4)
+    # A shard holding part of each tier (which one does depends on the unit ids, so it is found
+    # rather than assumed): the precondition for the two tier counts below to differ.
+    shard = next(
+        d
+        for w in range(4)
+        if 0
+        < (d := sr.declaration(review, worker=w, workers=4))["tier_1"]["members"]
+        < whole["tier_1"]["members"]
+        and 0 < d["tier_2"]["members"] < whole["tier_2"]["members"]
+    )
     assert shard["scope"] == "shard" and whole["scope"] == "run"
     assert shard["run_wide"] == list(sr.RUN_WIDE_KEYS)
 
@@ -1253,3 +1265,218 @@ def test_a_shards_read_gate_count_is_its_own_and_not_the_runs(tmp_path: Path) ->
         }
         assert n == sum(1 for r in review.unverifiable_read if r in mine), i
     conn.close()
+
+
+# ── tier 1's completion, and where a known issue sits ──────────────────────────────────────
+
+
+def test_tier_1_is_done_only_when_disposed_and_every_read_gate_applied(tmp_path: Path) -> None:
+    """★ must_read_complete = every tier 1 member disposed AND none of them resting on a read
+    gate that could not be applied; tiers_complete also needs tier 2. A tier 1 judged through by
+    a server keeping no tool-call log is disposed and still not done.
+
+    MUTATION (verified RED, 1 failed): drop the unverifiable set from must_read_set_done -> the
+    unlogged write completes tier 1 -> RED."""
+    conn, refs = _world(tmp_path, exec_n=2, second_n=1)
+    a, b = refs[sr.EXEC]
+    _write(conn, a, "inconclusive", read=True)
+    assert sr.declaration(_review(conn))["must_read_complete"] is False
+    overlay.upsert_overlay(
+        conn,
+        evidence_ref=b,
+        verdict="inconclusive",
+        rationale="r",
+        ctx=overlay.WriteContext(channel="mcp", read_basis=sr.read_basis_of(None, b)),
+    )
+    dec = sr.declaration(_review(conn))
+    assert dec["tier_1"]["undisposed"] == 0
+    assert dec["must_read_complete"] is False
+    _write(conn, b, "inconclusive", read=True)
+    dec = sr.declaration(_review(conn))
+    assert dec["must_read_complete"] is True and dec["tiers_complete"] is False
+    assert "must_read_complete true" in sr.coverage_statement(dec)
+    _write(conn, refs["second"][0], "excluded", read=True)
+    assert sr.declaration(_review(conn))["tiers_complete"] is True
+    conn.close()
+
+
+def test_a_shard_read_through_does_not_claim_the_run(tmp_path: Path) -> None:
+    """★ A shard whose own tier 1 is all disposed reads its own counts done, and the run's
+    must_read_complete (a whole-run key) still false while another shard is not.
+
+    MUTATION (verified RED, 1 failed): compute must_read_complete over the shard's units -> the
+    shard claims the run -> RED."""
+    conn, refs = _world(tmp_path, exec_n=ru.BATCH_UNIT_MAX * 4)
+    review = _review(conn)
+    shard_units = {
+        w: [u for u in review.units if u.must_read and ru.in_shard(u.unit_id, w, 4)]
+        for w in range(4)
+    }
+    w, mine = next((w, us) for w, us in shard_units.items() if us and len(us) < 4)
+    for u in mine:
+        for m in u.members:
+            _write(conn, m.anchor_ref, "inconclusive", read=True)
+    dec = sr.declaration(_review(conn), worker=w, workers=4)
+    assert dec["tier_1"]["undisposed"] == 0
+    assert dec["must_read_complete"] is False
+    conn.close()
+
+
+def test_band_reason_names_the_predicate_and_band_is_unchanged() -> None:
+    """★ band(c) is band_reason(c)'s band, word for word, and the tail says which of its two
+    predicates holds: a proven-safe fact, or neither a dangerous source nor an unread axis (the
+    second never measured on any corpus — built here so it has a tooth).
+
+    MUTATION (verified RED, 1 failed): call every tail member proven_safe -> RED."""
+    plain = _cand(param_source=False)  # not proven safe, no dangerous source, every axis read
+    assert sr.band_reason(plain) == (sr.TAIL, sr.PREDICATE_PLAIN)
+    assert sr.band(plain) == sr.TAIL
+    cases = [
+        _cand(),
+        _cand(sink_class="copy"),
+        _cand(param_source=False, unresolved=("reachability",)),
+        plain,
+    ]
+    for c in cases:
+        assert sr.band(c) == sr.band_reason(c)[0]
+    assert [sr.band_reason(c)[1] for c in cases] == [
+        sr.PREDICATE_EXEC,
+        sr.PREDICATE_WRITE,
+        sr.PREDICATE_UNRESOLVED,
+        sr.PREDICATE_PLAIN,
+    ]
+
+
+def test_the_set_sizes_of_a_fixed_world_are_pinned(tmp_path: Path) -> None:
+    """The tier 1 / tier 2 / tail member counts of one fixed world, so a change of the cut shows
+    here first."""
+    conn, _ = _world(tmp_path, exec_n=5, write_n=3, second_n=4)
+    review = _review(conn)
+    assert len(review.tier_members(sr.TIER_1)) == 8
+    assert len(review.tier_members(sr.TIER_2)) == 4
+    assert review.by_band[sr.TAIL] == 0
+    conn.close()
+
+
+def _inventory(conn: sqlite3.Connection, tmp_path: Path, fns: list[tuple[str, str, str]]) -> None:
+    """The run's function inventory: an analysis.db holding ``fns`` (sha256, path, address)."""
+    db = tmp_path / "analysis.db"
+    a = sqlite3.connect(db)
+    a.execute("CREATE TABLE current_binaries (id INTEGER PRIMARY KEY, path TEXT, sha256 TEXT)")
+    a.execute(
+        "CREATE TABLE functions (id INTEGER PRIMARY KEY, binary_id INT, name TEXT, address TEXT)"
+    )
+    for i, (sha, path, addr) in enumerate(fns, 1):
+        a.execute("INSERT INTO current_binaries VALUES (?, ?, ?)", (i, path, sha))
+        a.execute("INSERT INTO functions VALUES (?, ?, 'fn', ?)", (i, i, addr))
+    a.commit()
+    a.close()
+    conn.execute("INSERT INTO run (run_id, analysis_db_path) VALUES (?, ?)", (RUN, str(db)))
+    conn.commit()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["read", "unread", "tier2_undisposed", "tail", "ref_unresolved", "absent", "unanchored"],
+)
+def test_a_known_issue_falls_in_exactly_one_attribution_class(
+    tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Given a known issue's ref, the mechanism alone says where it sits — read (with the
+    verdict's outcome: hit / missed / inconclusive), unread, tier 2 undisposed, tail (with its
+    predicate), ref_unresolved, absent, unanchored — one class each, every class reachable. No
+    truth data is held: the test hands the ref in.
+
+    MUTATION (verified RED, 1 failed each): read a tier 1 member disposed on an unverifiable gate
+    as ``read`` -> RED (unread); call a function the inventory holds ``ref_unresolved`` -> RED
+    (absent)."""
+    conn, refs = _world(tmp_path, exec_n=2, second_n=1, binary="/fw/a")
+    _inventory(conn, tmp_path, [("b0001" + "0" * 59, "/fw/a", "00400001")])
+    tail_ref = refs[sr.EXEC][1]
+    real = sr.band_reason
+    monkeypatch.setattr(
+        sr,
+        "band_reason",
+        lambda c: (sr.TAIL, sr.PREDICATE_PROVEN_SAFE) if c.evidence_ref == tail_ref else real(c),
+    )
+    ref, want = {
+        "read": (refs[sr.EXEC][0], "read"),
+        "unread": (refs[sr.EXEC][0], "unread"),
+        "tier2_undisposed": (refs["second"][0], "tier2_undisposed"),
+        "tail": (tail_ref, "tail"),
+        "ref_unresolved": (f"{RUN}#ffff:00999999@cmd@0x1", "ref_unresolved"),
+        "absent": (f"{RUN}#b0001:00400001@cmd@0x99", "absent"),
+        "unanchored": (f"{RUN}#b0001:00400001@cmd@0x99", "unanchored"),
+    }[case]
+    if case == "read":
+        _write(conn, ref, "suspicious", read=True)
+    if case == "unread":
+        overlay.upsert_overlay(
+            conn,
+            evidence_ref=ref,
+            verdict="excluded",
+            rationale="r",
+            verdict_basis={"exclusion_why": "a guard"},
+            ctx=overlay.WriteContext(channel="mcp", read_basis=sr.read_basis_of(None, ref)),
+        )
+    clear_triage_cache()
+    candidates = triage(conn, run_id=RUN)
+    if case == "unanchored":
+        # A candidate with no evidence_ref at that function and sink class.
+        candidates.append(
+            replace(
+                candidates[0],
+                evidence_ref=None,
+                binary_path="/fw/a",
+                function="fn",
+                sink_class="cmd",
+            )
+        )
+    review = sr.review_run(conn, RUN, candidates)
+    got = sr.attribute(conn, review, candidates, ref)
+    assert got["class"] == want, got
+    assert set(sr.ATTRIBUTION_CLASSES) >= {got["class"]}
+    if case == "read":
+        assert (got["verdict"], got["outcome"]) == ("suspicious", "hit")
+    if case == "tail":
+        assert got["predicate"] == sr.PREDICATE_PROVEN_SAFE
+    if case in ("read", "unread", "tier2_undisposed"):
+        assert "source_kind" in got and "dangerous_source" in got
+    conn.close()
+
+
+def test_the_cli_says_where_each_known_issue_of_a_file_sits(tmp_path: Path) -> None:
+    """★ ``tmap review scan <run_id> --attribute <file>`` reads a JSON file of known issues (its
+    lists under any keys), keeps this run's items and prints each one's class — read-only, with
+    the per-class totals and the run-mode note tier2_undisposed needs.
+
+    MUTATION (verified RED, 1 failed): keep every item, whatever its run -> the other run's
+    item is counted -> RED."""
+    from click.testing import CliRunner
+
+    from treasure_map.cli.review_cli import review
+
+    conn, refs = _world(tmp_path, exec_n=1, second_n=1)
+    _write(conn, refs[sr.EXEC][0], "suspicious", read=True)
+    conn.close()
+    issues = tmp_path / "issues.json"
+    issues.write_text(
+        json.dumps(
+            {
+                "found": [{"id": "one", "run_id": RUN, "evidence_ref": refs[sr.EXEC][0]}],
+                "other": [
+                    {"evidence_ref": refs["second"][0]},
+                    {"id": "elsewhere", "run_id": "other_run", "evidence_ref": "other_run#a:1@cmd"},
+                ],
+            }
+        )
+    )
+    db = tmp_path / "atlas.db"
+    before = db.stat().st_mtime_ns
+    res = CliRunner().invoke(review, ["scan", RUN, "--attribute", str(issues), "--atlas", str(db)])
+    assert res.exit_code == 0, res.output
+    assert "one\tread\thit" in res.output
+    assert f"{refs['second'][0]}\ttier2_undisposed" in res.output
+    assert "elsewhere" not in res.output
+    assert f"2 issue(s) of {RUN}: read 1, tier2_undisposed 1" in res.output
+    assert db.stat().st_mtime_ns == before

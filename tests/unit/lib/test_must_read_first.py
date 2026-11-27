@@ -24,6 +24,7 @@ from tests.unit.lib.test_callee_groups import _world as _cg_world
 from tests.unit.lib.test_diff_review import (  # noqa: F401 — the autouse cache fixture
     DX,
     PAIR,
+    READ_WHOLE,
     World,
     _clear_view_caches,
     landed_refs,
@@ -176,6 +177,7 @@ def test_the_reduce_is_handed_out_once_the_must_read_part_is_judged(tmp_path: Pa
                 verdict="changed_real",
                 rationale="r",
                 diff_id=m.stream,
+                ctx=overlay.WriteContext(channel="api", read_basis=READ_WHOLE),
             )
     else:
         raise AssertionError("no reduce was handed out")
@@ -188,6 +190,7 @@ def test_the_reduce_is_handed_out_once_the_must_read_part_is_judged(tmp_path: Pa
             rationale="r",
             diff_id=m.stream,
             group_ref=ref,
+            ctx=overlay.WriteContext(channel="api", read_basis=READ_WHOLE),
         )
     r = review()
     assert r.next_unit(sweep=False) is None

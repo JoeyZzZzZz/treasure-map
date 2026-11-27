@@ -1316,6 +1316,14 @@ def annotate_diff(
         if commit:
             atlas.commit()
         return result
+    if diff_id is None and "::" not in anchor_ref.split("#", 1)[0]:
+        # One run's candidate (an evidence_ref), a one-sided binary's included: it has no diff,
+        # so no diff_id could take it — it is judged with annotate, as a scan candidate is.
+        raise ConfigError(
+            f"{anchor_ref!r} is a candidate's evidence_ref, judged with annotate, not "
+            "annotate_diff: explain_candidate(evidence_ref=...), then annotate(evidence_ref=..., "
+            "verdict=..., rationale=...)"
+        )
     if diff_id is None:
         raise ConfigError(
             f"{anchor_ref!r} is a function or candidate anchor: pass diff_id (list_diffs) — "

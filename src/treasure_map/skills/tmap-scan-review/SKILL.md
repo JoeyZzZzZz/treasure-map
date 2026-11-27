@@ -1,6 +1,6 @@
 ---
 name: tmap-scan-review
-description: Work through one firmware scan's candidate map with the Treasure Map (tmap) MCP server, reading each candidate before judging it. Reading one image's whole must-read set takes tmap's batch driver. Use when asked to review, triage or audit a single firmware scan (one run, not a version diff) with Treasure Map or tmap.
+description: Work through one firmware scan's must-read set with the Treasure Map (tmap) MCP server, unit by unit, reading each candidate before judging it. A whole image usually takes several sessions, or tmap's batch driver. Use when asked to review, triage or audit a single firmware scan (one run, not a version diff) with Treasure Map or tmap.
 ---
 
 # Reviewing one firmware scan with tmap
@@ -8,8 +8,8 @@ description: Work through one firmware scan's candidate map with the Treasure Ma
 tmap scans one firmware and hands you a candidate map — tens of thousands of leads for a large
 image. `list_candidates` RANKS them, which says what to read first and never what may be left
 unread. This skill is the other half: the scan review profile cuts the run into four bands and two
-tiers, hands the must-read part out in work units through tmap's batch driver, and counts what is
-still unread. tmap draws no conclusion and produces no attack: every judgment is yours.
+tiers, hands the must-read part out in work units (`start_scan_review`, or tmap's batch driver),
+and counts what is still unread. tmap draws no conclusion and produces no attack: every judgment is yours.
 
 ## The four bands
 
@@ -48,17 +48,19 @@ reading than an unread source on a `memcpy`.
 
 ## The loop
 
-The steps below are one unit as the BATCH DRIVER hands it out. No MCP tool hands out scan units,
-and `tmap review scan <run_id>` prints counts only — no unit ids and no refs. So in an interactive
-session step 1 does not happen: either a person runs the driver (below), or you work from refs you
-already have (from `list_candidates`, say), and steps 2–4 apply to each of them.
+`start_scan_review(run_id)` hands out tier 1 unit by unit: its answer carries the declaration,
+`coverage_statement`, `must_read_complete` and `next_unit`. The batch driver hands out the same
+units, one launch each.
 
-1. You are handed ONE unit: a list of candidate `evidence_ref`s from one binary, at most 16.
+1. You are handed ONE unit: a list of candidate `evidence_ref`s from one binary, at most 16 — in
+   `next_unit.material.candidates`, each with its band, binary, sink class and `judge_with`, and NO
+   candidate fact: being handed it is not reading it.
 2. For EVERY ref in the unit, call `explain_candidate(evidence_ref=...)`. Then read whatever else
    you need: `get_pseudocode`, `get_sink_provenance`, `get_callees`, `get_xrefs`, `get_strings`,
    `get_nvram_key_flow`.
-3. Judge EVERY ref with `annotate(evidence_ref=..., verdict=..., rationale=...)`.
-4. Then stop. Do not judge anything outside the unit.
+3. Judge EVERY ref with `annotate(evidence_ref=..., verdict=..., rationale=...)` — no `unit_id`.
+4. Interactively, call `start_scan_review(run_id)` again for the next unit; under the driver, stop.
+   Do not judge anything outside the unit.
 
 ## Rules
 
@@ -81,12 +83,23 @@ already have (from `list_candidates`, say), and steps 2–4 apply to each of the
 - `exploitable` should carry `chain` (citing code) and two or more `verification_gaps` — what is
   still to be confirmed on real hardware. `suspicious` floats a candidate up for more digging.
   `inconclusive` is an honest answer and stays in view.
-- **Stopping rule**: tier 1 empty for your scope, then stop. Tier 2 only when a person asks for
-  it. Stop only at a unit boundary — every ref of the unit in hand judged. Interactively you cannot
-  see tier 1: say which refs you judged and that the rest of the map is unread.
-- Quote the declaration's numbers (`tmap review scan <run_id>` prints them) verbatim when you
-  report: the four band counts, tier 1 disposed / not disposed, the tier 2 group count, and the
-  named gaps. Do not re-derive them.
+- **Stopping rule**: `next_unit` null for your scope, then stop. Tier 2 only when a person asks
+  for it. Stop only at a unit boundary — every ref of the unit in hand judged. An early stop is a
+  hand-off: quote the `coverage_statement`, say the review is not complete, and name
+  `start_scan_review(run_id)` as the call a fresh session continues with.
+- **`must_read_complete`** is the bar: every tier 1 member disposed, and none resting on a read
+  gate that could not be applied (no basis recorded with the write, or a server keeping no
+  tool-call log). `inconclusive` disposes a member — the declaration's `disposed_by_verdict` shows
+  how many were. `tiers_complete` also needs tier 2. Never call the review complete otherwise.
+- Once `must_read_complete` is true, `get_scan_handoff(run_id)` pages the hand-off: one block per
+  candidate judged `suspicious` or `exploitable` (any tier), then the tier 1 `inconclusive` ones as
+  open items. A report of the findings is that hand-off, never a list rebuilt from summaries.
+- Quote the declaration's numbers (`start_scan_review` carries them; `tmap review scan <run_id>`
+  prints them) verbatim when you report: the four band counts, tier 1 disposed / not disposed, the
+  tier 2 group count, and the named gaps. Do not re-derive them.
+- **A binary only one run of a pair holds** is reviewed in that pair's diff review the same way:
+  its tier 1 candidates are this run's own tier 1 refs, handed out as units of candidates and judged
+  with `annotate`. One `annotate` disposes the candidate in both reviews.
 - The `controllable` source branch (a value-store key a web form writes) has NOT been validated
   end to end: two of the three firmware images this profile was measured on hold no such
   candidate at all. It stays in the predicate because dropping it would lose that whole family

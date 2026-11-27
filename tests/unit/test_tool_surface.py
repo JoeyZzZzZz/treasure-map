@@ -183,15 +183,17 @@ def test_the_descriptions_and_the_instructions_fit_what_a_client_shows(atlas: Pa
     (The counts in this file are of the whole file run against the mutation.)"""
     listed = asyncio.run(mcp_app.build_server(atlas).list_tools())
     sizes = {t.name: len(t.description or "") for t in listed}
-    assert len(sizes) == 42
+    assert len(sizes) == 44
     # 23,404 once each description stopped repeating the "Full reference:" line (the instructions
-    # say it once): the cap sits just above that, so the room it freed is not spent silently.
-    # The per-tool cap (1,200) is unchanged — that is the real per-description UX limit.
-    assert sum(sizes.values()) <= 24_000, sum(sizes.values())
+    # say it once); 24,236 with the scan review's two tools (start_scan_review, get_scan_handoff)
+    # and the one-sided candidates named in two cards. The cap sits above that, so the room left
+    # is not spent silently. The per-tool cap (1,200) is unchanged — that is the real
+    # per-description UX limit.
+    assert sum(sizes.values()) <= 25_000, sum(sizes.values())
     assert max(sizes.values()) <= 1_200, max(sizes.items(), key=lambda kv: kv[1])
     for t in listed:
         assert t.description == inspect.cleandoc(t.description or ""), t.name
-    assert len(mcp_app._AGENT_INSTRUCTIONS) <= 3_800
+    assert len(mcp_app._AGENT_INSTRUCTIONS) <= mcp_app.INSTRUCTIONS_MAX
 
 
 # ── T-2: the first line ──────────────────────────────────────────────────────────────────────
@@ -212,6 +214,8 @@ EXPECTED_FIRST_LINES = {
     "get_diff_meta": "Required: diff_id.",
     "get_diff_string_delta": "Required: diff_id.",
     "get_diff_handoff": "Required: run_pair.",
+    "start_scan_review": "Required: run_id.",
+    "get_scan_handoff": "Required: run_id.",
     "get_function_alignment": "Required: diff_id, function.",
     "get_diff_capabilities": "Required: diff_id.",
     "list_diffs": "Required: none.",
@@ -551,6 +555,8 @@ _ONE_RUN = (
     "get_disassembly",
     "list_overlays",
     "clear_overlay",
+    "start_scan_review",
+    "get_scan_handoff",
 )
 _BIN_TOOLS = (
     "get_string_keyed_edges",
@@ -721,7 +727,7 @@ def test_appendix_a_is_what_the_refusal_offers_and_nothing_outside_it_offers_any
     MUTATION (verified RED, 1 failed): drop the (stride, side) veto -> RED."""
     accepted = _accepted()
     want = {(w, t): offer for w, offer, ts in APPENDIX_A for t in ts}
-    assert len(want) == 259
+    assert len(want) == 269  # 259, and the five run_id misspellings on the two scan review tools
     inputs = {p for ps in accepted.values() for p in ps} | set(cards._PARAM_SYNONYMS) | set(_TYPOS)
     seen = 0
     for wrong in sorted(inputs):
@@ -1091,6 +1097,11 @@ def test_every_reference_answer_fits_the_response_budget(
 
 _AMB = "``reason='ambiguous'``"
 BOUNDARY: dict[str, tuple[str, ...]] = {
+    "start_scan_review": ("NO candidate fact", "Unread is not 'nothing found'"),
+    "get_scan_handoff": (
+        "tmap draws no conclusion here",
+        "the status stays awaiting human verification",
+    ),
     "get_diff_handoff": (
         "tmap draws no conclusion here",
         "a cell it cannot read states its reason",
@@ -1301,10 +1312,11 @@ def test_the_instructions_hold_both_entry_points_within_what_a_client_shows() ->
     MUTATION (verified RED, 2 failed): move the DIFF part past character 3,800 -> RED (here and
     the length test)."""
     text = mcp_app._AGENT_INSTRUCTIONS
-    assert text.index("DIFF: ") < 3_800
+    assert text.index("DIFF: ") < mcp_app.INSTRUCTIONS_MAX
     # the whole sentence, not only its start: it is the one place a client is told where each
     # tool's full reference is (no tool description repeats it)
-    assert text.endswith(_POINTER) and text.index(_POINTER) + len(_POINTER) <= 3_800
+    assert text.endswith(_POINTER)
+    assert text.index(_POINTER) + len(_POINTER) <= mcp_app.INSTRUCTIONS_MAX
     for phrase in (
         "read-only fact tools, plus five that write only YOUR judgments onto an overlay "
         "(annotate, annotate_diff, annotate_diff_batch, promote, clear_overlay; the base map is "
@@ -1435,7 +1447,7 @@ def test_the_old_name_addr_is_refused_and_the_refusal_names_function(
 def test_the_cards_and_the_tools_are_the_same_set_and_the_reference_is_read_only() -> None:
     made = mcp_app.make_tools(Path("/nonexistent.db"))
     assert set(cards.TOOL_CARDS) == set(made)
-    assert len(made) == 42 and "get_tool_reference" in made
+    assert len(made) == 44 and "get_tool_reference" in made
     assert list(made)[-2:] == ["get_tool_reference", "legal_notice"]
     assert "get_tool_reference" not in mcp_app.WRITE_TOOLS
     assert mcp_app.tool_annotations("get_tool_reference").readOnlyHint is True
@@ -1602,9 +1614,9 @@ def test_the_input_schema_differs_from_plain_fastmcp_only_by_titles_and_folded_u
     for name in ours:
         _schema_differences(theirs[name].inputSchema, ours[name].inputSchema, name, out)
     assert out["OTHER"] == []
-    # counts of today's 42 tools, so a rewrite that quietly stops doing either shows
-    assert len(out["title_removed"]) == 275, len(out["title_removed"])
-    assert len(out["null_union_folded"]) == 131, len(out["null_union_folded"])
+    # counts of today's 44 tools, so a rewrite that quietly stops doing either shows
+    assert len(out["title_removed"]) == 282, len(out["title_removed"])
+    assert len(out["null_union_folded"]) == 133, len(out["null_union_folded"])
 
 
 def test_no_tool_declares_an_output_schema_and_plain_fastmcp_s_says_nothing(atlas: Path) -> None:
@@ -1640,7 +1652,7 @@ def test_every_parameter_that_took_null_still_declares_it(atlas: Path) -> None:
         for pn, p in t.inputSchema.get("properties", {}).items()
         if _nullable(p)
     }
-    assert len(nullable_before) == 138, len(nullable_before)  # never an empty set read as a pass
+    assert len(nullable_before) == 140, len(nullable_before)  # never an empty set read as a pass
     for name, t in ours.items():
         for pname, p in t.inputSchema.get("properties", {}).items():
             if "anyOf" in p:
@@ -1733,7 +1745,8 @@ def test_the_listing_fits_its_budget_as_a_client_receives_it(atlas: Path) -> Non
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    assert len(raw) <= 43_000, len(raw)
+    # 42,040 at 42 tools; 43,418 with the scan review's two. The cap sits above that.
+    assert len(raw) <= 44_500, len(raw)
 
 
 def test_a_call_still_answers_with_structured_content(atlas: Path) -> None:

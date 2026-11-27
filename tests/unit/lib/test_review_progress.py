@@ -71,6 +71,7 @@ STILL_OPEN_KEYS = {
     "audits_open",
     "disagreements",
     "judged_unread",
+    "read_gate_unverifiable",
 }
 PAIR_WIDE = [
     "must_read_left",
@@ -268,7 +269,14 @@ def test_only_the_reduce_left(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "cause",
-    ["must_read_left", "withheld_diffs", "failed_diffs", "disagreements", "judged_unread"],
+    [
+        "must_read_left",
+        "withheld_diffs",
+        "failed_diffs",
+        "disagreements",
+        "judged_unread",
+        "read_gate_unverifiable",
+    ],
 )
 def test_every_cause_of_an_incomplete_must_read_part_is_shown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str
@@ -283,7 +291,12 @@ def test_every_cause_of_an_incomplete_must_read_part_is_shown(
 
     MUTATION (verified RED, 1 of 5 failed each): give any one of still_open's withheld_diffs /
     failed_diffs / disagreements / judged_unread as 0 -> that case RED. MUTATION (verified RED, 5
-    of 5 failed): leave still_open out -> RED."""
+    of 5 failed): leave still_open out -> RED.
+
+    ``read_gate_unverifiable``: a must-read judgement written by a server keeping no tool-call log
+    disposes its subject, and holds must_read_complete false all the same (the read gate cannot be
+    applied to it). MUTATION (verified RED, 1 failed): leave the unverifiable set out of
+    ``must_read_set_done`` -> must_read_complete reads true -> RED."""
     assert ru.BLIND_AUDIT_ENABLED is False
     w = _build_world(tmp_path, monkeypatch)
     if cause == "withheld_diffs":
@@ -303,6 +316,24 @@ def test_every_cause_of_an_incomplete_must_read_part_is_shown(
             channel="mcp", session="w", read_basis={"basis": "none", "unread_before_verdict": True}
         )
         w.judge(_diff_of(anchor), anchor, "changed_real", ctx=unread)
+    elif cause == "read_gate_unverifiable":
+        unlogged = overlay.WriteContext(
+            channel="mcp", session="w", read_basis={"basis": "unknown", "why": ru.NO_SESSION_LOG}
+        )
+        # The same judgement again (no disagreement, every gate still met), by such a server.
+        verdict, basis = w.atlas.execute(
+            "SELECT verdict, verdict_basis FROM overlay WHERE anchor_ref = ?", (anchor,)
+        ).fetchone()
+        keep = (
+            ("evidence", "change_kind")
+            if verdict == "changed_real"
+            else ("checked", "why_unchanged")
+        )
+        given = {k: v for k, v in (json.loads(basis or "null") or {}).items() if k in keep}
+        w.judge(_diff_of(anchor), anchor, verdict, verdict_basis=given or None, ctx=unlogged)
+        rep = _review(w, k=0).report
+        assert rep["read_gate_unverifiable"]["subjects"] == [anchor]
+        assert rep["must_read"]["members_disposed"] == rep["must_read"]["members"]
     head = _server_call(server, "start_diff_review", {"run_pair": PAIR, "k": 0})
     p = head["progress"]
     assert p["must_read_complete"] is False and p["reduce_owed"] == 0
@@ -342,8 +373,9 @@ def test_every_stop_carries_progress(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert head["progress"]["coverage_statement"] == head["report"]["coverage_statement"]
 
 
-# Page budgets at which a 60-member batch's material is cut to fit.
-_PAGES = tuple(range(9_000, 21_001, 500))
+# Page budgets at which a 60-member batch's material is cut to fit. From 10,000: below it the
+# overview's own blocks (the report, the workflow) leave the material no room at all.
+_PAGES = tuple(range(10_000, 21_001, 500))
 
 
 @pytest.mark.parametrize("page", _PAGES)

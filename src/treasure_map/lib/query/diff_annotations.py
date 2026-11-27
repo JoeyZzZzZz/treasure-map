@@ -897,7 +897,12 @@ def pair_progress(
     the diffs undetermined as a whole, and the binaries no diff covers. ``complete`` is never true
     while any of the three is non-empty, or a binary_presence binary is unjudged, whatever the
     count of entries says. ``presence_staleness`` is the caller's reading of the two runs for the
-    binary_presence judgements (unknown reads needs_recheck)."""
+    binary_presence judgements (unknown reads needs_recheck).
+
+    ★ The WHOLE-LIST reading, deliberately unchanged by the work units: every listed subject counts
+    here, each one-sided binary's every function included, whatever the review's must-read
+    predicate selects. Its ``complete`` is not review_units' ``must_read_complete`` and is never
+    to be read as it — the two answer different questions."""
     from treasure_map.lib.query import binary_presence as bp
 
     if not diffs:

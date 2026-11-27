@@ -199,7 +199,13 @@ def report(
             # header saying it is a PARTIAL hand-off (the MCP tool serves none then).
             hrep = rr.handoff_report(conn, run_pair, file_staleness=file_staleness)
             text = (
-                rr.handoff_header(run_pair, len(findings), hrep, open_items=len(open_items))
+                rr.handoff_header(
+                    run_pair,
+                    rr.finding_counts(findings)[0],
+                    hrep,
+                    open_items=len(open_items),
+                    candidates=rr.finding_counts(findings)[1],
+                )
                 + "".join(rr.handoff_blocks(conn, run_pair, findings, stamp=stamp))
                 + "".join(rr.handoff_open_blocks(conn, run_pair, open_items))
             )
@@ -901,6 +907,52 @@ def run(
 # lib/query/scan_review for which is which).
 
 
+def _issue_items(data: object) -> list[dict[str, object]]:
+    """The items of a known-issue file that carry an evidence_ref: a list of them, or the lists
+    under its top-level keys."""
+    lists = (
+        [data] if isinstance(data, list) else list(data.values()) if isinstance(data, dict) else []
+    )
+    return [
+        x
+        for items in lists
+        if isinstance(items, list)
+        for x in items
+        if isinstance(x, dict) and isinstance(x.get("evidence_ref"), str)
+    ]
+
+
+def _print_attribution(conn: sqlite3.Connection, run_id: str, path: Path) -> None:
+    """``scan --attribute``: each known issue of this run, the class the mechanism puts it in."""
+    import json
+
+    from treasure_map.lib.query import scan_review as sr
+    from treasure_map.lib.query.triage import triage
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"{path} is not a JSON file of issues: {exc}") from exc
+    mine = [
+        x
+        for x in _issue_items(data)
+        if x.get("run_id", str(x["evidence_ref"]).split("#", 1)[0]) == run_id
+    ]
+    candidates = triage(conn, run_id=run_id)
+    review = sr.review_run(conn, run_id, candidates)
+    counts: dict[str, int] = {}
+    for x in mine:
+        got = sr.attribute(conn, review, candidates, str(x["evidence_ref"]))
+        counts[got["class"]] = counts.get(got["class"], 0) + 1
+        detail = got.get("outcome") or got.get("predicate") or got.get("why") or ""
+        click.echo(f"{x.get('id') or x['evidence_ref']}\t{got['class']}\t{detail}")
+    click.echo(
+        f"{len(mine)} issue(s) of {run_id}: "
+        + (", ".join(f"{c} {counts[c]}" for c in sr.ATTRIBUTION_CLASSES if c in counts) or "none")
+        + " — tier2_undisposed depends on the run mode (until=must_read does not hand tier 2 out)"
+    )
+
+
 def _open_run(atlas_db: str | None, run_id: str) -> tuple[sqlite3.Connection, str]:
     """Open the atlas and check it holds ``run_id``."""
     from treasure_map.cli.mcp_cli import _resolve_mcp_target
@@ -958,6 +1010,18 @@ def _open_run(atlas_db: str | None, run_id: str) -> tuple[sqlite3.Connection, st
     help="must_read: hand out tier 1 only, then stop and say how much of the second tier is "
     "unread; complete: the second tier too, after it.",
 )
+@click.option(
+    "--attribute",
+    "attribute_file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help=(
+        "Say where each known issue of a JSON file sits (read-only): read / unread / "
+        "tier2_undisposed / tail / ref_unresolved / absent / unanchored. The file holds items "
+        "with an evidence_ref (optional id, run_id), as a list or under any top-level keys; "
+        "the items of this run are read."
+    ),
+)
 @click.option("--atlas", "atlas_db", default=None, help="Atlas DB path.")
 def scan(
     run_id: str,
@@ -970,6 +1034,7 @@ def scan(
     worker: int | None,
     workers: int | None,
     until: str,
+    attribute_file: str | None,
     atlas_db: str | None,
 ) -> None:
     """One firmware scan's review: the four bands, the two tiers, the units they are handed out
@@ -990,8 +1055,13 @@ def scan(
         raise click.UsageError("--worker and --workers go together")
     if worker is not None and workers is not None and worker >= workers:
         raise click.UsageError(f"--worker must be below --workers ({workers})")
+    if attribute_file is not None and agent is not None:
+        raise click.UsageError("--attribute reads the review; it does not go with --agent")
     conn, atlas = _open_run(atlas_db, run_id)
     try:
+        if attribute_file is not None:
+            _print_attribution(conn, run_id, Path(attribute_file))
+            return
         if agent is None:
             review = sr.review_run(conn, run_id)
             dec = sr.declaration(

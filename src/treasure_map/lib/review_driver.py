@@ -37,7 +37,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -601,6 +601,11 @@ class _PairProfile:
         )
 
     def prompt(self, u: ru.Unit) -> str:
+        # A unit of one-sided candidates is judged the way a scan unit is — explain_candidate on
+        # every ref, then annotate — so it gets the scan prompt, for its side's run: unit_prompt
+        # says annotate_diff with a unit_id, which a candidate unit refuses.
+        if u.kind == ru.PRESENCE_CANDIDATES and u.members and u.members[0].run is not None:
+            return scan_unit_prompt(u.members[0].run, u)
         return unit_prompt(self.scope, u, self.k)
 
     def offer(self, atlas: sqlite3.Connection) -> dict[str, Any]:
@@ -609,7 +614,14 @@ class _PairProfile:
         )
 
     def written(self, atlas: sqlite3.Connection, u: ru.Unit, after: int) -> set[str]:
-        return members_written(atlas, u, after)
+        # By each member's write tool (review_units.write_tool): an annotate_diff write names its
+        # unit, an annotate write names none and is found by anchor. The union, so a unit holding
+        # both kinds would still read every write.
+        by_unit = members_written(atlas, u, after)
+        cands = [m for m in u.members if ru.write_tool(m) == "annotate"]
+        if not cands:
+            return by_unit
+        return by_unit | anchors_written(atlas, replace(u, members=tuple(cands)), after)
 
 
 @dataclass(frozen=True)
@@ -622,6 +634,9 @@ class _ScanProfile:
     ANCHOR out of the history instead of by unit."""
 
     run_id: str
+    # The shard the drive works, which the declaration at its stop is read for.
+    worker: int | None = None
+    workers: int | None = None
 
     @property
     def scope(self) -> str:
@@ -641,7 +656,9 @@ class _ScanProfile:
         return scan_unit_prompt(self.run_id, u)
 
     def offer(self, atlas: sqlite3.Connection) -> dict[str, Any]:
-        return scan_review.declaration(scan_review.review_run(atlas, self.run_id))
+        return scan_review.declaration(
+            scan_review.review_run(atlas, self.run_id), worker=self.worker, workers=self.workers
+        )
 
     def written(self, atlas: sqlite3.Connection, u: ru.Unit, after: int) -> set[str]:
         return anchors_written(atlas, u, after)
@@ -720,7 +737,7 @@ def scan_drive(
     if until not in UNTIL:
         raise ValueError(f"until must be one of {list(UNTIL)}, got {until!r}")
     return _drive(
-        _ScanProfile(run_id=run_id),
+        _ScanProfile(run_id=run_id, worker=worker, workers=workers),
         atlas_path,
         preset,
         workdir=workdir,
@@ -1097,8 +1114,10 @@ def compose_handoff(
 ) -> HandoffComposed | HandoffRefusal:
     """The hand-off document with each source's texts under the blocks they name (a source: its
     label and parse_handoff_analysis's mapping) — the driver's one agent, or the command line's
-    files. Every changed_real finding is a block whatever the sources name: the blocks are the
-    findings tmap reads, never the sources' keys. A key names a block by its anchor_ref as it is,
+    files. Every changed_real finding is a block whatever the sources name, and so is every
+    one-sided binary's candidate judged suspicious or exploitable (review_report.handoff_findings
+    reads both, so a source may name either): the blocks are the findings tmap reads, never the
+    sources' keys. A key names a block by its anchor_ref as it is,
     or as the block's heading writes it. The sources are read in order, each key in its order; an
     anchor named a second time (by any source) refuses at once, and a source's keys the hand-off
     does not hold refuse once that source is read — nothing is composed, never half-read."""
@@ -1124,7 +1143,13 @@ def compose_handoff(
     # The open items follow the findings as they are: the analysis is for the findings only.
     open_items = _rr.handoff_open_items(atlas, run_pair, file_staleness=file_staleness)
     document = (
-        _rr.handoff_header(run_pair, len(findings), rep, open_items=len(open_items))
+        _rr.handoff_header(
+            run_pair,
+            _rr.finding_counts(findings)[0],
+            rep,
+            open_items=len(open_items),
+            candidates=_rr.finding_counts(findings)[1],
+        )
         + "".join(_rr.handoff_blocks(atlas, run_pair, findings, stamp=stamp, analysis=named))
         + "".join(_rr.handoff_open_blocks(atlas, run_pair, open_items))
     )

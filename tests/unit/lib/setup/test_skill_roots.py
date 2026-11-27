@@ -42,10 +42,10 @@ _SRC = Path(__file__).parents[4] / "src"
 
 # The diff-review text this tmap ships. Changing it once it has been in a release means adding this
 # value to DIFF.legacy and the new one here.
-SHIPPED_SHA256 = "283897586b75ed41faf08541b086c2b5dbb38faae7a5fb90812164fb624665b6"
-# The scan-review text this tmap ships (7,895 bytes). It was in no release before this one, so
+SHIPPED_SHA256 = "bfef96167247492aba389f97cf914928c82318eeb98dccf404317db9891ef39c"
+# The scan-review text this tmap ships (9,089 bytes). It was in no release before this one, so
 # SCAN.legacy is empty; once it has shipped, changing it means adding this value to SCAN.legacy.
-SCAN_SHIPPED_SHA256 = "ac34d40d7268d081e040ab0da15b9be7b4e332a7c42c4ac530d89539296e5f88"
+SCAN_SHIPPED_SHA256 = "0c1b322e2dd1629bd2d528969c550c271e38702cc49b7047c77d5e5ef04d2d06"
 
 
 @pytest.fixture()

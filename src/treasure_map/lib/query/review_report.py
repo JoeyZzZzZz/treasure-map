@@ -26,6 +26,7 @@ from treasure_map.lib.query import diff_review as dr
 from treasure_map.lib.query import dispatch_groups as dg
 from treasure_map.lib.query import review_navigation as _rn
 from treasure_map.lib.query import review_units as ru
+from treasure_map.lib.query import scan_review as _sr
 from treasure_map.lib.query import upstream_version as uv
 from treasure_map.lib.query.diff_workflow import PAIR_SIDES
 
@@ -563,7 +564,29 @@ _HANDOFF_LABELS: tuple[str, ...] = (
     # an alternative entry's block, and an open item on a pairing component
     "pairing (tmap facts)",
     "pairing component (tmap facts)",
+    # a candidate's block (candidate_chunk)
+    "candidate (tmap facts)",
+    "dimensions (tmap facts)",
+    "sink argument provenance (tmap facts)",
+    "recorded chain",
+    "recorded verification gaps",
 )
+_CANDIDATE = "candidate (tmap facts)"
+_DIMENSIONS = "dimensions (tmap facts)"
+_PROVENANCE = "sink argument provenance (tmap facts)"
+# The subject kinds of a candidate's block: a one-sided binary's candidate in a run pair's
+# hand-off, one run's candidate in a scan's.
+PRESENCE_CANDIDATE_SUBJECT = "presence_candidate"
+SCAN_CANDIDATE_SUBJECT = "scan_candidate"
+CANDIDATE_SUBJECTS = (PRESENCE_CANDIDATE_SUBJECT, SCAN_CANDIDATE_SUBJECT)
+# The candidate verdicts a hand-off carries a block for: those that carry a lead forward (named
+# once, by the scan profile).
+CANDIDATE_FINDING_VERDICTS = _sr.LEAD_VERDICTS
+# The verdicts a candidate's block is for, and an open item's, as the templates name them.
+_LEADS = " or ".join(CANDIDATE_FINDING_VERDICTS)
+_OPEN_VERDICT = _sr.OPEN_VERDICT
+# How many sink argument provenance entries a candidate's block lists.
+_PROVENANCE_SHOWN = 6
 _OPEN_ALT = "alternative pairings (tmap facts)"
 _OPEN_HISTORY = "earlier writes and deletes"
 _PAIRING = "pairing (tmap facts)"
@@ -1382,6 +1405,8 @@ def handoff_chunk(
     blocks; handoff_blocks passes one."""
     from treasure_map.lib.query import file_diff as _fd
 
+    if finding.get("subject_kind") in CANDIDATE_SUBJECTS:
+        return candidate_chunk(atlas, finding, analysis=analysis, cap=cap)
     anchor = str(finding["anchor_ref"])
     kind = finding.get("subject_kind") or ""
     diff_id = finding.get("diff_id")
@@ -1436,6 +1461,212 @@ def handoff_chunk(
     return "\n".join(lines + tail) + "\n"
 
 
+def candidate_findings(
+    atlas: Any, run_id: str, refs: frozenset[str] | None, subject_kind: str
+) -> list[dict[str, Any]]:
+    """The candidates of ``run_id`` judged ``suspicious`` or ``exploitable`` — of ``refs`` only,
+    when given — as hand-off findings, by anchor_ref: each with its recorded verdict, rationale,
+    basis fields, who and when, and its review state as the candidate map reads it.
+
+    WHATEVER their tier: a candidate a person judged by hand in the tail is in, so a lead does not
+    leave the hand-off because of where the cut put it."""
+    from treasure_map.lib.query import coverage as cov  # noqa: PLC0415
+
+    marks = ",".join("?" * len(CANDIDATE_FINDING_VERDICTS))
+    rows = atlas.execute(
+        "SELECT anchor_ref, verdict, rationale, verdict_basis, attributed_to, updated_at "  # noqa: S608
+        f"FROM overlay WHERE anchor_kind = 'evidence_ref' AND run_id = ? AND verdict IN ({marks}) "
+        "ORDER BY anchor_ref",
+        (run_id, *CANDIDATE_FINDING_VERDICTS),
+    ).fetchall()
+    index = cov.load_coverage_index(atlas) if rows else None
+    out: list[dict[str, Any]] = []
+    for ref, verdict, rationale, basis, who, at in rows:
+        if refs is not None and ref not in refs:
+            continue
+        out.append(
+            {
+                "anchor_ref": str(ref),
+                "subject_kind": subject_kind,
+                "run_id": run_id,
+                "verdict": verdict,
+                "rationale": rationale,
+                "verdict_basis": _json_obj(basis),
+                "attributed_to": who,
+                "updated_at": at,
+                "review_state": index.state_for(str(ref)) if index is not None else None,
+            }
+        )
+    return out
+
+
+def presence_candidate_findings(atlas: Any, run_pair: str) -> list[dict[str, Any]]:
+    """The candidates of the pair's one-sided binaries (either side, every tier) judged
+    ``suspicious`` or ``exploitable`` (``candidate_findings``), by anchor_ref."""
+    from treasure_map.lib.query import binary_presence as bp  # noqa: PLC0415
+    from treasure_map.lib.query import file_diff as fd  # noqa: PLC0415
+    from treasure_map.lib.query.diff_align import not_diffed_groups  # noqa: PLC0415
+
+    runs = fd.split_run_pair(atlas, run_pair)
+    if runs is None:
+        return []
+    presence = bp.find_presence(atlas, runs[0], runs[1], not_diffed_groups(atlas, *runs))
+    by_run: dict[str, set[str]] = {}
+    for b in presence.items:
+        by_run.setdefault(b.run, set()).update(b.facts_by_ref)
+    out: list[dict[str, Any]] = []
+    for run, refs in sorted(by_run.items()):
+        if refs:
+            out += candidate_findings(atlas, run, frozenset(refs), PRESENCE_CANDIDATE_SUBJECT)
+    out.sort(key=lambda f: str(f["anchor_ref"]))
+    return out
+
+
+def finding_counts(findings: list[dict[str, Any]]) -> tuple[int, int]:
+    """``(changed_real findings, candidate findings)`` of a hand-off's findings."""
+    cands = sum(1 for f in findings if f.get("subject_kind") in CANDIDATE_SUBJECTS)
+    return len(findings) - cands, cands
+
+
+def _candidate_fact_lines(atlas: Any, ref: str) -> list[str]:
+    """A candidate's facts as explain_candidate reads them: where it is, its sink and source, every
+    dimension's state and value, and the first sink argument provenance entries — tmap's facts,
+    never a conclusion. A candidate that no longer resolves says so."""
+    from treasure_map.lib.query import explain_candidate as _explain  # noqa: PLC0415
+
+    try:
+        ex = _explain(atlas, ref)
+    except Exception as exc:  # noqa: BLE001 -- a cell that cannot be read states its reason
+        return [_cell(_CANDIDATE, _unavailable(_short_error(exc)))]
+    if ex is None:
+        return [_cell(_CANDIDATE, _unavailable("no candidate carries this evidence_ref now"))]
+    c = ex.candidate
+    lines = [
+        f"- {_CANDIDATE}:",
+        f"  - binary: {_inline(c.binary_path or 'unknown')}",
+        f"  - function: {_inline(c.function or 'unknown')}",
+        f"  - sink: {_inline(c.sink_anchor or 'unknown')} (class {_inline(c.sink_class)})",
+        f"  - source: {_inline(ex.source_class)} / {_inline(ex.source_kind)}",
+        f"  - entry reach: {_inline(c.entry_reach)}",
+        f"- {_DIMENSIONS}:",
+    ]
+    for d in ex.dimensions:
+        lines.append(f"  - {d.name}: {_inline(f'{d.state}:{d.value}')}")
+    summary = list(ex.sink_arg_provenance_summary or ())
+    if summary:
+        lines.append(f"- {_PROVENANCE}: {len(summary)}")
+        for s in summary[:_PROVENANCE_SHOWN]:
+            lines.append(f"  - {_inline(json.dumps(s, sort_keys=True, default=str))}")
+        if len(summary) > _PROVENANCE_SHOWN:
+            lines.append(
+                f"  - ... {len(summary) - _PROVENANCE_SHOWN} more: "
+                + _inline(f'get_sink_provenance(evidence_ref="{ref}", sink_idx=<idx>)')
+            )
+    else:
+        lines.append(_cell(_PROVENANCE, "none recorded"))
+    return lines
+
+
+def candidate_chunk(
+    atlas: Any,
+    finding: dict[str, Any],
+    *,
+    analysis: dict[str, str] | None = None,
+    cap: int | None = None,
+) -> str:
+    """One candidate's hand-off block — THE one assembly, shared by a scan's hand-off
+    (get_scan_handoff) and a run pair's for its one-sided binaries' candidates (every face of it:
+    get_diff_handoff, the driver's document, the command line's file): the recorded judgement
+    (verdict, rationale, the chain and verification gaps when recorded, who and when, the review
+    state), explain_candidate's facts, the two analysis placeholders and the standing status.
+    Cut at ``cap`` (default HANDOFF_BLOCK_CAP) as a finding block is; the placeholders and the
+    status are never cut."""
+    anchor = str(finding["anchor_ref"])
+    kind = str(finding.get("subject_kind") or SCAN_CANDIDATE_SUBJECT)
+    basis = finding.get("verdict_basis") or {}
+    state = finding.get("review_state")
+    lines = [
+        f"## `{handoff_anchor_text(anchor)}`",
+        "",
+        _cell("subject", kind),
+        _cell("recorded verdict", str(finding.get("verdict") or "")),
+        _cell("recorded by", _val(finding.get("attributed_to"))),
+        _cell("recorded at", _val(finding.get("updated_at"))),
+        _cell("review state", _val(state)),
+        _cell(
+            "basis",
+            "current"
+            if state == "concluded"
+            else f"MOVED or unsettled ({_val(state)}); re-read before relying on it",
+        ),
+    ]
+    rationale = str(finding.get("rationale") or "")
+    if rationale:
+        lines += _embedded("recorded rationale", rationale)
+    else:
+        lines.append(_cell("recorded rationale", "(none recorded)"))
+    chain = basis.get("chain") if isinstance(basis, dict) else None
+    if chain:
+        lines += _embedded("recorded chain", str(chain))
+    gaps = basis.get("verification_gaps") if isinstance(basis, dict) else None
+    if isinstance(gaps, list) and gaps:
+        lines.append(f"- recorded verification gaps: {len(gaps)}")
+        lines += [f"  - {_inline(str(g))}" for g in gaps]
+    lines.append("")
+    lines += _candidate_fact_lines(atlas, anchor)
+    tail = _handoff_tail(analysis)
+    skeleton_tail = tail if analysis is None else _handoff_tail(None)
+    room = (HANDOFF_BLOCK_CAP if cap is None else cap) - sum(
+        _json_len(x + "\n") for x in skeleton_tail
+    )
+    more = _inline(f'explain_candidate(evidence_ref="{anchor}")')
+    lines = _cap_lines(lines, room, more)
+    return "\n".join(lines + tail) + "\n"
+
+
+def candidate_open_chunk(
+    atlas: Any, ref: str, verdict: str | None, *, cap: int | None = None
+) -> str:
+    """One open item of a scan's hand-off: a tier 1 candidate judged ``inconclusive`` — read and
+    left open — with explain_candidate's facts. No placeholders and no status: it is listed for a
+    person to pick up, not handed off."""
+    lines = [
+        f"## open item: `{handoff_anchor_text(ref)}`",
+        "",
+        _cell("subject", SCAN_CANDIDATE_SUBJECT),
+        _cell("recorded verdict", _val(verdict)),
+        "",
+        *_candidate_fact_lines(atlas, ref),
+        "",
+    ]
+    more = _inline(f'explain_candidate(evidence_ref="{ref}")')
+    lines = _cap_lines(lines, HANDOFF_BLOCK_CAP if cap is None else cap, more)
+    return "\n".join(lines) + "\n"
+
+
+def scan_handoff_header(dec: dict[str, Any], n_findings: int, n_open: int) -> str:
+    """A scan hand-off's header (the declaration ``dec`` it is served under): the tier 2 still
+    undisposed and where tier 1's unread part sat, how the tier 1 members were judged, the read
+    gate count, the tail by predicate, the named gaps — counts, never a ruling — and how many
+    blocks follow."""
+    t1, t2 = dec["tier_1"], dec["tier_2"]
+    judged = ", ".join(f"{v} {n}" for v, n in t1["disposed_by_verdict"].items()) or "none"
+    tail = ", ".join(f"{p} {n}" for p, n in dec["tail"]["by_predicate"].items())
+    return (
+        f"# Scan hand-off for {dec['run_id']}\n\n"
+        f"_{n_findings} candidate(s) judged {_LEADS}, any tier. Each block "
+        "carries tmap's facts and the recorded judgment; the analysis is for a person to fill. "
+        f"{HANDOFF_BOUNDARY}_\n\n"
+        f"_{n_open} tier 1 candidate(s) judged {_OPEN_VERDICT} listed as open items after "
+        "them._\n\n"
+        f"_Tier 1: {t1['disposed']}/{t1['members']} disposed — by verdict: {judged}; read gate "
+        f"not applicable to {dec['read_gate_unverifiable']}. Tier 2: {t2['undisposed']} of "
+        f"{t2['members']} not disposed. Tail: {dec['tail']['members']} counted ({tail}). Named "
+        f"gaps: {', '.join(dec['not_seen'])}._\n\n"
+        f"_{dec['unread_not_unfound']}_\n\n"
+    )
+
+
 def handoff_findings(
     atlas: Any,
     run_pair: str,
@@ -1443,10 +1674,12 @@ def handoff_findings(
     file_staleness: Callable[[str, str], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """The pair's changed_real findings, ordered by anchor_ref (a stable paging order), each with
-    its review_state and basis as list_overlays reads them. Only this pair's judgements
-    are read and only their diffs' views built — no review_progress. ``file_staleness`` is the
-    caller's reading of the two runs for the file and binary_presence judgements (the MCP server's
-    stale-run gate, or local_handoff_context's); without it they read needs_recheck."""
+    its review_state and basis as list_overlays reads them — then the one-sided binaries'
+    candidates judged suspicious or exploitable (``presence_candidate_findings``). Only this
+    pair's judgements are read and only their diffs' views built — no review_progress.
+    ``file_staleness`` is the caller's reading of the two runs for the file and binary_presence
+    judgements (the MCP server's stale-run gate, or local_handoff_context's); without it they read
+    needs_recheck."""
     from treasure_map.lib.query import diff_annotations as da
 
     res = da.list_diff_overlays(
@@ -1458,7 +1691,11 @@ def handoff_findings(
     )
     rows = [r for r in res.get("overlays", []) if r.get("run_id") == run_pair]
     rows.sort(key=lambda r: str(r["anchor_ref"]))
-    return rows
+    # The one-sided binaries' candidates judged suspicious or exploitable follow, as findings of
+    # their own (candidate_chunk): appended HERE, the one reading every face of the hand-off calls,
+    # so the MCP pages, the driver's document (whose texts may name them) and the command line's
+    # file all carry them.
+    return rows + presence_candidate_findings(atlas, run_pair)
 
 
 def handoff_report(
@@ -1488,13 +1725,18 @@ def handoff_report(
     return review.report
 
 
-def handoff_header(run_pair: str, n_findings: int, rep: dict[str, Any], *, open_items: int) -> str:
+def handoff_header(
+    run_pair: str, n_findings: int, rep: dict[str, Any], *, open_items: int, candidates: int = 0
+) -> str:
     """The document's header line, served as its own first page by get_diff_handoff so the CLI file
     and the MCP pages are the same text. ``rep`` is the pair's report at the default k
     (``handoff_report``): the header counts its disposed subjects by verdict and, when the
     must-read set is not done, says the hand-off is a partial one (the MCP tool serves none then;
     the command line writes it for a person). ``open_items`` is how many change_inconclusive
-    blocks follow the findings (handoff_open_items)."""
+    blocks follow the findings (handoff_open_items). ``candidates`` is how many of the one-sided
+    binaries' candidates judged suspicious or exploitable follow the changed_real findings
+    (``finding_counts``); the line saying so states the one-sided candidates' counts as the
+    report reads them (``presence_candidates``)."""
     v = rep["verdicts"]["disposed"]
     n = sum(v.values())
     without = f" / {v['without_verdict']} without a verdict" if v["without_verdict"] else ""
@@ -1516,8 +1758,28 @@ def handoff_header(run_pair: str, n_findings: int, rep: dict[str, Any], *, open_
         f"_Of {n} disposed subjects: {v['changed_real']} changed_real / "
         f"{v['no_real_change']} no_real_change / {v['change_inconclusive']} "
         f"change_inconclusive{without}._\n\n"
+        f"{_candidates_line(rep, candidates)}"
         f"{partial}"
         f"_{PAIR_SIDES}_\n\n"
+    )
+
+
+def _candidates_line(rep: dict[str, Any], candidates: int) -> str:
+    """The header's line on the one-sided binaries' candidates: how the scan reading put them
+    (tier 1, tier 2, the tail by predicate), how far each tier is disposed and how, the binaries
+    holding no tier 1 candidate, and how many blocks follow — or nothing when there is none."""
+    pc = rep.get("presence_candidates") or {}
+    if not (pc.get("tier_1") or pc.get("tier_2") or pc.get("tail") or candidates):
+        return ""
+    tail = ", ".join(f"{p} {n}" for p, n in (pc.get("tail_by_predicate") or {}).items())
+    judged = ", ".join(f"{v} {n}" for v, n in (pc.get("disposed_by_verdict") or {}).items() if n)
+    return (
+        f"_One-sided binaries' candidates, read as their own run's scan reads them: tier 1 "
+        f"{pc.get('tier_1_disposed', 0)}/{pc.get('tier_1', 0)} disposed, tier 2 "
+        f"{pc.get('tier_2_disposed', 0)}/{pc.get('tier_2', 0)}, tail {pc.get('tail', 0)} counted "
+        f"({tail}); judged: {judged or 'none'}; binaries with no tier 1 candidate: "
+        f"{pc.get('binaries_without_tier_1', 0)}. {candidates} judged {_LEADS} "
+        "follow the changed_real findings, each awaiting human verification._\n\n"
     )
 
 

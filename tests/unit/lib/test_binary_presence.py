@@ -867,10 +867,12 @@ def _review(w: World) -> Any:
 
 def test_each_function_holding_a_candidate_is_a_must_read_member(world: World) -> None:
     """★ A one-sided binary is reviewed function by function: each function holding a candidate
-    is a must-read member of its own (25 functions, two candidates each: 50 rows, more than any
+    is a member of its own (25 functions, two candidates each: 50 rows, more than any
     first-rows rule reaches), the binary's own anchor is not one, and the
     binary's members are handed out together — every binary_presence unit holds the subjects of
-    one binary only.
+    one binary only. A function body is must-read only where the one-sided characterisation gate
+    holds it (no entry edge names this binary, so none is): its candidates are must-read by their
+    own scan tier, as members of their own.
 
     MUTATION (verified RED, 1 failed each): one member per binary again (``presence.items``) ->
     the functions are not members -> RED; cut every binary's subjects into one unit -> a unit
@@ -885,10 +887,10 @@ def test_each_function_holding_a_candidate_is_a_must_read_member(world: World) -
     review = _review(world)
     base = _anchor("b_only", "usr/bin/many")
     mine = [m for m in review.facts.presence_members if m.anchor_ref.startswith(base)]
-    assert len(mine) == 25 and all(m.must_read and m.rows == 2 for m in mine)
+    assert len(mine) == 25 and all(m.rows == 2 and not m.must_read for m in mine)
     assert base not in {m.anchor_ref for m in mine}
     assert f"{base}::{0x400000 + 0x100 * 12:08x}" in {m.anchor_ref for m in mine}
-    units = [u for u in review.units if u.kind == ru.PRESENCE]
+    units = [u for u in review.units if u.stream == ru.PRESENCE_STREAM]
     for u in units:
         bases = {
             (dr.split_presence_function(m.anchor_ref) or (m.anchor_ref,))[0] for m in u.members
@@ -1121,7 +1123,7 @@ def test_a_one_sided_binarys_unit_lists_its_functions_with_their_candidates(
     (unit,) = [
         u
         for u in _review(world).units
-        if u.kind == ru.PRESENCE
+        if u.stream == ru.PRESENCE_STREAM
         and u.members[0].anchor_ref.startswith(_anchor("a_only", "web/app/app.cgi"))
     ]
     first, second = (m.anchor_ref for m in unit.members)
@@ -1185,7 +1187,7 @@ def test_a_one_sided_binarys_unit_is_handed_out_by_its_page(
     (unit,) = [
         u
         for u in _review(world).units
-        if u.kind == ru.PRESENCE and u.members[0].anchor_ref.startswith(base)
+        if u.stream == ru.PRESENCE_STREAM and u.members[0].anchor_ref.startswith(base)
     ]
     total = len(unit.members)
     assert total == 6
@@ -1218,7 +1220,7 @@ def _cut_function_unit(world: World, monkeypatch: pytest.MonkeyPatch) -> tuple[A
     (unit,) = [
         u
         for u in _review(world).units
-        if u.kind == ru.PRESENCE
+        if u.stream == ru.PRESENCE_STREAM
         and u.members[0].anchor_ref.startswith(_anchor("a_only", "web/app/app.cgi"))
     ]
     full = _server(world)("start_diff_review", {"run_pair": PAIR, "unit": unit.unit_id})
@@ -1276,8 +1278,10 @@ def test_a_function_shown_with_its_rows_cut_is_read_by_explaining_its_candidates
         assert wrote["read_basis"] == {"basis": "unit_delivered", "material_cut": True}
         assert ru.disposed(state), state
     else:
-        assert wrote["read_basis"] == {"basis": "none", "unread_before_verdict": True}
-        assert state == ru.NEEDS_RECHECK
+        # Read nothing. A function body the one-sided gate does not hold is second tier (this
+        # binary is named by no entry edge): judged unread only where it is must-read.
+        assert unit.must_read is False
+        assert wrote["read_basis"] == {"basis": "none", "unread_before_verdict": False}
 
 
 def _calls_name_real_parameters(text: str) -> list[str]:
@@ -1310,7 +1314,7 @@ def test_the_one_sided_binary_reads_name_callable_tools(world: World) -> None:
     (unit,) = [
         u
         for u in _review(world).units
-        if u.kind == ru.PRESENCE
+        if u.stream == ru.PRESENCE_STREAM
         and u.members[0].anchor_ref.startswith(_anchor("a_only", "web/app/app.cgi"))
     ]
     call = _server(world)

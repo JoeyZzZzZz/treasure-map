@@ -416,7 +416,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "For a version diff, start with run_pair = {run_a}::{run_b}: the whole pair cut into "
             "work units by the server — report (coverage_statement, must-read units, "
             "must_read_complete) and next_unit with its material; judge each member with "
-            "annotate_diff(..., unit_id=<its unit_id>) and call again until next_unit is null; "
+            "annotate_diff(..., unit_id=<its unit_id>) — annotate for a candidate, as its "
+            "judge_with says — and call again until next_unit is null; "
             "unit=<unit_id> reads one, worker/workers a shard, k the first entries per diff that "
             "are must-read (default 4). START HERE for one diff: diff_id = {run_a}::{run_b}::"
             "{binary} (list_diffs gives the ids) — the entries to read first and the calls to read "
@@ -561,6 +562,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
         ),
         summary=(
             "A standardized hand-off of a run pair's changed_real findings, one block per finding, "
+            "and of its one-sided binaries' candidates judged suspicious or exploitable, "
             "paged by offset. Each block carries the recorded judgment, tmap's facts for the "
             "finding's subject shape (the change, the reachable shape, the same-shape siblings) "
             "and two analysis placeholders a person fills. tmap draws no conclusion here: a cell "
@@ -570,6 +572,29 @@ TOOL_CARDS: dict[str, ToolCard] = {
             "writes; re-fetch from offset 0 if findings_digest changes. Throughout, the status "
             "stays awaiting human verification. Refused until the pair's must_read_complete is "
             "true (refused: must_read_incomplete, with progress)."
+        ),
+    ),
+    "start_scan_review": ToolCard(
+        required=("run_id",),
+        example='start_scan_review(run_id="<run_id>")',
+        boundary=("NO candidate fact", "Unread is not 'nothing found'"),
+        summary=(
+            "One firmware scan's MUST-READ set (tier 1), in work units: declaration, "
+            "coverage_statement, must_read_complete and next_unit. Its material names each "
+            "candidate with NO candidate fact: read each with explain_candidate, then judge it "
+            "with annotate (no unit_id); call again. worker/workers keep a shard. Tier 2 is "
+            "counted, the tail too. Unread is not 'nothing found'."
+        ),
+    ),
+    "get_scan_handoff": ToolCard(
+        required=("run_id",),
+        example='get_scan_handoff(run_id="<run_id>")',
+        boundary=("tmap draws no conclusion here", "the status stays awaiting human verification"),
+        summary=(
+            "A scan's hand-off, paged by offset: a header of counts, one block per candidate "
+            "judged suspicious or exploitable (any tier), then the tier 1 inconclusive ones as "
+            "open items. tmap draws no conclusion here: the status stays awaiting human "
+            "verification. Refused until the scan's must_read_complete is true."
         ),
     ),
     "get_function_alignment": ToolCard(
@@ -1067,6 +1092,8 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             *_BINARY_READERS,
             "list_overlays",
             "clear_overlay",
+            "start_scan_review",
+            "get_scan_handoff",
         ),
         _KEPT,
         "with anchor_kind='diff_subject', list_overlays and clear_overlay take a run pair "
@@ -1165,13 +1192,13 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
     _param(
         "worker",
         "this shard's index (with workers)",
-        ("start_diff_review", "annotate_diff", "annotate_diff_batch"),
+        ("start_diff_review", "annotate_diff", "annotate_diff_batch", "start_scan_review"),
         _CONSISTENT,
     ),
     _param(
         "workers",
         "how many shards (with worker)",
-        ("start_diff_review", "annotate_diff", "annotate_diff_batch"),
+        ("start_diff_review", "annotate_diff", "annotate_diff_batch", "start_scan_review"),
         _CONSISTENT,
     ),
     _param(
@@ -1348,6 +1375,7 @@ PARAMETER_NAMES: list[dict[str, Any]] = [
             "get_diff_sink_overlay",
             "get_diff_string_delta",
             "get_diff_handoff",
+            "get_scan_handoff",
             "get_file_diff",
             "cross_firmware_patterns",
             "pattern_density",

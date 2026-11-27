@@ -410,7 +410,15 @@ def whole_members(material: dict[str, Any]) -> list[str] | None:
 
 
 # A material that lists members: the list's key and the identifier each item carries.
-_MEMBER_LISTS = (("entries", "entry_id"), ("owed", "anchor_ref"), ("functions", "anchor_ref"))
+_MEMBER_LISTS = (
+    ("entries", "entry_id"),
+    ("owed", "anchor_ref"),
+    ("functions", "anchor_ref"),
+    # A unit of candidates (scan_review.candidate_material): the members it names. Their read gate
+    # is explain_candidate, read without the unit (scan_review.read_basis_of), so naming them here
+    # reads nothing for them.
+    ("candidates", "anchor_ref"),
+)
 
 
 def shown_members(material: dict[str, Any]) -> list[str] | None:
