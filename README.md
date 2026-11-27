@@ -120,8 +120,8 @@ changes that look like security fixes. None of them is complete:
 > incompatibly between versions. See [Upgrading](#upgrading).
 
 **1. Install.** This installs `tmap` and then runs `tmap init`, which sets up the toolchain,
-registers the MCP server with the agents you choose, and installs the diff-review skill for agents
-that read skills. Restart your agent when it finishes.
+registers the MCP server with the agents you choose, and installs the scan-review and diff-review
+skills for agents that read skills. Restart your agent when it finishes.
 
 ```bash
 curl -LsSf https://github.com/JoeyZzZzZz/treasure-map/releases/latest/download/install.sh | sh
@@ -157,8 +157,8 @@ find the security fixes, judge whether each one is complete,
 and check whether the new code adds attack surface.
 ```
 
-The prompts only say what you want. The MCP server's instructions and the diff-review skill tell
-the agent how to work: what to read, how to record each judgment, and when the review may stop. A
+The prompts only say what you want. The MCP server's instructions and the review skills tell the
+agent how to work: what to read, how to record each judgment, and when the review may stop. A
 firmware pair often takes more than one agent session; a new session picks up where the last one
 stopped.
 
@@ -211,12 +211,12 @@ pass its checks.
 ## Connect your agent
 
 `tmap init` registers the MCP server with the agents you choose (Claude Code, Codex, Cursor, Claude
-Desktop, dsh; the ones it detects are pre-selected) and installs the diff-review skill for agents
-that load skills from disk. Restart the agent afterwards.
+Desktop, dsh; the ones it detects are pre-selected) and installs the scan-review and diff-review
+skills for agents that load skills from disk. Restart the agent afterwards.
 
-Claude Desktop only accepts skills as uploads: save the output of `tmap review skill` as
-`tmap-diff-review/SKILL.md`, zip the folder, and upload it under Customize > Skills (code execution
-must be on).
+Claude Desktop only accepts skills as uploads: save the output of `tmap review skill --scan` as
+`tmap-scan-review/SKILL.md` and of `tmap review skill` as `tmap-diff-review/SKILL.md`, zip
+each folder, and upload it under Customize > Skills (code execution must be on).
 
 <details>
 <summary>Registering the MCP server by hand</summary>
@@ -290,7 +290,7 @@ nothing, and exits non-zero on any ❌ or `?`.
 tmap uninstall
 ```
 
-It shows its plan and asks once, then removes the treasure-map entry and the diff-review skill from
+It shows its plan and asks once, then removes the treasure-map entry and the review skills from
 each agent, removes the toolchain `tmap init` downloaded (never a JDK, Ghidra or BinDiff you
 installed yourself), and offers to remove the program itself. **Your data stays:**
 `~/.treasure-map/config.yaml`, `.env`, the atlas and the workspaces. Reinstalling reuses all of it.

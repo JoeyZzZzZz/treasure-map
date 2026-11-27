@@ -75,7 +75,7 @@ agent 读懂单个函数已经不成问题。但面对整个根文件系统（�
 
 > **开发者预览版。** 命令、配置、atlas 数据库和 MCP 工具字段在版本之间可能不兼容，见下文[升级](#升级)。
 
-**1. 安装。** 一条命令装好 `tmap` 并自动运行 `tmap init`：配置工具链，把 MCP 服务器注册到你选择的 agent，并为能读取 skill 的 agent 装上 diff 审查 skill。完成后重启 agent。
+**1. 安装。** 一条命令装好 `tmap` 并自动运行 `tmap init`：配置工具链，把 MCP 服务器注册到你选择的 agent，并为能读取 skill 的 agent 装上 scan 审查和 diff 审查两个 skill。完成后重启 agent。
 
 ```bash
 curl -LsSf https://github.com/JoeyZzZzZz/treasure-map/releases/latest/download/install.sh | sh
@@ -110,7 +110,7 @@ tmap diff --before fw-v1 --after fw-v2
 并检查新代码有没有引入新的攻击面。
 ```
 
-提示词只需说清你要什么。怎么读地图、怎么审对比（读哪些、怎么记录判断、什么时候能停），由 MCP 服务器的说明和 diff 审查 skill 告诉 agent。一对固件往往一个会话审不完，新会话会接着上次的进度做。
+提示词只需说清你要什么。怎么读地图、怎么审对比（读哪些、怎么记录判断、什么时候能停），由 MCP 服务器的说明和审查 skill 告诉 agent。一对固件往往一个会话审不完，新会话会接着上次的进度做。
 
 `scan` 最耗时：每个二进制跑一遍 Ghidra，会显示进度。用同一个 `-w` 重新运行即可续跑。所有扫描和对比结果都存在同一个 **atlas**（`~/.treasure-map/atlas.db`）里，由 agent 自己选择处理哪个固件、哪次对比。
 
@@ -155,9 +155,9 @@ tmap diff --before fw-v1 --after fw-v2
 
 ## 连接你的 agent
 
-`tmap init` 会把 MCP 服务器注册到你选择的 agent（Claude Code、Codex、Cursor、Claude Desktop、dsh；检测到的默认勾选），并为从磁盘读取 skill 的 agent 装上 diff 审查 skill。注册后重启 agent。
+`tmap init` 会把 MCP 服务器注册到你选择的 agent（Claude Code、Codex、Cursor、Claude Desktop、dsh；检测到的默认勾选），并为从磁盘读取 skill 的 agent 装上 scan 审查和 diff 审查两个 skill。注册后重启 agent。
 
-Claude Desktop 只能通过上传添加 skill：把 `tmap review skill` 的输出存为 `tmap-diff-review/SKILL.md`，把这个文件夹打成 zip，在 Customize > Skills 里上传（需要开启代码执行）。
+Claude Desktop 只能通过上传添加 skill：把 `tmap review skill --scan` 的输出存为 `tmap-scan-review/SKILL.md`、`tmap review skill` 的输出存为 `tmap-diff-review/SKILL.md`，把每个文件夹分别打成 zip，在 Customize > Skills 里上传（需要开启代码执行）。
 
 <details>
 <summary>手动注册 MCP 服务器</summary>
@@ -223,7 +223,7 @@ tmap diff --before fw-v1 --after fw-v2      # 重新运行对比；过期的 run
 tmap uninstall
 ```
 
-它会先展示计划并询问一次，然后从每个 agent 中移除 treasure-map 条目和 diff 审查 skill，删除 `tmap init` 下载的工具链（绝不删你自己装的 JDK、Ghidra 或 BinDiff），并询问是否卸载程序本身。**数据会保留：** `~/.treasure-map/config.yaml`、`.env`、atlas 和各个工作区，重新安装后可以直接接着用。
+它会先展示计划并询问一次，然后从每个 agent 中移除 treasure-map 条目和审查 skill，删除 `tmap init` 下载的工具链（绝不删你自己装的 JDK、Ghidra 或 BinDiff），并询问是否卸载程序本身。**数据会保留：** `~/.treasure-map/config.yaml`、`.env`、atlas 和各个工作区，重新安装后可以直接接着用。
 
 <details>
 <summary>连数据一起删除，以及其他细节</summary>
